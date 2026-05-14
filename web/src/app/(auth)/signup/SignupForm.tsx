@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 
@@ -10,6 +10,13 @@ export function SignupForm() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const router = useRouter()
+
+  useEffect(() => {
+    const supabase = createClient()
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) router.replace('/wikis')
+    })
+  }, [router])
 
   async function handleSignup(e: React.FormEvent) {
     e.preventDefault()
@@ -27,7 +34,6 @@ export function SignupForm() {
       setLoading(false)
     } else {
       router.push('/onboarding')
-      router.refresh()
     }
   }
 

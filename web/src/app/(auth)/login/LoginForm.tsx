@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -12,6 +12,13 @@ function LoginFormInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const returnTo = searchParams.get('returnTo')
+
+  useEffect(() => {
+    const supabase = createClient()
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) router.replace('/wikis')
+    })
+  }, [router])
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault()
@@ -26,7 +33,6 @@ function LoginFormInner() {
     } else {
       const dest = returnTo && returnTo.startsWith('/') && !returnTo.startsWith('//') ? returnTo : '/wikis'
       router.push(dest)
-      router.refresh()
     }
   }
 

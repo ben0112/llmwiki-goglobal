@@ -29,7 +29,6 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
     initialized.current = true
 
     if (isLocal) {
-      // Local mode: static session, no Supabase
       setUser({ id: userId, email })
       setAccessToken('local')
       setOnboarded(true)
@@ -37,7 +36,8 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
       return
     }
 
-    // Hosted mode: Supabase session
+    let subscription: { unsubscribe: () => void } | undefined
+
     import('@/lib/supabase/client').then(({ createClient }) => {
       const supabase = createClient()
       supabase.auth.getUser().then(async ({ data: { user: authUser } }) => {
@@ -46,7 +46,6 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
           useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
           return
         }
-        // Still need the session for the access_token
         const { data: { session } } = await supabase.auth.getSession()
         if (!session) {
           signOut()
@@ -69,7 +68,7 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
         }
       })
 
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      const { data } = supabase.auth.onAuthStateChange((_event, session) => {
         if (session) {
           useUserStore.getState().setAccessToken(session.access_token)
         } else {
@@ -78,9 +77,10 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
           router.replace('/login')
         }
       })
-
-      return () => subscription.unsubscribe()
+      subscription = data.subscription
     })
+
+    return () => subscription?.unsubscribe()
   }, [userId, email, setUser, setAccessToken, setOnboarded, fetchKBs, router, pathname, signOut])
 
   React.useEffect(() => {
