@@ -48,13 +48,13 @@ def cmd_init(workspace: str) -> None:
 
     # Initialize SQLite
     import sqlite3
-    schema_path = API_DIR / "infra" / "db" / "sqlite_schema.sql"
+    schema_path = REPO_ROOT / "shared" / "sqlite_schema.sql"
     if not schema_path.exists():
         print(f"Error: schema not found at {schema_path}", file=sys.stderr)
         sys.exit(1)
 
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(schema_path.read_text())
+    conn.executescript(schema_path.read_text(encoding="utf-8"))
 
     import uuid
     user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "local"))
@@ -253,6 +253,10 @@ def cmd_mcp(workspace: str) -> None:
     if not (ws / ".llmwiki" / "index.db").exists():
         cmd_init(str(ws))
 
+    # local_server lives in mcp/; chdir so `python -m local_server` resolves
+    # the module no matter where the CLI was invoked from (Claude Desktop /
+    # Code launches this with cwd set to ~ on macOS).
+    os.chdir(str(MCP_DIR))
     os.execvp(
         sys.executable,
         [sys.executable, "-m", "local_server", "--workspace", str(ws)],
