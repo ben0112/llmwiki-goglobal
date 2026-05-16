@@ -36,11 +36,13 @@ cd web && npm install && cd ..
 # Initialize a workspace (point at any folder with your files)
 ./llmwiki init ~/research
 
-# Start the app
+# Start API + web UI
 ./llmwiki serve ~/research
 ```
 
 Open [localhost:3000](http://localhost:3000). Your files are indexed, wiki is scaffolded, ready to go.
+
+> If `./llmwiki init` errors out on a fresh checkout, first make sure you're up to date with `master` and try again. If it still fails, open an issue with the full output; local setup gets fewer reports, so there may be undocumented edge cases.
 
 ### Connect Claude
 
