@@ -2,16 +2,16 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.encoders import jsonable_encoder
-from starlette.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from starlette.responses import StreamingResponse
 
 from infra.rate_limit import limiter
 from services.base import PublicWikiService
 
 router = APIRouter(prefix="/v1/public", tags=["public"])
 
-_NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
+_NO_CACHE_VALUE = "no-store, must-revalidate"
+_NO_CACHE_HEADERS = {"Cache-Control": _NO_CACHE_VALUE}
 _SLUG_MAX = 80
 
 
@@ -31,6 +31,7 @@ def _normalize_slug(slug: str) -> str | None:
 async def get_public_wiki(
     request: Request,
     slug: str,
+    response: Response,
     service: Annotated[PublicWikiService, Depends(get_public_wiki_service)],
 ):
     normalized = _normalize_slug(slug)
@@ -39,7 +40,8 @@ async def get_public_wiki(
     wiki = await service.get_by_slug(normalized)
     if not wiki:
         raise HTTPException(status_code=404, detail="Wiki not found")
-    return JSONResponse(content=jsonable_encoder(wiki), headers=_NO_CACHE)
+    response.headers["Cache-Control"] = _NO_CACHE_VALUE
+    return wiki
 
 
 @router.get("/wiki/{slug}/assets/{document_number}")
@@ -71,7 +73,7 @@ async def get_public_wiki_asset(
     async def _gen():
         yield body
 
-    return StreamingResponse(_gen(), media_type=media_type, headers=_NO_CACHE)
+    return StreamingResponse(_gen(), media_type=media_type, headers=_NO_CACHE_HEADERS)
 
 
 def _media_type_for_key(key: str) -> str:
