@@ -349,3 +349,28 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER document_change_trigger
   AFTER INSERT OR UPDATE OR DELETE ON documents
   FOR EACH ROW EXECUTE FUNCTION notify_document_change();
+
+-- Mirror of 006_kb_sharing.sql so the test DB reflects the live schema.
+CREATE TYPE kb_visibility AS ENUM ('private', 'shared', 'public');
+
+ALTER TABLE knowledge_bases
+    ADD COLUMN visibility kb_visibility NOT NULL DEFAULT 'private',
+    ADD COLUMN public_slug TEXT,
+    ADD COLUMN share_token TEXT NOT NULL DEFAULT replace(gen_random_uuid()::text, '-', ''),
+    ADD COLUMN visibility_updated_at TIMESTAMPTZ,
+    ADD COLUMN published_at TIMESTAMPTZ,
+    ADD CONSTRAINT knowledge_bases_public_slug_format
+        CHECK (public_slug IS NULL OR public_slug ~ '^[a-z0-9][a-z0-9-]{0,78}[a-z0-9]$'),
+    ADD CONSTRAINT knowledge_bases_public_requires_slug
+        CHECK (visibility <> 'public' OR public_slug IS NOT NULL);
+
+CREATE UNIQUE INDEX idx_knowledge_bases_public_slug
+    ON knowledge_bases (public_slug)
+    WHERE public_slug IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_knowledge_bases_share_token
+    ON knowledge_bases (share_token);
+
+CREATE INDEX idx_knowledge_bases_public_lookup
+    ON knowledge_bases (public_slug, updated_at)
+    WHERE visibility = 'public';

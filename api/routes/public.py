@@ -3,6 +3,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from starlette.responses import JSONResponse, StreamingResponse
 
 from infra.rate_limit import limiter
@@ -38,7 +39,7 @@ async def get_public_wiki(
     wiki = await service.get_by_slug(normalized)
     if not wiki:
         raise HTTPException(status_code=404, detail="Wiki not found")
-    return JSONResponse(content=wiki, headers=_NO_CACHE)
+    return JSONResponse(content=jsonable_encoder(wiki), headers=_NO_CACHE)
 
 
 @router.get("/wiki/{slug}/assets/{document_number}")
