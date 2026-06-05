@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isBuiltInDisabledHost,
+  normalizeApiUrl,
   normalizeFolderPath,
 } from "./settings";
 
@@ -16,6 +17,13 @@ describe("extension settings helpers", () => {
     it("falls back on traversal or Windows-style paths", () => {
       expect(normalizeFolderPath("/webclipper/../wiki/")).toBe("/webclipper/");
       expect(normalizeFolderPath("/webclipper\\research")).toBe("/webclipper/");
+    });
+  });
+
+  describe("normalizeApiUrl", () => {
+    it("removes trailing slash, query, and hash from API URLs", () => {
+      expect(normalizeApiUrl(" http://localhost:8000/?x=1#top ")).toBe("http://localhost:8000");
+      expect(normalizeApiUrl("https://example.com/api///")).toBe("https://example.com/api");
     });
   });
 

@@ -5,7 +5,7 @@ import { useSearchParams } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2 } from 'lucide-react'
 import * as tus from 'tus-js-client'
-import { useUserStore } from '@/stores'
+import { useUserStore, useUploadStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
 import { toast } from 'sonner'
@@ -117,6 +117,18 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const token = useUserStore((s) => s.accessToken)
   const userId = useUserStore((s) => s.user?.id)
   const { documents, setDocuments, loading } = useKBDocuments(kbId)
+
+  // ─── Upload tracking (global progress panel) ─────────────────
+  const addUpload = useUploadStore((s) => s.addUpload)
+  const setUploadProgress = useUploadStore((s) => s.setProgress)
+  const markUploadProcessing = useUploadStore((s) => s.markProcessing)
+  const markUploadFailed = useUploadStore((s) => s.markFailed)
+  const reconcileUploads = useUploadStore((s) => s.reconcileDocuments)
+  const processingUploads = useUploadStore(
+    (s) => s.items.filter((i) => i.kbId === kbId && i.phase === 'processing').length,
+  )
+  const openRequest = useUploadStore((s) => s.openRequest)
+  const consumeOpenRequest = useUploadStore((s) => s.consumeOpenRequest)
 
   // ─── URL helpers ─────────────────────────────────────────────
   // Search param updates are instant (no Next.js route recompilation).
@@ -589,18 +601,21 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const tusUploadFile = React.useCallback((file: File, targetPath: string = '/'): Promise<void> => {
     const t = getToken()
     if (!t) return Promise.reject(new Error('Not authenticated'))
+    const uploadId = crypto.randomUUID()
+    addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
     return new Promise((resolve, reject) => {
       const upload = new tus.Upload(file, {
         endpoint: `${API_URL}/v1/uploads`,
         retryDelays: [0, 1000, 3000, 5000],
         metadata: { filename: file.name, knowledge_base_id: kbId, path: targetPath },
         headers: { Authorization: `Bearer ${t}` },
-        onError: (error) => { toast.error(`Upload failed: ${file.name}`); reject(error) },
-        onSuccess: () => { toast.success(`${file.name} uploaded, processing...`); resolve() },
+        onProgress: (sent, total) => setUploadProgress(uploadId, total > 0 ? sent / total : 0),
+        onError: (error) => { markUploadFailed(uploadId); reject(error) },
+        onSuccess: () => { markUploadProcessing(uploadId); resolve() },
       })
       upload.start()
     })
-  }, [kbId])
+  }, [kbId, kbSlug, addUpload, setUploadProgress, markUploadProcessing, markUploadFailed])
 
   const uploadFiles = React.useCallback((files: File[], targetPath: string = '/') => {
     const t = getToken()
@@ -636,6 +651,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
         if (ext && supportedTypes.has(ext)) {
           if (process.env.NEXT_PUBLIC_MODE === 'local') {
+            const uploadId = crypto.randomUUID()
+            addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
             const formData = new FormData()
             formData.append('file', file)
             formData.append('path', targetPath)
@@ -644,8 +661,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
               if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
               const data = await res.json()
               setDocuments((prev) => [data, ...prev])
-              toast.success(`${file.name} uploaded`)
-            } catch { toast.error(`Upload failed: ${file.name}`) }
+              markUploadProcessing(uploadId)
+            } catch { markUploadFailed(uploadId) }
           } else {
             await tusUploadFile(file, targetPath)
           }
@@ -663,7 +680,21 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         navigateToView('files')
       }
     })
-  }, [kbId, userId, tusUploadFile, documents, sourceDocs.length, navigateToView])
+  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, markUploadProcessing, markUploadFailed])
+
+  React.useEffect(() => {
+    reconcileUploads(kbId, documents)
+  }, [kbId, documents, processingUploads, reconcileUploads])
+
+  React.useEffect(() => {
+    if (!openRequest || openRequest.kbId !== kbId) return
+    const doc = documents.find((d) => d.document_number === openRequest.documentNumber)
+    if (!doc) return
+    setActiveSourceDocId(doc.id)
+    setActiveView('doc')
+    navigateToView('files', { searchParams: { doc: String(openRequest.documentNumber) } })
+    consumeOpenRequest()
+  }, [openRequest, kbId, documents, navigateToView, consumeOpenRequest])
 
   // ─── Drag-and-drop ───────────────────────────────────────────
   const [fileDragOver, setFileDragOver] = React.useState(false)
@@ -702,10 +733,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const handleFilesPathChange = React.useCallback((path: string) => {
     const clean = path === '/' ? '' : path.replace(/^\//, '').replace(/\/$/, '')
     const url = `/wikis/${kbSlug}` + (clean ? `/files/${encodeURI(clean)}` : '/files')
-    // Use replaceState to update the URL bar without triggering a Next.js
-    // navigation — avoids re-rendering the page component and the flash
-    // that comes from KBPage → KBDetail → FilesGrid prop cascade.
-    window.history.replaceState(window.history.state, '', url)
+    // pushState so each folder is a back-button stop; FilesGrid already holds the path.
+    window.history.pushState(window.history.state, '', url)
   }, [kbSlug])
 
   const handleFilesDocOpen = React.useCallback((docNumber: number | null) => {

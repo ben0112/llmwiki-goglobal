@@ -15,7 +15,6 @@ import {
   fetchKnowledgeBases,
   getDocumentByUrl,
   getHighlights,
-  replaceHighlights,
   saveWebPage,
   upsertHighlight,
 } from "@/lib/api";
@@ -30,10 +29,17 @@ import {
 } from "@/lib/settings";
 
 export default defineContentScript({
-  matches: ["<all_urls>"],
+  // Injected on demand via chrome.scripting.executeScript when the popup opens
+  // (under the activeTab grant) — never auto-mounted. `matches` is the API
+  // origin only so WXT doesn't fold a broad host into the manifest.
+  matches: ["https://api.llmwiki.app/*"],
+  registration: "runtime",
   runAt: "document_idle",
-  cssInjectionMode: "manifest",
+  cssInjectionMode: "manual",
   async main() {
+    const w = window as unknown as { __llmwikiLoaded?: boolean };
+    if (w.__llmwikiLoaded) return;
+    w.__llmwikiLoaded = true;
     if (isRestrictedPage()) return;
     if (isLlmWikiAppPage()) return;
     if (await isDomainDisabled(location.hostname)) return;
@@ -49,9 +55,35 @@ function isLlmWikiAppPage(): boolean {
 }
 
 const STYLE_ID = "llmwiki-highlight-style";
-const MAX_INLINE_IMAGES = 12;
+const MAX_INLINE_IMAGES = 24;
 const MAX_INLINE_IMAGE_BYTES = 2_500_000;
 const MAX_INLINE_TOTAL_BYTES = 6_000_000;
+const PENDING_PAGE_PREFIX = "llmwiki_pending_page:";
+const LAZY_IMAGE_SRC_ATTRIBUTES = [
+  "data-src",
+  "data-original",
+  "data-lazy-src",
+  "data-hires",
+  "data-url",
+  "data-image",
+  "data-full-url",
+];
+const LAZY_IMAGE_SRCSET_ATTRIBUTES = [
+  "data-srcset",
+  "data-lazy-srcset",
+];
+
+interface PendingPageState {
+  url: string;
+  title: string;
+  documentId: string | null;
+  knowledgeBaseId: string | null;
+  version: number | null;
+  folderPath: string;
+  highlights: Highlight[];
+  deletedHighlightIds: string[];
+  updatedAt: string;
+}
 
 function injectStyle(): void {
   if (document.getElementById(STYLE_ID)) return;
@@ -128,15 +160,16 @@ function injectStyle(): void {
       border: 1px solid #e5e7eb;
       border-radius: 8px;
       box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
-      padding: 10px;
-      width: 280px;
+      padding: 8px;
+      width: min(320px, calc(100vw - 20px));
       font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .llmwiki-popover textarea {
       width: 100%;
       box-sizing: border-box;
       min-height: 64px;
-      max-height: 220px;
+      max-height: 180px;
+      overflow-y: auto;
       resize: vertical;
       border: 1px solid #d1d5db;
       border-radius: 6px;
@@ -259,8 +292,61 @@ function largestSrcsetUrl(srcset: string): string {
   }
 }
 
+function absoluteImageUrl(value: string | null | undefined): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed, location.href).toString();
+  } catch {
+    return trimmed;
+  }
+}
+
+function pictureSourceUrl(img: HTMLImageElement): string {
+  const picture = img.closest("picture");
+  if (!picture) return "";
+  for (const source of Array.from(picture.querySelectorAll("source"))) {
+    const srcset = source.getAttribute("srcset") || source.getAttribute("data-srcset") || "";
+    const best = largestSrcsetUrl(srcset);
+    if (best) return best;
+    const src = absoluteImageUrl(source.getAttribute("src"));
+    if (src) return src;
+  }
+  return "";
+}
+
+function candidateImageUrl(img: HTMLImageElement): string {
+  const directCandidates = [
+    img.currentSrc,
+    img.getAttribute("src"),
+    img.src,
+    largestSrcsetUrl(img.getAttribute("srcset") || ""),
+    pictureSourceUrl(img),
+    ...LAZY_IMAGE_SRC_ATTRIBUTES.map((attr) => img.getAttribute(attr)),
+    ...LAZY_IMAGE_SRCSET_ATTRIBUTES.map((attr) => largestSrcsetUrl(img.getAttribute(attr) || "")),
+  ];
+
+  for (const candidate of directCandidates) {
+    const src = absoluteImageUrl(candidate);
+    if (src) return src;
+  }
+  return "";
+}
+
+function imageDimensions(img: HTMLImageElement): { width: number; height: number } {
+  const rect = img.getBoundingClientRect();
+  const widthAttr = Number.parseInt(img.getAttribute("width") || "", 10);
+  const heightAttr = Number.parseInt(img.getAttribute("height") || "", 10);
+  return {
+    width: Math.round(rect.width || img.naturalWidth || widthAttr || 0),
+    height: Math.round(rect.height || img.naturalHeight || heightAttr || 0),
+  };
+}
+
 class HighlightController {
   private highlights: Highlight[] = [];
+  private deletedHighlightIds = new Set<string>();
   private documentId: string | null = null;
   private knowledgeBaseId: string | null = null;
   private folderPath = "/webclipper/";
@@ -273,6 +359,7 @@ class HighlightController {
   private saveTimer: number | null = null;
   private toastTimer: number | null = null;
   private isSaving = false;
+  private restoredPendingState = false;
   private autoSavePromise: Promise<boolean> | null = null;
   private autoSaveIncludedHighlightIds = new Set<string>();
 
@@ -303,6 +390,7 @@ class HighlightController {
       // In cloud mode, no token means the user is signed out. Keep the page
       // untouched until they sign in. Local mode is intentionally unauthenticated.
       if (this.mode !== "local" && !this.accessToken) return;
+      await this.restorePendingPageState();
       const url = canonicalizeUrl(location.href);
       let doc;
       try {
@@ -310,19 +398,27 @@ class HighlightController {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         // 401 means the stored session is stale; sign-in flow will refresh.
-        // Anything else is worth logging.
-        if (!msg.includes("401")) {
+        // Network failures are expected when a selected local server is down.
+        // Pending edits are already restored from chrome.storage and will
+        // retry on the next sync opportunity, so do not spam extension logs.
+        if (shouldWarnForLookupFailure(msg)) {
           console.warn("[llmwiki] by-url lookup failed:", err);
         }
+        if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
         return;
       }
-      if (!doc) return;
+      if (!doc) {
+        if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
+        return;
+      }
       this.documentId = doc.id;
       this.knowledgeBaseId = doc.knowledge_base_id;
       this.version = doc.version;
-      this.highlights = doc.highlights ?? [];
+      this.highlights = mergeHighlightsById(doc.highlights ?? [], this.highlights);
+      this.dropDeletedHighlights();
       // Defer apply slightly so SPA hydration settles
       window.requestAnimationFrame(() => applyHighlights(this.highlights));
+      if (this.highlights.length || this.deletedHighlightIds.size) this.scheduleSave();
     } catch (err) {
       console.warn("[llmwiki] bootstrap failed:", err);
     }
@@ -384,7 +480,11 @@ class HighlightController {
     this.openPopoverForExisting(id, target);
   };
 
-  private onViewportChange = () => {
+  private onViewportChange = (event?: Event) => {
+    const target = event?.target;
+    if (this.popover && target instanceof Node && this.popover.contains(target)) {
+      return;
+    }
     this.removePill();
     this.removePopover();
   };
@@ -457,6 +557,8 @@ class HighlightController {
     // anchor so it persists, the LLM sees it, and the next page-load reapply
     // pass can attempt text-scan resolution into a single text node.
     this.highlights.push(highlight);
+    this.deletedHighlightIds.delete(highlight.id);
+    this.savePendingPageState();
     window.getSelection()?.removeAllRanges();
     if (withNote && wrapped) {
       const mark = findMark(highlight.id);
@@ -473,6 +575,12 @@ class HighlightController {
   private discardLocalHighlight(id: string) {
     unwrapById(id);
     this.highlights = this.highlights.filter((h) => h.id !== id);
+    this.deletedHighlightIds.delete(id);
+    if (this.highlights.length || this.deletedHighlightIds.size) {
+      this.savePendingPageState();
+    } else {
+      this.clearPendingPageState();
+    }
   }
 
   private openPopoverAtRect(
@@ -488,6 +596,7 @@ class HighlightController {
     const textarea = document.createElement("textarea");
     textarea.placeholder = "Add a note…";
     textarea.value = highlight.comment ?? "";
+    this.configureCommentTextarea(textarea);
     popover.appendChild(textarea);
     const row = document.createElement("div");
     row.className = "llmwiki-row";
@@ -506,6 +615,7 @@ class HighlightController {
     save.onclick = () => {
       const value = textarea.value.trim() || null;
       highlight.comment = value;
+      this.savePendingPageState();
       this.removePopover();
       this.syncCommentMarkers(highlight);
       this.persistHighlight(highlight, "Comment saved");
@@ -515,8 +625,7 @@ class HighlightController {
     row.appendChild(actions);
     popover.appendChild(row);
     document.body.appendChild(popover);
-    popover.style.top = `${window.scrollY + rect.bottom + 6}px`;
-    popover.style.left = `${window.scrollX + rect.left}px`;
+    this.positionPopover(popover, rect);
     this.popover = popover;
     setTimeout(() => textarea.focus(), 0);
   }
@@ -535,6 +644,7 @@ class HighlightController {
     const textarea = document.createElement("textarea");
     textarea.placeholder = "Add a note…";
     textarea.value = highlight.comment ?? "";
+    this.configureCommentTextarea(textarea);
     popover.appendChild(textarea);
 
     const row = document.createElement("div");
@@ -560,20 +670,9 @@ class HighlightController {
     save.className = "llmwiki-save";
     save.textContent = "Save";
     save.onclick = () => {
-      const value = textarea.value.trim() || null;
-      highlight.comment = value;
-      // A multi-node highlight has multiple marks under the same id — keep
-      // the comment indicator in sync across all of them.
-      for (const m of findAllMarks(highlight.id)) {
-        m.toggleAttribute("data-llmwiki-comment", !!value);
-        if (value) {
-          m.setAttribute("data-llmwiki-comment-text", value);
-          m.setAttribute("title", value);
-        } else {
-          m.removeAttribute("data-llmwiki-comment-text");
-          m.removeAttribute("title");
-        }
-      }
+      highlight.comment = textarea.value.trim() || null;
+      this.syncCommentMarkers(highlight);
+      this.savePendingPageState();
       this.removePopover();
       this.persistHighlight(highlight, "Comment saved");
     };
@@ -584,17 +683,44 @@ class HighlightController {
     popover.appendChild(row);
     document.body.appendChild(popover);
 
-    const top = window.scrollY + rect.bottom + 6;
-    const left = window.scrollX + rect.left;
-    popover.style.top = `${top}px`;
-    popover.style.left = `${left}px`;
+    this.positionPopover(popover, rect);
     this.popover = popover;
     setTimeout(() => textarea.focus(), 0);
+  }
+
+  private configureCommentTextarea(textarea: HTMLTextAreaElement) {
+    const maxHeight = 180;
+    const fit = () => {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+      textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+    };
+    textarea.addEventListener("input", fit);
+    setTimeout(fit, 0);
+  }
+
+  private positionPopover(popover: HTMLElement, rect: DOMRect) {
+    const margin = 8;
+    const below = window.scrollY + rect.bottom + 6;
+    const above = window.scrollY + rect.top - popover.offsetHeight - 6;
+    const maxTop = window.scrollY + window.innerHeight - popover.offsetHeight - margin;
+    const top = below <= maxTop
+      ? below
+      : Math.max(window.scrollY + margin, above);
+    const maxLeft = window.scrollX + window.innerWidth - popover.offsetWidth - margin;
+    const left = Math.min(
+      Math.max(window.scrollX + margin, window.scrollX + rect.left),
+      Math.max(window.scrollX + margin, maxLeft),
+    );
+    popover.style.top = `${top}px`;
+    popover.style.left = `${left}px`;
   }
 
   private deleteHighlight(id: string) {
     unwrapById(id);
     this.highlights = this.highlights.filter((h) => h.id !== id);
+    this.deletedHighlightIds.add(id);
+    this.savePendingPageState();
     this.persistDelete(id);
   }
 
@@ -608,14 +734,69 @@ class HighlightController {
     this.highlights = Array.from(localById.values());
   }
 
+  private dropDeletedHighlights() {
+    if (!this.deletedHighlightIds.size) return;
+    this.highlights = this.highlights.filter((h) => !this.deletedHighlightIds.has(h.id));
+  }
+
+  private pendingStorageKey(): string {
+    return `${PENDING_PAGE_PREFIX}${canonicalizeUrl(location.href)}`;
+  }
+
+  private async restorePendingPageState() {
+    try {
+      const key = this.pendingStorageKey();
+      const result = await chrome.storage.local.get(key);
+      const pending = result[key] as PendingPageState | undefined;
+      if (!pending || pending.url !== canonicalizeUrl(location.href)) return;
+
+      this.documentId = this.documentId ?? pending.documentId ?? null;
+      this.knowledgeBaseId = this.knowledgeBaseId ?? pending.knowledgeBaseId ?? null;
+      this.version = this.version ?? pending.version ?? null;
+      this.folderPath = pending.folderPath || this.folderPath;
+      this.highlights = mergeHighlightsById(this.highlights, pending.highlights ?? []);
+      this.deletedHighlightIds = new Set(pending.deletedHighlightIds ?? []);
+      this.dropDeletedHighlights();
+      this.restoredPendingState = true;
+
+      if (this.highlights.length) {
+        window.requestAnimationFrame(() => applyHighlights(this.highlights));
+      }
+    } catch (err) {
+      console.warn("[llmwiki] restore pending highlights failed:", err);
+    }
+  }
+
+  private savePendingPageState() {
+    const state: PendingPageState = {
+      url: canonicalizeUrl(location.href),
+      title: document.title || location.href,
+      documentId: this.documentId,
+      knowledgeBaseId: this.knowledgeBaseId,
+      version: this.version,
+      folderPath: this.folderPath,
+      highlights: this.highlights,
+      deletedHighlightIds: Array.from(this.deletedHighlightIds),
+      updatedAt: new Date().toISOString(),
+    };
+    chrome.storage.local.set({ [this.pendingStorageKey()]: state }).catch((err) => {
+      console.warn("[llmwiki] save pending highlights failed:", err);
+    });
+  }
+
+  private clearPendingPageState() {
+    chrome.storage.local.remove(this.pendingStorageKey()).catch(() => {});
+  }
+
   private syncCommentMarkers(highlight: Highlight) {
     const comment = highlight.comment?.trim() || null;
     for (const mark of findAllMarks(highlight.id)) {
-      mark.toggleAttribute("data-llmwiki-comment", !!comment);
       if (comment) {
+        mark.setAttribute("data-llmwiki-comment", "1");
         mark.setAttribute("data-llmwiki-comment-text", comment);
         mark.setAttribute("title", comment);
       } else {
+        mark.removeAttribute("data-llmwiki-comment");
         mark.removeAttribute("data-llmwiki-comment-text");
         mark.removeAttribute("title");
       }
@@ -659,23 +840,26 @@ class HighlightController {
     const cloneImages = Array.from(clone.querySelectorAll("img"));
     const candidates = liveImages
       .map((img, index) => {
-        const rect = img.getBoundingClientRect();
-        const width = Math.round(rect.width || img.naturalWidth || 0);
-        const height = Math.round(rect.height || img.naturalHeight || 0);
-        const src = img.currentSrc || img.src || largestSrcsetUrl(img.srcset) || "";
+        const { width, height } = imageDimensions(img);
+        const src = candidateImageUrl(img);
         const inArticle = !!img.closest("article, main, [role='main']");
+        const hasKnownSize = width > 0 && height > 0;
+        const area = hasKnownSize ? width * height : 120_000;
         return {
           index,
           src,
           width,
           height,
-          score: (inArticle ? 10_000_000 : 0) + width * height,
+          inArticle,
+          hasKnownSize,
+          score: (inArticle ? 10_000_000 : 0) + area,
         };
       })
       .filter((item) => {
         if (!item.src || item.src.startsWith("data:") || item.src.startsWith("blob:")) return false;
         if (!/^https?:\/\//i.test(item.src)) return false;
-        return item.width >= 80 && item.height >= 50;
+        if (item.width >= 80 && item.height >= 50) return true;
+        return item.inArticle && !item.hasKnownSize;
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, MAX_INLINE_IMAGES);
@@ -763,12 +947,15 @@ class HighlightController {
       });
       this.knowledgeBaseId = knowledgeBaseId;
       this.documentId = result.id;
+      if (typeof result.version === "number") this.version = result.version;
+      if (result.highlights) this.highlights = result.highlights;
       await this.refreshAfterSave(result.id, false);
       this.showToast("Article saved with highlight");
       return true;
     } catch (err) {
-      console.warn("[llmwiki] auto-save failed:", err);
-      this.showToast("Could not save highlight");
+      console.warn("[llmwiki] auto-save failed; cached locally:", err);
+      this.savePendingPageState();
+      this.showToast("Saved locally; will retry");
       return false;
     }
   }
@@ -788,6 +975,7 @@ class HighlightController {
         successMessage === "Highlight saved" &&
         this.autoSaveIncludedHighlightIds.has(highlight.id)
       ) {
+        if (!this.restoredPendingState) this.clearPendingPageState();
         return;
       }
     }
@@ -813,17 +1001,24 @@ class HighlightController {
         payload,
       );
       this.mergeServerHighlights(result);
+      this.deletedHighlightIds.delete(highlight.id);
+      if (!this.restoredPendingState && !this.deletedHighlightIds.size) this.clearPendingPageState();
       if (successMessage && (hadDocument || successMessage !== "Highlight saved")) {
         this.showToast(successMessage);
       }
     } catch (err) {
-      console.warn("[llmwiki] save highlight failed:", err);
+      console.warn("[llmwiki] save highlight failed; cached locally:", err);
+      this.savePendingPageState();
+      this.showToast("Saved locally; will retry");
       this.scheduleSave();
     }
   }
 
   private async persistDelete(id: string) {
-    if (!this.documentId || !this.apiUrl) return;
+    if (!this.documentId || !this.apiUrl) {
+      this.savePendingPageState();
+      return;
+    }
     try {
       await this.ensureSession();
       const result = await deleteHighlight(
@@ -833,8 +1028,12 @@ class HighlightController {
         id,
       );
       this.version = result.version;
+      this.deletedHighlightIds.delete(id);
+      if (!this.restoredPendingState && !this.deletedHighlightIds.size) this.clearPendingPageState();
     } catch (err) {
-      console.warn("[llmwiki] delete highlight failed:", err);
+      console.warn("[llmwiki] delete highlight failed; cached locally:", err);
+      this.savePendingPageState();
+      this.showToast("Saved locally; will retry");
       this.scheduleSave();
     }
   }
@@ -847,9 +1046,7 @@ class HighlightController {
   }
 
   private async flushSave() {
-    // Without a saved document, highlights live in-memory only until the user
-    // hits "Save to LLM Wiki" — SaveForm will pull them via GET_PAGE_HIGHLIGHTS.
-    if (!this.documentId || !this.apiUrl) return;
+    if (!this.apiUrl) return;
     if (this.isSaving) {
       // Re-queue
       this.scheduleSave();
@@ -858,14 +1055,39 @@ class HighlightController {
     this.isSaving = true;
     try {
       await this.ensureSession();
-      const result = await replaceHighlights(
-        this.apiUrl,
-        this.accessToken,
-        this.documentId,
-        this.highlights,
-        this.version ?? undefined,
-      );
-      this.version = result.version;
+      const saved = await this.ensureDocumentSavedForHighlights();
+      if (!saved || !this.documentId) {
+        this.savePendingPageState();
+        return;
+      }
+
+      this.dropDeletedHighlights();
+      for (const id of Array.from(this.deletedHighlightIds)) {
+        const result = await deleteHighlight(
+          this.apiUrl,
+          this.accessToken,
+          this.documentId,
+          id,
+        );
+        this.version = result.version;
+        this.deletedHighlightIds.delete(id);
+      }
+
+      for (const highlight of this.highlights) {
+        const result = await upsertHighlight(
+          this.apiUrl,
+          this.accessToken,
+          this.documentId,
+          highlight,
+        );
+        this.mergeServerHighlights(result);
+      }
+
+      const fresh = await getHighlights(this.apiUrl, this.accessToken, this.documentId);
+      this.version = fresh.version;
+      this.highlights = mergeHighlightsById(fresh.highlights ?? [], this.highlights);
+      this.restoredPendingState = false;
+      this.clearPendingPageState();
     } catch (err) {
       const conflict = (err as { conflict?: boolean })?.conflict;
       if (conflict && this.documentId) {
@@ -878,6 +1100,7 @@ class HighlightController {
             if (!ids.has(h.id)) merged.push(h);
           }
           this.highlights = merged;
+          this.dropDeletedHighlights();
           this.version = fresh.version;
           this.isSaving = false;
           this.scheduleSave();
@@ -886,12 +1109,43 @@ class HighlightController {
           console.warn("[llmwiki] reconcile failed:", e);
         }
       } else {
-        console.warn("[llmwiki] save highlights failed:", err);
+        console.warn("[llmwiki] save highlights failed; cached locally:", err);
+        this.savePendingPageState();
+        this.showToast("Saved locally; will retry");
       }
     } finally {
       this.isSaving = false;
     }
   }
+}
+
+function mergeHighlightsById(serverHighlights: Highlight[], localHighlights: Highlight[]): Highlight[] {
+  const merged = new Map<string, Highlight>();
+  for (const highlight of serverHighlights) {
+    merged.set(highlight.id, highlight);
+  }
+  for (const highlight of localHighlights) {
+    const existing = merged.get(highlight.id);
+    merged.set(
+      highlight.id,
+      existing
+        ? {
+            ...existing,
+            ...highlight,
+            textAnchor: highlight.textAnchor ?? existing.textAnchor,
+          }
+        : highlight,
+    );
+  }
+  return Array.from(merged.values());
+}
+
+function shouldWarnForLookupFailure(message: string): boolean {
+  return (
+    !message.includes("401") &&
+    !message.includes("Failed to fetch") &&
+    !message.includes("Network error")
+  );
 }
 
 function isRangeInDocument(range: Range): boolean {

@@ -3,11 +3,13 @@ import AuthGate from "./components/AuthGate";
 import SaveForm from "./components/SaveForm";
 import Settings from "./components/Settings";
 import {
+  checkLocalHealth,
   getMode,
   getApiUrl,
   isBuiltInDisabledHost,
   isDomainDisabled,
   setDomainDisabled,
+  setMode,
   type Mode,
 } from "@/lib/settings";
 
@@ -85,6 +87,16 @@ export default function App() {
     setApiUrl(url);
 
     if (currentMode === "local") {
+      const connected = await checkLocalHealth(url);
+      if (!connected) {
+        await setMode("cloud");
+        const cloudUrl = await getApiUrl();
+        setModeState("cloud");
+        setApiUrl(cloudUrl);
+        setAuthError(`Could not connect to ${url}/health. Switched back to cloud.`);
+        await checkSession();
+        return;
+      }
       setAuth({ status: "local" });
     } else {
       await checkSession();

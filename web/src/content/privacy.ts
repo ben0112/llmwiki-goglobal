@@ -1,6 +1,6 @@
 export const privacy = `# Privacy Policy
 
-**LLM Wiki** · Effective date: April 26, 2026
+**LLM Wiki** · Effective date: June 3, 2026
 
 LLM Wiki is operated by Polybius, L.L.C., a Delaware limited liability company ("Polybius," "we," "us," "our"). LLM Wiki is a free, open-source knowledge base service available at llmwiki.app. This policy explains what data we collect, how we use it, and your rights regarding that data.
 
@@ -16,7 +16,9 @@ Documents, notes, PDFs, and other files you add to your knowledge bases are stor
 When you upload PDFs or office documents, we process them server-side to extract text. The extracted text is stored alongside the original file.
 
 ### Browser extension data
-If you use the LLM Wiki Chrome extension, it captures the text content of web pages you explicitly choose to clip. The extension only activates when you click the save button — it does not passively monitor your browsing. Page content is sent directly to our API and stored in your knowledge base.
+If you use the LLM Wiki Chrome extension, it captures the content of web pages and PDFs you explicitly choose to clip, including copies of the page's images. The extension only acts on a page when you invoke it — it does not passively monitor your browsing. Clipped content is sent to our API and stored in your knowledge base.
+
+Clipped pages may contain personal data about third parties (for example, names or contact details that appear in an article). You are responsible for having a lawful basis to store such content, and we process it solely on your behalf to provide the service.
 
 ### Usage data
 We collect basic usage analytics: page views, feature usage, and error logs. We do not use third-party tracking scripts or advertising pixels.
@@ -58,17 +60,29 @@ LLM Wiki connects to AI assistants (such as Claude by Anthropic) via the Model C
 
 We do not control how Anthropic processes content sent through Claude conversations. Refer to Anthropic's privacy policy for details on their data handling.
 
+## Google API Limited Use
+
+Our use of information received from Google APIs adheres to the [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/user-data-faq), including the Limited Use requirements. We use Google account data only to authenticate you and provide the service. We do not sell it, use it for advertising, or use it to train AI models.
+
 ## What we do NOT do
 
 - We do not sell your data
 - We do not serve advertisements
 - We do not use your content to train AI models
-- We do not share your content with other users (unless you explicitly make a knowledge base public)
+- We do not share your content with other users
 - We do not access your content for any purpose other than providing the service, unless required by law
 
-## Public knowledge bases
+## Legal bases for processing (GDPR)
 
-If you choose to make a knowledge base public, its wiki pages will be visible to anyone on the internet and may be indexed by search engines. Raw source documents in a public knowledge base are not made public — only wiki pages. You can make a knowledge base private again at any time, which removes it from public access.
+Where the GDPR applies, we process your data on these legal bases: performance of our contract with you (to provide the service), your consent (where you grant it — for example, connecting an AI tool), and our legitimate interests (security, abuse prevention, and basic analytics).
+
+## International data transfers
+
+Your data is stored in US regions. Where data is transferred from the EEA, UK, or Switzerland to the United States, we and our subprocessors rely on the European Commission's Standard Contractual Clauses and the EU-US Data Privacy Framework (and its UK and Swiss extensions) as transfer mechanisms.
+
+## Security incidents
+
+If a security incident affects your personal data, we will notify you and, where required, the relevant supervisory authority without undue delay.
 
 ## Data retention and deletion
 
@@ -93,10 +107,11 @@ You can at any time:
 - Export your data (download your documents and wiki pages)
 - Delete specific content or your entire account
 - Disconnect AI tool access by removing MCP connectors
-- Make knowledge bases private or public
 - Request information about what data we hold (email lucas@llmwiki.app)
 
-If you are in the EU, you have additional rights under GDPR including the right to data portability, rectification, and erasure. Contact lucas@llmwiki.app to exercise these rights.
+If you are in the EU, UK, or Switzerland, you have additional rights under GDPR including the right to data portability, rectification, and erasure. Contact lucas@llmwiki.app to exercise these rights.
+
+If you are a California resident, the CCPA/CPRA gives you the right to know, delete, and correct the personal information we hold. We do not sell or share your personal information as those terms are defined under the CCPA. Contact lucas@llmwiki.app to exercise these rights.
 
 ## Self-hosting
 

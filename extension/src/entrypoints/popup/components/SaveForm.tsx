@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import {
   getDocumentByUrl,
+  moveDocument,
   saveWebPage,
   savePdf,
   type DocumentByUrl,
@@ -15,32 +16,7 @@ import {
 } from "@/lib/settings";
 import KBPicker from "./KBPicker";
 import StatusFeedback, { type Status } from "./StatusFeedback";
-import { recordSave } from "@/lib/streak";
-
-const TRACKING_PARAMS = new Set([
-  "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-  "utm_id", "utm_name", "utm_brand", "utm_social",
-  "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "ref_src",
-  "_branch_match_id", "igshid",
-]);
-
-function canonicalize(href: string): string {
-  try {
-    const u = new URL(href);
-    u.hash = "";
-    const keep = new URLSearchParams();
-    u.searchParams.forEach((v, k) => {
-      if (!TRACKING_PARAMS.has(k.toLowerCase())) keep.append(k, v);
-    });
-    u.search = keep.toString() ? `?${keep.toString()}` : "";
-    if (u.pathname.length > 1 && u.pathname.endsWith("/")) {
-      u.pathname = u.pathname.replace(/\/+$/, "");
-    }
-    return u.toString();
-  } catch {
-    return href;
-  }
-}
+import { canonicalize } from "@/lib/url";
 
 function safeHost(href: string): string {
   try {
@@ -97,11 +73,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!tab || tab.isPdf) {
-      setExistingDoc(null);
-      setCheckingExisting(false);
-      return;
-    }
+    if (!tab) return;
 
     let cancelled = false;
 
@@ -150,11 +122,18 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
 
     setTab({ url, title: activeTab.title ?? "", isPdf, tabId: activeTab.id });
     setTitle(activeTab.title ?? "");
+
+    // Inject the highlighter under the activeTab grant so saved highlights
+    // overlay and the user can annotate. No-op on PDFs / restricted pages.
+    if (/^https?:/.test(url) && !isPdf) {
+      chrome.scripting
+        .executeScript({ target: { tabId: activeTab.id }, files: ["content-scripts/content.js"] })
+        .catch(() => {});
+    }
   }
 
   async function handleSave() {
     if (!tab || !knowledgeBaseId) return;
-
     try {
       if (tab.isPdf) {
         await handleSavePdf();
@@ -180,13 +159,26 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId: tab.tabId },
         func: async () => {
-          const MAX_IMAGES = 12;
+          const MAX_IMAGES = 24;
           const MAX_IMAGE_BYTES = 2_500_000;
           const MAX_TOTAL_BYTES = 6_000_000;
+          const LAZY_IMAGE_SRC_ATTRIBUTES = [
+            "data-src",
+            "data-original",
+            "data-lazy-src",
+            "data-hires",
+            "data-url",
+            "data-image",
+            "data-full-url",
+          ];
+          const LAZY_IMAGE_SRCSET_ATTRIBUTES = [
+            "data-srcset",
+            "data-lazy-srcset",
+          ];
 
           const clone = document.documentElement.cloneNode(true) as HTMLElement;
           clone.querySelectorAll(
-            ".llmwiki-pill, .llmwiki-popover, #llmwiki-highlight-style",
+            ".llmwiki-pill, .llmwiki-popover, .llmwiki-toast, #llmwiki-highlight-style",
           ).forEach((el) => el.remove());
           clone.querySelectorAll("mark.llmwiki-hl").forEach((mark) => {
             const parent = mark.parentNode;
@@ -199,30 +191,56 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
           const cloneImages = Array.from(clone.querySelectorAll("img"));
           const candidates = liveImages
             .map((img, index) => {
-              const rect = img.getBoundingClientRect();
-              const width = Math.round(rect.width || img.naturalWidth || 0);
-              const height = Math.round(rect.height || img.naturalHeight || 0);
-              const src = img.currentSrc || img.src || largestSrcsetUrl(img.srcset) || "";
+              const { width, height } = imageDimensions(img);
+              const src = candidateImageUrl(img);
               const inArticle = !!img.closest("article, main, [role='main']");
+              const hasKnownSize = width > 0 && height > 0;
+              const area = hasKnownSize ? width * height : 120_000;
               return {
                 index,
                 src,
                 width,
                 height,
-                score: (inArticle ? 10_000_000 : 0) + width * height,
+                inArticle,
+                hasKnownSize,
+                score: (inArticle ? 10_000_000 : 0) + area,
               };
             })
             .filter((item) => {
               if (!item.src || item.src.startsWith("data:") || item.src.startsWith("blob:")) return false;
               if (!/^https?:\/\//i.test(item.src)) return false;
-              return item.width >= 80 && item.height >= 50;
+              if (item.width >= 80 && item.height >= 50) return true;
+              return item.inArticle && !item.hasKnownSize;
             })
             .sort((a, b) => b.score - a.score)
             .slice(0, MAX_IMAGES);
 
+          const pageOrigin = location.origin;
+          const isSameOrigin = (src: string): boolean => {
+            try {
+              return new URL(src).origin === pageOrigin;
+            } catch {
+              return false;
+            }
+          };
+
           let totalBytes = 0;
           for (const item of candidates) {
-            if (totalBytes >= MAX_TOTAL_BYTES) break;
+            const cloneImg = cloneImages[item.index];
+            if (!cloneImg) continue;
+
+            // Under activeTab we can only read same-origin resources; cross-origin
+            // images keep their absolute URL for the server-side fetch.
+            if (!isSameOrigin(item.src)) {
+              cloneImg.setAttribute("src", item.src);
+              cloneImg.removeAttribute("srcset");
+              cloneImg.removeAttribute("sizes");
+              if (item.width) cloneImg.setAttribute("width", String(item.width));
+              if (item.height) cloneImg.setAttribute("height", String(item.height));
+              continue;
+            }
+
+            if (totalBytes >= MAX_TOTAL_BYTES) continue;
             const remaining = MAX_TOTAL_BYTES - totalBytes;
             const maxBytes = Math.min(MAX_IMAGE_BYTES, remaining);
             try {
@@ -233,8 +251,6 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
               });
               if (!response?.dataUrl || response?.error) continue;
               totalBytes += response.size ?? 0;
-              const cloneImg = cloneImages[item.index];
-              if (!cloneImg) continue;
               cloneImg.setAttribute("src", response.dataUrl);
               cloneImg.removeAttribute("srcset");
               cloneImg.removeAttribute("sizes");
@@ -247,6 +263,58 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
           }
 
           return clone.outerHTML;
+
+          function absoluteImageUrl(value: string | null | undefined): string {
+            if (!value) return "";
+            const trimmed = value.trim();
+            if (!trimmed) return "";
+            try {
+              return new URL(trimmed, location.href).toString();
+            } catch {
+              return trimmed;
+            }
+          }
+
+          function pictureSourceUrl(img: HTMLImageElement): string {
+            const picture = img.closest("picture");
+            if (!picture) return "";
+            for (const source of Array.from(picture.querySelectorAll("source"))) {
+              const srcset = source.getAttribute("srcset") || source.getAttribute("data-srcset") || "";
+              const best = largestSrcsetUrl(srcset);
+              if (best) return best;
+              const src = absoluteImageUrl(source.getAttribute("src"));
+              if (src) return src;
+            }
+            return "";
+          }
+
+          function candidateImageUrl(img: HTMLImageElement): string {
+            const directCandidates = [
+              img.currentSrc,
+              img.getAttribute("src"),
+              img.src,
+              largestSrcsetUrl(img.getAttribute("srcset") || ""),
+              pictureSourceUrl(img),
+              ...LAZY_IMAGE_SRC_ATTRIBUTES.map((attr) => img.getAttribute(attr)),
+              ...LAZY_IMAGE_SRCSET_ATTRIBUTES.map((attr) => largestSrcsetUrl(img.getAttribute(attr) || "")),
+            ];
+
+            for (const candidate of directCandidates) {
+              const src = absoluteImageUrl(candidate);
+              if (src) return src;
+            }
+            return "";
+          }
+
+          function imageDimensions(img: HTMLImageElement): { width: number; height: number } {
+            const rect = img.getBoundingClientRect();
+            const widthAttr = Number.parseInt(img.getAttribute("width") || "", 10);
+            const heightAttr = Number.parseInt(img.getAttribute("height") || "", 10);
+            return {
+              width: Math.round(rect.width || img.naturalWidth || widthAttr || 0),
+              height: Math.round(rect.height || img.naturalHeight || heightAttr || 0),
+            };
+          }
 
           function largestSrcsetUrl(srcset: string): string {
             let bestUrl = "";
@@ -317,13 +385,12 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       title: title || tab.title,
       path: normalizedFolderPath,
       filename: "",
-      version: 1,
-      highlights,
+      version: result.version ?? 1,
+      highlights: result.highlights ?? highlights,
     });
     setSelectedKnowledgeBaseId(knowledgeBaseId).catch(() => {});
     setSelectedFolderPath(normalizedFolderPath).catch(() => {});
-    const stats = await recordSave().catch(() => null);
-    setStatus({ type: "success", stats: stats ?? undefined });
+    setStatus({ type: "success" });
   }
 
   async function handleSavePdf() {
@@ -348,13 +415,22 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
 
     setSelectedKnowledgeBaseId(knowledgeBaseId).catch(() => {});
     setSelectedFolderPath(normalizedFolderPath).catch(() => {});
-    const stats = await recordSave().catch(() => null);
-    setStatus({ type: "success", stats: stats ?? undefined });
+    setStatus({ type: "success" });
   }
 
-  function handleKnowledgeBaseChange(id: string) {
+  async function handleKnowledgeBaseChange(id: string) {
     setKnowledgeBaseId(id);
     setSelectedKnowledgeBaseId(id).catch(() => {});
+    // If the page is already saved (instant-save just ran), changing the KB
+    // moves the document rather than selecting a target for a future save.
+    if (existingDoc && existingDoc.knowledge_base_id !== id) {
+      try {
+        await moveDocument(apiUrl, accessToken, existingDoc.id, id);
+        setExistingDoc({ ...existingDoc, knowledge_base_id: id });
+      } catch {
+        setStatus({ type: "error", message: "Couldn't move to that knowledge base." });
+      }
+    }
   }
 
   if (!tab) {

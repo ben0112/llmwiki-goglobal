@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     WORKSPACE_PATH: str = "."
 
     DATABASE_URL: str = ""
+    # Direct (non-pooler) connection used only for the long-lived LISTEN/NOTIFY
+    # socket. Supavisor recycles pooled sessions, which silently kills LISTEN;
+    # a direct connection sidesteps that. Falls back to DATABASE_URL when unset.
+    DIRECT_DATABASE_URL: str = ""
     SUPABASE_URL: str = ""
     SUPABASE_JWT_SECRET: str = ""
     VOYAGE_API_KEY: str = ""
@@ -38,6 +42,11 @@ class Settings(BaseSettings):
     GLOBAL_MAX_USERS: int = 10_000
 
     SENTRY_DSN: str = ""
+
+    @property
+    def listen_database_url(self) -> str:
+        """Connection for the LISTEN loop — direct if configured, else the pooler."""
+        return self.DIRECT_DATABASE_URL or self.DATABASE_URL
 
 
 settings = Settings()

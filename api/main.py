@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
 
     # Real-time document change notifications via WebSocket
     from routes.ws import setup_listener
-    listener_task = await setup_listener(settings.DATABASE_URL)
+    listener_task = await setup_listener(settings.listen_database_url)
 
     from infra.tus import cleanup_stale_uploads
     cleanup_task = asyncio.create_task(cleanup_stale_uploads())

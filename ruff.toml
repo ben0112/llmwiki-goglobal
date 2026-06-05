@@ -1,0 +1,28 @@
+target-version = "py311"
+line-length = 120
+extend-exclude = [".venv", "venv", "node_modules", "scripts", "wiki", "emails", "supabase"]
+
+[lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes — unused imports/vars, undefined names
+  "I",    # isort — import order
+  "UP",   # pyupgrade — X | None, modern syntax
+  "B",    # bugbear — real bugs
+  "SIM",  # flake8-simplify — flatten/dedupe control flow
+  "RET",  # flake8-return — no else after return
+  "C90",  # mccabe — complexity (short methods)
+  "BLE",  # blind-except — bare `except Exception`
+]
+ignore = [
+  "E501",    # line length — long SQL strings; soft
+  "B008",    # FastAPI Depends() in defaults is idiomatic
+  "SIM108",  # ternary-over-if often reads worse
+  "RET504",  # assign-then-return is sometimes clearer
+]
+
+[lint.mccabe]
+max-complexity = 12
+
+[lint.per-file-ignores]
+"tests/**" = ["B", "C90", "BLE"]

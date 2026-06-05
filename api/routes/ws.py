@@ -59,37 +59,46 @@ class DocumentWSManager:
 
 manager = DocumentWSManager()
 
+# Ping the LISTEN connection on this interval. Short enough that the pooler
+# never idle-kills the socket, and so a dead socket is noticed within seconds
+# instead of silently swallowing every NOTIFY until the next reconnect.
+KEEPALIVE_SECONDS = 30
+RECONNECT_DELAY_SECONDS = 5
+
 
 async def setup_listener(database_url: str) -> asyncio.Task:
     """Start a supervised Postgres LISTEN loop that reconnects on failure."""
+    return asyncio.create_task(_supervise_listener(database_url))
 
-    async def _listen_loop():
+
+async def _supervise_listener(database_url: str) -> None:
+    """Reconnect forever around a single LISTEN connection's lifetime."""
+    while True:
+        try:
+            await _listen_until_closed(database_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("LISTEN connection lost (%s), reconnecting in %ds", e, RECONNECT_DELAY_SECONDS)
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+
+
+async def _listen_until_closed(database_url: str) -> None:
+    """Hold one LISTEN connection open, pinging it so it stays alive and a drop surfaces."""
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.add_listener("document_changes", _on_notify)
+        logger.info("Postgres LISTEN on 'document_changes' active")
         while True:
-            conn = None
-            try:
-                conn = await asyncpg.connect(database_url)
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+            await conn.execute("SELECT 1")
+    finally:
+        if not conn.is_closed():
+            await conn.close()
 
-                def on_notify(conn, pid, channel, payload):
-                    asyncio.get_running_loop().create_task(_handle_notify(payload))
 
-                await conn.add_listener("document_changes", on_notify)
-                logger.info("Postgres LISTEN on 'document_changes' active")
-
-                # Hold the connection open — asyncpg delivers notifications via its
-                # internal reader loop. We just need to keep the coroutine alive.
-                while True:
-                    await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                if conn and not conn.is_closed():
-                    await conn.close()
-                raise
-            except Exception as e:
-                logger.warning("LISTEN connection lost (%s), reconnecting in 5s", e)
-                if conn and not conn.is_closed():
-                    await conn.close()
-                await asyncio.sleep(5)
-
-    return asyncio.create_task(_listen_loop())
+def _on_notify(conn: asyncpg.Connection, pid: int, channel: str, payload: str) -> None:
+    asyncio.get_running_loop().create_task(_handle_notify(payload))
 
 
 async def _handle_notify(payload: str) -> None:

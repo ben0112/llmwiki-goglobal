@@ -100,8 +100,20 @@ function isWebClipDoc(doc: DocumentListItem): boolean {
   return (
     metadata.clip_kind === 'web'
     || metadata.source_url !== undefined
+    || ((doc.path || '').startsWith('/webclipper/') && doc.file_type === 'md')
     || ['html', 'htm'].includes(doc.file_type)
   )
+}
+
+function getSourceUrl(doc: DocumentListItem | null): string | null {
+  const value = doc?.metadata?.source_url
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null
+  } catch {
+    return null
+  }
 }
 
 function docIcon(ft: string) {
@@ -175,19 +187,18 @@ export function FilesGrid({
   const [activeDocId, setActiveDocId] = React.useState<string | null>(initialDocId ?? null)
   const [docInitialPage, setDocInitialPage] = React.useState<number | undefined>(initialPage)
 
-  // Sync from route when browser back/forward changes initialPath
   React.useEffect(() => {
     const path = initialPath ?? '/'
-    if (path !== currentPath) {
-      setCurrentPath(path)
-      setHistory((prev) => {
-        const next = prev.slice(0, historyIdx + 1)
-        next.push(path)
-        return next
-      })
-      setHistoryIdx((prev) => prev + 1)
+    if (path === currentPath) return
+    setCurrentPath(path)
+    if (history[historyIdx - 1] === path) {
+      setHistoryIdx(historyIdx - 1)
+    } else if (history[historyIdx + 1] === path) {
+      setHistoryIdx(historyIdx + 1)
+    } else {
+      setHistory(history.slice(0, historyIdx + 1).concat(path))
+      setHistoryIdx(historyIdx + 1)
     }
-    // Only react to prop changes, not internal navigation
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPath])
 
@@ -265,19 +276,13 @@ export function FilesGrid({
       return
     }
     if (historyIdx <= 0) return
-    const newIdx = historyIdx - 1
-    setHistoryIdx(newIdx)
-    setCurrentPath(history[newIdx])
-    onPathChange?.(history[newIdx])
-  }, [isBrowsing, closeDoc, historyIdx, history, onPathChange])
+    window.history.back()
+  }, [isBrowsing, closeDoc, historyIdx])
 
   const goForward = React.useCallback(() => {
     if (!isBrowsing || !canGoForward) return
-    const newIdx = historyIdx + 1
-    setHistoryIdx(newIdx)
-    setCurrentPath(history[newIdx])
-    onPathChange?.(history[newIdx])
-  }, [isBrowsing, canGoForward, historyIdx, history, onPathChange])
+    window.history.forward()
+  }, [isBrowsing, canGoForward])
 
   // Grid data
   const folders = React.useMemo(() => getChildFolders(sourceDocs, currentPath), [sourceDocs, currentPath])
@@ -297,6 +302,7 @@ export function FilesGrid({
 
   const isActiveWebClip = activeDoc ? isWebClipDoc(activeDoc) : false
   const isActiveNote = activeDoc ? isNoteFile(activeDoc) && !isActiveWebClip : false
+  const activeSourceUrl = getSourceUrl(activeDoc)
 
   // Breadcrumbs — adapt to browsing vs viewing
   const breadcrumbs = React.useMemo(() => {
@@ -544,12 +550,30 @@ export function FilesGrid({
         ) : activeDoc && isActiveNote ? (
           <>
             <NoteFormattingButtons editor={noteEditor} />
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
               <X className="size-3.5" />
             </button>
           </>
         ) : activeDoc && isActiveWebClip ? (
           <>
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
               <X className="size-3.5" />
             </button>

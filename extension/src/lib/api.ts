@@ -12,6 +12,8 @@ export interface KnowledgeBase {
 export interface SaveResult {
   id: string;
   status: string;
+  version?: number;
+  highlights?: Highlight[];
 }
 
 export interface HighlightAnchor {
@@ -75,10 +77,11 @@ function jsonHeaders(accessToken: string | null): Record<string, string> {
 // MV3 content scripts make `fetch` calls from the page's origin. Most sites
 // (Substack, Medium, console.cloud.google.com, anywhere with strict CSP) will
 // block our API calls via CORS or CSP. The background service worker runs on
-// the extension origin with host_permissions: ["<all_urls>"] — fetches there
-// succeed. So when we're inside a content script we proxy through the
-// background via chrome.runtime.sendMessage. In the popup (which loads on
-// chrome-extension://...) direct fetch already works, so we use it.
+// the extension origin and holds the required host permission for the API
+// origin — fetches there succeed. So when we're inside a content script we
+// proxy through the background via chrome.runtime.sendMessage. In the popup
+// (which loads on chrome-extension://...) direct fetch already works, so we
+// use it.
 
 function isContentScriptContext(): boolean {
   if (typeof window === "undefined") return false;
@@ -231,6 +234,22 @@ export async function replaceHighlights(
     throw new Error(`Save highlights failed (${res.status}): ${res.text}`);
   }
   return res.data as HighlightsResponse;
+}
+
+export async function moveDocument(
+  apiUrl: string,
+  accessToken: string | null,
+  documentId: string,
+  knowledgeBaseId: string,
+): Promise<void> {
+  const res = await smartFetch(`${apiUrl}/v1/documents/${documentId}`, {
+    method: "PATCH",
+    headers: jsonHeaders(accessToken),
+    body: JSON.stringify({ knowledge_base_id: knowledgeBaseId }),
+  });
+  if (!res.ok) {
+    throw new Error(`Move failed (${res.status})`);
+  }
 }
 
 export async function upsertHighlight(

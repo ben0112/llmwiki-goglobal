@@ -1,14 +1,9 @@
 import React from "react";
 
-export interface SaveStats {
-  totalSources: number;
-  streakDays: number;
-}
-
 export type Status =
   | { type: "idle" }
   | { type: "saving"; message: string }
-  | { type: "success"; stats?: SaveStats }
+  | { type: "success" }
   | { type: "error"; message: string };
 
 interface Props {
@@ -42,23 +37,7 @@ export default function StatusFeedback({ status }: Props) {
           >
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
           </svg>
-          <span>
-            Saved
-            {status.stats && (
-              <>
-                {" · "}
-                <span className="font-medium text-emerald-800">
-                  wiki: {status.stats.totalSources}
-                </span>
-                {status.stats.streakDays > 0 && (
-                  <>
-                    {" · "}
-                    <span aria-hidden>🔥</span> {status.stats.streakDays}d
-                  </>
-                )}
-              </>
-            )}
-          </span>
+          <span>Saved</span>
         </div>
       )}
       {status.type === "error" && (

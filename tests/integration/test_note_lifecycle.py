@@ -1,8 +1,19 @@
 """Integration tests for note (document) CRUD lifecycle."""
 
+import json
+import uuid
+
 import pytest
 
 from tests.helpers.jwt import auth_headers
+
+
+class _RecordingS3:
+    def __init__(self):
+        self.deleted: list[str] = []
+
+    async def delete_prefix(self, prefix: str) -> None:
+        self.deleted.append(prefix)
 
 USER_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_EMAIL = "alice@test.com"
@@ -308,3 +319,78 @@ class TestDeleteDocument:
         for doc_id in ids:
             row = await pool.fetchrow("SELECT id FROM documents WHERE id = $1", doc_id)
             assert row is None
+
+
+class TestDeleteS3Purge:
+
+    async def _insert_doc(self, pool, doc_id, path, filename, metadata=None):
+        await pool.execute(
+            "INSERT INTO documents (id, knowledge_base_id, user_id, filename, title, path, "
+            "file_type, status, content, tags, version, metadata) "
+            "VALUES ($1, $2, $3, $4, $5, $6, 'md', 'ready', 'body', $7, 0, $8::jsonb)",
+            doc_id, KB_ID, USER_ID, filename, filename, path, [],
+            json.dumps(metadata) if metadata else None,
+        )
+
+    async def test_delete_purges_doc_and_child_asset_s3(self, pool):
+        from services.hosted import HostedDocumentService
+
+        parent_id = str(uuid.uuid4())
+        asset_id = str(uuid.uuid4())
+        await self._insert_doc(pool, parent_id, "/webclipper/", "page.md")
+        await self._insert_doc(
+            pool, asset_id, "/webclipper/page.assets/", "image-01.png",
+            metadata={"asset": True, "parent_document_id": parent_id},
+        )
+
+        s3 = _RecordingS3()
+        service = HostedDocumentService(pool, USER_ID, s3)
+        assert await service.delete(parent_id) is True
+
+        assert f"{USER_ID}/{parent_id}/" in s3.deleted
+        assert f"{USER_ID}/{asset_id}/" in s3.deleted
+        row = await pool.fetchrow(
+            "SELECT id FROM documents WHERE id = ANY($1::uuid[])", [parent_id, asset_id],
+        )
+        assert row is None
+
+    async def test_kb_delete_purges_document_s3(self, pool):
+        from services.hosted import HostedKBService
+
+        doc_id = str(uuid.uuid4())
+        await self._insert_doc(pool, doc_id, "/webclipper/", "page.md")
+
+        s3 = _RecordingS3()
+        assert await HostedKBService(pool, USER_ID, s3).delete(KB_ID) is True
+
+        assert f"{USER_ID}/{doc_id}/" in s3.deleted
+
+
+class TestWebClipReclip:
+
+    async def test_reclip_same_url_replaces_assets_without_500(self, client, pool):
+        png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        body = {
+            "url": "https://example.com/reclip",
+            "title": "Reclip",
+            "html": f'<article><p>Body text here, long enough to chunk.</p>'
+                    f'<img src="data:image/png;base64,{png}"></article>',
+            "path": "/webclipper/",
+        }
+        headers = auth_headers(USER_ID)
+
+        r1 = await client.post(f"/v1/knowledge-bases/{KB_ID}/documents/web", headers=headers, json=body)
+        assert r1.status_code == 201
+
+        # Re-clipping the same URL must update, not 500 on the asset unique index.
+        r2 = await client.post(f"/v1/knowledge-bases/{KB_ID}/documents/web", headers=headers, json=body)
+        assert r2.status_code == 201
+        assert r2.json()["id"] == r1.json()["id"]
+
+        # Old asset cleared, new one inserted — exactly one asset doc remains.
+        asset_count = await pool.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE knowledge_base_id = $1 "
+            "AND COALESCE(metadata->>'asset', 'false') = 'true'",
+            KB_ID,
+        )
+        assert asset_count == 1

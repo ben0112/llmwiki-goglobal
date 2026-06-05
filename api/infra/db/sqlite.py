@@ -152,7 +152,7 @@ class SQLiteDocumentRepository:
                 updates.append("tags = ?")
                 params.append(json.dumps(value))
             elif key == "metadata":
-                updates.append("metadata = ?")
+                updates.append("metadata = json_patch(COALESCE(metadata, '{}'), ?)")
                 params.append(json.dumps(value))
             else:
                 updates.append(f"{key} = ?")

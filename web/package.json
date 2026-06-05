@@ -59,6 +59,10 @@
     "fast-uri": "3.1.2",
     "ws": "8.21.0"
   },
+  "optionalDependencies": {
+    "lightningcss-linux-x64-gnu": "1.32.0",
+    "@tailwindcss/oxide-linux-x64-gnu": "4.2.2"
+  },
   "devDependencies": {
     "@tailwindcss/postcss": "4.2.2",
     "@types/react": "19.2.14",

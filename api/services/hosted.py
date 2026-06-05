@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
-from typing import Any
 from datetime import datetime
+from typing import Any
 
 import asyncpg
-from fastapi import HTTPException
-
 from config import settings
+from fastapi import HTTPException
 from services.chunker import chunk_text, store_chunks
 from services.webclip_assets import materialize_webclip_assets
-from .base import UserService, KBService, DocumentService, PublicWikiService, ServiceFactory
-from .parsers import parse_frontmatter, title_from_filename, extract_tags
+
+from .base import DocumentService, KBService, PublicWikiService, ServiceFactory, UserService
+from .parsers import parse_frontmatter, title_from_filename
+
+logger = logging.getLogger(__name__)
 
 
 class HostedUserService(UserService):
@@ -100,9 +103,10 @@ def _slugify(name: str) -> str:
 
 class HostedKBService(KBService):
 
-    def __init__(self, pool, user_id: str):
+    def __init__(self, pool, user_id: str, s3=None):
         self.pool = pool
         self.user_id = user_id
+        self.s3 = s3
 
     async def list(self) -> list[dict]:
         rows = await self.pool.fetch(
@@ -223,11 +227,31 @@ class HostedKBService(KBService):
         return dict(row) if row else None
 
     async def delete(self, kb_id: str) -> bool:
+        doc_ids = await self._kb_document_ids(kb_id)
         result = await self.pool.execute(
             "DELETE FROM knowledge_bases WHERE id = $1 AND user_id = $2",
             kb_id, self.user_id,
         )
-        return result != "DELETE 0"
+        if result == "DELETE 0":
+            return False
+        await self._purge_document_prefixes(doc_ids)
+        return True
+
+    async def _kb_document_ids(self, kb_id: str) -> list[str]:
+        rows = await self.pool.fetch(
+            "SELECT id::text FROM documents WHERE knowledge_base_id = $1 AND user_id = $2",
+            kb_id, self.user_id,
+        )
+        return [row["id"] for row in rows]
+
+    async def _purge_document_prefixes(self, doc_ids: list[str]) -> None:
+        if not self.s3:
+            return
+        for doc_id in doc_ids:
+            try:
+                await self.s3.delete_prefix(f"{self.user_id}/{doc_id}/")
+            except Exception:
+                logger.exception("S3 purge failed for document %s", doc_id)
 
     async def _unique_slug(self, name: str) -> str:
         base = _slugify(name)
@@ -267,6 +291,22 @@ def _normalize_webclip_path(path: str | None) -> str:
     if normalized != _WEBCLIP_ROOT and not normalized.startswith(_WEBCLIP_ROOT):
         raise HTTPException(status_code=400, detail="Web clips must be stored under /webclipper/")
     return normalized
+
+
+def _merge_highlights_by_id(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for highlight in [*existing, *incoming]:
+        if not isinstance(highlight, dict):
+            continue
+        highlight_id = highlight.get("id")
+        if not highlight_id:
+            continue
+        if highlight_id not in merged:
+            order.append(highlight_id)
+        current = merged.get(highlight_id, {})
+        merged[highlight_id] = {**current, **highlight}
+    return [merged[highlight_id] for highlight_id in order]
 
 
 class HostedDocumentService(DocumentService):
@@ -375,8 +415,20 @@ class HostedDocumentService(DocumentService):
         parser = Parser(html, url=url, content_only=True)
         result = parser.parse(highlights=highlights or [])
 
-        filename = self._slugify_filename(title, "md")
-        filename = await self._dedupe_filename(kb_id, path, filename, "md")
+        existing_preview = await self.pool.fetchrow(
+            "SELECT id::text, filename FROM documents "
+            "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
+            "AND metadata->>'source_url' = $3 "
+            "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            kb_id, self.user_id, url,
+        )
+
+        if existing_preview:
+            filename = existing_preview["filename"]
+        else:
+            filename = self._slugify_filename(title, "md")
+            filename = await self._dedupe_filename(kb_id, path, filename, "md")
         stem = filename.rsplit(".", 1)[0]
         markdown, assets = await materialize_webclip_assets(
             result.content,
@@ -390,8 +442,7 @@ class HostedDocumentService(DocumentService):
         await self._check_storage_available(file_size)
 
         enriched = self._merge_text_anchors(highlights or [], result.highlights)
-        highlights_json = json.dumps(enriched)
-        parent_doc_id = str(uuid.uuid4())
+        parent_doc_id = str(existing_preview["id"]) if existing_preview else str(uuid.uuid4())
         for asset in assets:
             asset.document_id = str(uuid.uuid4())
 
@@ -409,19 +460,66 @@ class HostedDocumentService(DocumentService):
                     asset.content_type,
                 )
 
+        old_asset_ids: list[str] = []
         conn = await self.pool.acquire()
         try:
             async with conn.transaction():
                 await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", self.user_id)
                 await self._check_storage_available(file_size, conn=conn)
-                row = await conn.fetchrow(
-                    f"INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                    f"file_type, file_size, status, content, tags, metadata, highlights) "
-                    f"VALUES ($1, $2, $3, $4, $5, $6, 'md', $7, 'ready', $8, $9, $10, $11::jsonb) "
-                    f"RETURNING {_DOC_COLUMNS}",
-                    parent_doc_id, kb_id, self.user_id, filename, path, title, markdown_size, markdown,
-                    [], json.dumps(parent_metadata), highlights_json,
-                )
+                existing = None
+                if existing_preview:
+                    existing = await conn.fetchrow(
+                        "SELECT id::text, version, highlights FROM documents "
+                        "WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                        parent_doc_id, self.user_id,
+                    )
+                if not existing:
+                    existing = await conn.fetchrow(
+                        "SELECT id::text, version, highlights FROM documents "
+                        "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
+                        "AND metadata->>'source_url' = $3 "
+                        "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+                        "ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
+                        kb_id, self.user_id, url,
+                    )
+
+                if existing:
+                    parent_doc_id = str(existing["id"])
+                    current_highlights = self._parse_highlights(existing["highlights"])
+                    next_highlights = _merge_highlights_by_id(current_highlights, enriched)
+                    row = await conn.fetchrow(
+                        f"UPDATE documents SET path = $1, title = $2, file_size = $3, "
+                        f"status = 'ready', content = $4, metadata = $5::jsonb, "
+                        f"highlights = $6::jsonb, version = version + 1, updated_at = now() "
+                        f"WHERE id = $7 AND user_id = $8 "
+                        f"RETURNING {_DOC_COLUMNS}",
+                        path, title, markdown_size, markdown, json.dumps(parent_metadata),
+                        json.dumps(next_highlights), parent_doc_id, self.user_id,
+                    )
+                    # Re-clip of the same URL: clear the previous asset docs so
+                    # the fresh assets don't collide on (kb, path, filename).
+                    old_asset_ids = [
+                        r["id"] for r in await conn.fetch(
+                            "SELECT id::text FROM documents WHERE user_id = $1 "
+                            "AND metadata->>'parent_document_id' = $2",
+                            self.user_id, parent_doc_id,
+                        )
+                    ]
+                    if old_asset_ids:
+                        await conn.execute(
+                            "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
+                            old_asset_ids, self.user_id,
+                        )
+                else:
+                    next_highlights = enriched
+                    row = await conn.fetchrow(
+                        f"INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                        f"file_type, file_size, status, content, tags, metadata, highlights) "
+                        f"VALUES ($1, $2, $3, $4, $5, $6, 'md', $7, 'ready', $8, $9, $10, $11::jsonb) "
+                        f"RETURNING {_DOC_COLUMNS}",
+                        parent_doc_id, kb_id, self.user_id, filename, path, title, markdown_size, markdown,
+                        [], json.dumps(parent_metadata), json.dumps(next_highlights),
+                    )
                 for asset in assets:
                     await conn.execute(
                         "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
@@ -444,23 +542,27 @@ class HostedDocumentService(DocumentService):
                             **asset.metadata(),
                         }),
                     )
-                if markdown:
-                    chunks = chunk_text(markdown)
-                    if chunks:
-                        await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
-                        # Materialize the highlights we just persisted into
-                        # the freshly-created chunks. Without this, comments
-                        # on a clipped-with-highlights doc would not be
-                        # searchable until the user touched the highlight
-                        # again (next upsert/delete triggers materialization).
-                        if enriched:
-                            await self._recompute_chunks_for_doc(
-                                conn, str(row["id"]), [], enriched,
-                            )
+                chunks = chunk_text(markdown) if markdown else []
+                if chunks:
+                    await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
+                else:
+                    await conn.execute("DELETE FROM document_chunks WHERE document_id = $1", str(row["id"]))
+                # Materialize the highlights we just persisted into the
+                # freshly-created chunks. Without this, comments on a
+                # clipped-with-highlights doc would not be searchable until
+                # the user touched the highlight again.
+                if next_highlights:
+                    await self._recompute_chunks_for_doc(
+                        conn, str(row["id"]), [], next_highlights,
+                    )
         finally:
             await self.pool.release(conn)
 
-        return dict(row)
+        await self._purge_s3(old_asset_ids)
+
+        response = dict(row)
+        response["highlights"] = next_highlights
+        return response
 
     @staticmethod
     def _merge_text_anchors(payloads: list[dict], mapped) -> list[dict]:
@@ -698,7 +800,9 @@ class HostedDocumentService(DocumentService):
         the documents.highlights write commit atomically.
         """
         from services.highlight_chunks import (
-            ChunkRecord, all_affected_chunks, iter_chunks_with_annotations,
+            ChunkRecord,
+            all_affected_chunks,
+            iter_chunks_with_annotations,
         )
 
         rows = await conn.fetch(
@@ -826,7 +930,7 @@ class HostedDocumentService(DocumentService):
             params.append(fields["tags"])
             idx += 1
         if "metadata" in fields:
-            sets.append(f"metadata = ${idx}")
+            sets.append(f"metadata = COALESCE(metadata, '{{}}'::jsonb) || ${idx}::jsonb")
             params.append(_json.dumps(fields["metadata"]))
             idx += 1
 
@@ -948,14 +1052,7 @@ class HostedDocumentService(DocumentService):
                 doc_id, self.user_id,
             )
             return result != "UPDATE 0"
-        await self.pool.execute("DELETE FROM document_pages WHERE document_id = $1", doc_id)
-        await self.pool.execute("DELETE FROM document_chunks WHERE document_id = $1", doc_id)
-        await self.pool.execute("DELETE FROM document_references WHERE source_document_id = $1 OR target_document_id = $1", doc_id)
-        result = await self.pool.execute(
-            "DELETE FROM documents WHERE id = $1 AND user_id = $2",
-            doc_id, self.user_id,
-        )
-        return result != "DELETE 0"
+        return await self._hard_delete([doc_id]) > 0
 
     async def bulk_delete(self, doc_ids: list[str]) -> int:
         if not doc_ids:
@@ -973,16 +1070,38 @@ class HostedDocumentService(DocumentService):
                 wiki_ids, self.user_id,
             )
             count += int(result.split()[-1]) if result else 0
-        if source_ids:
-            await self.pool.execute("DELETE FROM document_pages WHERE document_id = ANY($1::uuid[])", source_ids)
-            await self.pool.execute("DELETE FROM document_chunks WHERE document_id = ANY($1::uuid[])", source_ids)
-            await self.pool.execute("DELETE FROM document_references WHERE source_document_id = ANY($1::uuid[]) OR target_document_id = ANY($1::uuid[])", source_ids)
-            result = await self.pool.execute(
-                "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
-                source_ids, self.user_id,
-            )
-            count += int(result.split()[-1]) if result else 0
+        count += await self._hard_delete(source_ids)
         return count
+
+    async def _hard_delete(self, source_ids: list[str]) -> int:
+        if not source_ids:
+            return 0
+        doc_ids = source_ids + await self._child_asset_ids(source_ids)
+        result = await self.pool.execute(
+            "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
+            doc_ids, self.user_id,
+        )
+        deleted = int(result.split()[-1]) if result else 0
+        if deleted:
+            await self._purge_s3(doc_ids)
+        return deleted
+
+    async def _child_asset_ids(self, parent_ids: list[str]) -> list[str]:
+        rows = await self.pool.fetch(
+            "SELECT id::text FROM documents WHERE user_id = $1 "
+            "AND metadata->>'parent_document_id' = ANY($2::text[])",
+            self.user_id, parent_ids,
+        )
+        return [r["id"] for r in rows]
+
+    async def _purge_s3(self, doc_ids: list[str]) -> None:
+        if not self.s3:
+            return
+        for doc_id in doc_ids:
+            try:
+                await self.s3.delete_prefix(f"{self.user_id}/{doc_id}/")
+            except Exception:
+                logger.exception("S3 purge failed for document %s", doc_id)
 
 
 class HostedPublicWikiService(PublicWikiService):
@@ -1088,8 +1207,8 @@ class HostedServiceFactory(ServiceFactory):
     def user_service(self, user_id: str) -> HostedUserService:
         return HostedUserService(self.pool, user_id)
 
-    def kb_service(self, user_id: str) -> "HostedKBService":
-        return HostedKBService(self.pool, user_id)
+    def kb_service(self, user_id: str) -> HostedKBService:
+        return HostedKBService(self.pool, user_id, self.s3)
 
     def document_service(self, user_id: str) -> HostedDocumentService:
         return HostedDocumentService(self.pool, user_id, self.s3)

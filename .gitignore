@@ -12,6 +12,7 @@ venv/
 .output/
 dist/
 *.egg-info/
+*.tsbuildinfo
 
 # Secrets — NEVER commit
 .env
@@ -48,6 +49,8 @@ nvidia-10k-first20.md
 .claude
 .playwright-mcp
 .pytest_cache
+
+CLAUDE.md
 
 # Supabase CLI cache
 supabase/.temp/

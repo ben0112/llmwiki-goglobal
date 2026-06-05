@@ -1,12 +1,12 @@
 export const terms = `# Terms of Service
 
-**LLM Wiki** · Effective date: April 26, 2026
+**LLM Wiki** · Effective date: June 3, 2026
 
 These terms govern your use of LLM Wiki ("the Service"), operated by Polybius, L.L.C., a Delaware limited liability company ("Polybius," "we," "us," "our"), at llmwiki.app. By using the Service, you agree to these terms.
 
 ## What LLM Wiki is
 
-LLM Wiki is a free, open-source knowledge base that lets you store documents, notes, and wiki pages, and connect them to AI assistants via the Model Context Protocol (MCP). The Service is provided at no cost.
+LLM Wiki is a free, open-source, private knowledge base. A Chrome extension lets you save the web pages and PDFs you choose to clip into your account — including copies of a page's images — where the content becomes a searchable wiki. A web app lets you read and edit it, and you can connect AI assistants via the Model Context Protocol (MCP) to read and write your knowledge bases on your behalf. The Service is provided at no cost.
 
 ## Your account
 
@@ -14,9 +14,13 @@ You must provide a valid email address to create an account. You are responsible
 
 ## Your content
 
-You own everything you upload to or create within LLM Wiki. We claim no intellectual property rights over your content. By using the Service, you grant us a limited license to store, process, and display your content solely for the purpose of providing the Service to you.
+You own everything you upload to or create within LLM Wiki. We claim no intellectual property rights over your content. By using the Service, you grant us a limited license to store, process, transform, index, render, and transmit your content solely for the purpose of providing the Service to you.
 
-"Processing" includes: text extraction from PDFs and office documents, indexing content for search, and making content available to AI tools you have connected via MCP.
+You represent and warrant that you have the necessary rights to store, process, and reproduce any content you clip or upload, and that doing so does not violate any third party's rights. You, not Polybius, are responsible for determining whether content you clip is protected by copyright or other rights and whether you are permitted to store it.
+
+"Processing" includes: converting clipped pages and documents (including HTML-to-Markdown conversion and image storage), text extraction from PDFs and office documents, indexing content for search, and making content available to AI tools you have connected via MCP.
+
+We do not pre-screen or monitor content, and we have no obligation to do so. We reserve the right, but not the obligation, to remove or disable access to any content at our sole discretion.
 
 When you delete content, we delete it permanently (subject to a standard 7-day database backup retention window).
 
@@ -38,7 +42,7 @@ We reserve the right to suspend or terminate accounts that violate these terms.
 
 LLM Wiki respects copyright and responds to notices submitted under the Digital Millennium Copyright Act. Copyright complaints should be sent to our designated agent as described in our [DMCA Policy](/dmca).
 
-We may remove or disable access to material identified in a valid copyright complaint. We may also suspend or terminate accounts that repeatedly infringe copyrights or repeatedly receive valid copyright complaints.
+We may remove or disable access to material identified in a valid copyright complaint. We may also suspend or terminate accounts that repeatedly infringe copyrights or repeatedly receive valid copyright complaints. If your content is removed in response to a complaint, you may submit a counter-notice as described in our [DMCA Policy](/dmca).
 
 ## PDF processing limits
 
@@ -72,6 +76,10 @@ LLM Wiki is a free, open-source project. The Service is provided "as is" and "as
 To the maximum extent permitted by law, Polybius, L.L.C. and its officers, directors, and maintainers shall not be liable for any indirect, incidental, special, consequential, or punitive damages, or any loss of data, revenue, or profits, arising from your use of the Service.
 
 Our total liability for any claim related to the Service shall not exceed the amount you paid for the Service (which is zero, as the Service is free).
+
+## Indemnification
+
+You agree to indemnify and hold harmless Polybius, L.L.C. and its officers, directors, and maintainers from any claim or demand, including reasonable attorneys' fees, arising from content you store or process through the Service, or your violation of these terms. We will notify you promptly of any such claim and may, at our option, allow you to control the defense.
 
 ## Service continuity
 

@@ -9,16 +9,55 @@ from base64 import b64decode
 from dataclasses import dataclass, field
 
 from fastapi import APIRouter, Request, HTTPException, Response
+from starlette.requests import ClientDisconnect
 
 from auth import get_current_user
 from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Bytes buffered in memory before flushing a PATCH body to the temp file.
+FLUSH_SIZE = 1_048_576
+
 
 def _append_file(path: Path, data: bytes):
     with open(path, "ab") as f:
         f.write(data)
+
+
+@dataclass
+class _StreamResult:
+    bytes_written: int
+    overflow: bool
+    disconnected: bool
+
+
+async def _drain_to_temp(request: Request, temp_path: Path, remaining: int) -> _StreamResult:
+    """Append the PATCH body to temp_path, capped at `remaining` bytes."""
+    buf = bytearray()
+    bytes_written = 0
+    try:
+        async for chunk in request.stream():
+            if bytes_written + len(buf) + len(chunk) > remaining:
+                return _StreamResult(bytes_written, overflow=True, disconnected=False)
+            buf.extend(chunk)
+            if len(buf) >= FLUSH_SIZE:
+                await asyncio.to_thread(_append_file, temp_path, bytes(buf))
+                bytes_written += len(buf)
+                buf.clear()
+    except ClientDisconnect:
+        bytes_written += await _flush(temp_path, buf)
+        return _StreamResult(bytes_written, overflow=False, disconnected=True)
+    bytes_written += await _flush(temp_path, buf)
+    return _StreamResult(bytes_written, overflow=False, disconnected=False)
+
+
+async def _flush(temp_path: Path, buf: bytearray) -> int:
+    """Append any buffered bytes to disk; return how many were written."""
+    if not buf:
+        return 0
+    await asyncio.to_thread(_append_file, temp_path, bytes(buf))
+    return len(buf)
 
 
 # Magic-byte signatures we check at finalize time. We don't try to handle
@@ -370,40 +409,23 @@ async def tus_patch(upload_id: str, request: Request):
     if client_offset != upload.upload_offset:
         raise HTTPException(status_code=409, detail="Offset mismatch")
 
-    FLUSH_SIZE = 1_048_576
     # Hard ceiling on how many bytes this PATCH can write — never let the
     # client exceed Upload-Length, regardless of streamed body size.
     remaining = upload.upload_length - upload.upload_offset
-    buf = bytearray()
-    bytes_written = 0
-    overflow = False
-    async for chunk in request.stream():
-        if bytes_written + len(buf) + len(chunk) > remaining:
-            overflow = True
-            break
-        buf.extend(chunk)
-        if len(buf) >= FLUSH_SIZE:
-            await asyncio.to_thread(_append_file, upload.temp_path, bytes(buf))
-            bytes_written += len(buf)
-            buf.clear()
-
-    if buf and not overflow:
-        await asyncio.to_thread(_append_file, upload.temp_path, bytes(buf))
-        bytes_written += len(buf)
-
-    if overflow:
-        # Client tried to write past Upload-Length. Discard partial body
-        # already flushed and reject. The next PATCH still resumes from the
-        # current upload_offset.
-        upload.upload_offset += bytes_written
-        raise HTTPException(
-            status_code=413,
-            detail="Body exceeds declared Upload-Length",
-        )
-
-    upload.upload_offset += bytes_written
-
+    result = await _drain_to_temp(request, upload.temp_path, remaining)
+    upload.upload_offset += result.bytes_written
     upload.last_activity = time.time()
+
+    if result.overflow:
+        raise HTTPException(status_code=413, detail="Body exceeds declared Upload-Length")
+
+    if result.disconnected:
+        # Client hung up mid-PATCH. Bytes received so far are persisted and the
+        # offset advanced, so the client resumes from HEAD + the next PATCH.
+        return Response(
+            status_code=204,
+            headers=_tus_headers({"Upload-Offset": str(upload.upload_offset)}),
+        )
 
     if upload.upload_offset > upload.upload_length:
         upload.temp_path.unlink(missing_ok=True)
@@ -416,6 +438,8 @@ async def tus_patch(upload_id: str, request: Request):
         try:
             document_id = await _finalize(upload, request.app.state)
             headers["X-Document-Id"] = document_id
+        except HTTPException:
+            raise
         except Exception:
             logger.exception("TUS finalization failed for upload %s", upload_id)
             raise HTTPException(status_code=500, detail="Finalization failed")

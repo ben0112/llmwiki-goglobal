@@ -11,14 +11,23 @@ const SCAN_SKIP_TAGS = new Set([
   "HEADER", "FOOTER", "IFRAME", "OBJECT", "EMBED",
   "BUTTON", "INPUT", "TEXTAREA", "SELECT", "FORM",
 ]);
-const ROOT_CONTAINER_TAGS = ["ARTICLE", "MAIN", "[role=main]"];
+const ROOT_LANDMARK_SELECTOR = "main, [role=main], article";
 
+// The page's main content root. We pick the landmark with the most text rather
+// than the first match: some sites (e.g. HuggingFace) render unrelated card
+// components as <article>, so "first <article>" can land on a sidebar card that
+// doesn't contain the post — breaking both capture and resolve.
 function findRoot(): Element {
-  for (const sel of ROOT_CONTAINER_TAGS) {
-    const el = document.querySelector(sel);
-    if (el) return el;
+  let best: Element | null = null;
+  let bestLen = 0;
+  for (const el of Array.from(document.querySelectorAll(ROOT_LANDMARK_SELECTOR))) {
+    const len = el.textContent?.length ?? 0;
+    if (len > bestLen) {
+      best = el;
+      bestLen = len;
+    }
   }
-  return document.body;
+  return best ?? document.body;
 }
 
 // ── Anchor computation ──

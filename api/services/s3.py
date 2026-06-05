@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 
 import aioboto3
-
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -42,6 +41,19 @@ class S3Service:
                 Params={"Bucket": self._bucket, "Key": key, "ContentType": content_type},
                 ExpiresIn=expires_in,
             )
+
+    async def delete_prefix(self, prefix: str) -> None:
+        async with self._session.client("s3") as s3:
+            paginator = s3.get_paginator("list_objects_v2")
+            batch: list[dict] = []
+            async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    batch.append({"Key": obj["Key"]})
+                    if len(batch) == 1000:
+                        await s3.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
+                        batch = []
+            if batch:
+                await s3.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
 
     async def download_bytes(self, key: str) -> bytes:
         async with self._session.client("s3") as s3:

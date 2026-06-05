@@ -48,6 +48,12 @@ function slugify(text: string): string {
     .replace(/^-|-$/g, '')
 }
 
+const FRONTMATTER_RE = /^\s*---[ \t]*\n[\s\S]*?\n---[ \t]*\n/
+
+function stripFrontmatter(content: string): string {
+  return content.replace(FRONTMATTER_RE, '')
+}
+
 function stripLeadingH1(content: string, title: string): string {
   const trimmed = content.trimStart()
   const match = trimmed.match(/^#\s+(.+)\n?/)
@@ -349,7 +355,7 @@ interface WikiContentProps {
 }
 
 export function WikiContent({ content, title, onNavigate, onSourceClick, onGraphClick, documents }: WikiContentProps) {
-  const processedContent = React.useMemo(() => stripLeadingH1(content, title), [content, title])
+  const processedContent = React.useMemo(() => stripLeadingH1(stripFrontmatter(content), title), [content, title])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
   const [copied, setCopied] = React.useState(false)

@@ -46,9 +46,9 @@ function mergePreservingIdentity(
   let allSame = prev.length === next.length
   const merged = next.map((nextDoc, i) => {
     const prevDoc = prevById.get(nextDoc.id)
-    if (prevDoc && shallowEqualForIdentity(prevDoc, nextDoc)) return prevDoc
-    if (prevDoc !== prev[i]) allSame = false
-    return nextDoc
+    const result = prevDoc && shallowEqualForIdentity(prevDoc, nextDoc) ? prevDoc : nextDoc
+    if (result !== prev[i]) allSame = false
+    return result
   })
   return allSame ? prev : merged
 }

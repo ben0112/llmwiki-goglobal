@@ -169,6 +169,22 @@ def _merge_text_anchors(payloads: list[dict], mapped) -> list[dict]:
     return out
 
 
+def _merge_highlights_by_id(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for highlight in [*existing, *incoming]:
+        if not isinstance(highlight, dict):
+            continue
+        highlight_id = highlight.get("id")
+        if not highlight_id:
+            continue
+        if highlight_id not in merged:
+            order.append(highlight_id)
+        current = merged.get(highlight_id, {})
+        merged[highlight_id] = {**current, **highlight}
+    return [merged[highlight_id] for highlight_id in order]
+
+
 class LocalDocumentService(DocumentService):
 
     def __init__(self, db, user_id: str):
@@ -260,6 +276,61 @@ class LocalDocumentService(DocumentService):
         asset_dir_name = f"{stem}.assets"
         markdown, assets = await materialize_webclip_assets(markdown, result.images, asset_dir_name)
 
+        existing = await self.doc_repo.get_by_source_url(url)
+        if existing:
+            parent_id = str(existing["id"])
+            parent_doc = await self.doc_repo.get(parent_id)
+            if parent_doc and (parent_doc.get("path") != path or parent_doc.get("title") != title):
+                await self.update_metadata(parent_id, {"path": path, "title": title})
+
+            await self.update_content(parent_id, markdown or "")
+
+            asset_metadata: list[dict] = []
+            for asset in assets:
+                asset_id = str(uuid.uuid4())
+                asset.document_id = asset_id
+                asset_path = f"{path}{asset_dir_name}/"
+                relative_asset = f"{relative_dir}/{asset.src}" if relative_dir else asset.src
+                local_asset = _safe_resolve(relative_asset)
+                local_asset.parent.mkdir(parents=True, exist_ok=True)
+                mark_written(str(local_asset))
+                local_asset.write_bytes(asset.data)
+                await self.doc_repo.create_asset(
+                    asset_id,
+                    self.user_id,
+                    asset.filename,
+                    asset_path,
+                    asset.filename,
+                    asset.file_type,
+                    len(asset.data),
+                    {
+                        "asset": True,
+                        "hidden": True,
+                        "parent_document_id": parent_id,
+                        "source_url": url,
+                        **asset.metadata(),
+                    },
+                )
+                asset_metadata.append(asset.metadata())
+
+            await self.doc_repo.set_metadata_field(parent_id, "source_url", url)
+            await self.doc_repo.set_metadata_field(parent_id, "clip_kind", "web")
+            await self.doc_repo.set_metadata_field(parent_id, "assets", asset_metadata)
+
+            current = await self.doc_repo.get_highlights(parent_id)
+            current_highlights = current["highlights"] if current else []
+            enriched = _merge_text_anchors(highlights or [], result.highlights)
+            merged_highlights = _merge_highlights_by_id(current_highlights, enriched)
+            if merged_highlights or current_highlights:
+                await self.doc_repo.replace_highlights(parent_id, self.user_id, merged_highlights)
+
+            doc = await self.doc_repo.get(parent_id) or existing
+            fresh_highlights = await self.doc_repo.get_highlights(parent_id)
+            if fresh_highlights:
+                doc["version"] = fresh_highlights["version"]
+                doc["highlights"] = fresh_highlights["highlights"]
+            return doc
+
         file_path.parent.mkdir(parents=True, exist_ok=True)
         mark_written(str(file_path))
         file_path.write_text(markdown or "", encoding="utf-8")
@@ -316,7 +387,12 @@ class LocalDocumentService(DocumentService):
             enriched = _merge_text_anchors(highlights, result.highlights)
             await self.doc_repo.replace_highlights(parent_id, self.user_id, enriched)
 
-        return await self.doc_repo.get(parent_id) or row
+        doc = await self.doc_repo.get(parent_id) or row
+        fresh_highlights = await self.doc_repo.get_highlights(parent_id)
+        if fresh_highlights:
+            doc["version"] = fresh_highlights["version"]
+            doc["highlights"] = fresh_highlights["highlights"]
+        return doc
 
     async def get_by_source_url(self, url: str) -> dict | None:
         return await self.doc_repo.get_by_source_url(url)
