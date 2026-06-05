@@ -1,5 +1,6 @@
 def register(mcp, get_user_id, fs_factory) -> None:
     from .guide import register as register_guide
+    from .list import register as register_list
     from .search import register as register_search
     from .read import register as register_read
     from .write import register as register_write
@@ -7,6 +8,7 @@ def register(mcp, get_user_id, fs_factory) -> None:
     from .lint import register as register_lint
 
     register_guide(mcp, get_user_id, fs_factory)
+    register_list(mcp, get_user_id, fs_factory)
     register_search(mcp, get_user_id, fs_factory)
     register_read(mcp, get_user_id, fs_factory)
     register_write(mcp, get_user_id, fs_factory)

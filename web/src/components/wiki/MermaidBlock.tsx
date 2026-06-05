@@ -4,16 +4,30 @@ import * as React from 'react'
 import { Maximize2 } from 'lucide-react'
 import { DiagramViewer } from './DiagramViewer'
 
+function useIsDarkMode(): boolean {
+  const [isDark, setIsDark] = React.useState(false)
+  React.useEffect(() => {
+    const root = document.documentElement
+    const update = () => setIsDark(root.classList.contains('dark'))
+    update()
+    const observer = new MutationObserver(update)
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+  return isDark
+}
+
 export function MermaidBlock({ chart }: { chart: string }) {
   const containerRef = React.useRef<HTMLDivElement>(null)
   const idRef = React.useRef(`mermaid-${Math.random().toString(36).slice(2, 9)}`)
   const [svgContent, setSvgContent] = React.useState<string | null>(null)
   const [fullscreen, setFullscreen] = React.useState(false)
+  const isDark = useIsDarkMode()
 
   React.useEffect(() => {
     let cancelled = false
     import('mermaid').then(({ default: mermaid }) => {
-      mermaid.initialize({ startOnLoad: false, theme: 'neutral' })
+      mermaid.initialize({ startOnLoad: false, theme: isDark ? 'dark' : 'neutral' })
       mermaid
         .render(idRef.current, chart)
         .then(({ svg }) => {
@@ -33,7 +47,7 @@ export function MermaidBlock({ chart }: { chart: string }) {
     return () => {
       cancelled = true
     }
-  }, [chart])
+  }, [chart, isDark])
 
   return (
     <>
