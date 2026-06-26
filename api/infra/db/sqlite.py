@@ -20,7 +20,7 @@ _SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_s
 
 _DOC_COLUMNS = (
     "id, user_id, filename, title, path, relative_path, source_kind, "
-    "file_type, file_size, document_number, status, page_count, content, "
+    "file_type, file_size, document_number, status, page_count, "
     "tags, date, metadata, error_message, version, parser, "
     "content_hash, mtime_ns, last_indexed_at, stale_since, "
     "created_at, updated_at"
