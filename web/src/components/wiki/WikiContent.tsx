@@ -8,7 +8,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import type { Components } from 'react-markdown'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { FileText, Copy, Download, Check, Network } from 'lucide-react'
+import { FileText, Copy, Check, Network } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
@@ -54,18 +54,23 @@ function stripFrontmatter(content: string): string {
   return content.replace(FRONTMATTER_RE, '')
 }
 
-function stripLeadingH1(content: string, title: string): string {
-  const trimmed = content.trimStart()
-  const match = trimmed.match(/^#\s+(.+)\n?/)
-  if (match) {
-    const h1Text = match[1].replace(/\*\*/g, '').trim()
-    const normalizedH1 = h1Text.toLowerCase().replace(/[^\w\s]/g, '').trim()
-    const normalizedTitle = title.toLowerCase().replace(/[^\w\s]/g, '').trim()
-    if (normalizedH1 === normalizedTitle) {
-      return trimmed.slice(match[0].length)
+interface MdastLike {
+  type: string
+  value?: string
+  children?: MdastLike[]
+}
+
+// Models routinely double-escape LaTeX backslashes (\\log instead of \log) when authoring through tools;
+// KaTeX reads \\ as a line break and fails. Restore a single backslash before a command letter.
+// Genuine \\ line breaks are followed by whitespace or [, never a letter, so they are left intact.
+function remarkFixOverescapedMath() {
+  const restore = (node: MdastLike): void => {
+    if ((node.type === 'inlineMath' || node.type === 'math') && typeof node.value === 'string') {
+      node.value = node.value.replace(/\\\\(?=[a-zA-Z])/g, '\\')
     }
+    node.children?.forEach(restore)
   }
-  return content
+  return restore
 }
 
 function TableOfContents({ items }: { items: TocItem[] }) {
@@ -355,7 +360,10 @@ interface WikiContentProps {
 }
 
 export function WikiContent({ content, title, onNavigate, onSourceClick, onGraphClick, documents }: WikiContentProps) {
-  const processedContent = React.useMemo(() => stripLeadingH1(stripFrontmatter(content), title), [content, title])
+  const processedContent = React.useMemo(() => stripFrontmatter(content), [content])
+  // The body's own opening heading is the page title; only fall back to the chrome title when there is none.
+  const startsWithHeading = React.useMemo(() => /^\s*#{1,6}\s+\S/.test(processedContent), [processedContent])
+  const showTitle = Boolean(title) && !startsWithHeading
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
   const [copied, setCopied] = React.useState(false)
@@ -366,17 +374,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
       setTimeout(() => setCopied(false), 2000)
     })
   }, [content])
-
-  const handleDownload = React.useCallback(() => {
-    const filename = title ? `${title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').toLowerCase()}.md` : 'page.md'
-    const blob = new Blob([content], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
-  }, [content, title])
 
   const components: Components = React.useMemo(
     () => ({
@@ -699,39 +696,34 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
             'min-w-0',
             hasToc ? 'flex-1 max-w-[720px]' : 'w-full',
           )}>
-            {title && (
-              <div className="flex items-start justify-between gap-4 mb-2">
+            <div className="flex items-start justify-between gap-4 mb-2">
+              {showTitle ? (
                 <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
-                <div className="flex items-center gap-1 shrink-0 mt-1.5">
+              ) : (
+                <div className="min-w-0" />
+              )}
+              <div className="flex items-center gap-1 shrink-0 mt-1.5">
+                <button
+                  onClick={handleCopy}
+                  className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
+                  title="Copy markdown"
+                >
+                  {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+                </button>
+                {onGraphClick && (
                   <button
-                    onClick={handleCopy}
+                    onClick={onGraphClick}
                     className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                    title="Copy markdown"
+                    title="Show in graph"
                   >
-                    {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+                    <Network className="size-3.5" />
                   </button>
-                  {/* <button
-                    onClick={handleDownload}
-                    className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                    title="Download as .md"
-                  >
-                    <Download className="size-3.5" />
-                  </button> */}
-                  {onGraphClick && (
-                    <button
-                      onClick={onGraphClick}
-                      className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                      title="Show in graph"
-                    >
-                      <Network className="size-3.5" />
-                    </button>
-                  )}
-                </div>
+                )}
               </div>
-            )}
+            </div>
             <div className="wiki-content text-[15px] leading-relaxed">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath]}
+                remarkPlugins={[remarkGfm, remarkMath, remarkFixOverescapedMath]}
                 rehypePlugins={[rehypeKatex]}
                 components={components}
               >

@@ -1,6 +1,8 @@
 """Postgres + S3 implementation of VaultFS."""
 
 import logging
+import re
+from datetime import date
 
 import aioboto3
 import asyncpg
@@ -14,6 +16,32 @@ logger = logging.getLogger(__name__)
 
 _s3_session = None
 
+_OVERVIEW_TEMPLATE = """\
+---
+title: Overview
+description: Research hub for {name}.
+date: {date}
+tags: [overview, wiki]
+---
+
+This wiki tracks research on {name}. No sources have been ingested yet.
+
+## Key Findings
+
+No sources ingested yet - add your first source to get started.
+
+## Recent Updates
+
+No activity yet.\
+"""
+
+_LOG_TEMPLATE = """\
+Chronological record of ingests, queries, and maintenance passes.
+
+## [{date}] created | Wiki Created
+- Initialized wiki: {name}\
+"""
+
 
 def _get_s3_session():
     global _s3_session
@@ -24,6 +52,13 @@ def _get_s3_session():
             region_name=settings.AWS_REGION,
         )
     return _s3_session
+
+
+def _slugify(name: str) -> str:
+    slug = name.lower().strip()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"[\s-]+", "-", slug).strip("-")
+    return slug or "kb"
 
 
 class PostgresVaultFS(VaultFS):
@@ -46,6 +81,11 @@ class PostgresVaultFS(VaultFS):
             "SELECT name, slug, created_at FROM knowledge_bases WHERE user_id = $1 ORDER BY created_at DESC",
             self.user_id,
         )
+
+    async def create_knowledge_base(self, name: str, description: str | None = None) -> dict:
+        row = await self._insert_knowledge_base(name, description)
+        await self._scaffold_wiki(str(row["id"]), row["name"])
+        return row
 
 
     async def get_document(self, kb_id: str, filename: str, dir_path: str) -> dict | None:
@@ -351,4 +391,63 @@ class PostgresVaultFS(VaultFS):
             "  AND d.stale_since IS NOT NULL "
             "ORDER BY d.stale_since DESC",
             kb_id, self.user_id,
+        )
+
+    async def _insert_knowledge_base(self, name: str, description: str | None) -> dict:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            current_name = name
+            for attempt in range(10):
+                slug = await self._unique_slug(current_name, conn)
+                try:
+                    row = await conn.fetchrow(
+                        "INSERT INTO knowledge_bases (user_id, name, slug, description) "
+                        "VALUES ($1, $2, $3, $4) "
+                        "RETURNING id, user_id, name, slug, description, created_at, updated_at",
+                        self.user_id, current_name, slug, description,
+                    )
+                    return dict(row)
+                except asyncpg.UniqueViolationError:
+                    current_name = f"{name} ({attempt + 2})"
+        raise RuntimeError("Could not create knowledge base after too many duplicate names")
+
+    async def _unique_slug(self, name: str, conn=None) -> str:
+        base = _slugify(name)
+        slug = base
+        counter = 2
+
+        if conn is not None:
+            while await conn.fetchval(
+                "SELECT 1 FROM knowledge_bases WHERE slug = $1 AND user_id = $2",
+                slug, self.user_id,
+            ):
+                slug = f"{base}-{counter}"
+                counter += 1
+            return slug
+
+        pool = await get_pool()
+        async with pool.acquire() as acquired:
+            return await self._unique_slug(name, acquired)
+
+    async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
+        today = date.today().isoformat()
+        await self.create_document(
+            kb_id,
+            "overview.md",
+            "Overview",
+            "/wiki/",
+            "md",
+            _OVERVIEW_TEMPLATE.format(name=name, date=today),
+            ["overview", "wiki"],
+            date=today,
+            metadata={"description": f"Research hub for {name}."},
+        )
+        await self.create_document(
+            kb_id,
+            "log.md",
+            "Log",
+            "/wiki/",
+            "md",
+            _LOG_TEMPLATE.format(name=name, date=today),
+            ["log"],
         )

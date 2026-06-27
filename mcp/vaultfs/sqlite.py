@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import date
 from pathlib import Path
 
 import aiosqlite
@@ -17,6 +18,32 @@ _SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_schema.s
 
 _db: aiosqlite.Connection | None = None
 _workspace_root: Path | None = None
+
+_OVERVIEW_TEMPLATE = """\
+---
+title: Overview
+description: Research hub for {name}.
+date: {date}
+tags: [overview, wiki]
+---
+
+This wiki tracks research on {name}. No sources have been ingested yet.
+
+## Key Findings
+
+No sources ingested yet - add your first source to get started.
+
+## Recent Updates
+
+No activity yet.\
+"""
+
+_LOG_TEMPLATE = """\
+Chronological record of ingests, queries, and maintenance passes.
+
+## [{date}] created | Wiki Created
+- Initialized wiki: {name}\
+"""
 
 
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
@@ -97,12 +124,41 @@ class SqliteVaultFS(VaultFS):
     async def list_knowledge_bases(self) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
-            "SELECT w.name, w.name as slug, "
+            "SELECT w.id, w.name, w.name as slug, w.description, w.created_at, "
             "(SELECT count(*) FROM documents WHERE source_kind != 'wiki' AND status != 'failed') as source_count, "
             "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_count "
             "FROM workspace w",
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def create_knowledge_base(self, name: str, description: str | None = None) -> dict:
+        """Create the local singleton workspace, or return it if already initialized."""
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, name, name as slug, description, created_at FROM workspace LIMIT 1",
+        )
+        row = await cursor.fetchone()
+        if row:
+            existing = _rows_to_dicts(cursor, [row])[0]
+            existing["already_exists"] = True
+            existing["local_singleton"] = True
+            return existing
+
+        ws_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, ?, ?, ?)",
+            (ws_id, name, description or "", self.user_id),
+        )
+        await db.commit()
+
+        await self._scaffold_wiki(ws_id, name)
+        kb = await self.resolve_kb(name)
+        return {
+            **(kb or {"id": ws_id, "name": name, "slug": name}),
+            "description": description or "",
+            "already_exists": False,
+            "local_singleton": True,
+        }
 
 
     async def get_document(self, kb_id: str, filename: str, dir_path: str) -> dict | None:
@@ -453,3 +509,24 @@ class SqliteVaultFS(VaultFS):
         )
         await db.commit()
         return ws_id
+
+    async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
+        today = date.today().isoformat()
+        overview = _OVERVIEW_TEMPLATE.format(name=name, date=today)
+        log = _LOG_TEMPLATE.format(name=name, date=today)
+        await self.create_document(
+            kb_id,
+            "overview.md",
+            "Overview",
+            "/wiki/",
+            "md",
+            overview,
+            ["overview", "wiki"],
+            date=today,
+            metadata={"description": f"Research hub for {name}."},
+        )
+        await self.create_document(
+            kb_id, "log.md", "Log", "/wiki/", "md", log, ["log"],
+        )
+        self.write_to_disk("/wiki/", "overview.md", overview)
+        self.write_to_disk("/wiki/", "log.md", log)

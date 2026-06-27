@@ -38,6 +38,34 @@ class TestWriteReadFlow:
         result = await writer.create("/wiki/", "Concepts", "# Concepts", ["overview"], "", False)
         assert "cite sources" in result.lower() or "footnotes" in result.lower()
 
+    async def test_create_wiki_page_adds_frontmatter_from_args(self, fs):
+        instance, kb_id = fs
+        from tools.lint import LintHandler
+        from tools.write import WriteHandler, _parse_frontmatter
+
+        kb = _make_kb(kb_id)
+        writer = WriteHandler(instance, kb)
+        linter = LintHandler(instance, kb)
+
+        await writer.create(
+            "/wiki/",
+            "Auto Metadata",
+            "A short synthesized page.",
+            ["alpha", "beta"],
+            "2026-06-15",
+            False,
+        )
+
+        doc = await instance.get_document(kb_id, "auto-metadata.md", "/wiki/")
+        meta = _parse_frontmatter(doc["content"])
+        assert meta["title"] == "Auto Metadata"
+        assert meta["description"] == "A short synthesized page."
+        assert str(meta["date"]) == "2026-06-15"
+        assert meta["tags"] == ["alpha", "beta"]
+
+        result = await linter.run(path="/wiki/auto-metadata.md", include_graph=False)
+        assert "Lint passed" in result
+
     async def test_create_rejects_missing_title(self, fs):
         instance, kb_id = fs
         from tools.write import WriteHandler

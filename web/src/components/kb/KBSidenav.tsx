@@ -27,6 +27,12 @@ interface Usage {
   max_storage_bytes: number
 }
 
+// Only normalize all-lowercase names (file slugs); preserve intentional casing like "GRPO" or "LoRA".
+function toDisplayTitle(title: string): string {
+  if (title !== title.toLowerCase()) return title
+  return title.replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
 
 interface KBSidenavProps {
   kbId: string
@@ -170,7 +176,7 @@ export function KBSidenav({
                   className="flex items-center"
                 >
                   <FileText className="size-3.5 mr-2 opacity-50 shrink-0" />
-                  <span className="truncate">{item.title}</span>
+                  <span className="truncate">{toDisplayTitle(item.title)}</span>
                   {item.tags.length > 0 && (
                     <span className="ml-auto flex items-center gap-1 shrink-0 pl-2">
                       {item.tags.slice(0, 3).map((tag) => (
@@ -378,7 +384,7 @@ function WikiTreeNode({
           <span className="w-3.5" />
         )}
         {wikiNodeIcon(node, depth)}
-        <span className="truncate flex-1 min-w-0">{node.title}</span>
+        <span className="truncate flex-1 min-w-0">{toDisplayTitle(node.title)}</span>
       </div>
       <AnimatePresence initial={false}>
         {hasChildren && expanded && (

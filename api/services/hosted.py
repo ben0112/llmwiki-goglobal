@@ -75,6 +75,13 @@ _KB_LIST_QUERY = (
 )
 
 _OVERVIEW_TEMPLATE = """\
+---
+title: Overview
+description: Research hub for {name}.
+date: {date}
+tags: [overview, wiki]
+---
+
 This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
@@ -177,9 +184,14 @@ class HostedKBService(KBService):
         today = datetime.now().strftime("%Y-%m-%d")
         await self.pool.execute(
             "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-            "file_type, status, content, tags, version, sort_order) "
-            "VALUES ($1, $2, 'overview.md', 'Overview', '/wiki/', 'md', 'ready', $3, $4, 0, -100)",
-            kb_id, self.user_id, _OVERVIEW_TEMPLATE.format(name=name), ["overview"],
+            "file_type, status, content, tags, date, metadata, version, sort_order) "
+            "VALUES ($1, $2, 'overview.md', 'Overview', '/wiki/', 'md', 'ready', $3, $4, $5, $6::jsonb, 0, -100)",
+            kb_id,
+            self.user_id,
+            _OVERVIEW_TEMPLATE.format(name=name, date=today),
+            ["overview", "wiki"],
+            today,
+            json.dumps({"description": f"Research hub for {name}."}),
         )
         await self.pool.execute(
             "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "

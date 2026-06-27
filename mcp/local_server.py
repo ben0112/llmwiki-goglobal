@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import uuid
+from datetime import date
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -45,31 +46,41 @@ async def _init_workspace(workspace_path: str) -> None:
     if not existing:
         ws_name = ws.name
         ws_id = await fs.ensure_workspace(ws_name)
+        today = date.today().isoformat()
+        overview_content = (
+            "---\n"
+            "title: Overview\n"
+            f"description: Research hub for {ws_name}.\n"
+            f"date: {today}\n"
+            "tags: [overview, wiki]\n"
+            "---\n\n"
+            f"This wiki tracks research on {ws_name}.\n\n"
+            "## Key Findings\n\n"
+            "No sources ingested yet.\n\n"
+            "## Recent Updates\n\n"
+            "No activity yet."
+        )
+        log_content = "Chronological record of ingests, queries, and maintenance passes."
 
         await fs.create_document(
             ws_id, "overview.md", "Overview", "/wiki/", "md",
-            f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet.\n\n## Recent Updates\n\nNo activity yet.",
-            ["overview"],
+            overview_content,
+            ["overview", "wiki"],
+            date=today,
+            metadata={"description": f"Research hub for {ws_name}."},
         )
         await fs.create_document(
             ws_id, "log.md", "Log", "/wiki/", "md",
-            "Chronological record of ingests, queries, and maintenance passes.",
+            log_content,
             ["log"],
         )
 
         overview_path = ws / "wiki" / "overview.md"
         if not overview_path.exists():
-            overview_path.write_text(
-                f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\n"
-                "No sources ingested yet.\n\n## Recent Updates\n\nNo activity yet.\n",
-                encoding="utf-8",
-            )
+            overview_path.write_text(overview_content + "\n", encoding="utf-8")
         log_path = ws / "wiki" / "log.md"
         if not log_path.exists():
-            log_path.write_text(
-                "Chronological record of ingests, queries, and maintenance passes.\n",
-                encoding="utf-8",
-            )
+            log_path.write_text(log_content + "\n", encoding="utf-8")
 
         logger.info("Initialized workspace: %s", ws)
     else:

@@ -10,7 +10,7 @@ You are connected to an **LLM Wiki** — a personal knowledge workspace where yo
 
 1. **Raw Sources** (path: `/`) — uploaded documents (PDFs, notes, images, spreadsheets). Source of truth. Read-only.
 2. **Compiled Wiki** (path: `/wiki/`) — markdown pages YOU create and maintain. You own this layer.
-3. **Tools** — `search`, `read`, `create`, `edit`, `append`, `delete` — your interface to both layers.
+3. **Tools** — `create_knowledge_base`, `list_knowledge_bases`, `search`, `read`, `create`, `edit`, `append`, `delete` — your interface to both layers.
 
 ## Reading Images
 
@@ -225,7 +225,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         fs = fs_factory(user_id)
         kbs = await fs.list_knowledge_bases()
         if not kbs:
-            return GUIDE_TEXT + "No knowledge bases yet. Create one at " + settings.APP_URL + "/wikis"
+            return GUIDE_TEXT + "No knowledge bases yet. Use `create_knowledge_base`, or create one at " + settings.APP_URL + "/wikis"
 
         lines = []
         for kb in kbs:

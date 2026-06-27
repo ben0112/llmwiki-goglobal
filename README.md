@@ -125,6 +125,7 @@ Once connected over MCP, Claude works the wiki through a small, deliberate set o
 | Tool | What it does |
 |------|--------------|
 | `guide` | Orients Claude — how the vault works and which knowledge bases exist. It calls this first. |
+| `create_knowledge_base` | Creates a knowledge base and starter wiki pages (`overview.md`, `log.md`); local mode returns the existing singleton workspace. |
 | `list_knowledge_bases` | Lists your knowledge bases and their slugs (every other tool takes one). |
 | `search` | Browse files, full-text search across content, or query the citation graph — what cites what, plus stale or uncited pages. |
 | `read` | Read documents — a single file or a glob batch, PDF/office page ranges, optionally with embedded images. |

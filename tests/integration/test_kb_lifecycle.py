@@ -34,12 +34,17 @@ class TestCreateKB:
 
         kb_id = data["id"]
         docs = await pool.fetch(
-            "SELECT filename, path, title FROM documents WHERE knowledge_base_id = $1 ORDER BY filename",
+            "SELECT filename, path, title, content, tags, date FROM documents "
+            "WHERE knowledge_base_id = $1 ORDER BY filename",
             kb_id,
         )
         filenames = [d["filename"] for d in docs]
         assert "log.md" in filenames
         assert "overview.md" in filenames
+        overview = next(d for d in docs if d["filename"] == "overview.md")
+        assert overview["content"].startswith("---\n")
+        assert overview["tags"] == ["overview", "wiki"]
+        assert overview["date"]
 
     async def test_duplicate_name_rejected(self, client):
         headers = auth_headers(USER_ID)

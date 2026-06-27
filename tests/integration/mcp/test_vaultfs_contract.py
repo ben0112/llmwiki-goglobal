@@ -11,6 +11,43 @@ from tests.integration.mcp.conftest import TEST_USER_ID
 
 class TestWorkspace:
 
+    async def test_create_knowledge_base_initializes_empty_workspace(self, workspace):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            instance = SqliteVaultFS(TEST_USER_ID)
+            kb = await instance.create_knowledge_base("Research Notes", "Test workspace")
+
+            assert kb["name"] == "Research Notes"
+            assert kb["slug"] == "Research Notes"
+            assert kb["already_exists"] is False
+            assert kb["local_singleton"] is True
+
+            docs = await instance.list_documents(kb["id"])
+            wiki_files = {doc["path"] + doc["filename"] for doc in docs}
+            assert "/wiki/overview.md" in wiki_files
+            assert "/wiki/log.md" in wiki_files
+            overview = await instance.get_document(kb["id"], "overview.md", "/wiki/")
+            assert overview["content"].startswith("---\n")
+            assert overview["tags"] == ["overview", "wiki"]
+            assert overview["date"]
+            assert (workspace / "wiki" / "overview.md").exists()
+            assert (workspace / "wiki" / "log.md").exists()
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_create_knowledge_base_returns_existing_local_workspace(self, fs):
+        instance, kb_id = fs
+        kb = await instance.create_knowledge_base("Another KB", "Should not create a second workspace")
+
+        assert kb["id"] == kb_id
+        assert kb["name"] == "test-workspace"
+        assert kb["slug"] == "test-workspace"
+        assert kb["already_exists"] is True
+        assert kb["local_singleton"] is True
+
     async def test_resolve_kb_returns_workspace(self, fs):
         instance, kb_id = fs
         kb = await instance.resolve_kb("test-workspace")

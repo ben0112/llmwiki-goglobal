@@ -17,6 +17,10 @@ import {
 import { useTheme } from 'next-themes'
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
+function wikiHref(slug: string): string {
+  return `/wikis/${slug}`
+}
+
 function relativeTime(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
   const minutes = Math.floor(diff / 60000)
@@ -43,13 +47,31 @@ export default function WikisPage() {
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [name, setName] = React.useState('')
 
+  const prefetchWiki = React.useCallback((slug: string) => {
+    router.prefetch(wikiHref(slug))
+  }, [router])
+
+  const openWiki = React.useCallback((slug: string) => {
+    router.push(wikiHref(slug))
+  }, [router])
+
+  React.useEffect(() => {
+    if (loading || error || knowledgeBases.length === 0) return
+    const timer = window.setTimeout(() => {
+      for (const kb of knowledgeBases.slice(0, 12)) {
+        router.prefetch(wikiHref(kb.slug))
+      }
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [error, knowledgeBases, loading, router])
+
   const handleQuickCreate = async () => {
     setCreating(true)
     try {
       const email = user?.email || 'My'
       const displayName = email.split('@')[0].charAt(0).toUpperCase() + email.split('@')[0].slice(1)
       const kb = await createKB(`${displayName}'s Wiki`)
-      router.push(`/wikis/${kb.slug}`)
+      openWiki(kb.slug)
     } catch (err) {
       console.error('Failed to create KB:', err)
     } finally {
@@ -64,7 +86,7 @@ export default function WikisPage() {
       const kb = await createKB(name.trim())
       setDialogOpen(false)
       setName('')
-      router.push(`/wikis/${kb.slug}`)
+      openWiki(kb.slug)
     } catch (err) {
       console.error('Failed to create KB:', err)
     } finally {
@@ -207,6 +229,7 @@ export default function WikisPage() {
               const stats: string[] = []
               if (kb.source_count > 0) stats.push(`${kb.source_count} source${kb.source_count !== 1 ? 's' : ''}`)
               if (kb.wiki_page_count > 0) stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+              const handleOpen = () => openWiki(kb.slug)
 
               return (
                 <motion.div
@@ -216,8 +239,16 @@ export default function WikisPage() {
                   transition={{ duration: 0.3, delay: index * 0.05, ease: [0.25, 0.1, 0.25, 1] }}
                   role="button"
                   tabIndex={0}
-                  onClick={() => router.push(`/wikis/${kb.slug}`)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') router.push(`/wikis/${kb.slug}`) }}
+                  onMouseEnter={() => prefetchWiki(kb.slug)}
+                  onFocus={() => prefetchWiki(kb.slug)}
+                  onPointerDown={() => prefetchWiki(kb.slug)}
+                  onClick={handleOpen}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      handleOpen()
+                    }
+                  }}
                   className="flex flex-col items-start gap-3 p-5 rounded-xl border border-border bg-card hover:bg-accent/50 transition-colors cursor-pointer text-left group overflow-hidden"
                 >
                   <div className="flex items-center gap-3 min-w-0 w-full">
