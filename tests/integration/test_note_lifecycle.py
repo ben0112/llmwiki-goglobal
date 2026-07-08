@@ -204,6 +204,57 @@ class TestUpdateMetadata:
         assert resp.json()["title"] == "New Title"
         assert resp.json()["tags"] == ["important", "v2"]
 
+    async def test_metadata_round_trips_as_object(self, client):
+        headers = auth_headers(USER_ID)
+        create_resp = await client.post(
+            f"/v1/knowledge-bases/{KB_ID}/documents/note",
+            headers=headers,
+            json={"filename": "progress.md", "content": "x " * 70},
+        )
+        doc_id = create_resp.json()["id"]
+
+        course = {"status": "complete", "completed_at": "2026-07-07T00:00:00Z"}
+        patch_resp = await client.patch(
+            f"/v1/documents/{doc_id}",
+            headers=headers,
+            json={"metadata": {"course": course}},
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.json()["metadata"] == {"course": course}
+
+        list_resp = await client.get(
+            f"/v1/knowledge-bases/{KB_ID}/documents", headers=headers,
+        )
+        listed = next(d for d in list_resp.json() if d["id"] == doc_id)
+        assert listed["metadata"] == {"course": course}
+
+        get_resp = await client.get(f"/v1/documents/{doc_id}", headers=headers)
+        assert get_resp.json()["metadata"] == {"course": course}
+
+    async def test_metadata_patch_merges_top_level_keys(self, client):
+        headers = auth_headers(USER_ID)
+        create_resp = await client.post(
+            f"/v1/knowledge-bases/{KB_ID}/documents/note",
+            headers=headers,
+            json={"filename": "merge.md", "content": "x " * 70},
+        )
+        doc_id = create_resp.json()["id"]
+
+        await client.patch(
+            f"/v1/documents/{doc_id}",
+            headers=headers,
+            json={"metadata": {"source_url": "https://example.com"}},
+        )
+        resp = await client.patch(
+            f"/v1/documents/{doc_id}",
+            headers=headers,
+            json={"metadata": {"course": {"status": "complete"}}},
+        )
+        assert resp.json()["metadata"] == {
+            "source_url": "https://example.com",
+            "course": {"status": "complete"},
+        }
+
     async def test_empty_patch_rejected(self, client):
         headers = auth_headers(USER_ID)
         create_resp = await client.post(

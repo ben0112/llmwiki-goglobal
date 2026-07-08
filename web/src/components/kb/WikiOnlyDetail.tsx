@@ -145,10 +145,13 @@ export function WikiOnlyDetail({
 
   // Applies ?p= to the active path exactly once per URL value (deep links, back/forward).
   // `documents` churns constantly (WS/poll, optimistic course-progress writes) — re-running
-  // on churn would re-assert a stale URL and snap in-app navigation back.
+  // on churn would re-assert a stale URL and snap in-app navigation back. useSearchParams
+  // also lags our own history.replaceState writes, so a churn-triggered run can observe the
+  // pre-navigation ?p= — trust only values that match the live URL.
   React.useEffect(() => {
     if (urlWikiDocNumber == null || !documents.length) return
     if (urlWikiDocNumber === handledUrlDocNumberRef.current) return
+    if (new URL(window.location.href).searchParams.get('p') !== String(urlWikiDocNumber)) return
     const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
     if (!doc) return
     handledUrlDocNumberRef.current = urlWikiDocNumber

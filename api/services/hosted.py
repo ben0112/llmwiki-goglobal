@@ -286,6 +286,14 @@ _DOC_COLUMNS = (
     "version, document_number, archived, created_at, updated_at"
 )
 
+
+def _doc_dict(row) -> dict:
+    """asyncpg returns jsonb as str — decode metadata so responses carry an object."""
+    doc = dict(row)
+    if isinstance(doc.get("metadata"), str):
+        doc["metadata"] = json.loads(doc["metadata"])
+    return doc
+
 _WEBCLIP_ROOT = "/webclipper/"
 
 
@@ -349,14 +357,14 @@ class HostedDocumentService(DocumentService):
                 "ORDER BY filename",
                 kb_id, self.user_id,
             )
-        return [dict(r) for r in rows]
+        return [_doc_dict(r) for r in rows]
 
     async def get(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(
             f"SELECT {_DOC_COLUMNS} FROM documents WHERE id = $1 AND user_id = $2",
             doc_id, self.user_id,
         )
-        return dict(row) if row else None
+        return _doc_dict(row) if row else None
 
     async def get_content(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(
@@ -415,7 +423,7 @@ class HostedDocumentService(DocumentService):
                     await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
         finally:
             await self.pool.release(conn)
-        return dict(row)
+        return _doc_dict(row)
 
     async def create_web_clip(
         self, kb_id: str, url: str, title: str, html: str,
@@ -574,7 +582,7 @@ class HostedDocumentService(DocumentService):
 
         await self._purge_s3(old_asset_ids)
 
-        response = dict(row)
+        response = _doc_dict(row)
         response["highlights"] = next_highlights
         return response
 
@@ -1056,13 +1064,13 @@ class HostedDocumentService(DocumentService):
                     )
             finally:
                 await self.pool.release(conn)
-            return dict(row)
+            return _doc_dict(row)
 
         try:
             row = await self.pool.fetchrow(sql, *params)
         except asyncpg.UniqueViolationError as e:
             self._reraise_doc_conflict(e)
-        return dict(row) if row else None
+        return _doc_dict(row) if row else None
 
     async def delete(self, doc_id: str) -> bool:
         # Wiki pages are archived to preserve slugs and cross-references;
