@@ -34,6 +34,9 @@ jobs:
         working-directory: mcp
         run: pytest ../tests/unit/mcp/ -v
 
+      - name: Run corpus classification tests
+        run: pytest tests/unit/corpus/ -v
+
   mcp-integration:
     name: MCP integration tests (SQLite)
     runs-on: ubuntu-latest
