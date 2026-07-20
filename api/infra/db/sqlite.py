@@ -99,8 +99,59 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         cur = await db.execute("PRAGMA table_info(workspace)")
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
+        await _migrate_fts_tokenizer(db, schema)
         await db.commit()
     return db
+
+
+async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:
+    """Rebuild chunks_fts when an existing DB still uses the old tokenizer.
+
+    The schema moved from `porter unicode61` (CJK-blind) to `trigram` so
+    Chinese content is searchable. executescript is CREATE IF NOT EXISTS, so
+    pre-existing databases keep the old virtual table unless dropped and
+    repopulated here. Mirrored in mcp/vaultfs/sqlite.py init — both processes
+    open the same index.db.
+    """
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+    )
+    row = await cur.fetchone()
+    if not row or "trigram" in (row[0] or ""):
+        return
+    for trigger in ("chunks_fts_insert", "chunks_fts_delete", "chunks_fts_update"):
+        await db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    await db.execute("DROP TABLE chunks_fts")
+    await db.executescript(schema)
+    await db.execute(
+        "INSERT INTO chunks_fts(rowid, content) SELECT rowid, content FROM document_chunks"
+    )
+    logger.info("Rebuilt chunks_fts with trigram tokenizer")
+
+
+def build_fts_match(query: str) -> str | None:
+    """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
+
+    Tokens are double-quoted so FTS5 operators and stray quotes in user
+    queries can't raise OperationalError. The trigram tokenizer cannot match
+    tokens shorter than 3 characters (common for 2-char Chinese terms like
+    税务) — those queries fall back to a LIKE scan.
+    Mirrored in mcp/vaultfs/sqlite.py.
+    """
+    tokens = [t for t in query.split() if t]
+    if not tokens or any(len(t) < 3 for t in tokens):
+        return None
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    return " AND ".join(quoted)
+
+
+def build_like_patterns(query: str) -> list[str]:
+    """One escaped LIKE %pattern% per whitespace token."""
+    patterns = []
+    for token in query.split():
+        escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        patterns.append(f"%{escaped}%")
+    return patterns
 
 
 class SQLiteDocumentRepository:
@@ -699,23 +750,40 @@ class SQLiteChunkRepository:
         self, kb_id: str, query: str, *, limit: int = 20,
         path_filter: str | None = None, user_id: str | None = None,
     ) -> list[dict]:
-        sql = (
-            "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, "
-            "rank "
-            "FROM document_chunks dc "
-            "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-            "JOIN documents d ON dc.document_id = d.id "
-            "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
-        )
-        params: list = [query]
+        match_expr = build_fts_match(query)
+        params: list = []
+        if match_expr is not None:
+            sql = (
+                "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "rank "
+                "FROM document_chunks dc "
+                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                "JOIN documents d ON dc.document_id = d.id "
+                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+            )
+            params.append(match_expr)
+        else:
+            patterns = build_like_patterns(query)
+            if not patterns:
+                return []
+            like_conds = " AND ".join("dc.content LIKE ? ESCAPE '\\'" for _ in patterns)
+            sql = (
+                "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "0 as rank "
+                "FROM document_chunks dc "
+                "JOIN documents d ON dc.document_id = d.id "
+                f"WHERE {like_conds} AND d.status != 'failed' "
+            )
+            params.extend(patterns)
 
         if path_filter == "wiki":
             sql += "AND d.source_kind = 'wiki' "
         elif path_filter == "sources":
             sql += "AND d.source_kind != 'wiki' "
 
-        sql += "ORDER BY rank LIMIT ?"
+        sql += "ORDER BY rank LIMIT ?" if match_expr is not None else "ORDER BY d.path, d.filename, dc.chunk_index LIMIT ?"
         params.append(limit)
 
         cursor = await self._db.execute(sql, params)

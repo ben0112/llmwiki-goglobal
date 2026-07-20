@@ -11,6 +11,7 @@ import aiosqlite
 
 from services.chunker import chunk_text, store_chunks_sqlite
 from .base import VaultFS, DuplicateDocumentError
+from .facets import sqlite_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,54 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
     return results
 
 
+async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:
+    """Rebuild chunks_fts when an existing DB still uses the old tokenizer.
+
+    The schema moved from `porter unicode61` (CJK-blind) to `trigram`.
+    executescript is CREATE IF NOT EXISTS, so pre-existing databases keep the
+    old virtual table unless we drop and repopulate it here. Mirrored in
+    api/infra/db/sqlite.py create_pool — both processes open the same index.db.
+    """
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+    )
+    row = await cur.fetchone()
+    if not row or "trigram" in (row[0] or ""):
+        return
+    for trigger in ("chunks_fts_insert", "chunks_fts_delete", "chunks_fts_update"):
+        await db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    await db.execute("DROP TABLE chunks_fts")
+    await db.executescript(schema)
+    await db.execute(
+        "INSERT INTO chunks_fts(rowid, content) SELECT rowid, content FROM document_chunks"
+    )
+    logger.info("Rebuilt chunks_fts with trigram tokenizer")
+
+
+def _build_fts_match(query: str) -> str | None:
+    """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
+
+    Tokens are double-quoted so FTS5 operators and stray quotes in user
+    queries can't raise OperationalError. The trigram tokenizer cannot match
+    tokens shorter than 3 characters (common for 2-char Chinese terms like
+    税务) — those queries fall back to a LIKE scan.
+    """
+    tokens = [t for t in query.split() if t]
+    if not tokens or any(len(t) < 3 for t in tokens):
+        return None
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
+    return " AND ".join(quoted)
+
+
+def _like_patterns(query: str) -> list[str]:
+    """One escaped LIKE %pattern% per whitespace token."""
+    patterns = []
+    for token in query.split():
+        escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        patterns.append(f"%{escaped}%")
+    return patterns
+
+
 class SqliteVaultFS(VaultFS):
     """SQLite + local filesystem vault."""
 
@@ -92,8 +141,11 @@ class SqliteVaultFS(VaultFS):
         _db = await aiosqlite.connect(db_path)
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
+        await _db.execute("PRAGMA busy_timeout=5000")
         if _SCHEMA_PATH.exists():
-            await _db.executescript(_SCHEMA_PATH.read_text(encoding='utf-8'))
+            schema = _SCHEMA_PATH.read_text(encoding='utf-8')
+            await _db.executescript(schema)
+            await _migrate_fts_tokenizer(_db, schema)
             await _db.commit()
         logger.info("SQLite initialized: %s", db_path)
 
@@ -291,14 +343,20 @@ class SqliteVaultFS(VaultFS):
         return cursor.rowcount
 
 
-    async def list_documents(self, kb_id: str) -> list[dict]:
+    async def list_documents(self, kb_id: str, facets: dict | None = None) -> list[dict]:
         db = self._db_or_raise()
-        cursor = await db.execute(
+        sql = (
             "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at "
-            "FROM documents WHERE status != 'failed' "
+            "FROM documents d WHERE status != 'failed' "
             "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
-            "ORDER BY path, filename",
         )
+        params: list = []
+        conds, facet_params = sqlite_facet_conditions(validate_facets(facets))
+        for cond in conds:
+            sql += f"AND {cond} "
+        params.extend(facet_params)
+        sql += "ORDER BY path, filename"
+        cursor = await db.execute(sql, params)
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
     async def list_documents_with_content(self, kb_id: str) -> list[dict]:
@@ -338,6 +396,7 @@ class SqliteVaultFS(VaultFS):
         path_filter: str | None = None,
         annotated_only: bool = False,
         scope: str = "all",
+        facets: dict | None = None,
     ) -> list[dict]:
         db = self._db_or_raise()
         # SQLite's chunks_fts only indexes `content` (which already includes
@@ -347,24 +406,52 @@ class SqliteVaultFS(VaultFS):
         # slice to the requested limit. Acceptable at personal scale;
         # production hosted-mode uses Postgres + PGroonga per-column matches.
         sql_limit = limit if scope == "all" else limit * 3
-        sql = (
-            "SELECT dc.content, dc.source_content, dc.annotations_text, "
-            "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, "
-            "rank as score "
-            "FROM document_chunks dc "
-            "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-            "JOIN documents d ON dc.document_id = d.id "
-            "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
-        )
-        params: list = [query]
+
+        # Trigram MATCH when every token is indexable; otherwise a LIKE scan
+        # (short tokens — e.g. 2-char Chinese terms — have no trigrams).
+        match_expr = _build_fts_match(query)
+        params: list = []
+        if match_expr is not None:
+            sql = (
+                "SELECT dc.content, dc.source_content, dc.annotations_text, "
+                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "rank as score "
+                "FROM document_chunks dc "
+                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                "JOIN documents d ON dc.document_id = d.id "
+                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+            )
+            params.append(match_expr)
+        else:
+            patterns = _like_patterns(query)
+            if not patterns:
+                return []
+            like_conds = " AND ".join("dc.content LIKE ? ESCAPE '\\'" for _ in patterns)
+            sql = (
+                "SELECT dc.content, dc.source_content, dc.annotations_text, "
+                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "0 as score "
+                "FROM document_chunks dc "
+                "JOIN documents d ON dc.document_id = d.id "
+                f"WHERE {like_conds} AND d.status != 'failed' "
+            )
+            params.extend(patterns)
+
         if annotated_only:
             sql += "AND dc.has_highlight = 1 "
         if path_filter == "wiki":
             sql += "AND d.source_kind = 'wiki' "
         elif path_filter == "sources":
             sql += "AND d.source_kind != 'wiki' "
-        sql += "ORDER BY rank LIMIT ?"
+
+        facet_conds, facet_params = sqlite_facet_conditions(validate_facets(facets))
+        for cond in facet_conds:
+            sql += f"AND {cond} "
+        params.extend(facet_params)
+
+        sql += "ORDER BY score LIMIT ?" if match_expr is not None else "ORDER BY d.path, d.filename, dc.chunk_index LIMIT ?"
         params.append(sql_limit)
 
         cursor = await db.execute(sql, params)

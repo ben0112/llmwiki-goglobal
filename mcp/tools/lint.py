@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
-
 from vaultfs import VaultFS
+
 from .helpers import glob_match
 from .references import _parse_citation_filename, _parse_wiki_links
 from .write import (
@@ -26,6 +28,28 @@ _ROOT_PAGES = frozenset({"/wiki/overview.md", "/wiki/index.md", "/wiki/readme.md
 _LEDGER_PAGES = frozenset({"/wiki/log.md"})
 _MATCH_ALL_PATHS = frozenset({"*", "**", "**/*"})
 _MAX_ISSUES_PER_GROUP = 40
+
+# 八维 corpus entry validation (码表 v2026.06 closed lists; the authoritative
+# versioned tables live in corpus/codetables/ — these frozen sets exist so the
+# MCP server can lint without importing outside its package root).
+_CORPUS_STAGES = frozenset({"S0", "S1", "S2", "S3", "S4"})
+_CORPUS_DOMAINS = frozenset(
+    {f"G{i}" for i in range(1, 5)} | {f"C{i}" for i in range(1, 6)}
+    | {f"O{i}" for i in range(1, 7)} | {f"Z{i}" for i in range(1, 5)} | {"X9"}
+)
+_CORPUS_GENRES = frozenset({
+    "政策法规", "办事指南流程", "国别研究", "案例经验", "风险预警",
+    "实操指引方法论", "知识问答QA", "数据指标", "资源名录", "规则提炼", "其他",
+})
+_CORPUS_RULES = frozenset({f"R{i}" for i in range(7)})
+_CORPUS_EVIDENCE = frozenset({f"E{i}" for i in range(5)})
+_CORPUS_ORIGINS = frozenset({"目的地国", "国际", "国内", "混合"})
+_CORPUS_TIMELINESS = frozenset({"M1", "M2", "M3"})
+_CORPUS_STATES = frozenset({"草拟", "待复核", "已入库", "已发布", "待更新", "已过期", "已归档"})
+# 公理一/公理三: every dimension holds a value, provenance is mandatory.
+_CORPUS_REQUIRED = ("stage", "domain", "genre", "evidence", "origin", "gov_dept",
+                    "timeliness", "lifecycle_state", "review_due")
+_CORPUS_LAYERS = ("G", "C", "O", "Z", "X")
 
 Scope = Literal["all", "wiki", "sources"]
 
@@ -74,14 +98,23 @@ class LintHandler:
         )
 
         issues: list[LintIssue] = []
+        corpus_entries: list[tuple[dict, dict]] = []
         for doc in docs:
             if self._is_wiki_page(doc):
                 issues.extend(await self._lint_wiki_page(doc, ctx, include_graph))
+            else:
+                meta = self._corpus_meta(doc)
+                if meta is not None:
+                    corpus_entries.append((doc, meta))
+                    issues.extend(self._lint_corpus_entry(doc, meta))
 
         if include_graph:
             issues.extend(await self._lint_kb_wide(path, scope))
 
-        return self._format_report(issues, docs)
+        report = self._format_report(issues, docs)
+        if corpus_entries:
+            report += "\n\n" + self._format_coverage_ledger(corpus_entries)
+        return report
 
     # ----- selection -------------------------------------------------------
 
@@ -279,6 +312,93 @@ class LintHandler:
             for row in rows
         ]
 
+    # ----- corpus (八维) entry checks ---------------------------------------
+
+    def _corpus_meta(self, doc: dict) -> dict | None:
+        """Structured 八维 metadata for a classified corpus entry, else None."""
+        meta = doc.get("metadata")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if not isinstance(meta, dict):
+            return None
+        return meta if "spec_version" in meta and "stage" in meta else None
+
+    def _lint_corpus_entry(self, doc: dict, meta: dict) -> list[LintIssue]:
+        path = self._doc_path(doc)
+        issues: list[LintIssue] = []
+
+        missing = [f for f in _CORPUS_REQUIRED if not meta.get(f)]
+        if missing:
+            issues.append(LintIssue(
+                "error", "corpus-missing-dimension", path,
+                f"八维元数据缺失必填维度: {', '.join(missing)} (公理一/公理三)",
+            ))
+
+        def check_code(value, valid: frozenset, dim: str) -> None:
+            if value and value not in valid:
+                issues.append(LintIssue(
+                    "error", "corpus-unknown-code", path,
+                    f"{dim} 取值 `{value}` 不在码表内",
+                ))
+
+        check_code(meta.get("stage"), _CORPUS_STAGES, "阶段")
+        for ext in meta.get("stage_ext") or []:
+            check_code(ext, _CORPUS_STAGES, "阶段(副)")
+        check_code(meta.get("domain"), _CORPUS_DOMAINS, "服务大类")
+        for ext in meta.get("domain_ext") or []:
+            check_code(ext, _CORPUS_DOMAINS, "服务大类(副)")
+        check_code(meta.get("genre"), _CORPUS_GENRES, "体裁")
+        for rule in meta.get("rule_type") or []:
+            check_code(rule, _CORPUS_RULES, "隐性规则")
+        check_code(meta.get("evidence"), _CORPUS_EVIDENCE, "证据强度")
+        check_code(meta.get("origin"), _CORPUS_ORIGINS, "来源域")
+        check_code(meta.get("timeliness"), _CORPUS_TIMELINESS, "时效")
+        check_code(meta.get("lifecycle_state"), _CORPUS_STATES, "生命周期状态")
+
+        review_due = str(meta.get("review_due") or "")
+        if review_due and review_due[:10] < date.today().isoformat():
+            issues.append(LintIssue(
+                "warn", "corpus-review-overdue", path,
+                f"复审已到期 ({review_due[:10]}, 时效 {meta.get('timeliness')}) — 需复核后更新 review_due",
+            ))
+
+        if meta.get("lifecycle_state") == "待复核":
+            issues.append(LintIssue(
+                "warn", "corpus-pending-review", path,
+                "条目在人工复核队列 (低置信/X9/校验错误)",
+            ))
+
+        return issues
+
+    def _format_coverage_ledger(self, entries: list[tuple[dict, dict]]) -> str:
+        """货架覆盖率账本: 主阶段 × 大类层 grid over classified corpus entries."""
+        stages = sorted(_CORPUS_STAGES)
+        grid = {s: dict.fromkeys(_CORPUS_LAYERS, 0) for s in stages}
+        pending = 0
+        for _doc, meta in entries:
+            stage = meta.get("stage")
+            domain = str(meta.get("domain") or "X9")
+            if stage in grid and domain[:1] in _CORPUS_LAYERS:
+                grid[stage][domain[:1]] += 1
+            if meta.get("lifecycle_state") == "待复核":
+                pending += 1
+
+        lines = [
+            f"**覆盖率账本** ({len(entries)} 条语料; 待复核 {pending}):",
+            "",
+            "| 阶段＼层 | G政府 | C合规 | O运营 | Z专项 | X兜底 |",
+            "|---|---|---|---|---|---|",
+        ]
+        for s in stages:
+            lines.append(f"| {s} | " + " | ".join(str(grid[s][layer]) for layer in _CORPUS_LAYERS) + " |")
+        empty = [f"{s}×{layer}" for s in stages for layer in ("G", "C", "O", "Z") if grid[s][layer] == 0]
+        if empty:
+            lines += ["", f"空格 (补采方向): {' · '.join(empty)}"]
+        return "\n".join(lines)
+
     # ----- report ----------------------------------------------------------
 
     def _format_report(self, issues: list[LintIssue], docs: list[dict]) -> str:
@@ -400,6 +520,10 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "Checks wiki frontmatter, tag/date index consistency, footnote hygiene, "
             "citation resolution, citation graph edges, dangling wiki links, orphan pages, "
             "uncited sources, and stale pages.\n\n"
+            "For classified corpus entries (八维标注) it additionally checks dimension "
+            "completeness (公理一), code-table membership, overdue reviews (review_due), "
+            "and pending manual reviews — and appends the 阶段×大类 coverage ledger "
+            "(货架覆盖率) with empty shelf cells to guide the next collection round.\n\n"
             "Use `path` to scope the run, e.g. `*`, `/wiki/**`, or `/wiki/concepts/*.md`."
         ),
     )

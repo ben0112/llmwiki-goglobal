@@ -63,9 +63,31 @@ python3 -m corpus.import_annotations \
 按规范 §5.2:新版本 = 新增 `codetables/vYYYY.MM.json`,旧版本不动;
 导入时 `--codetable vYYYY.MM` 指定。X9 积累到阈值 → 码表评审 → 升版 → 按"理由"字段批量重标。
 
+## 分面检索与治理(第二期已落地)
+
+导入后,MCP `search` 工具支持**分面过滤**(list 与 search 两种模式):
+
+```
+search(knowledge_base="...", mode="search", query="数据出境",
+       facets={"domain": "Z1", "country": "IDN", "timeliness": "M2"})
+```
+
+可用分面:`stage` `domain`(主/副均命中)· `genre` · `rule` · `evidence` · `origin` ·
+`dept` · `country`(ISO3 或中文名)· `region` · `industry` · `mode` · `timeliness` ·
+`state` · `business`(`B4.14` 精确 / `B4` 类前缀)· `entry_id`。
+两种后端(SQLite / Postgres)同一套分面键。
+
+**中文全文检索**:本地 FTS5 分词器由 `porter unicode61` 换为 `trigram`
+(旧库启动时自动重建索引);短于 3 字符的检索词(如二字词"税务")自动降级为
+LIKE 扫描,FTS 特殊字符不再报错。英文检索改为子串匹配(不再做词干归并)。
+
+**lint 八维检查**:对已分类语料逐条检查维度完备性(公理一)、码表取值合法性、
+`review_due` 复审到期(时效达标率)、待复核队列;报告末尾附**覆盖率账本**
+(主阶段×大类层矩阵 + 空格清单,即补采罗盘)。
+
 ## 分期路线
 
-- **第一期(本目录)**:码表 + 八维校验 + 导入。✅
-- 第二期:分面检索(VaultFS/API/MCP `search` 增加 metadata 过滤;本地 FTS5 换 CJK 分词)、`lint` 八维完备率检查、覆盖率账本 API。
+- **第一期**:码表 + 八维校验 + 导入。✅
+- **第二期**:分面检索(VaultFS 双后端 + MCP `search`)、FTS5 CJK 分词(trigram + 迁移)、`lint` 八维完备率检查 + 覆盖率账本。✅
 - 第三期:Web 分面筛选/货架矩阵/业务视图导航/生命周期标记。
 - 第四期:关系层五类边(上下位/前后置/路径衔接/归口映射/阶段服务包)、review_due 到期驱动与 KPI 仪表盘。

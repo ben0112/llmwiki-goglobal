@@ -3,10 +3,11 @@
 import logging
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP, Context
-
+from mcp.server.fastmcp import Context, FastMCP
 from vaultfs import VaultFS
-from .helpers import deep_link, glob_match, resolve_path, MAX_LIST, MAX_SEARCH
+from vaultfs.facets import UnknownFacetError
+
+from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,10 @@ class SearchHandler:
         self.kb_id = str(kb["id"])
         self.slug = kb["slug"]
 
-    async def list_documents(self, target: str, tags: list[str] | None) -> str:
-        """List documents matching a glob pattern and optional tag filter."""
-        docs = await self.fs.list_documents(self.kb_id)
+    async def list_documents(self, target: str, tags: list[str] | None,
+                             facets: dict | None = None) -> str:
+        """List documents matching a glob pattern and optional tag/facet filters."""
+        docs = await self.fs.list_documents(self.kb_id, facets=facets)
 
         if target not in ("*", "**", "**/*"):
             glob_pat = "/" + target.lstrip("/") if not target.startswith("/") else target
@@ -84,6 +86,7 @@ class SearchHandler:
     async def search_chunks(
         self, query: str, path: str, tags: list[str] | None, limit: int,
         annotated_only: bool = False, scope: str = "all",
+        facets: dict | None = None,
     ) -> str:
         """Full-text search across document chunks.
 
@@ -91,12 +94,13 @@ class SearchHandler:
         `scope='annotations'` matches only within the user's notes/quotes;
         `scope='source'` matches only within original document content;
         `scope='all'` (default) matches either.
+        `facets` filters by the corpus 八维 classification metadata.
         """
         path_filter = self._path_filter_key(path)
 
         matches = await self.fs.search_chunks(
             self.kb_id, query, limit, path_filter,
-            annotated_only=annotated_only, scope=scope,
+            annotated_only=annotated_only, scope=scope, facets=facets,
         )
         matches = self._apply_path_glob(matches, path)
 
@@ -294,7 +298,15 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "- `search(mode=\"references\", query=\"uncited\")` — sources with no wiki citations\n"
             "- `search(mode=\"references\", query=\"stale\")` — pages flagged as potentially stale\n\n"
             "Use `path` to scope: `*` for root, `/wiki/**` for wiki only, `*.pdf` for PDFs, etc.\n"
-            "Use `tags` to filter by document tags."
+            "Use `tags` to filter by document tags.\n\n"
+            "Corpus facet filtering (list + search modes): when the knowledge base holds "
+            "classified corpus entries (八维标注), pass `facets` to filter by classification "
+            "metadata, e.g. `facets={\"domain\": \"C2\", \"country\": \"IDN\"}`. Keys: "
+            "stage (S0-S4), domain (G/C/O/Z codes or X9), genre (体裁 name), rule (R0-R6), "
+            "evidence (E0-E4), origin (目的地国/国际/国内/混合), dept (归口部门), "
+            "country (ISO alpha-3 or Chinese name), region (e.g. 东盟), industry, mode, "
+            "timeliness (M1-M3), state (生命周期), business (业务码 B4.14 or class B4), entry_id. "
+            "Multi-value dimensions match primary or secondary labels."
         ),
     )
     async def search(
@@ -307,6 +319,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         limit: int = 10,
         annotated_only: bool = False,
         scope: Literal["all", "annotations", "source"] = "all",
+        facets: dict[str, str] | None = None,
     ) -> str:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
@@ -320,16 +333,19 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
 
         handler = SearchHandler(fs, kb)
 
-        if mode == "list":
-            return await handler.list_documents(path, tags)
-        elif mode == "search":
-            if not query:
-                return "search mode requires a query."
-            return await handler.search_chunks(
-                query, path, tags, min(limit, MAX_SEARCH),
-                annotated_only=annotated_only, scope=scope,
-            )
-        elif mode == "references":
-            return await handler.query_references(path, query)
+        try:
+            if mode == "list":
+                return await handler.list_documents(path, tags, facets=facets)
+            if mode == "search":
+                if not query:
+                    return "search mode requires a query."
+                return await handler.search_chunks(
+                    query, path, tags, min(limit, MAX_SEARCH),
+                    annotated_only=annotated_only, scope=scope, facets=facets,
+                )
+            if mode == "references":
+                return await handler.query_references(path, query)
+        except UnknownFacetError as e:
+            return f"{e} (facets filter classified corpus entries by 八维 metadata)"
 
         return f"Unknown mode: {mode}"

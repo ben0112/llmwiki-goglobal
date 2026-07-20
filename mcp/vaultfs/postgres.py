@@ -11,6 +11,7 @@ from config import settings
 from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute, get_pool
 from services.chunker import chunk_text, store_chunks_pg
 from .base import VaultFS, DuplicateDocumentError
+from .facets import postgres_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
 
@@ -205,14 +206,17 @@ class PostgresVaultFS(VaultFS):
         return int(result.split()[-1]) if result else 0
 
 
-    async def list_documents(self, kb_id: str) -> list[dict]:
+    async def list_documents(self, kb_id: str, facets: dict | None = None) -> list[dict]:
+        conds, facet_params = postgres_facet_conditions(validate_facets(facets), start_index=3, doc_alias="d")
+        facet_sql = "".join(f" AND {c}" for c in conds)
         return await scoped_query(
             self.user_id,
             "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at "
-            "FROM documents WHERE knowledge_base_id = $1 AND NOT archived AND user_id = $2 "
+            "FROM documents d WHERE knowledge_base_id = $1 AND NOT archived AND user_id = $2 "
             "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+            f"{facet_sql} "
             "ORDER BY path, filename",
-            kb_id, self.user_id,
+            kb_id, self.user_id, *facet_params,
         )
 
     async def list_documents_with_content(self, kb_id: str) -> list[dict]:
@@ -248,6 +252,7 @@ class PostgresVaultFS(VaultFS):
         path_filter: str | None = None,
         annotated_only: bool = False,
         scope: str = "all",
+        facets: dict | None = None,
     ) -> list[dict]:
         path_clause = ""
         if path_filter == "wiki":
@@ -274,6 +279,11 @@ class PostgresVaultFS(VaultFS):
         else:
             scope_clause = ""
 
+        facet_conds, facet_params = postgres_facet_conditions(
+            validate_facets(facets), start_index=5, doc_alias="d",
+        )
+        facet_sql = "".join(f"  AND {c}" for c in facet_conds)
+
         rows = await scoped_query(
             self.user_id,
             f"SELECT dc.content, dc.source_content, dc.annotations_text, "
@@ -290,10 +300,11 @@ class PostgresVaultFS(VaultFS):
             f"  AND d.user_id = $3"
             f"{annotated_clause}"
             f"{scope_clause}"
-            f"{path_clause} "
+            f"{path_clause}"
+            f"{facet_sql} "
             f"ORDER BY score DESC, dc.chunk_index "
             f"LIMIT $4",
-            kb_id, query, self.user_id, limit,
+            kb_id, query, self.user_id, limit, *facet_params,
         )
         return rows
 

@@ -83,12 +83,19 @@ CREATE TABLE IF NOT EXISTS document_references (
     UNIQUE(source_document_id, target_document_id, reference_type)
 );
 
--- FTS5 full-text search (replaces pgroonga)
+-- FTS5 full-text search (replaces pgroonga).
+-- Tokenizer is trigram (SQLite >= 3.34) so CJK text is searchable — the
+-- default `porter unicode61` treats a run of Chinese characters as a single
+-- token, making Chinese queries unmatchable. Trigram trades English stemming
+-- for substring matching in any script. Queries shorter than 3 characters
+-- can't use the trigram index; the search layers fall back to a LIKE scan
+-- for those (see mcp/vaultfs/sqlite.py and api/infra/db/sqlite.py, which
+-- also migrate pre-existing databases to this tokenizer on startup).
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     content,
     content='document_chunks',
     content_rowid='rowid',
-    tokenize='porter unicode61'
+    tokenize='trigram'
 );
 
 -- Keep FTS in sync with document_chunks
