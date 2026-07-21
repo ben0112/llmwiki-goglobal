@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { apiUrl } from '@/lib/runtime-env'
+import { collectDroppedFiles } from '@/lib/dropFiles'
 import { NoteEditor } from '@/components/editor/NoteEditor'
 import { NoteFormattingButtons } from '@/components/editor/NoteToolbar'
 import type { Editor } from '@tiptap/react'
@@ -146,10 +147,11 @@ interface FilesGridProps {
   onDeleteDocument: (id: string) => void
   onRenameDocument: (id: string, newTitle: string) => void
   onUpload: (path: string) => void
+  onUploadFolder?: (path: string) => void
   onCreateNote: (path: string) => void
   onCreateFolder: (name: string, parentPath: string) => void
   onMoveDocument?: (docId: string, targetPath: string) => void
-  onUploadFiles?: (files: File[], targetPath: string) => void
+  onUploadFiles?: (files: File[], targetPath: string, relMap?: Map<File, string>) => void
   /** If set, open this doc on mount (e.g. from a citation click) */
   initialDocId?: string | null
   initialPage?: number
@@ -168,6 +170,7 @@ export function FilesGrid({
   onDeleteDocument,
   onRenameDocument,
   onUpload,
+  onUploadFolder,
   onCreateNote,
   onCreateFolder,
   onMoveDocument,
@@ -319,6 +322,7 @@ export function FilesGrid({
 
   // Bind creation actions to current path
   const handleUploadHere = React.useCallback(() => onUpload(currentPath), [onUpload, currentPath])
+  const handleUploadFolderHere = React.useCallback(() => onUploadFolder?.(currentPath), [onUploadFolder, currentPath])
   const handleCreateNoteHere = React.useCallback(() => onCreateNote(currentPath), [onCreateNote, currentPath])
 
   const handleCreateFolder = () => {
@@ -361,8 +365,10 @@ export function FilesGrid({
     e.preventDefault()
     gridDragCounter.current = 0
     setGridDragOver(false)
-    const files = Array.from(e.dataTransfer.files)
-    if (files.length > 0) onUploadFiles?.(files, currentPath)
+    // 文件夹拖放:递归遍历目录树,保留相对路径(必须在事件内同步启动)
+    collectDroppedFiles(e.dataTransfer).then(({ files, relMap }) => {
+      if (files.length > 0) onUploadFiles?.(files, currentPath, relMap)
+    })
   }
 
   const handleFolderDrop = React.useCallback((docIds: string[], targetPath: string) => {
@@ -498,10 +504,24 @@ export function FilesGrid({
               )}
             </div>
 
-            <button onClick={handleUploadHere} className="flex items-center gap-1.5 p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
-              <Upload className="size-3.5" />
-              <span className="text-xs">上传</span>
-            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button className="flex items-center gap-1.5 p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
+                  <Upload className="size-3.5" />
+                  <span className="text-xs">上传</span>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={handleUploadHere}>
+                  <FileText className="size-3.5 mr-2" />
+                  上传文件(含压缩包)
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleUploadFolderHere}>
+                  <Folder className="size-3.5 mr-2" />
+                  上传文件夹(含子文件夹)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             <button
               onClick={() => setSortDir((d) => d === 'asc' ? 'desc' : 'asc')}
@@ -647,7 +667,7 @@ export function FilesGrid({
                     <div className="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-3">
                       <AnimatePresence initial={false} mode="popLayout">
                         <motion.div key="add-new" layout transition={{ layout: { duration: 0.15, ease: 'easeOut' } }} className="h-full">
-                          <NewCard onCreateNote={handleCreateNoteHere} onUpload={handleUploadHere} onCreateFolder={() => setFolderDialogOpen(true)} />
+                          <NewCard onCreateNote={handleCreateNoteHere} onUpload={handleUploadHere} onUploadFolder={handleUploadFolderHere} onCreateFolder={() => setFolderDialogOpen(true)} />
                         </motion.div>
                         {filteredFolders.map((folder) => (
                           <motion.div key={`folder-${folder.path}`} layout exit={{ opacity: 0, scale: 0.95 }} transition={{ layout: { duration: 0.15, ease: 'easeOut' }, opacity: { duration: 0.1 } }} className="h-full">
@@ -676,6 +696,7 @@ export function FilesGrid({
               <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />新建文件夹</ContextMenuItem>
               <ContextMenuSeparator />
               <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />上传文件</ContextMenuItem>
+              <ContextMenuItem onClick={handleUploadFolderHere}><Folder className="size-3.5 mr-2" />上传文件夹</ContextMenuItem>
             </ContextMenuContent>
           </ContextMenu>
         )}
@@ -841,7 +862,7 @@ function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListIt
   )
 }
 
-function NewCard({ onCreateNote, onUpload, onCreateFolder }: { onCreateNote: () => void; onUpload: () => void; onCreateFolder: () => void }) {
+function NewCard({ onCreateNote, onUpload, onUploadFolder, onCreateFolder }: { onCreateNote: () => void; onUpload: () => void; onUploadFolder: () => void; onCreateFolder: () => void }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -859,6 +880,7 @@ function NewCard({ onCreateNote, onUpload, onCreateFolder }: { onCreateNote: () 
         <DropdownMenuItem onClick={onCreateFolder}><FolderPlus className="size-3.5 mr-2" />文件夹</DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />上传文件</DropdownMenuItem>
+        <DropdownMenuItem onClick={onUploadFolder}><Folder className="size-3.5 mr-2" />上传文件夹</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )

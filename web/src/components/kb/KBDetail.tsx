@@ -9,6 +9,7 @@ import { useUserStore, useUploadStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
 import { apiUrl } from '@/lib/runtime-env'
+import { collectDroppedFiles } from '@/lib/dropFiles'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { SelectionActionBar } from '@/components/kb/SelectionActionBar'
@@ -138,6 +139,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const addUpload = useUploadStore((s) => s.addUpload)
   const setUploadProgress = useUploadStore((s) => s.setProgress)
   const markUploadProcessing = useUploadStore((s) => s.markProcessing)
+  const markUploadReady = useUploadStore((s) => s.markReady)
   const markUploadFailed = useUploadStore((s) => s.markFailed)
   const reconcileUploads = useUploadStore((s) => s.reconcileDocuments)
   const processingUploads = useUploadStore(
@@ -674,8 +676,18 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     uploadPathRef.current = targetPath
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = '.md,.txt,.pdf,.pptx,.ppt,.docx,.doc,.png,.jpg,.jpeg,.webp,.gif,.svg,.xlsx,.xls,.csv,.html,.htm'
+    input.accept = '.md,.txt,.pdf,.pptx,.ppt,.docx,.doc,.png,.jpg,.jpeg,.webp,.gif,.svg,.xlsx,.xls,.csv,.html,.htm,.zip,.tar,.tgz,.gz'
     input.multiple = true
+    input.onchange = () => { if (input.files) uploadFiles(Array.from(input.files), uploadPathRef.current) }
+    input.click()
+  }
+
+  // 选择目录并递归上传其下全部文件(含子文件夹;webkitRelativePath 保留结构)
+  const handleUploadFolderClick = (targetPath: string = '/') => {
+    uploadPathRef.current = targetPath
+    const input = document.createElement('input')
+    input.type = 'file'
+    ;(input as HTMLInputElement & { webkitdirectory: boolean }).webkitdirectory = true
     input.onchange = () => { if (input.files) uploadFiles(Array.from(input.files), uploadPathRef.current) }
     input.click()
   }
@@ -700,19 +712,40 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     })
   }, [kbId, kbSlug, addUpload, setUploadProgress, markUploadProcessing, markUploadFailed])
 
-  const uploadFiles = React.useCallback(async (files: File[], targetPath: string = '/') => {
+  const uploadFiles = React.useCallback(async (
+    files: File[], targetPath: string = '/', relMap?: Map<File, string>,
+  ) => {
     const t = getToken()
     if (!t || !userId) return
+
+    // 目录上传/文件夹拖放:webkitRelativePath 或 relMap 带出相对路径,
+    // 逐文件保留子目录结构(目标 = targetPath + 相对目录/)。
+    const relOf = (file: File): string =>
+      relMap?.get(file) ?? (file as File & { webkitRelativePath?: string }).webkitRelativePath ?? ''
+    const destOf = (file: File): string => {
+      const rel = relOf(file)
+      if (!rel || !rel.includes('/')) return targetPath
+      const dir = rel.split('/').slice(0, -1).join('/')
+      return targetPath.replace(/\/$/, '') + '/' + dir + '/'
+    }
+    const JUNK = new Set(['.ds_store', 'thumbs.db', 'desktop.ini'])
+    const isJunk = (file: File): boolean =>
+      JUNK.has(file.name.toLowerCase()) || file.name.startsWith('.')
+      || relOf(file).split('/').some((p) => p.startsWith('.') || p === '__MACOSX')
+    const isArchive = (name: string): boolean => /\.(zip|tar|tgz)$/i.test(name) || /\.tar\.gz$/i.test(name)
 
     // 双层去重,自动跳过(不打断上传,仅在完成报告中提及):
     // 第一层:目标位置同名文件(不区分大小写);
     // 第二层:文件内容 SHA-256 与库内任意既有文件相同(本地模式;
     // 后端 content_hash 即原始字节哈希),同批内重复内容也只传一份。
-    const existingNames = new Set(
-      documents
-        .filter((d) => d.path === targetPath && !d.archived)
-        .map((d) => d.filename.toLowerCase()),
-    )
+    // 压缩包本身不入库,跳过去重(包内条目由服务端按同口径去重)。
+    const namesByPath = new Map<string, Set<string>>()
+    for (const d of documents) {
+      if (d.archived) continue
+      const set = namesByPath.get(d.path) ?? new Set<string>()
+      set.add(d.filename.toLowerCase())
+      namesByPath.set(d.path, set)
+    }
     const existingHashes = new Set(
       documents.filter((d) => !d.archived && d.content_hash).map((d) => d.content_hash as string),
     )
@@ -721,9 +754,17 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     const skippedByName: string[] = []
     const skippedByContent: string[] = []
     const batchHashes = new Set<string>()
+    const batchNames = new Set<string>()
     const toUpload: File[] = []
     for (const file of files) {
-      if (existingNames.has(file.name.toLowerCase())) {
+      if (isJunk(file)) continue // 系统垃圾文件静默丢弃
+      if (isArchive(file.name)) {
+        toUpload.push(file)
+        continue
+      }
+      const dest = destOf(file)
+      const nameKey = dest + ' ' + file.name.toLowerCase()
+      if (namesByPath.get(dest)?.has(file.name.toLowerCase()) || batchNames.has(nameKey)) {
         skippedByName.push(file.name)
         continue
       }
@@ -738,13 +779,14 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
           batchHashes.add(hex)
         } catch { /* 哈希失败不阻断上传 */ }
       }
+      batchNames.add(nameKey)
       toUpload.push(file)
     }
     const skippedTotal = skippedByName.length + skippedByContent.length
     if (toUpload.length === 0) {
       if (skippedTotal > 0) {
         const names = [...skippedByName, ...skippedByContent]
-        toast.info(`未上传:所选 ${files.length} 个文件均为重复文件(重名 ${skippedByName.length} 个,内容相同 ${skippedByContent.length} 个)`, {
+        toast.info(`未上传:${skippedTotal} 个文件均为重复文件(重名 ${skippedByName.length} 个,内容相同 ${skippedByContent.length} 个)`, {
           description: names.slice(0, 5).join('、') + (names.length > 5 ? ` 等 ${names.length} 个` : ''),
         })
       }
@@ -753,20 +795,67 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
     const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
     const results: { name: string; ok: boolean }[] = []
-    let unsupported = 0
+    const unsupportedNames: string[] = []
+    let extractedCreated = 0
+    let archiveSkipped = 0
 
     const uploadOne = async (file: File): Promise<boolean | null> => {
+      const dest = destOf(file)
       const ext = file.name.split('.').pop()?.toLowerCase()
+      if (isArchive(file.name)) {
+        if (process.env.NEXT_PUBLIC_MODE !== 'local') {
+          unsupportedNames.push(file.name) // 托管模式暂不支持服务端解压
+          return null
+        }
+        // 压缩包:上传后服务端解压入库(zip/tar[.gz],以包名建文件夹)
+        const uploadId = crypto.randomUUID()
+        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: dest })
+        const formData = new FormData()
+        formData.append('file', file)
+        formData.append('path', dest)
+        try {
+          const data = await new Promise<{
+            created: number; skipped_duplicate: number; skipped_unsupported: number
+            documents: DocumentListItem[]
+          }>((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            xhr.open('POST', `${apiUrl()}/v1/upload/archive`)
+            xhr.upload.onprogress = (e) => {
+              // 上传占 90%,余下留给服务端解压阶段
+              if (e.lengthComputable) setUploadProgress(uploadId, (e.loaded / e.total) * 0.9)
+            }
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                try { resolve(JSON.parse(xhr.responseText)) } catch { reject(new Error('响应解析失败')) }
+              } else {
+                let detail = `上传失败:${xhr.status}`
+                try { detail = JSON.parse(xhr.responseText).detail || detail } catch { /* keep default */ }
+                reject(new Error(detail))
+              }
+            }
+            xhr.onerror = () => reject(new Error('网络错误'))
+            xhr.send(formData)
+          })
+          setDocuments((prev) => [...data.documents, ...prev])
+          extractedCreated += data.created
+          archiveSkipped += data.skipped_duplicate + data.skipped_unsupported
+          markUploadReady(uploadId)
+          return true
+        } catch (err) {
+          markUploadFailed(uploadId, err instanceof Error ? err.message : null)
+          return false
+        }
+      }
       if (ext === 'md' || ext === 'txt') {
         // 文本文件走笔记导入,也进上传面板,让批量上传有统一进度
         const uploadId = crypto.randomUUID()
-        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
+        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: dest })
         try {
           const content = await file.text()
           const title = file.name.replace(/\.(md|txt)$/i, '')
           const data = await apiFetch<DocumentListItem>(`/v1/knowledge-bases/${kbId}/documents/note`, t, {
             method: 'POST',
-            body: JSON.stringify({ filename: file.name, title, content, path: targetPath }),
+            body: JSON.stringify({ filename: file.name, title, content, path: dest }),
           })
           setDocuments((prev) => [data, ...prev])
           setUploadProgress(uploadId, 1)
@@ -778,17 +867,16 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         }
       }
       if (!ext || !supportedTypes.has(ext)) {
-        unsupported += 1
-        toast.info(`暂不支持 ${ext ?? '未知'} 文件:${file.name}`)
+        unsupportedNames.push(file.name)
         return null
       }
       if (process.env.NEXT_PUBLIC_MODE === 'local') {
         // XHR 而非 fetch:浏览器上传进度事件驱动面板进度条
         const uploadId = crypto.randomUUID()
-        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
+        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: dest })
         const formData = new FormData()
         formData.append('file', file)
-        formData.append('path', targetPath)
+        formData.append('path', dest)
         try {
           const data = await new Promise<DocumentListItem>((resolve, reject) => {
             const xhr = new XMLHttpRequest()
@@ -813,28 +901,37 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         }
       }
       try {
-        await tusUploadFile(file, targetPath)
+        await tusUploadFile(file, dest)
         return true
       } catch {
         return false
       }
     }
 
-    await Promise.all(toUpload.map(async (file) => {
-      const ok = await uploadOne(file)
-      if (ok !== null) results.push({ name: file.name, ok })
-    }))
+    // 并发池:目录上传可能带来上百个文件,限流避免同时打开过多请求
+    const queue = [...toUpload]
+    const workers = Array.from({ length: Math.min(5, queue.length) }, async () => {
+      for (;;) {
+        const file = queue.shift()
+        if (!file) return
+        const ok = await uploadOne(file)
+        if (ok !== null) results.push({ name: file.name, ok })
+      }
+    })
+    await Promise.all(workers)
 
-    // 完成汇总:成功/失败数量确认(+ 自动跳过的重复文件与不支持类型)
+    // 完成汇总:成功/失败数量确认(+ 解压导入与自动跳过的重复/不支持)
     const okCount = results.filter((r) => r.ok).length
     const failed = results.filter((r) => !r.ok).map((r) => r.name)
     const extras = [
+      extractedCreated > 0 ? `解压导入 ${extractedCreated} 个` : '',
+      archiveSkipped > 0 ? `压缩包内跳过 ${archiveSkipped} 个` : '',
       skippedByName.length > 0 ? `跳过重名 ${skippedByName.length} 个` : '',
       skippedByContent.length > 0 ? `跳过内容相同 ${skippedByContent.length} 个` : '',
-      unsupported > 0 ? `不支持 ${unsupported} 个` : '',
+      unsupportedNames.length > 0 ? `不支持 ${unsupportedNames.length} 个` : '',
     ].filter(Boolean).join(',')
     const suffix = extras ? `(${extras})` : ''
-    const skippedNames = [...skippedByName, ...skippedByContent]
+    const skippedNames = [...skippedByName, ...skippedByContent, ...unsupportedNames]
     const skippedDesc = skippedNames.length > 0
       ? `已跳过:${skippedNames.slice(0, 5).join('、')}${skippedNames.length > 5 ? ` 等 ${skippedNames.length} 个` : ''}`
       : undefined
@@ -850,6 +947,11 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
           duration: 10000,
         })
       }
+    } else if (unsupportedNames.length > 0) {
+      toast.info(`未上传:${unsupportedNames.length} 个文件类型不支持`, {
+        description: unsupportedNames.slice(0, 5).join('、')
+          + (unsupportedNames.length > 5 ? ` 等 ${unsupportedNames.length} 个` : ''),
+      })
     }
 
     // Navigate to files view after first upload
@@ -857,7 +959,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       setActiveView('files')
       navigateToView('files')
     }
-  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadFailed])
+  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadReady, markUploadFailed])
 
   React.useEffect(() => {
     reconcileUploads(kbId, documents)
@@ -902,8 +1004,10 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     e.preventDefault()
     dragCounterRef.current = 0
     setFileDragOver(false)
-    const files = Array.from(e.dataTransfer.files)
-    if (files.length > 0) uploadFiles(files)
+    // 文件夹拖放:递归遍历目录树,保留相对路径(必须在事件内同步启动)
+    collectDroppedFiles(e.dataTransfer).then(({ files, relMap }) => {
+      if (files.length > 0) uploadFiles(files, '/', relMap)
+    })
   }
 
   // ─── FilesGrid URL-sync callbacks ────────────────────────────
@@ -1025,6 +1129,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                   onDeleteDocument={handleDeleteDocument}
                   onRenameDocument={handleRenameDocument}
                   onUpload={handleUploadClick}
+                  onUploadFolder={handleUploadFolderClick}
                   onCreateNote={handleCreateNote}
                   onCreateFolder={handleCreateFolder}
                   onMoveDocument={handleMoveDocument}

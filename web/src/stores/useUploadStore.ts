@@ -35,6 +35,7 @@ interface UploadState {
   addUpload: (upload: NewUpload) => void
   setProgress: (id: string, progress: number) => void
   markProcessing: (id: string) => void
+  markReady: (id: string) => void
   markFailed: (id: string, error?: string | null) => void
   reconcileDocuments: (kbId: string, documents: DocumentListItem[]) => void
   dismiss: (id: string) => void
@@ -71,6 +72,14 @@ export const useUploadStore = create<UploadState>((set) => ({
     set((state) => ({
       items: state.items.map((item) =>
         item.id === id ? { ...item, phase: 'processing', progress: 1 } : item,
+      ),
+    })),
+
+  // 压缩包解压等服务端一步完成的上传:没有对应文档行可 reconcile,直接置为完成
+  markReady: (id) =>
+    set((state) => ({
+      items: state.items.map((item) =>
+        item.id === id ? { ...item, phase: 'ready', progress: 1 } : item,
       ),
     })),
 
