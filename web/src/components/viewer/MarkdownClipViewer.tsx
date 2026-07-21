@@ -55,9 +55,21 @@ const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const HIGHLIGHT_POLL_INTERVAL = 2000
 
+// Source .md files (e.g. classified corpus entries) may carry YAML frontmatter.
+// TipTap would render it as body text, so it is split off for display/editing
+// and re-prepended on save so metadata is never lost.
+const FRONTMATTER_RE = /^---[ \t]*\n[\s\S]*?\n---[ \t]*\n/
+
+function splitFrontmatter(text: string): { frontmatter: string; body: string } {
+  const m = FRONTMATTER_RE.exec(text)
+  if (!m) return { frontmatter: '', body: text }
+  return { frontmatter: m[0], body: text.slice(m[0].length) }
+}
+
 export default function MarkdownClipViewer({ documentId, className }: Props) {
   const token = useUserStore((s) => s.accessToken)
   const [markdown, setMarkdown] = React.useState<string | null>(null)
+  const frontmatterRef = React.useRef('')
   const [highlights, setHighlights] = React.useState<Highlight[] | null>(null)
   const [highlightVersion, setHighlightVersion] = React.useState<number>(0)
   const [knowledgeBaseId, setKnowledgeBaseId] = React.useState<string | null>(null)
@@ -138,6 +150,7 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
     setCommentError(null)
     setNotice(null)
     docRef.current = null
+    frontmatterRef.current = ''
     imageUrlsRef.current = {}
     imageAttrsRef.current = {}
 
@@ -155,7 +168,9 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
         imageUrlsRef.current = imageUrls
         imageAttrsRef.current = resolveWebclipImageAttrs(doc)
         setKnowledgeBaseId(doc.knowledge_base_id)
-        setMarkdown(content.content ?? '')
+        const { frontmatter, body } = splitFrontmatter(content.content ?? '')
+        frontmatterRef.current = frontmatter
+        setMarkdown(body)
         setHighlights(highlightResponse.highlights ?? [])
         setHighlightVersion(highlightResponse.version ?? 0)
       })
@@ -291,7 +306,8 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
     setSavingEdit(true)
     setError(null)
     try {
-      const content = String((editor.storage as { markdown?: { getMarkdown?: () => string } }).markdown?.getMarkdown?.() ?? '')
+      const edited = String((editor.storage as { markdown?: { getMarkdown?: () => string } }).markdown?.getMarkdown?.() ?? '')
+      const content = frontmatterRef.current + edited
       const res = await apiFetch<ContentResponse>(
         `/v1/documents/${documentId}/content`,
         token ?? '',
@@ -300,7 +316,9 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
           body: JSON.stringify({ content }),
         },
       )
-      setMarkdown(res.content ?? content)
+      const { frontmatter, body } = splitFrontmatter(res.content ?? content)
+      frontmatterRef.current = frontmatter
+      setMarkdown(body)
       setIsEditing(false)
       setNotice('Saved')
     } catch (err) {

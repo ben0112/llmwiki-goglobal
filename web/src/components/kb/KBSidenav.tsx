@@ -1,12 +1,13 @@
 'use client'
 
 import * as React from 'react'
+import { useParams, usePathname, useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   ChevronRight, FileText, NotepadText, Library,
   Upload, BookOpen, ArrowUpRight, Search as SearchIcon,
   Lightbulb, Box, ScrollText, Network, Folder, Check, Lock,
-  PanelLeftClose, PanelLeftOpen,
+  PanelLeftClose, PanelLeftOpen, LayoutGrid,
 } from 'lucide-react'
 import {
   CommandDialog, CommandInput, CommandList, CommandItem,
@@ -78,6 +79,24 @@ export function KBSidenav({
 }: KBSidenavProps) {
   const [searchOpen, setSearchOpen] = React.useState(false)
   const [collapsed, setCollapsed] = React.useState(false)
+  const router = useRouter()
+  const pathname = usePathname()
+  const params = useParams<{ slug?: string }>()
+
+  // 语料库 view is only offered when classified corpus entries exist
+  // (metadata written by corpus/import_annotations.py).
+  const hasCorpus = React.useMemo(
+    () =>
+      sourceDocs.some((d) => {
+        const meta = d.metadata as Record<string, unknown> | null
+        return meta && typeof meta === 'object' && 'spec_version' in meta && 'stage' in meta
+      }),
+    [sourceDocs],
+  )
+  const corpusViewActive = pathname?.endsWith('/corpus') ?? false
+  const onCorpusToggle = React.useCallback(() => {
+    if (params.slug) router.push(`/wikis/${params.slug}/corpus`)
+  }, [router, params.slug])
 
   React.useEffect(() => {
     setCollapsed(localStorage.getItem(SIDENAV_COLLAPSED_KEY) === '1')
@@ -176,6 +195,20 @@ export function KBSidenav({
               >
                 <Network className="size-3.5" />
               </button>
+              {hasCorpus && (
+                <button
+                  onClick={onCorpusToggle}
+                  title="语料库"
+                  className={cn(
+                    'flex items-center justify-center size-8 rounded-md transition-colors cursor-pointer',
+                    corpusViewActive
+                      ? 'bg-accent text-foreground'
+                      : 'text-muted-foreground/50 hover:text-muted-foreground hover:bg-accent',
+                  )}
+                >
+                  <LayoutGrid className="size-3.5" />
+                </button>
+              )}
               <button
                 onClick={onUpload}
                 title="Upload files"
@@ -244,6 +277,20 @@ export function KBSidenav({
             title="Knowledge graph"
           >
             <Network className="size-3" />
+          </button>
+        )}
+        {!courseMode && hasCorpus && (
+          <button
+            onClick={onCorpusToggle}
+            className={cn(
+              'flex items-center justify-center size-8 shrink-0 border rounded-md transition-colors cursor-pointer',
+              corpusViewActive
+                ? 'bg-accent text-foreground border-border'
+                : 'text-muted-foreground/50 hover:text-muted-foreground border-border hover:bg-accent',
+            )}
+            title="语料库"
+          >
+            <LayoutGrid className="size-3" />
           </button>
         )}
       </div>
