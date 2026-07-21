@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"
     S3_BUCKET: str = "supavault-documents"
+    # Self-hosting: point the S3 client at MinIO or another S3-compatible
+    # endpoint. Empty = AWS S3. Mirrors api/config.py.
+    S3_ENDPOINT_URL: str = ""
+    S3_FORCE_PATH_STYLE: bool = False
     LOGFIRE_TOKEN: str = ""
     STAGE: str = "dev"
     APP_URL: str = "http://localhost:3000"

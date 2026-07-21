@@ -55,6 +55,20 @@ def _get_s3_session():
     return _s3_session
 
 
+def _s3_client_kwargs() -> dict:
+    """Client kwargs honoring a self-hosted S3-compatible endpoint (MinIO).
+
+    Mirrors api/services/s3.py s3_client_kwargs.
+    """
+    kwargs: dict = {}
+    if settings.S3_ENDPOINT_URL:
+        kwargs["endpoint_url"] = settings.S3_ENDPOINT_URL
+    if settings.S3_FORCE_PATH_STYLE:
+        from botocore.config import Config as BotoConfig
+        kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
+    return kwargs
+
+
 def _slugify(name: str) -> str:
     slug = name.lower().strip()
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
@@ -334,7 +348,7 @@ class PostgresVaultFS(VaultFS):
         if not session:
             return None
         try:
-            async with session.client("s3") as s3:
+            async with session.client("s3", **_s3_client_kwargs()) as s3:
                 resp = await s3.get_object(Bucket=settings.S3_BUCKET, Key=key)
                 return await resp["Body"].read()
         except Exception as e:

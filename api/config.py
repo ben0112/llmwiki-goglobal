@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"
     S3_BUCKET: str = "supavault-documents"
+    # Self-hosting: point the S3 clients at MinIO or another S3-compatible
+    # endpoint (e.g. "https://s3.example.internal:9000"). Empty = AWS S3.
+    # MinIO needs path-style addressing unless wildcard DNS is configured.
+    S3_ENDPOINT_URL: str = ""
+    S3_FORCE_PATH_STYLE: bool = False
     MISTRAL_API_KEY: str = ""
     PDF_BACKEND: str = "opendataloader"  # "opendataloader" or "mistral"
     STAGE: str = "dev"

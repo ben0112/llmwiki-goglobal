@@ -51,6 +51,11 @@ CONVERTER_SECRET = os.environ.get("CONVERTER_SECRET", "")
 # be processed by this service).
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# Self-hosting: the S3-compatible endpoint presigned URLs point at
+# (e.g. "http://minio:9000" or "https://s3.example.internal"). When set, the
+# allowlist accepts that host instead of *.amazonaws.com — still locked to
+# S3_BUCKET. Matches S3_ENDPOINT_URL on the API service.
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", os.environ.get("S3_ENDPOINT_URL", ""))
 
 # Refuse to start in "public mode". Setting CONVERTER_SECRET is mandatory.
 if not CONVERTER_SECRET:
@@ -110,6 +115,21 @@ def _validate_s3_url(url: str) -> None:
     parsed = urlparse(url)
     if not parsed.hostname:
         raise HTTPException(400, "URL has no hostname")
+    if S3_ENDPOINT:
+        # Self-hosted mode: lock to the configured endpoint (host + port),
+        # and to the bucket when one is configured. Accept path style
+        # (`endpoint/{bucket}/...`) and virtual-host (`{bucket}.endpoint`).
+        ep = urlparse(S3_ENDPOINT if "://" in S3_ENDPOINT else f"//{S3_ENDPOINT}")
+        host_ok = parsed.hostname == ep.hostname or (
+            S3_BUCKET and parsed.hostname == f"{S3_BUCKET}.{ep.hostname}"
+        )
+        port_ok = ep.port is None or parsed.port == ep.port
+        if not (host_ok and port_ok):
+            raise HTTPException(400, "URL does not point to the configured S3 endpoint")
+        if S3_BUCKET and parsed.hostname == ep.hostname \
+                and not parsed.path.lstrip("/").startswith(f"{S3_BUCKET}/"):
+            raise HTTPException(400, "URL does not point to the configured S3 bucket")
+        return
     if not S3_BUCKET:
         # Fall back to broad check if bucket isn't configured. Less safe but
         # the service still works for self-hosters.

@@ -4,9 +4,20 @@ import logging
 from pathlib import Path
 
 import aioboto3
+from botocore.config import Config as BotoConfig
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def s3_client_kwargs() -> dict:
+    """Client kwargs honoring a self-hosted S3-compatible endpoint (MinIO)."""
+    kwargs: dict = {}
+    if settings.S3_ENDPOINT_URL:
+        kwargs["endpoint_url"] = settings.S3_ENDPOINT_URL
+    if settings.S3_FORCE_PATH_STYLE:
+        kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
+    return kwargs
 
 
 class S3Service:
@@ -19,7 +30,7 @@ class S3Service:
         self._bucket = settings.S3_BUCKET
 
     async def upload_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream"):
-        async with self._session.client("s3") as s3:
+        async with self._session.client("s3", **s3_client_kwargs()) as s3:
             await s3.put_object(Bucket=self._bucket, Key=key, Body=data, ContentType=content_type)
 
     async def upload_file(self, key: str, file_path: str, content_type: str = "application/octet-stream"):
@@ -27,7 +38,7 @@ class S3Service:
         await self.upload_bytes(key, data, content_type)
 
     async def generate_presigned_get(self, key: str, expires_in: int = 3600) -> str:
-        async with self._session.client("s3") as s3:
+        async with self._session.client("s3", **s3_client_kwargs()) as s3:
             return await s3.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": self._bucket, "Key": key},
@@ -35,7 +46,7 @@ class S3Service:
             )
 
     async def generate_presigned_put(self, key: str, content_type: str = "application/pdf", expires_in: int = 3600) -> str:
-        async with self._session.client("s3") as s3:
+        async with self._session.client("s3", **s3_client_kwargs()) as s3:
             return await s3.generate_presigned_url(
                 "put_object",
                 Params={"Bucket": self._bucket, "Key": key, "ContentType": content_type},
@@ -43,7 +54,7 @@ class S3Service:
             )
 
     async def delete_prefix(self, prefix: str) -> None:
-        async with self._session.client("s3") as s3:
+        async with self._session.client("s3", **s3_client_kwargs()) as s3:
             paginator = s3.get_paginator("list_objects_v2")
             batch: list[dict] = []
             async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
@@ -56,7 +67,7 @@ class S3Service:
                 await s3.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
 
     async def download_bytes(self, key: str) -> bytes:
-        async with self._session.client("s3") as s3:
+        async with self._session.client("s3", **s3_client_kwargs()) as s3:
             resp = await s3.get_object(Bucket=self._bucket, Key=key)
             return await resp["Body"].read()
 
