@@ -76,6 +76,8 @@ cd web && npm install && cd ..
 
 把输出的 JSON 粘贴到 `claude_desktop_config.json`(Claude Desktop)或 `.claude/settings.json`(Claude Code)。一个工作区对应一个 MCP server 条目。然后对 Claude 说:*"先读 guide,然后收录我的资料并开始构建维基。"*
 
+> 接入其他智能体(Codex CLI、Hermes、OpenClaw 等)以及托管模式的 API 密钥认证,见 **[`docs/agent-integration.md`](docs/agent-integration.md)**。
+
 **4. 导入标注语料(可选)** — 若已有 LLM 标注工具包产出的 `标注明细.csv`:
 
 ```bash
@@ -169,7 +171,9 @@ python3 -m corpus.import_annotations \
 
 ---
 
-# Claude 能做什么(MCP 工具)
+# 智能体能做什么(MCP 工具)
+
+任何 MCP 客户端(Claude、Codex CLI、Hermes、OpenClaw 等)均可调用下列工具;各客户端的配置与认证步骤见 [`docs/agent-integration.md`](docs/agent-integration.md)。
 
 | 工具 | 作用 |
 |------|------|
