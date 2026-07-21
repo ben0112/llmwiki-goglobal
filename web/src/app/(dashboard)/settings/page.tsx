@@ -55,20 +55,20 @@ export default function SettingsPage() {
         >
           <ArrowLeft className="size-4" />
         </button>
-        <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
+        <h1 className="text-xl font-semibold tracking-tight">设置</h1>
       </div>
 
       {/* Usage */}
       {usage && (
         <section>
-          <h2 className="text-base font-medium">Usage</h2>
+          <h2 className="text-base font-medium">用量</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            {usage.document_count} document{usage.document_count !== 1 ? 's' : ''} uploaded
+            已上传 {usage.document_count} 个文档
           </p>
           <div className="mt-4 space-y-4">
             <div>
               <div className="flex items-center justify-between text-sm mb-1.5">
-                <span className="text-muted-foreground">Storage</span>
+                <span className="text-muted-foreground">存储</span>
                 <span className="font-mono text-xs">
                   {formatBytes(usage.total_storage_bytes)} / {formatBytes(usage.max_storage_bytes)}
                 </span>
@@ -89,7 +89,7 @@ export default function SettingsPage() {
             </div>
             <div>
               <div className="flex items-center justify-between text-sm mb-1.5">
-                <span className="text-muted-foreground">OCR Pages</span>
+                <span className="text-muted-foreground">OCR 页数</span>
                 <span className="font-mono text-xs">
                   {usage.total_pages.toLocaleString()} / {usage.max_pages.toLocaleString()}
                 </span>
@@ -117,9 +117,9 @@ export default function SettingsPage() {
       {/* MCP Config */}
       {process.env.NEXT_PUBLIC_MODE === 'local' ? (
         <section>
-          <h2 className="text-base font-medium">Connect Claude</h2>
+          <h2 className="text-base font-medium">连接 Claude</h2>
           <p className="mt-2 text-sm text-muted-foreground">
-            Run this command to get the Claude Desktop / Claude Code MCP config for this workspace:
+            运行以下命令获取此工作区的 Claude Desktop / Claude Code MCP 配置:
           </p>
           <pre className="mt-4 rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
             llmwiki mcp-config &lt;workspace-path&gt;
@@ -152,7 +152,7 @@ function CopyButton({ text }: { text: string }) {
           : 'bg-background border border-border text-muted-foreground hover:text-foreground hover:bg-accent'
       )}
     >
-      {copied ? <><Check size={12} />Copied</> : <><Copy size={12} />Copy</>}
+      {copied ? <><Check size={12} />已复制</> : <><Copy size={12} />复制</>}
     </button>
   )
 }
@@ -186,13 +186,13 @@ function ApiKeysSection() {
     try {
       const res = await apiFetch<ApiKey & { key: string }>('/v1/api-keys', token, {
         method: 'POST',
-        body: JSON.stringify({ name: name.trim() || 'Default' }),
+        body: JSON.stringify({ name: name.trim() || '默认' }),
       })
       setNewKey(res.key)
       setName('')
       refresh()
     } catch {
-      setError('Failed to create API key')
+      setError('创建 API 密钥失败')
     } finally {
       setCreating(false)
     }
@@ -204,25 +204,24 @@ function ApiKeysSection() {
       await apiFetch(`/v1/api-keys/${id}`, token, { method: 'DELETE' })
       refresh()
     } catch {
-      setError('Failed to revoke API key')
+      setError('吊销 API 密钥失败')
     }
   }
 
   return (
     <section>
-      <h2 className="text-base font-medium">Connect Claude (MCP)</h2>
+      <h2 className="text-base font-medium">连接 Claude (MCP)</h2>
       <p className="mt-2 text-sm text-muted-foreground">
-        Create an API key and add the configuration below to your MCP client
-        (Claude Desktop, Claude Code, or claude.ai custom connectors). The key
-        authenticates as you — treat it like a password and revoke it when no
-        longer needed.
+        创建 API 密钥,并将下方配置添加到您的 MCP 客户端(Claude Desktop、Claude
+        Code 或 claude.ai 自定义连接器)。该密钥以您的身份进行认证——请像密码一样妥善
+        保管,不再需要时及时吊销。
       </p>
 
       <div className="mt-4 flex items-center gap-2">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Key name (e.g. claude-desktop)"
+          placeholder="密钥名称(如 claude-desktop)"
           className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
         />
         <button
@@ -231,7 +230,7 @@ function ApiKeysSection() {
           className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
         >
           <KeyRound size={14} />
-          Create key
+          创建密钥
         </button>
       </div>
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
@@ -239,7 +238,7 @@ function ApiKeysSection() {
       {newKey && (
         <div className="mt-4">
           <p className="text-xs text-amber-600 dark:text-amber-500">
-            This key is shown once — copy the config now and store it safely.
+            此密钥仅显示一次——请立即复制配置并妥善保存。
           </p>
           <div className="relative mt-2">
             <pre className="rounded-lg bg-muted border border-border p-4 text-xs font-mono overflow-x-auto text-foreground">
@@ -254,15 +253,15 @@ function ApiKeysSection() {
         <div className="mt-5 divide-y divide-border rounded-lg border border-border">
           {keys.map((k) => (
             <div key={k.id} className="flex items-center gap-3 px-3 py-2 text-sm">
-              <span className="font-medium">{k.name || 'Default'}</span>
+              <span className="font-medium">{k.name || '默认'}</span>
               <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{k.key_prefix}…</code>
               <span className="flex-1 text-xs text-muted-foreground">
-                created {k.created_at.slice(0, 10)}
-                {k.last_used_at ? ` · last used ${k.last_used_at.slice(0, 10)}` : ' · never used'}
+                创建于 {k.created_at.slice(0, 10)}
+                {k.last_used_at ? ` · 最近使用 ${k.last_used_at.slice(0, 10)}` : ' · 从未使用'}
               </span>
               <button
                 onClick={() => revokeKey(k.id)}
-                title="Revoke"
+                title="吊销"
                 className="p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-accent transition-colors cursor-pointer"
               >
                 <Trash2 size={14} />
@@ -273,7 +272,7 @@ function ApiKeysSection() {
       )}
 
       <p className="mt-3 text-xs text-muted-foreground">
-        MCP URL:{' '}
+        MCP 地址:{' '}
         <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{MCP_URL}</code>
       </p>
     </section>

@@ -22,7 +22,7 @@ export function useWikiHighlights(documentId: string | null): WikiHighlightsApi 
   // The local backend signals the per-doc highlight cap with a 200 + no
   // highlights array; treat it as a failure instead of wiping state.
   const applyResponse = React.useCallback((res: HighlightsResponse) => {
-    if (!Array.isArray(res.highlights)) throw new Error('Highlight limit reached for this page')
+    if (!Array.isArray(res.highlights)) throw new Error('本页高亮数量已达上限')
     setHighlights(res.highlights)
   }, [])
 

@@ -88,7 +88,7 @@ export default function App() {
         const cloudUrl = await getApiUrl();
         setModeState("cloud");
         setApiUrl(cloudUrl);
-        setAuthError(`Could not connect to ${url}/health. Switched back to cloud.`);
+        setAuthError(`无法连接 ${url}/health,已切换回云端模式。`);
         await checkSession();
         return;
       }
@@ -126,9 +126,9 @@ export default function App() {
     });
     if (result.success) {
       await checkSession();
-      showAuthNotice("Signed in to LLM Wiki");
+      showAuthNotice("已登录 LLM Wiki");
     } else {
-      setAuthError(result.error ?? "Sign in failed");
+      setAuthError(result.error ?? "登录失败");
       setAuth({ status: "signed_out" });
     }
   }
@@ -183,7 +183,7 @@ export default function App() {
           )}
           {mode === "local" && (
             <span className="rounded border border-zinc-200 bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-600">
-              local
+              本地
             </span>
           )}
         </div>
@@ -191,7 +191,7 @@ export default function App() {
           {showHostToggle && (
             <button
               onClick={handleToggleHost}
-              title={`${hostDisabled ? "Enable" : "Disable"} on ${currentHost}`}
+              title={`在 ${currentHost} 上${hostDisabled ? "启用" : "禁用"}`}
               className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
             >
               {hostDisabled ? (
@@ -215,14 +215,14 @@ export default function App() {
             onClick={() => setView("settings")}
             className="rounded-md px-2 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
           >
-            Settings
+            设置
           </button>
         </div>
       </div>
 
       {showReloadHint && (
         <div className="mb-3 rounded-md border border-zinc-200 bg-zinc-100 px-3 py-1.5 text-[11px] text-zinc-600">
-          Reload the page to apply.
+          刷新页面以生效。
         </div>
       )}
 

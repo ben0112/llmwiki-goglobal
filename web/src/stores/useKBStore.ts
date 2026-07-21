@@ -20,7 +20,7 @@ type KBState = {
 
 function getToken(): string {
   const token = useUserStore.getState().accessToken
-  if (!token) throw new Error('Not authenticated')
+  if (!token) throw new Error('未登录')
   return token
 }
 

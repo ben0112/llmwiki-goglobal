@@ -136,16 +136,16 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
       )
       const total = res.citations + res.links
       if (total === 0) {
-        toast.info('No citations or cross-references found')
+        toast.info('未发现引用或交叉链接')
       } else {
-        toast.success(`${res.citations} citation${res.citations !== 1 ? 's' : ''}, ${res.links} cross-reference${res.links !== 1 ? 's' : ''}`)
+        toast.success(`引用 ${res.citations} 条,交叉链接 ${res.links} 条`)
       }
       fetchGraph()
     } catch (err) {
       if (err instanceof ApiError && err.status === 429) {
-        toast.info('References were just rebuilt — try again in a minute')
+        toast.info('引用刚刚重建过,请稍后再试')
       } else {
-        toast.error('Failed to rebuild references')
+        toast.error('重建引用失败')
       }
     } finally {
       setRebuilding(false)
@@ -336,15 +336,14 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
   if (loading) {
     overlay = <Loader2 className="size-5 animate-spin text-muted-foreground" />
   } else if (error || !graphData) {
-    overlay = <p className="text-sm text-muted-foreground">Failed to load graph data</p>
+    overlay = <p className="text-sm text-muted-foreground">图谱数据加载失败</p>
   } else if (!hasNodes) {
-    overlay = <p className="text-sm text-muted-foreground">No documents to visualize yet</p>
+    overlay = <p className="text-sm text-muted-foreground">暂无可视化文档</p>
   } else if (!hasEdges) {
     overlay = (
       <div className="flex flex-col items-center gap-3">
         <p className="text-sm text-muted-foreground text-center max-w-xs">
-          {graphData.nodes.length} document{graphData.nodes.length !== 1 ? 's' : ''} found, but no
-          references have been indexed yet.
+          已发现 {graphData.nodes.length} 个文档,但尚未建立引用索引。
         </p>
         <button
           onClick={handleRebuild}
@@ -352,10 +351,10 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
           className="inline-flex items-center gap-2 rounded-full border border-border px-4 py-1.5 text-xs font-medium hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
         >
           <RefreshCw className={`size-3.5 ${rebuilding ? 'animate-spin' : ''}`} strokeWidth={2.25} />
-          {rebuilding ? 'Building...' : 'Build references'}
+          {rebuilding ? '构建中…' : '构建引用'}
         </button>
         <p className="text-[11px] text-muted-foreground/50 text-center max-w-xs">
-          Parses wiki pages for citations and cross-references
+          解析维基页面中的引用与交叉链接
         </p>
       </div>
     )
@@ -397,19 +396,19 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
             <button
               onClick={() => setShowSources((s) => !s)}
               className={`cursor-pointer transition-colors ${showSources ? 'text-foreground' : 'text-muted-foreground/40 hover:text-muted-foreground'}`}
-              title={showSources ? 'Hide sources' : 'Show sources'}
+              title={showSources ? '隐藏源文件' : '显示源文件'}
             >
-              Sources
+              源文件
             </button>
             <span className="text-muted-foreground/20">|</span>
             <button
               onClick={handleRebuild}
               disabled={rebuilding}
               className="flex items-center gap-1 hover:text-foreground transition-colors cursor-pointer disabled:opacity-50"
-              title="Rebuild references"
+              title="重建引用"
             >
               <RefreshCw className={`size-2.5 ${rebuilding ? 'animate-spin' : ''}`} />
-              {rebuilding ? 'Building...' : 'Rebuild'}
+              {rebuilding ? '构建中…' : '重建'}
             </button>
           </div>
 
@@ -417,10 +416,10 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
           {hoverNodeState && (() => {
             const p = hoverNodeState.path.toLowerCase()
             const category = hoverNodeState.source_kind !== 'wiki'
-              ? 'Source'
-              : p.includes('concepts/') ? 'Concept'
-              : p.includes('entities/') ? 'Entity'
-              : 'Page'
+              ? '源文件'
+              : p.includes('concepts/') ? '概念'
+              : p.includes('entities/') ? '实体'
+              : '页面'
             return (
               <div
                 className="absolute text-xs bg-background/95 backdrop-blur-sm border border-border rounded-md px-3 py-2 pointer-events-none max-w-72 z-10"

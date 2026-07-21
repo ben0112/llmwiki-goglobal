@@ -37,7 +37,7 @@ export function UploadProgressPanel() {
             size="icon"
             className="size-6 text-muted-foreground"
             onClick={() => setCollapsed((v) => !v)}
-            aria-label={collapsed ? 'Expand' : 'Collapse'}
+            aria-label={collapsed ? '展开' : '收起'}
           >
             <ChevronDown className={`size-4 transition-transform ${collapsed ? '-rotate-180' : ''}`} />
           </Button>
@@ -47,7 +47,7 @@ export function UploadProgressPanel() {
             className="size-6 text-muted-foreground"
             onClick={clearFinished}
             disabled={inFlight === items.length}
-            aria-label="Clear completed"
+            aria-label="清除已完成"
           >
             <X className="size-4" />
           </Button>
@@ -66,8 +66,8 @@ export function UploadProgressPanel() {
 }
 
 function headerLabel(inFlight: number, total: number): string {
-  if (inFlight > 0) return `Uploading ${inFlight} item${inFlight > 1 ? 's' : ''}`
-  return `${total} upload${total > 1 ? 's' : ''} complete`
+  if (inFlight > 0) return `正在上传 ${inFlight} 个文件`
+  return `${total} 个文件上传完成`
 }
 
 function UploadRow({
@@ -117,7 +117,7 @@ function RowStatus({ item }: { item: UploadItem }) {
       ? 'Processing…'
       : item.phase === 'ready'
         ? 'Done'
-        : item.error || 'Upload failed'
+        : item.error || '上传失败'
   return <p className="mt-0.5 truncate text-xs text-muted-foreground">{label}</p>
 }
 
@@ -144,7 +144,7 @@ function RowAction({
         size="icon"
         className="size-6 shrink-0 text-muted-foreground"
         onClick={() => onDismiss(item.id)}
-        aria-label="Dismiss"
+        aria-label="关闭"
       >
         <X className="size-4" />
       </Button>

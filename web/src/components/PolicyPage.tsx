@@ -21,13 +21,13 @@ export function PolicyPage({ content }: { content: string }) {
             href="/login"
             className="text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
-            Sign in
+            登录
           </Link>
           <Link
             href="/signup"
             className="hidden sm:inline-flex items-center gap-1.5 rounded-full bg-foreground text-background px-4 py-1.5 text-sm font-medium hover:opacity-90 transition-opacity"
           >
-            Get started
+            开始使用
           </Link>
         </div>
       </nav>
@@ -66,8 +66,8 @@ export function PolicyPage({ content }: { content: string }) {
       <footer className="border-t border-border px-6 lg:px-10 py-6 flex items-center justify-between text-xs text-muted-foreground/50">
         <span>LLM Wiki</span>
         <div className="flex items-center gap-4">
-          <Link href="/terms" className="hover:text-muted-foreground transition-colors">Terms</Link>
-          <Link href="/privacy" className="hover:text-muted-foreground transition-colors">Privacy</Link>
+          <Link href="/terms" className="hover:text-muted-foreground transition-colors">条款</Link>
+          <Link href="/privacy" className="hover:text-muted-foreground transition-colors">隐私</Link>
           <Link href="/dmca" className="hover:text-muted-foreground transition-colors">DMCA</Link>
         </div>
       </footer>

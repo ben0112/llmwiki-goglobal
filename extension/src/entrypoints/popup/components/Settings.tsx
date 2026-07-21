@@ -41,7 +41,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
     if (newMode === "local") {
       setModeState("local");
       setShowLocalConfig(true);
-      setMessage("Enter your local API URL. Click away to test /health.");
+      setMessage("输入您的本地 API 地址,点击其他位置以测试 /health。");
       setSaved(false);
       return;
     }
@@ -51,7 +51,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
     setSaved(false);
     await setMode(newMode);
     onModeChange(newMode);
-    flash("Settings saved");
+    flash("设置已保存");
   }
 
   async function handleUrlSave() {
@@ -82,7 +82,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
       setModeState("cloud");
       setShowLocalConfig(true);
       onModeChange("cloud");
-      setMessage(`Could not connect to ${normalized}/health. Cloud remains active.`);
+      setMessage(`无法连接 ${normalized}/health,继续使用云端模式。`);
       return false;
     }
     await setLocalUrl(normalized);
@@ -90,7 +90,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
     setLocalUrlState(normalized);
     setModeState("local");
     onModeChange("local");
-    flash(`Connected to ${normalized}`);
+    flash(`已连接 ${normalized}`);
     return true;
   }
 
@@ -112,11 +112,11 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
         disabled={checking}
         className="rounded-md px-2 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
       >
-        &larr; Back
+        &larr; 返回
       </button>
 
       <div>
-        <label className="mb-2 block text-xs font-medium text-zinc-700">Mode</label>
+        <label className="mb-2 block text-xs font-medium text-zinc-700">模式</label>
         <div className="grid grid-cols-2 gap-1 rounded-md border border-zinc-200 bg-zinc-100 p-1">
           <button
             onClick={() => handleModeChange("cloud")}
@@ -127,7 +127,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
                 : "text-zinc-500 hover:text-zinc-900"
             }`}
           >
-            Cloud
+            云端
           </button>
           <button
             onClick={() => handleModeChange("local")}
@@ -138,22 +138,22 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
                 : "text-zinc-500 hover:text-zinc-900"
             }`}
           >
-            Local
+            本地
           </button>
         </div>
         <p className="mt-1.5 text-[11px] leading-4 text-zinc-500">
           {mode === "cloud"
             ? showLocalConfig
-              ? "Cloud stays active until the local URL connects"
-              : "Saves to llmwiki.app, requires sign in"
-            : "Saves to your local LLM Wiki instance, no sign in needed"}
+              ? "本地地址连接成功前将继续使用云端模式"
+              : "保存到 llmwiki.app,需要登录"
+            : "保存到您的本地 LLM Wiki 实例,无需登录"}
         </p>
       </div>
 
       {showLocalConfig && (
         <div>
           <label className="mb-1.5 block text-xs font-medium text-zinc-700">
-            API URL
+            API 地址
           </label>
           <div className="flex gap-2">
             <input
@@ -161,7 +161,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
               onChange={(e) => {
                 setLocalUrlState(e.target.value);
                 setSaved(false);
-                setMessage("Click away to test /health.");
+                setMessage("点击其他位置以测试 /health。");
               }}
               onBlur={() => {
                 if (!checking) handleUrlSave();
@@ -180,7 +180,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
               className="h-9 rounded-md bg-zinc-950 px-3 text-xs font-medium text-zinc-50
                          transition-colors hover:bg-zinc-800 disabled:cursor-default disabled:opacity-60"
             >
-              {checking ? "Checking" : "Test"}
+              {checking ? "检测中" : "测试"}
             </button>
           </div>
         </div>
@@ -202,7 +202,7 @@ export default function Settings({ onBack, onModeChange, isSignedIn, onSignOut }
                        focus-visible:outline-none focus-visible:ring-2
                        focus-visible:ring-zinc-950 focus-visible:ring-offset-2"
           >
-            Sign out
+            退出登录
           </button>
         </div>
       )}

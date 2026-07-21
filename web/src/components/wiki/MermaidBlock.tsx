@@ -81,7 +81,7 @@ export function MermaidBlock({ chart }: { chart: string }) {
           <button
             onClick={(e) => { e.stopPropagation(); setFullscreen(true) }}
             className="absolute top-2 right-2 p-1.5 rounded-md bg-background/80 border border-border text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-            title="View fullscreen"
+            title="全屏查看"
           >
             <Maximize2 className="size-3.5" />
           </button>

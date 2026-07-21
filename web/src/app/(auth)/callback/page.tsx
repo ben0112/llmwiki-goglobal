@@ -33,7 +33,7 @@ function CallbackContent() {
 
   return (
     <div className="flex min-h-screen items-center justify-center">
-      <p className="text-muted-foreground">Completing sign in...</p>
+      <p className="text-muted-foreground">正在完成登录...</p>
     </div>
   );
 }

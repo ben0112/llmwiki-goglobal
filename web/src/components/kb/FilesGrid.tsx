@@ -79,7 +79,7 @@ function sortDocs(docs: DocumentListItem[], field: SortField, dir: SortDir): Doc
 }
 
 function parseBreadcrumbs(path: string): { label: string; path: string }[] {
-  const segments: { label: string; path: string }[] = [{ label: 'Files', path: '/' }]
+  const segments: { label: string; path: string }[] = [{ label: '文件', path: '/' }]
   if (path === '/') return segments
   const parts = path.replace(/^\//, '').replace(/\/$/, '').split('/')
   let accumulated = '/'
@@ -372,7 +372,7 @@ export function FilesGrid({
     onUploadFiles?.(files, targetPath)
   }, [onUploadFiles])
 
-  const sortLabels: Record<SortField, string> = { name: 'Name', date: 'Modified', type: 'Kind' }
+  const sortLabels: Record<SortField, string> = { name: '名称', date: '修改时间', type: '类型' }
   const isEmpty = filteredFolders.length === 0 && filteredDocs.length === 0
 
   return (
@@ -388,8 +388,8 @@ export function FilesGrid({
         <div className="absolute inset-0 z-40 bg-background/80 backdrop-blur-sm flex items-center justify-center pointer-events-none">
           <div className="flex flex-col items-center gap-3 border-2 border-dashed border-primary rounded-xl px-12 py-10">
             <Upload className="size-8 text-primary" />
-            <p className="text-sm font-medium text-primary">Drop files to upload</p>
-            <p className="text-xs text-muted-foreground">to {currentPath === '/' ? 'Files' : currentPath.replace(/\/$/, '').split('/').pop()}</p>
+            <p className="text-sm font-medium text-primary">拖放文件以上传</p>
+            <p className="text-xs text-muted-foreground">上传到 {currentPath === '/' ? '文件' : currentPath.replace(/\/$/, '').split('/').pop()}</p>
           </div>
         </div>
       )}
@@ -435,7 +435,7 @@ export function FilesGrid({
                       setNoteTitle(e.target.value)
                       noteTitleChangeRef.current?.(e.target.value)
                     }}
-                    placeholder="Untitled"
+                    placeholder="未命名"
                     className="min-w-[80px] flex-1 text-sm font-medium text-foreground bg-transparent border-none outline-none placeholder:text-muted-foreground/30 truncate"
                   />
                 ) : isDocLeaf ? (
@@ -480,7 +480,7 @@ export function FilesGrid({
                   <input
                     ref={searchInputRef}
                     type="text"
-                    placeholder="Filter..."
+                    placeholder="筛选..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     onKeyDown={(e) => { if (e.key === 'Escape') { setSearchQuery(''); setSearchOpen(false) } }}
@@ -499,13 +499,13 @@ export function FilesGrid({
 
             <button onClick={handleUploadHere} className="flex items-center gap-1.5 p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
               <Upload className="size-3.5" />
-              <span className="text-xs">Upload</span>
+              <span className="text-xs">上传</span>
             </button>
 
             <button
               onClick={() => setSortDir((d) => d === 'asc' ? 'desc' : 'asc')}
               className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
-              title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
+              title={sortDir === 'asc' ? '升序' : '降序'}
             >
               {sortDir === 'asc' ? <ArrowUp className="size-3.5" /> : <ArrowDown className="size-3.5" />}
             </button>
@@ -519,17 +519,17 @@ export function FilesGrid({
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => setFolderDialogOpen(true)}>
                   <FolderPlus className="size-3.5 mr-2" />
-                  New Folder
+                  新建文件夹
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={handleCreateNoteHere}>
                   <NotepadText className="size-3.5 mr-2" />
-                  New Note
+                  新建笔记
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger>
                     {sortDir === 'asc' ? <ArrowUp className="size-3.5 mr-2" /> : <ArrowDown className="size-3.5 mr-2" />}
-                    Sort by {sortLabels[sortField]}
+                    排序:{sortLabels[sortField]}
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent>
                     {(Object.keys(sortLabels) as SortField[]).map((field) => (
@@ -554,12 +554,12 @@ export function FilesGrid({
               <button
                 onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
                 className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
-                title="Open source URL"
+                title="打开来源链接"
               >
                 <ExternalLink className="size-3.5" />
               </button>
             )}
-            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
           </>
@@ -569,24 +569,24 @@ export function FilesGrid({
               <button
                 onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
                 className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
-                title="Open source URL"
+                title="打开来源链接"
               >
                 <ExternalLink className="size-3.5" />
               </button>
             )}
-            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
           </>
         ) : activeDoc ? (
           <>
-            <button onClick={() => { /* TODO: trigger search in PDF viewer */ }} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Find in document">
+            <button onClick={() => { /* TODO: trigger search in PDF viewer */ }} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="文档内查找">
               <Search className="size-3.5" />
             </button>
-            <a href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Download">
+            <a href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="下载">
               <Download className="size-3.5" />
             </a>
-            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
           </>
@@ -662,10 +662,10 @@ export function FilesGrid({
               </div>
             </ContextMenuTrigger>
             <ContextMenuContent>
-              <ContextMenuItem onClick={handleCreateNoteHere}><NotepadText className="size-3.5 mr-2" />New Note</ContextMenuItem>
-              <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />New Folder</ContextMenuItem>
+              <ContextMenuItem onClick={handleCreateNoteHere}><NotepadText className="size-3.5 mr-2" />新建笔记</ContextMenuItem>
+              <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />新建文件夹</ContextMenuItem>
               <ContextMenuSeparator />
-              <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />Upload Files</ContextMenuItem>
+              <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />上传文件</ContextMenuItem>
             </ContextMenuContent>
           </ContextMenu>
         )}
@@ -675,11 +675,11 @@ export function FilesGrid({
       {folderDialogOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setFolderDialogOpen(false)}>
           <div className="bg-background border border-border rounded-lg p-6 w-80 shadow-xl" onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-sm font-medium mb-3">New folder</h3>
-            <input value={folderName} onChange={(e) => setFolderName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleCreateFolder()} placeholder="Folder name" className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm mb-3" autoFocus />
+            <h3 className="text-sm font-medium mb-3">新建文件夹</h3>
+            <input value={folderName} onChange={(e) => setFolderName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleCreateFolder()} placeholder="文件夹名称" className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm mb-3" autoFocus />
             <div className="flex justify-end gap-2">
-              <button onClick={() => setFolderDialogOpen(false)} className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer">Cancel</button>
-              <button onClick={handleCreateFolder} disabled={!folderName.trim()} className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer">Create</button>
+              <button onClick={() => setFolderDialogOpen(false)} className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer">取消</button>
+              <button onClick={handleCreateFolder} disabled={!folderName.trim()} className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer">创建</button>
             </div>
           </div>
         </div>
@@ -799,15 +799,15 @@ function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListIt
               <span className="text-[9px] text-muted-foreground/50 uppercase">{doc.file_type}</span>
               {doc.page_count && <span className="text-[9px] text-muted-foreground/40">· {doc.page_count}p</span>}
             </div>
-            {doc.status === 'failed' && <span className="text-[9px] font-medium text-destructive/80">Failed</span>}
+            {doc.status === 'failed' && <span className="text-[9px] font-medium text-destructive/80">处理失败</span>}
           </div>
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onClick={onOpen}><ExternalLink className="size-3.5 mr-2" />Open</ContextMenuItem>
-        <ContextMenuItem onClick={startRename}><Pencil className="size-3.5 mr-2" />Rename</ContextMenuItem>
+        <ContextMenuItem onClick={onOpen}><ExternalLink className="size-3.5 mr-2" />打开</ContextMenuItem>
+        <ContextMenuItem onClick={startRename}><Pencil className="size-3.5 mr-2" />重命名</ContextMenuItem>
         <ContextMenuSeparator />
-        <ContextMenuItem variant="destructive" onClick={onDelete}><Trash2 className="size-3.5 mr-2" />Delete</ContextMenuItem>
+        <ContextMenuItem variant="destructive" onClick={onDelete}><Trash2 className="size-3.5 mr-2" />删除</ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
   )
@@ -822,15 +822,15 @@ function NewCard({ onCreateNote, onUpload, onCreateFolder }: { onCreateNote: () 
             <Plus className="size-5 text-muted-foreground/40 group-hover:text-muted-foreground/60 transition-colors" />
           </div>
           <div className="px-2 py-1.5 text-center">
-            <span className="text-xs font-medium text-muted-foreground/50">New</span>
+            <span className="text-xs font-medium text-muted-foreground/50">新建</span>
           </div>
         </div>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
-        <DropdownMenuItem onClick={onCreateNote}><NotepadText className="size-3.5 mr-2" />Note</DropdownMenuItem>
-        <DropdownMenuItem onClick={onCreateFolder}><FolderPlus className="size-3.5 mr-2" />Folder</DropdownMenuItem>
+        <DropdownMenuItem onClick={onCreateNote}><NotepadText className="size-3.5 mr-2" />笔记</DropdownMenuItem>
+        <DropdownMenuItem onClick={onCreateFolder}><FolderPlus className="size-3.5 mr-2" />文件夹</DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />Upload Files</DropdownMenuItem>
+        <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />上传文件</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -883,15 +883,15 @@ function EmptyState({ isRoot, onUpload, onCreateNote }: { isRoot: boolean; onUpl
   return (
     <div className="flex flex-col items-center justify-center py-20 gap-6">
       <div className="text-center">
-        <p className="text-sm text-muted-foreground">{isRoot ? 'No files yet' : 'This folder is empty'}</p>
-        <p className="text-xs text-muted-foreground/60 mt-1">Upload documents or create notes to get started</p>
+        <p className="text-sm text-muted-foreground">{isRoot ? '暂无文件' : '此文件夹为空'}</p>
+        <p className="text-xs text-muted-foreground/60 mt-1">上传文档或新建笔记开始使用</p>
       </div>
       <div className="flex gap-3">
         <button onClick={onUpload} className="flex flex-col items-center gap-2 px-6 py-4 rounded-lg border border-dashed border-border hover:border-foreground/20 hover:bg-muted/50 transition-colors cursor-pointer">
-          <Upload className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">Upload files</span>
+          <Upload className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">上传文件</span>
         </button>
         <button onClick={onCreateNote} className="flex flex-col items-center gap-2 px-6 py-4 rounded-lg border border-dashed border-border hover:border-foreground/20 hover:bg-muted/50 transition-colors cursor-pointer">
-          <NotepadText className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">New note</span>
+          <NotepadText className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">新建笔记</span>
         </button>
       </div>
     </div>

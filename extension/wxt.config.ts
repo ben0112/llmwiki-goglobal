@@ -21,7 +21,7 @@ export default defineConfig({
   },
   manifest: {
     name: "LLM Wiki",
-    description: "Save any web page or PDF to your LLM Wiki knowledge base",
+    description: "将任意网页或 PDF 保存到您的 LLM Wiki 知识库",
     version: "0.1.0",
     permissions: ["activeTab", "storage", "scripting"],
     // The page is reached via activeTab on the toolbar click; host_permissions

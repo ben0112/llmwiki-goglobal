@@ -2,11 +2,11 @@ import type { Metadata } from 'next'
 import { LoginForm } from './LoginForm'
 
 export const metadata: Metadata = {
-  title: 'Sign In | LLM Wiki',
-  description: 'Sign in to LLM Wiki to manage your knowledge bases and wikis.',
+  title: '登录 | LLM Wiki',
+  description: '登录 LLM Wiki,管理您的知识库和维基。',
   openGraph: {
-    title: 'Sign In | LLM Wiki',
-    description: 'Sign in to LLM Wiki to manage your knowledge bases and wikis.',
+    title: '登录 | LLM Wiki',
+    description: '登录 LLM Wiki,管理您的知识库和维基。',
   },
 }
 

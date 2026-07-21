@@ -175,7 +175,7 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
         setHighlightVersion(highlightResponse.version ?? 0)
       })
       .catch((err) => {
-        if (!cancelled) setError(err?.message ?? 'Failed to load document')
+        if (!cancelled) setError(err?.message ?? '文档加载失败')
       })
 
     return () => {
@@ -320,10 +320,10 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
       frontmatterRef.current = frontmatter
       setMarkdown(body)
       setIsEditing(false)
-      setNotice('Saved')
+      setNotice('已保存')
     } catch (err) {
       setNotice(null)
-      setError(err instanceof Error ? err.message : 'Failed to save document')
+      setError(err instanceof Error ? err.message : '文档保存失败')
     } finally {
       setSavingEdit(false)
     }
@@ -344,7 +344,7 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
       selection.to,
     )
     if (!textAnchor) {
-      setCommentError('Select text in the article first.')
+      setCommentError('请先在正文中选中文字。')
       return
     }
 
@@ -373,10 +373,10 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
       setCommentOpen(false)
       setCommentDraft('')
       setSelection(null)
-      setNotice(commentDraft.trim() ? 'Comment saved' : 'Highlight saved')
+      setNotice(commentDraft.trim() ? '批注已保存' : '高亮已保存')
       editor.commands.setTextSelection(selection.to)
     } catch (err) {
-      setCommentError(err instanceof Error ? err.message : 'Failed to save comment')
+      setCommentError(err instanceof Error ? err.message : '批注保存失败')
     } finally {
       setSavingComment(false)
     }
@@ -419,8 +419,8 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
                   ? 'text-muted-foreground hover:bg-accent hover:text-foreground'
                   : 'text-muted-foreground/35 cursor-default',
               )}
-              title="Add comment"
-              aria-label="Add comment"
+              title="添加批注"
+              aria-label="添加批注"
             >
               <MessageSquarePlus className="size-3.5" />
             </button>
@@ -431,8 +431,8 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
               onClick={saveEdit}
               disabled={savingEdit}
               className="inline-flex size-7 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-60"
-              title="Save"
-              aria-label="Save"
+              title="保存"
+              aria-label="保存"
             >
               {savingEdit ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
             </button>
@@ -441,8 +441,8 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
               type="button"
               onClick={beginEdit}
               className="inline-flex size-7 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              title="Edit"
-              aria-label="Edit"
+              title="编辑"
+              aria-label="编辑"
             >
               <Pencil className="size-3.5" />
             </button>
@@ -454,7 +454,7 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
                 <textarea
                   value={commentDraft}
                   onChange={(event) => setCommentDraft(event.target.value)}
-                  placeholder="Comment"
+                  placeholder="批注"
                   rows={3}
                   className="min-h-20 w-full resize-none rounded-md border border-input bg-background px-2.5 py-2 text-sm outline-none transition-colors placeholder:text-muted-foreground focus:border-ring"
                   autoFocus
@@ -467,8 +467,8 @@ export default function MarkdownClipViewer({ documentId, className }: Props) {
                     setCommentError(null)
                   }}
                   className="self-start rounded-sm p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  aria-label="Cancel"
-                  title="Cancel"
+                  aria-label="取消"
+                  title="取消"
                 >
                   <X className="size-3.5" />
                 </button>

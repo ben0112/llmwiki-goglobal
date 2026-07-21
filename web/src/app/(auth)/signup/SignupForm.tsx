@@ -42,12 +42,12 @@ export function SignupForm() {
     <div className="flex min-h-screen items-center justify-center p-8">
       <div className="w-full max-w-sm space-y-6">
         <div className="text-center">
-          <h1 className="text-2xl font-bold">Create your account</h1>
+          <h1 className="text-2xl font-bold">创建账号</h1>
         </div>
 
         <form onSubmit={handleSignup} className="space-y-4">
           <div>
-            <label htmlFor="email" className="block text-sm font-medium">Email</label>
+            <label htmlFor="email" className="block text-sm font-medium">邮箱</label>
             <input
               id="email"
               type="email"
@@ -58,7 +58,7 @@ export function SignupForm() {
             />
           </div>
           <div>
-            <label htmlFor="password" className="block text-sm font-medium">Password</label>
+            <label htmlFor="password" className="block text-sm font-medium">密码</label>
             <input
               id="password"
               type="password"
@@ -75,18 +75,18 @@ export function SignupForm() {
             disabled={loading}
             className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? 'Creating account...' : 'Create account'}
+            {loading ? '创建中...' : '创建账号'}
           </button>
         </form>
         <p className="text-center text-sm text-muted-foreground">
-          Already have an account?{' '}
-          <a href="/login" className="font-medium text-foreground underline">Sign in</a>
+          已有账号?{' '}
+          <a href="/login" className="font-medium text-foreground underline">登录</a>
         </p>
         <p className="text-center text-xs text-muted-foreground/60">
-          By signing up, you agree to our{' '}
-          <a href="/terms" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">Terms of Service</a>
-          {' '}and{' '}
-          <a href="/privacy" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">Privacy Policy</a>.
+          注册即表示您同意我们的{' '}
+          <a href="/terms" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">服务条款</a>
+          {' '}与{' '}
+          <a href="/privacy" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">隐私政策</a>.
         </p>
       </div>
     </div>

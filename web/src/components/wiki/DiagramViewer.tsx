@@ -79,17 +79,17 @@ export function DiagramViewer({ content, type, alt, onClose }: DiagramViewerProp
       {/* Controls */}
       <div className="shrink-0 flex items-center justify-between px-4 h-10">
         <div className="flex items-center gap-1 text-xs text-muted-foreground">
-          <button onClick={zoomOut} disabled={scale <= MIN_SCALE} className="p-1.5 rounded-md hover:bg-accent hover:text-foreground disabled:opacity-30 cursor-pointer" title="Zoom out">
+          <button onClick={zoomOut} disabled={scale <= MIN_SCALE} className="p-1.5 rounded-md hover:bg-accent hover:text-foreground disabled:opacity-30 cursor-pointer" title="缩小">
             <ZoomOut className="size-3.5" />
           </button>
-          <button onClick={zoomReset} className="tabular-nums hover:text-foreground cursor-pointer min-w-[3.5ch] text-center" title="Reset zoom">
+          <button onClick={zoomReset} className="tabular-nums hover:text-foreground cursor-pointer min-w-[3.5ch] text-center" title="重置缩放">
             {Math.round(scale * 100)}%
           </button>
-          <button onClick={zoomIn} disabled={scale >= MAX_SCALE} className="p-1.5 rounded-md hover:bg-accent hover:text-foreground disabled:opacity-30 cursor-pointer" title="Zoom in">
+          <button onClick={zoomIn} disabled={scale >= MAX_SCALE} className="p-1.5 rounded-md hover:bg-accent hover:text-foreground disabled:opacity-30 cursor-pointer" title="放大">
             <ZoomIn className="size-3.5" />
           </button>
         </div>
-        <button onClick={onClose} className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer" title="Close">
+        <button onClick={onClose} className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer" title="关闭">
           <X className="size-4" />
         </button>
       </div>
@@ -142,7 +142,7 @@ export function ExpandableMedia({
         <button
           onClick={(e) => { e.stopPropagation(); setFullscreen(true) }}
           className="absolute top-2 right-2 p-1.5 rounded-md bg-background/80 border border-border text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-          title="View fullscreen"
+          title="全屏查看"
         >
           <Maximize2 className="size-3.5" />
         </button>

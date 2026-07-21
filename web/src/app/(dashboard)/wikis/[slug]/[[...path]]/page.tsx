@@ -53,9 +53,9 @@ export default function KBPage() {
   if (!kb) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-2 bg-background">
-        <h1 className="text-lg font-medium">Wiki not found</h1>
+        <h1 className="text-lg font-medium">未找到维基</h1>
         <p className="text-sm text-muted-foreground">
-          The wiki &ldquo;{params.slug}&rdquo; does not exist or you don&apos;t have access.
+          维基 &ldquo;{params.slug}&rdquo; 不存在,或您没有访问权限。
         </p>
       </div>
     )

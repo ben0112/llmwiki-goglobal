@@ -37,7 +37,7 @@ export default defineBackground(() => {
       handleMessage(message)
         .then(sendResponse)
         .catch((err: unknown) => {
-          sendResponse({ error: err instanceof Error ? err.message : "Background error" });
+          sendResponse({ error: err instanceof Error ? err.message : "后台错误" });
         });
       return true; // will respond asynchronously
     },
@@ -56,7 +56,7 @@ export default defineBackground(() => {
       case "API_FETCH":
         return apiFetchProxy(msg);
       default:
-        return { error: "Unknown message type" };
+        return { error: "未知消息类型" };
     }
   }
 
@@ -116,7 +116,7 @@ export default defineBackground(() => {
       }
       return { success: true };
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Sign in failed";
+      const message = err instanceof Error ? err.message : "登录失败";
       return { success: false, error: message };
     }
   }

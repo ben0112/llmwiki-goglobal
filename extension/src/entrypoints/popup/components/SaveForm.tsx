@@ -140,7 +140,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
         await handleSaveWeb();
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Save failed";
+      const message = err instanceof Error ? err.message : "保存失败";
       setStatus({ type: "error", message });
     }
   }
@@ -148,7 +148,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
   async function handleSaveWeb() {
     if (!tab || !knowledgeBaseId) return;
 
-    setStatus({ type: "saving", message: "Extracting page..." });
+    setStatus({ type: "saving", message: "正在提取页面..." });
 
     let html: string;
     try {
@@ -302,7 +302,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       });
       html = result as string;
     } catch {
-      throw new Error("Could not extract page content. Try refreshing the page.");
+      throw new Error("无法提取页面内容,请尝试刷新页面。");
     }
 
     let highlights: Highlight[] = [];
@@ -317,7 +317,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       // Content script may not be present (e.g. PDF, restricted page). Ignore.
     }
 
-    setStatus({ type: "saving", message: "Saving to LLM Wiki..." });
+    setStatus({ type: "saving", message: "正在保存到 LLM Wiki..." });
 
     const canonicalUrl = canonicalize(tab.url);
     const normalizedFolderPath = normalizeFolderPath(folderPath);
@@ -358,7 +358,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
   async function handleSavePdf() {
     if (!tab || !knowledgeBaseId) return;
 
-    setStatus({ type: "saving", message: "Downloading PDF..." });
+    setStatus({ type: "saving", message: "正在下载 PDF..." });
 
     const downloadResult = await chrome.runtime.sendMessage({
       type: "DOWNLOAD_PDF",
@@ -369,7 +369,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
       throw new Error(downloadResult.error);
     }
 
-    setStatus({ type: "saving", message: "Uploading to LLM Wiki..." });
+    setStatus({ type: "saving", message: "正在上传到 LLM Wiki..." });
 
     const pdfBytes = new Uint8Array(downloadResult.blob);
     const normalizedFolderPath = normalizeFolderPath(folderPath);
@@ -390,7 +390,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
         await moveDocument(apiUrl, accessToken, existingDoc.id, id);
         setExistingDoc({ ...existingDoc, knowledge_base_id: id });
       } catch {
-        setStatus({ type: "error", message: "Couldn't move to that knowledge base." });
+        setStatus({ type: "error", message: "无法移动到该知识库。" });
       }
     }
   }
@@ -411,7 +411,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
     <div className="space-y-3">
       {/* Title */}
       <div>
-        <label className="mb-1.5 block text-xs font-medium text-zinc-700">Title</label>
+        <label className="mb-1.5 block text-xs font-medium text-zinc-700">标题</label>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
@@ -419,7 +419,7 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
                      text-zinc-950 shadow-sm outline-none transition-colors
                      placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-2
                      focus:ring-zinc-950/10"
-          placeholder="Page title"
+          placeholder="页面标题"
         />
       </div>
 
@@ -480,16 +480,16 @@ export default function SaveForm({ apiUrl, accessToken }: Props) {
                      focus-visible:ring-zinc-950 focus-visible:ring-offset-2
                      disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {isSaving ? "Saving..." : "Save to LLM Wiki"}
+          {isSaving ? "保存中..." : "保存到 LLM Wiki"}
         </button>
       )}
 
       {checkingExisting && (
-        <p className="text-xs text-zinc-500">Checking saved status...</p>
+        <p className="text-xs text-zinc-500">正在检查保存状态...</p>
       )}
       {isAlreadySaved && status.type !== "success" && (
         <p className="text-xs text-emerald-700">
-          This page is already in LLM Wiki.
+          此页面已保存在 LLM Wiki 中。
         </p>
       )}
 

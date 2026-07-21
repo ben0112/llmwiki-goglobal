@@ -29,15 +29,15 @@ function wikiHref(slug: string): string {
 function relativeTime(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
   const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return 'Just now'
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes} 分钟前`
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
+  if (hours < 24) return `${hours} 小时前`
   const days = Math.floor(hours / 24)
-  if (days < 30) return `${days}d ago`
+  if (days < 30) return `${days} 天前`
   const months = Math.floor(days / 30)
-  if (months < 12) return `${months}mo ago`
-  return `${Math.floor(months / 12)}y ago`
+  if (months < 12) return `${months} 个月前`
+  return `${Math.floor(months / 12)} 年前`
 }
 
 export default function WikisPage() {
@@ -67,7 +67,7 @@ export default function WikisPage() {
     try {
       const email = user?.email || 'My'
       const displayName = email.split('@')[0].charAt(0).toUpperCase() + email.split('@')[0].slice(1)
-      const kb = await createKB(`${displayName}'s Wiki`)
+      const kb = await createKB(`${displayName} 的维基`)
       openWiki(kb.slug)
     } catch (err) {
       console.error('Failed to create KB:', err)
@@ -119,7 +119,7 @@ export default function WikisPage() {
                 <AlertCircle className="size-4" />
               </div>
               <div className="min-w-0">
-                <h1 className="text-sm font-semibold text-foreground">Could not load wikis</h1>
+                <h1 className="text-sm font-semibold text-foreground">维基加载失败</h1>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
                   {error}
                 </p>
@@ -130,7 +130,7 @@ export default function WikisPage() {
               className="mt-4 inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
             >
               <RefreshCcw className="size-4" />
-              Retry
+              重试
             </button>
           </div>
         </div>
@@ -149,10 +149,10 @@ export default function WikisPage() {
                 <BookOpen size={24} className="text-background" />
               </div>
               <h1 className="text-3xl font-bold tracking-tight">
-                Create your first wiki
+                创建您的第一个维基
               </h1>
               <p className="mt-3 text-base text-muted-foreground leading-relaxed max-w-md mx-auto">
-                Upload sources, connect Claude, and let it compile a structured wiki automatically.
+                上传资料、连接 Claude,让它自动编纂出结构化的维基。
               </p>
             </div>
 
@@ -160,18 +160,18 @@ export default function WikisPage() {
               {[
                 {
                   step: '1',
-                  title: 'Create a wiki',
-                  desc: 'Name your knowledge space. You can have as many as you need.',
+                  title: '创建维基',
+                  desc: '为您的知识空间命名,数量不限。',
                 },
                 {
                   step: '2',
-                  title: 'Add sources',
-                  desc: 'Upload PDFs, notes, transcripts — anything you want Claude to learn from.',
+                  title: '添加资料',
+                  desc: '上传 PDF、笔记、会议记录 — 任何想让 Claude 学习的内容。',
                 },
                 {
                   step: '3',
-                  title: 'Ask Claude',
-                  desc: 'Claude reads your sources and compiles a wiki with cross-references and summaries.',
+                  title: '交给 Claude',
+                  desc: 'Claude 阅读您的资料,编纂出带交叉引用与摘要的维基。',
                 },
               ].map((item, i) => (
                 <motion.div
@@ -197,16 +197,16 @@ export default function WikisPage() {
                 className="inline-flex items-center justify-center gap-2.5 rounded-full bg-foreground text-background px-8 py-3 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-50"
               >
                 {creating ? (
-                  <><Loader2 size={15} className="animate-spin" /> Setting up...</>
+                  <><Loader2 size={15} className="animate-spin" /> 初始化中...</>
                 ) : (
-                  <><Plus size={15} /> Get started</>
+                  <><Plus size={15} /> 开始使用</>
                 )}
               </button>
               <button
                 onClick={() => setDialogOpen(true)}
                 className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
               >
-                or create with a custom name
+                或自定义名称创建
               </button>
             </div>
           </div>
@@ -248,7 +248,7 @@ export default function WikisPage() {
               className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-dashed border-border hover:border-primary/50 hover:bg-accent/30 transition-colors cursor-pointer min-h-[112px]"
             >
               <Plus size={16} className="text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">New Wiki</span>
+              <span className="text-xs text-muted-foreground">新建维基</span>
             </button>
           </div>
         </div>
@@ -287,8 +287,8 @@ function WikiCard({
   const [busy, setBusy] = React.useState(false)
 
   const stats: string[] = []
-  if (kb.source_count > 0) stats.push(`${kb.source_count} source${kb.source_count !== 1 ? 's' : ''}`)
-  if (kb.wiki_page_count > 0) stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+  if (kb.source_count > 0) stats.push(`${kb.source_count} 份资料`)
+  if (kb.wiki_page_count > 0) stats.push(`${kb.wiki_page_count} 个页面`)
 
   const handleRename = async () => {
     const next = renameName.trim()
@@ -298,7 +298,7 @@ function WikiCard({
       await renameKB(kb.id, next)
       setRenameOpen(false)
     } catch {
-      toast.error('Failed to rename wiki')
+      toast.error('重命名维基失败')
     } finally {
       setBusy(false)
     }
@@ -311,7 +311,7 @@ function WikiCard({
       await deleteKB(kb.id)
       setDeleteOpen(false)
     } catch {
-      toast.error('Failed to delete wiki')
+      toast.error('删除维基失败')
     } finally {
       setBusy(false)
     }
@@ -357,7 +357,7 @@ function WikiCard({
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
-                  aria-label="Wiki actions"
+                  aria-label="维基操作"
                   className="flex items-center justify-center size-7 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-accent opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 transition-opacity cursor-pointer"
                 >
                   <EllipsisVertical className="size-3.5" />
@@ -371,11 +371,11 @@ function WikiCard({
                   }}
                 >
                   <Pencil />
-                  Rename
+                  重命名
                 </DropdownMenuItem>
                 <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                   <Trash2 />
-                  Delete
+                  删除
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -385,7 +385,7 @@ function WikiCard({
           {stats.length > 0 ? (
             <span>{stats.join(' · ')}</span>
           ) : (
-            <span className="text-muted-foreground/30">No sources yet</span>
+            <span className="text-muted-foreground/30">暂无资料</span>
           )}
           <span className="ml-auto text-muted-foreground/30 shrink-0">
             {relativeTime(kb.updated_at)}
@@ -396,7 +396,7 @@ function WikiCard({
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Rename wiki</DialogTitle>
+            <DialogTitle>重命名维基</DialogTitle>
           </DialogHeader>
           <Input
             value={renameName}
@@ -406,7 +406,7 @@ function WikiCard({
           />
           <DialogFooter>
             <Button onClick={handleRename} disabled={busy || !renameName.trim() || renameName.trim() === kb.name}>
-              {busy ? 'Renaming…' : 'Rename'}
+              {busy ? '重命名中…' : '重命名'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -415,17 +415,17 @@ function WikiCard({
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete wiki</DialogTitle>
+            <DialogTitle>删除维基</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground">
-            This will permanently delete <strong>{kb.name}</strong> and all its documents. This cannot be undone.
+            将永久删除 <strong>{kb.name}</strong> 及其全部文档,此操作不可恢复。
           </p>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteOpen(false)}>
-              Cancel
+              取消
             </Button>
             <Button variant="destructive" onClick={handleDelete} disabled={busy}>
-              {busy ? 'Deleting…' : 'Delete'}
+              {busy ? '删除中…' : '删除'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -445,7 +445,7 @@ function PageHeader({ onNew }: { onNew?: () => void }) {
             className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
           >
             <Plus className="size-3" />
-            New
+            新建
           </button>
         )}
         <UserMenu />
@@ -491,16 +491,16 @@ function UserMenu() {
         {mounted && (
           <DropdownMenuItem onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
             {theme === 'dark' ? (
-              <><Sun className="mr-2 h-4 w-4" />Light Mode</>
+              <><Sun className="mr-2 h-4 w-4" />浅色模式</>
             ) : (
-              <><Moon className="mr-2 h-4 w-4" />Dark Mode</>
+              <><Moon className="mr-2 h-4 w-4" />深色模式</>
             )}
           </DropdownMenuItem>
         )}
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={handleSignOut}>
           <LogOut className="mr-2 h-4 w-4" />
-          Sign Out
+          退出登录
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -531,18 +531,18 @@ function CreateWikiDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Create {isCourse ? 'course' : 'wiki'}</DialogTitle>
+          <DialogTitle>新建{isCourse ? '课程' : '维基'}</DialogTitle>
         </DialogHeader>
         <Input
           value={name}
           onChange={(e) => onNameChange(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && onCreate()}
-          placeholder={isCourse ? 'Intro to Reinforcement Learning' : 'My Research'}
+          placeholder={isCourse ? '强化学习入门' : '我的研究'}
           autoFocus
         />
         {isCourse && (
           <p className="-mt-1 text-xs leading-relaxed text-muted-foreground">
-            A course presents your material as ordered lessons with progress tracking and resume, instead of a free-form wiki.
+            课程会将您的材料组织为有序课时,支持进度跟踪与续学,而非自由形式的维基。
           </p>
         )}
         <DialogFooter className="items-center gap-3 sm:justify-between">
@@ -551,10 +551,10 @@ function CreateWikiDialog({
             onClick={() => onKindChange(isCourse ? 'wiki' : 'course')}
             className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
           >
-            {isCourse ? 'Back to wiki' : 'Make this a course instead'}
+            {isCourse ? '改为维基' : '改为课程'}
           </button>
           <Button onClick={onCreate} disabled={creating || !name.trim()}>
-            {creating ? 'Creating…' : `Create ${isCourse ? 'course' : 'wiki'}`}
+            {creating ? '创建中…' : `创建${isCourse ? '课程' : '维基'}`}
           </Button>
         </DialogFooter>
       </DialogContent>

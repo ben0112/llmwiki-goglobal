@@ -534,13 +534,13 @@ class HighlightController {
     const pill = document.createElement("div");
     pill.className = "llmwiki-pill";
     const highlightBtn = document.createElement("button");
-    highlightBtn.textContent = "Highlight";
+    highlightBtn.textContent = "高亮";
     highlightBtn.onclick = (ev) => {
       ev.preventDefault();
       this.handleHighlight(range, false);
     };
     const noteBtn = document.createElement("button");
-    noteBtn.textContent = "Note";
+    noteBtn.textContent = "批注";
     noteBtn.onclick = (ev) => {
       ev.preventDefault();
       this.handleHighlight(range, true);
@@ -590,7 +590,7 @@ class HighlightController {
       // last range bounding rect via a transient anchor element.
       this.openPopoverAtRect(highlight.id, range.getBoundingClientRect(), { discardOnCancel: true });
     } else {
-      this.persistHighlight(highlight, "Highlight saved");
+      this.persistHighlight(highlight, "高亮已保存");
     }
   }
 
@@ -617,7 +617,7 @@ class HighlightController {
     const popover = document.createElement("div");
     popover.className = "llmwiki-popover";
     const textarea = document.createElement("textarea");
-    textarea.placeholder = "Add a note…";
+    textarea.placeholder = "添加批注…";
     textarea.value = highlight.comment ?? "";
     this.configureCommentTextarea(textarea);
     popover.appendChild(textarea);
@@ -627,21 +627,21 @@ class HighlightController {
     actions.className = "llmwiki-actions";
     const cancel = document.createElement("button");
     cancel.className = "llmwiki-cancel";
-    cancel.textContent = "Cancel";
+    cancel.textContent = "取消";
     cancel.onclick = () => {
       if (options.discardOnCancel) this.discardLocalHighlight(id);
       this.removePopover();
     };
     const save = document.createElement("button");
     save.className = "llmwiki-save";
-    save.textContent = "Save";
+    save.textContent = "保存";
     save.onclick = () => {
       const value = textarea.value.trim() || null;
       highlight.comment = value;
       this.savePendingPageState();
       this.removePopover();
       this.syncCommentMarkers(highlight);
-      this.persistHighlight(highlight, "Comment saved");
+      this.persistHighlight(highlight, "批注已保存");
     };
     actions.appendChild(cancel);
     actions.appendChild(save);
@@ -666,7 +666,7 @@ class HighlightController {
     const popover = document.createElement("div");
     popover.className = "llmwiki-popover";
     const textarea = document.createElement("textarea");
-    textarea.placeholder = "Add a note…";
+    textarea.placeholder = "添加批注…";
     textarea.value = highlight.comment ?? "";
     this.configureCommentTextarea(textarea);
     popover.appendChild(textarea);
@@ -675,7 +675,7 @@ class HighlightController {
     row.className = "llmwiki-row";
     const del = document.createElement("button");
     del.className = "llmwiki-delete";
-    del.textContent = "Delete";
+    del.textContent = "删除";
     del.onclick = () => {
       if (options.discardOnCancel) this.discardLocalHighlight(id);
       else this.deleteHighlight(id);
@@ -685,20 +685,20 @@ class HighlightController {
     actions.className = "llmwiki-actions";
     const cancel = document.createElement("button");
     cancel.className = "llmwiki-cancel";
-    cancel.textContent = "Cancel";
+    cancel.textContent = "取消";
     cancel.onclick = () => {
       if (options.discardOnCancel) this.discardLocalHighlight(id);
       this.removePopover();
     };
     const save = document.createElement("button");
     save.className = "llmwiki-save";
-    save.textContent = "Save";
+    save.textContent = "保存";
     save.onclick = () => {
       highlight.comment = textarea.value.trim() || null;
       this.syncCommentMarkers(highlight);
       this.savePendingPageState();
       this.removePopover();
-      this.persistHighlight(highlight, "Comment saved");
+      this.persistHighlight(highlight, "批注已保存");
     };
     actions.appendChild(cancel);
     actions.appendChild(save);
@@ -936,17 +936,17 @@ class HighlightController {
       this.apiUrl = this.apiUrl ?? await getApiUrl();
       await this.ensureSession();
       if (this.mode !== "local" && !this.accessToken) {
-        this.showToast("Sign in to save highlights");
+        this.showToast("登录后才能保存高亮");
         return false;
       }
 
       const knowledgeBaseId = await this.resolveKnowledgeBaseId();
       if (!knowledgeBaseId) {
-        this.showToast("Choose a knowledge base first");
+        this.showToast("请先选择知识库");
         return false;
       }
 
-      this.showToast("Saving article...");
+      this.showToast("正在保存文章...");
       const highlightsToSave = this.highlights.length ? [...this.highlights] : [];
       this.autoSaveIncludedHighlightIds = new Set(highlightsToSave.map((h) => h.id));
       const result = await saveWebPage(this.apiUrl, this.accessToken, knowledgeBaseId, {
@@ -961,12 +961,12 @@ class HighlightController {
       if (typeof result.version === "number") this.version = result.version;
       if (result.highlights) this.highlights = result.highlights;
       await this.refreshAfterSave(result.id, false);
-      this.showToast("Article saved with highlight");
+      this.showToast("文章及高亮已保存");
       return true;
     } catch (err) {
       console.warn("[llmwiki] auto-save failed; cached locally:", err);
       this.savePendingPageState();
-      this.showToast("Saved locally; will retry");
+      this.showToast("已保存到本地,稍后重试");
       return false;
     }
   }
@@ -983,7 +983,7 @@ class HighlightController {
       // replace that enriched copy and drop textAnchor, so skip only the
       // highlight event that was part of the initial autosave payload.
       if (
-        successMessage === "Highlight saved" &&
+        successMessage === "高亮已保存" &&
         this.autoSaveIncludedHighlightIds.has(highlight.id)
       ) {
         if (!this.restoredPendingState) this.clearPendingPageState();
@@ -1014,13 +1014,13 @@ class HighlightController {
       this.mergeServerHighlights(result);
       this.deletedHighlightIds.delete(highlight.id);
       if (!this.restoredPendingState && !this.deletedHighlightIds.size) this.clearPendingPageState();
-      if (successMessage && (hadDocument || successMessage !== "Highlight saved")) {
+      if (successMessage && (hadDocument || successMessage !== "高亮已保存")) {
         this.showToast(successMessage);
       }
     } catch (err) {
       console.warn("[llmwiki] save highlight failed; cached locally:", err);
       this.savePendingPageState();
-      this.showToast("Saved locally; will retry");
+      this.showToast("已保存到本地,稍后重试");
       this.scheduleSave();
     }
   }
@@ -1044,7 +1044,7 @@ class HighlightController {
     } catch (err) {
       console.warn("[llmwiki] delete highlight failed; cached locally:", err);
       this.savePendingPageState();
-      this.showToast("Saved locally; will retry");
+      this.showToast("已保存到本地,稍后重试");
       this.scheduleSave();
     }
   }
@@ -1122,7 +1122,7 @@ class HighlightController {
       } else {
         console.warn("[llmwiki] save highlights failed; cached locally:", err);
         this.savePendingPageState();
-        this.showToast("Saved locally; will retry");
+        this.showToast("已保存到本地,稍后重试");
       }
     } finally {
       this.isSaving = false;

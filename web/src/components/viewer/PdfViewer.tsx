@@ -332,7 +332,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
           [anchorNode, focusNode].find(
             (n) => n && !inThisPage(n) && (n as HTMLElement).closest?.('[data-page]') !== null,
           ) ?? null
-        if (otherPageWrapper) setNotice('Highlight must stay on one page')
+        if (otherPageWrapper) setNotice('高亮不能跨页')
         return
       }
 
@@ -797,8 +797,8 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                     if (e.key === 'Enter') { e.preventDefault(); navigateMatch(e.shiftKey ? -1 : 1) }
                     if (e.key === 'Escape') closeSearch()
                   }}
-                  placeholder="Find in document..."
-                  aria-label="Find in document"
+                  placeholder="文档内查找..."
+                  aria-label="文档内查找"
                   className="flex-1 min-w-0 bg-transparent outline-none text-foreground placeholder:text-muted-foreground/50"
                 />
               </div>
@@ -806,18 +806,18 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                 <span className="tabular-nums text-[10px] flex-shrink-0">{currentMatchIndex + 1}/{matchCount}</span>
               )}
               {searchQuery && matchCount === 0 && !isIndexing && (
-                <span className="text-[10px] flex-shrink-0 opacity-50">No results</span>
+                <span className="text-[10px] flex-shrink-0 opacity-50">无结果</span>
               )}
               {isIndexing && searchQuery && (
-                <span className="text-[10px] flex-shrink-0 opacity-50">Indexing...</span>
+                <span className="text-[10px] flex-shrink-0 opacity-50">索引中...</span>
               )}
-              <button onClick={() => navigateMatch(-1)} disabled={matchCount === 0} aria-label="Previous match" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer">
+              <button onClick={() => navigateMatch(-1)} disabled={matchCount === 0} aria-label="上一个匹配" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer">
                 <ChevronUp className="size-3.5" />
               </button>
-              <button onClick={() => navigateMatch(1)} disabled={matchCount === 0} aria-label="Next match" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer">
+              <button onClick={() => navigateMatch(1)} disabled={matchCount === 0} aria-label="下一个匹配" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer">
                 <ChevronDown className="size-3.5" />
               </button>
-              <button onClick={closeSearch} aria-label="Close search" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent cursor-pointer">
+              <button onClick={closeSearch} aria-label="关闭搜索" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent cursor-pointer">
                 <X className="size-3.5" />
               </button>
             </>
@@ -825,23 +825,23 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
             <>
               {title && <span className="min-w-0 truncate text-foreground mr-auto">{title}</span>}
               {!title && <div className="flex-1" />}
-              <button onClick={openSearch} aria-label="Find in document" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent cursor-pointer" title="Find (Cmd+F)">
+              <button onClick={openSearch} aria-label="文档内查找" className="p-1.5 rounded-md hover:text-foreground hover:bg-accent cursor-pointer" title="查找 (Cmd+F)">
                 <Search className="size-3.5" />
               </button>
               {documentId && (
                 <button
                   onClick={() => setDrawerOpen((v) => !v)}
-                  aria-label="Highlights"
+                  aria-label="高亮"
                   className={cn(
                     'p-1.5 rounded-md hover:text-foreground hover:bg-accent cursor-pointer',
                     drawerOpen && 'text-foreground bg-accent',
                   )}
-                  title={`Highlights (${pdfHighlightCount})`}
+                  title={`高亮 (${pdfHighlightCount})`}
                 >
                   <MessageSquare className="size-3.5" />
                 </button>
               )}
-              <a href={fileUrl} download className="p-1.5 rounded-md hover:text-foreground hover:bg-accent" title="Download PDF">
+              <a href={fileUrl} download className="p-1.5 rounded-md hover:text-foreground hover:bg-accent" title="下载 PDF">
                 <Download className="size-3.5" />
               </a>
               <div className="w-px h-4 bg-border mx-1" />
@@ -861,7 +861,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                     className="w-8 text-center bg-muted/50 rounded px-1 py-0.5 outline-none text-foreground tabular-nums"
                   />
                 ) : (
-                  <button onClick={activatePageInput} className="tabular-nums hover:text-foreground cursor-text" title="Go to page">
+                  <button onClick={activatePageInput} className="tabular-nums hover:text-foreground cursor-text" title="跳转到页">
                     {currentPage}
                   </button>
                 )}
@@ -872,13 +872,13 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
               </div>
               <div className="w-px h-4 bg-border mx-1" />
               <div className="flex items-center gap-0.5">
-                <button onClick={zoomOut} disabled={displayScale <= 0.25} className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer" title="Zoom out">
+                <button onClick={zoomOut} disabled={displayScale <= 0.25} className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer" title="缩小">
                   <ZoomOut className="size-3.5" />
                 </button>
-                <button onClick={zoomReset} className="tabular-nums hover:text-foreground min-w-[3ch] text-center cursor-pointer" title="Reset zoom">
+                <button onClick={zoomReset} className="tabular-nums hover:text-foreground min-w-[3ch] text-center cursor-pointer" title="重置缩放">
                   {Math.round(displayScale * 100)}%
                 </button>
-                <button onClick={zoomIn} disabled={displayScale >= 3} className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer" title="Zoom in">
+                <button onClick={zoomIn} disabled={displayScale >= 3} className="p-1.5 rounded-md hover:text-foreground hover:bg-accent disabled:opacity-30 cursor-pointer" title="放大">
                   <ZoomIn className="size-3.5" />
                 </button>
               </div>
@@ -906,7 +906,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
             }
             error={
               <div className="text-center py-16 text-sm text-destructive">
-                <p>Failed to load PDF</p>
+                <p>PDF 加载失败</p>
               </div>
             }
           >
@@ -960,14 +960,14 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                           disabled={savingHighlight}
                           className="rounded-full px-3 py-1 font-medium hover:bg-white/10 disabled:opacity-50"
                         >
-                          {savingHighlight ? 'Saving…' : 'Highlight'}
+                          {savingHighlight ? '保存中…' : '高亮'}
                         </button>
                         <button
                           onClick={startNoteFromCreate}
                           disabled={savingHighlight}
                           className="rounded-full px-3 py-1 font-medium hover:bg-white/10 disabled:opacity-50"
                         >
-                          Note
+                          批注
                         </button>
                       </div>
                     )}
@@ -982,14 +982,14 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                           disabled={savingHighlight}
                           className="rounded-full px-3 py-1 font-medium hover:bg-white/10 disabled:opacity-50"
                         >
-                          Add note
+                          添加批注
                         </button>
                         <button
                           onClick={deleteHighlight}
                           disabled={savingHighlight}
                           className="rounded-full px-3 py-1 font-medium text-red-300 hover:bg-white/10 disabled:opacity-50"
                         >
-                          {savingHighlight ? 'Deleting…' : 'Delete'}
+                          {savingHighlight ? '删除中…' : '删除'}
                         </button>
                       </div>
                     )}
@@ -1008,14 +1008,14 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                             disabled={savingHighlight}
                             className="rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
                           >
-                            {savingHighlight ? 'Deleting…' : 'Delete'}
+                            {savingHighlight ? '删除中…' : '删除'}
                           </button>
                           <button
                             onClick={() => setCommentExpanded(true)}
                             disabled={savingHighlight}
                             className="rounded bg-zinc-950 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
                           >
-                            Edit
+                            编辑
                           </button>
                         </div>
                       </div>
@@ -1033,7 +1033,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                         <textarea
                           autoFocus
                           rows={2}
-                          placeholder="Add a comment (optional)"
+                          placeholder="添加批注(可选)"
                           value={commentDraft}
                           onChange={(e) => setCommentDraft(e.target.value)}
                           className="w-full resize-none rounded border border-zinc-200 px-2 py-1 text-xs outline-none focus:border-zinc-400"
@@ -1045,7 +1045,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                               disabled={savingHighlight}
                               className="rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
                             >
-                              Delete
+                              删除
                             </button>
                           ) : (
                             <span />
@@ -1055,14 +1055,14 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                               onClick={cancelPopover}
                               className="rounded px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-100"
                             >
-                              Cancel
+                              取消
                             </button>
                             <button
                               onClick={saveHighlight}
                               disabled={savingHighlight}
                               className="rounded bg-zinc-950 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
                             >
-                              {savingHighlight ? 'Saving…' : popover.mode === 'edit' ? 'Save' : 'Highlight'}
+                              {savingHighlight ? '保存中…' : popover.mode === 'edit' ? '保存' : '高亮'}
                             </button>
                           </div>
                         </div>
@@ -1079,12 +1079,12 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
         <aside className="hidden w-72 shrink-0 border-l border-border bg-background md:flex md:flex-col">
           <div className="flex items-center justify-between border-b border-border px-3 py-2">
             <div className="text-xs font-semibold text-foreground">
-              Highlights {pdfHighlightCount > 0 ? `(${pdfHighlightCount})` : ''}
+              高亮 {pdfHighlightCount > 0 ? `(${pdfHighlightCount})` : ''}
             </div>
             <button
               onClick={() => setDrawerOpen(false)}
               className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-              aria-label="Close highlights drawer"
+              aria-label="关闭高亮列表"
             >
               <X className="size-3.5" />
             </button>
@@ -1092,7 +1092,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
           <div className="flex-1 overflow-auto">
             {pdfHighlightsSorted.length === 0 ? (
               <div className="px-3 py-6 text-center text-xs text-muted-foreground">
-                Select text in the PDF to highlight or add a comment.
+                在 PDF 中选中文字即可高亮或添加批注。
               </div>
             ) : (
               <ul className="divide-y divide-border">
@@ -1106,7 +1106,7 @@ export default function PdfViewer({ fileUrl, documentId, title, className, initi
                         &ldquo;{h.pdfAnchor.textContent}&rdquo;
                       </div>
                       <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
-                        <span>Page {h.pdfAnchor.page}</span>
+                        <span>第 {h.pdfAnchor.page} 页</span>
                         {h.comment && <span className="truncate">· {h.comment}</span>}
                       </div>
                     </button>

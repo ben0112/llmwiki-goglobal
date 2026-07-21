@@ -2,11 +2,11 @@ import type { Metadata } from 'next'
 import { SignupForm } from './SignupForm'
 
 export const metadata: Metadata = {
-  title: 'Sign Up | LLM Wiki',
-  description: "Create a free LLM Wiki account. Upload documents and build a compounding wiki powered by Claude.",
+  title: '注册 | LLM Wiki',
+  description: "免费注册 LLM Wiki 账号。上传文档,由 Claude 构建持续积累的维基。",
   openGraph: {
-    title: 'Sign Up | LLM Wiki',
-    description: "Create a free LLM Wiki account. Upload documents and build a compounding wiki powered by Claude.",
+    title: '注册 | LLM Wiki',
+    description: "免费注册 LLM Wiki 账号。上传文档,由 Claude 构建持续积累的维基。",
   },
 }
 

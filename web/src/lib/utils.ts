@@ -15,6 +15,6 @@ export function sanitizeTitle(title: string): string {
 /** Convert a note title to a safe filename */
 export function toNoteFilename(title: string): string {
   const clean = sanitizeTitle(title)
-  const base = clean || 'Untitled'
+  const base = clean || '无标题'
   return base.endsWith('.md') ? base : base + '.md'
 }

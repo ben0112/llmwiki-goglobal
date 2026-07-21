@@ -40,7 +40,7 @@ export default function HtmlViewer({ fileUrl, sourceUrl, highlightIds = [], clas
 
     fetch(fileUrl)
       .then((res) => {
-        if (!res.ok) throw new Error(`Failed to load: ${res.status}`)
+        if (!res.ok) throw new Error(`加载失败: ${res.status}`)
         return res.text()
       })
       .then((html) => {
@@ -78,7 +78,7 @@ export default function HtmlViewer({ fileUrl, sourceUrl, highlightIds = [], clas
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-3">
-        <p className="text-sm text-muted-foreground">Failed to load document</p>
+        <p className="text-sm text-muted-foreground">文档加载失败</p>
         {sourceUrl && (
           <a
             href={sourceUrl}
@@ -100,7 +100,7 @@ export default function HtmlViewer({ fileUrl, sourceUrl, highlightIds = [], clas
       srcDoc={srcdoc ?? ''}
       sandbox="allow-same-origin"
       className={cn('w-full h-full border-0 bg-white', className)}
-      title="Document viewer"
+      title="文档查看器"
       onLoad={handleIframeLoad}
     />
   )

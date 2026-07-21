@@ -16,13 +16,13 @@ export default function AuthGate({ onPasswordSignIn }: Props) {
   return (
     <div className="flex flex-col gap-4 py-2">
       <p className="max-w-[260px] text-center text-sm leading-5 text-zinc-500">
-        Sign in to save pages to your knowledge base
+        登录后即可将页面保存到您的知识库
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-3">
         <div className="space-y-1.5">
           <label htmlFor="llmwiki-email" className="text-xs font-medium text-zinc-600">
-            Email
+            邮箱
           </label>
           <input
             id="llmwiki-email"
@@ -36,7 +36,7 @@ export default function AuthGate({ onPasswordSignIn }: Props) {
         </div>
         <div className="space-y-1.5">
           <label htmlFor="llmwiki-password" className="text-xs font-medium text-zinc-600">
-            Password
+            密码
           </label>
           <input
             id="llmwiki-password"
@@ -52,7 +52,7 @@ export default function AuthGate({ onPasswordSignIn }: Props) {
           type="submit"
           className="inline-flex h-9 w-full items-center justify-center rounded-md bg-zinc-950 px-3 text-sm font-medium text-white shadow-sm transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-950 focus-visible:ring-offset-2"
         >
-          Sign in
+          登录
         </button>
       </form>
     </div>

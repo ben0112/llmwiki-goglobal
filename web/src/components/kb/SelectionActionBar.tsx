@@ -34,7 +34,7 @@ export function SelectionActionBar({ count, onDelete, onClear }: Props) {
           <button
             onClick={onClear}
             className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors cursor-pointer"
-            title="Clear selection (Esc)"
+            title="清除选择 (Esc)"
           >
             <X className="size-4" />
           </button>

@@ -43,7 +43,7 @@ export default function OnboardingPage() {
   React.useEffect(() => {
     if (user) {
       const name = user.email.split('@')[0]
-      setWikiName(`${name.charAt(0).toUpperCase() + name.slice(1)}'s Wiki`)
+      setWikiName(`${name.charAt(0).toUpperCase() + name.slice(1)} 的维基`)
     }
   }, [user])
 
@@ -56,7 +56,7 @@ export default function OnboardingPage() {
       setCreatedSlug(kb.slug)
       goToStep('connect')
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to create wiki'
+      const msg = err instanceof Error ? err.message : '创建维基失败'
       setError(msg)
     } finally {
       setCreating(false)
@@ -121,17 +121,17 @@ export default function OnboardingPage() {
                 <BookOpen size={28} className="text-background" />
               </div>
               <h1 className="text-3xl font-bold tracking-tight">
-                Welcome to LLM Wiki
+                欢迎使用 LLM Wiki
               </h1>
               <p className="mt-4 text-base text-muted-foreground leading-relaxed max-w-sm mx-auto">
-                Your LLM compiles and maintains a structured wiki from your raw sources.
+                大模型基于您的原始资料,自动编纂并持续维护结构化的维基。
               </p>
 
               <div className="grid grid-cols-3 gap-3 mt-10 text-left">
                 {[
-                  { icon: FileText, title: 'Sources', desc: 'PDFs, notes, transcripts' },
-                  { icon: BookOpen, title: 'Wiki', desc: 'Auto-generated pages' },
-                  { icon: PenTool, title: 'Tools', desc: 'Search, read, write via MCP' },
+                  { icon: FileText, title: '资料', desc: 'PDF、笔记、会议记录' },
+                  { icon: BookOpen, title: '维基', desc: '自动生成的页面' },
+                  { icon: PenTool, title: '工具', desc: '通过 MCP 搜索、阅读、写作' },
                 ].map((item) => (
                   <div key={item.title} className="rounded-xl border border-border p-4 bg-card">
                     <item.icon className="size-4 text-muted-foreground mb-2.5" strokeWidth={1.5} />
@@ -145,7 +145,7 @@ export default function OnboardingPage() {
                 onClick={() => goToStep('create')}
                 className="mt-10 inline-flex items-center gap-2 rounded-full bg-foreground text-background px-8 py-3 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
               >
-                Get started
+                开始使用
                 <ArrowRight className="size-3.5" />
               </button>
             </motion.div>
@@ -165,14 +165,14 @@ export default function OnboardingPage() {
                 className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer mb-8"
               >
                 <ArrowLeft className="size-3" />
-                Back
+                返回
               </button>
 
               <h1 className="text-2xl font-bold tracking-tight">
-                Name your wiki
+                为维基命名
               </h1>
               <p className="mt-2 text-sm text-muted-foreground">
-                This is your knowledge space. You can rename it anytime.
+                这是您的知识空间,之后可随时重命名。
               </p>
 
               <div className="mt-8">
@@ -181,7 +181,7 @@ export default function OnboardingPage() {
                   value={wikiName}
                   onChange={(e) => setWikiName(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleCreateWiki()}
-                  placeholder="My Research"
+                  placeholder="我的研究"
                   className="w-full rounded-xl border border-border bg-card px-4 py-3.5 text-base focus:outline-none focus:ring-2 focus:ring-foreground/20 transition-shadow"
                   autoFocus
                 />
@@ -197,9 +197,9 @@ export default function OnboardingPage() {
                 className="mt-6 w-full inline-flex items-center justify-center gap-2 rounded-full bg-foreground text-background px-8 py-3 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-40"
               >
                 {creating ? (
-                  <><Loader2 size={15} className="animate-spin" /> Creating...</>
+                  <><Loader2 size={15} className="animate-spin" /> 创建中...</>
                 ) : (
-                  <>Create wiki <ArrowRight className="size-3.5" /></>
+                  <>创建维基 <ArrowRight className="size-3.5" /></>
                 )}
               </button>
             </motion.div>
@@ -219,14 +219,14 @@ export default function OnboardingPage() {
                 className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer mb-8"
               >
                 <ArrowLeft className="size-3" />
-                Back
+                返回
               </button>
 
               <h1 className="text-2xl font-bold tracking-tight">
-                Connect Claude
+                连接 Claude
               </h1>
               <p className="mt-2 text-sm text-muted-foreground">
-                Add LLM Wiki as a connector so Claude can read and write to your wiki.
+                将 LLM Wiki 添加为连接器,让 Claude 可以读写您的维基。
               </p>
 
               <div className="mt-8 space-y-6">
@@ -244,22 +244,22 @@ export default function OnboardingPage() {
                         : 'bg-foreground text-background hover:opacity-90'
                     )}
                   >
-                    {urlCopied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy</>}
+                    {urlCopied ? <><Check size={14} /> 已复制</> : <><Copy size={14} /> 复制</>}
                   </button>
                 </div>
 
                 {/* Steps */}
                 <div className="rounded-xl border border-border bg-card p-5">
                   <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/50 mb-3">
-                    In Claude
+                    在 Claude 中
                   </p>
                   <ol className="space-y-2.5">
                     {[
-                      <>Open <strong>Settings</strong></>,
-                      <>Go to <strong>Connectors</strong></>,
-                      <>Click <strong>Add custom connector</strong></>,
-                      'Paste the URL above and approve access',
-                      'Sign in with your account when prompted',
+                      <>打开<strong>设置</strong></>,
+                      <>进入<strong>连接器 (Connectors)</strong></>,
+                      <>点击<strong>添加自定义连接器</strong></>,
+                      '粘贴上方 URL 并批准访问',
+                      '按提示登录您的账号',
                     ].map((text, i) => (
                       <li key={i} className="flex items-start gap-3 text-sm">
                         <span className="flex items-center justify-center w-5 h-5 rounded-full bg-muted text-[10px] font-bold text-muted-foreground shrink-0 mt-0.5">
@@ -277,7 +277,7 @@ export default function OnboardingPage() {
                   onClick={() => goToStep('done')}
                   className="flex-1 inline-flex items-center justify-center gap-2 rounded-full bg-foreground text-background px-8 py-3 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
                 >
-                  Continue
+                  继续
                   <ArrowRight className="size-3.5" />
                 </button>
               </div>
@@ -286,7 +286,7 @@ export default function OnboardingPage() {
                 onClick={() => goToStep('done')}
                 className="mt-3 w-full text-center text-xs text-muted-foreground/50 hover:text-muted-foreground transition-colors cursor-pointer"
               >
-                Skip — I&apos;ll set this up later
+                跳过 — 稍后再设置
               </button>
             </motion.div>
           )}
@@ -305,17 +305,17 @@ export default function OnboardingPage() {
                 <Check size={28} className="text-green-600 dark:text-green-400" />
               </div>
               <h1 className="text-2xl font-bold tracking-tight">
-                You&apos;re all set
+                设置完成
               </h1>
               <p className="mt-3 text-sm text-muted-foreground leading-relaxed max-w-sm mx-auto">
-                Upload some sources to your wiki, then ask Claude to compile them into structured pages.
+                上传一些资料到维基,然后让 Claude 将它们编纂为结构化页面。
               </p>
 
               <button
                 onClick={handleComplete}
                 className="mt-10 inline-flex items-center justify-center gap-2 rounded-full bg-foreground text-background px-8 py-3 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
               >
-                Go to my wiki
+                进入我的维基
                 <ArrowRight className="size-3.5" />
               </button>
 
@@ -327,7 +327,7 @@ export default function OnboardingPage() {
                   className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
                 >
                   <ExternalLink size={12} />
-                  Open Claude
+                  打开 Claude
                 </a>
               </div>
             </motion.div>

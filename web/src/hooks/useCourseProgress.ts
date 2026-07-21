@@ -33,7 +33,7 @@ export function useCourseProgress(
         })
       } catch {
         // The next documents refetch reverts the optimistic state — say so.
-        toast.error("Progress didn't save — check your connection and try again")
+        toast.error("进度保存失败 — 请检查网络后重试")
       }
     },
     [token, setDocuments],

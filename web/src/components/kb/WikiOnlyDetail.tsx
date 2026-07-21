@@ -261,7 +261,7 @@ export function WikiOnlyDetail({
   const forward = React.useMemo(() => {
     if (activeLessonIdx < 0) return null
     const next = lessons[activeLessonIdx + 1]
-    return { label: next?.title ?? 'Finish', path: next?.path ?? 'overview.md' }
+    return { label: next?.title ?? '完成', path: next?.path ?? 'overview.md' }
   }, [activeLessonIdx, lessons])
 
   const resumeLesson = React.useMemo(() => {
@@ -293,7 +293,7 @@ export function WikiOnlyDetail({
         if (!controller.signal.aborted) setPageContent(res.content || '')
       })
       .catch(() => {
-        if (!controller.signal.aborted) setPageContent('Failed to load page content.')
+        if (!controller.signal.aborted) setPageContent('页面内容加载失败。')
       })
       .finally(() => {
         if (!controller.signal.aborted) {
@@ -434,9 +434,9 @@ export function WikiOnlyDetail({
             <div className="flex h-full flex-col items-center justify-center gap-4 px-6">
               <BookOpen className="size-10 text-muted-foreground/20" />
               <div className="max-w-sm text-center">
-                <h3 className="mb-1.5 text-base font-medium">No wiki yet</h3>
+                <h3 className="mb-1.5 text-base font-medium">还没有维基</h3>
                 <p className="text-sm leading-relaxed text-muted-foreground">
-                  Add some sources, then ask Claude to compile a wiki from them.
+                  先添加一些资料,然后让 Claude 从中编译出一个维基。
                 </p>
               </div>
               <div className="mt-2 flex items-center gap-3">

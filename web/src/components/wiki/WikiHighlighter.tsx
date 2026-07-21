@@ -289,7 +289,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
 
   const handleHighlight = React.useCallback(async () => {
     if (!toolbar) return
-    const ok = await runSave(() => saveHighlight(toolbar.anchor, null), 'Failed to save highlight')
+    const ok = await runSave(() => saveHighlight(toolbar.anchor, null), '高亮保存失败')
     if (!ok) return
     window.getSelection()?.removeAllRanges()
     setToolbar(null)
@@ -305,7 +305,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
 
   const handleComposerSave = React.useCallback(async () => {
     if (!composer) return
-    const ok = await runSave(() => saveHighlight(composer.anchor, draft), 'Failed to save note')
+    const ok = await runSave(() => saveHighlight(composer.anchor, draft), '批注保存失败')
     if (!ok) return
     setComposer(null)
     setDraft('')
@@ -313,7 +313,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
 
   const handleCommentSave = React.useCallback(async () => {
     if (!active) return
-    const ok = await runSave(() => updateComment(active.id, draft), 'Failed to save note')
+    const ok = await runSave(() => updateComment(active.id, draft), '批注保存失败')
     if (!ok) return
     setActive({ ...active, comment: draft.trim() || null })
     setEditing(false)
@@ -321,7 +321,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
 
   const handleDelete = React.useCallback(async () => {
     if (!active) return
-    const ok = await runSave(() => removeHighlight(active.id), 'Failed to remove highlight')
+    const ok = await runSave(() => removeHighlight(active.id), '高亮删除失败')
     if (!ok) return
     setActive(null)
     setEditing(false)
@@ -350,7 +350,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
             variant="ghost"
             size="icon"
             className="size-7"
-            title="Highlight"
+            title="高亮"
             disabled={saving}
             onClick={handleHighlight}
           >
@@ -360,7 +360,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
             variant="ghost"
             size="icon"
             className="size-7"
-            title="Highlight with note"
+            title="高亮并批注"
             disabled={saving}
             onClick={handleOpenComposer}
           >
@@ -378,7 +378,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
           <Textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder="What's unclear here?"
+            placeholder="这里有什么疑问?"
             rows={5}
             maxLength={4000}
             className="max-h-72 min-h-28 resize-y text-sm"
@@ -414,7 +414,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
               <Textarea
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
-                placeholder="What's unclear here?"
+                placeholder="这里有什么疑问?"
                 rows={5}
                 maxLength={4000}
                 className="max-h-72 min-h-28 resize-y text-sm"
@@ -438,14 +438,14 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
                   active.comment ? 'text-foreground' : 'italic text-muted-foreground',
                 )}
               >
-                {active.comment ?? 'No note'}
+                {active.comment ?? '暂无批注'}
               </p>
               <div className="flex shrink-0 gap-0.5">
                 <Button
                   variant="ghost"
                   size="icon"
                   className="size-7"
-                  title={active.comment ? 'Edit note' : 'Add note'}
+                  title={active.comment ? '编辑批注' : '添加批注'}
                   onClick={() => {
                     setDraft(active.comment ?? '')
                     setEditing(true)
@@ -457,7 +457,7 @@ export function WikiHighlighter({ scrollRef, contentRef, documentId, contentKey 
                   variant="ghost"
                   size="icon"
                   className="size-7 text-muted-foreground hover:text-destructive"
-                  title="Remove highlight"
+                  title="删除高亮"
                   disabled={saving}
                   onClick={handleDelete}
                 >

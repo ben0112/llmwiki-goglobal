@@ -122,7 +122,7 @@ export function NoteEditor({
         heading: { levels: [1, 2, 3] },
         link: false,
       }),
-      Placeholder.configure({ placeholder: 'Start writing...' }),
+      Placeholder.configure({ placeholder: '开始写作...' }),
       Typography,
       Link.configure({ autolink: true, openOnClick: false }),
       Image.configure({ inline: false, allowBase64: true }),
@@ -495,7 +495,7 @@ export function NoteEditor({
               type="text"
               value={title}
               onChange={handleTitleChange}
-              placeholder="Untitled"
+              placeholder="无标题"
               className="w-full text-2xl font-bold text-foreground bg-transparent border-none outline-none placeholder:text-muted-foreground/30 mb-4"
             />
           )}
@@ -534,7 +534,7 @@ export function NoteEditor({
                       date ? 'text-foreground' : 'text-muted-foreground/40'
                     )}
                   >
-                    {dateValue ? format(dateValue, 'PPP') : 'Pick a date'}
+                    {dateValue ? format(dateValue, 'PPP') : '选择日期'}
                   </button>
                 </PopoverTrigger>
                 <PopoverContent className="w-auto p-0" align="start">
@@ -584,7 +584,7 @@ export function NoteEditor({
               className="flex items-center gap-1.5 h-7 text-sm text-muted-foreground/30 hover:text-muted-foreground transition-colors cursor-pointer"
             >
               <ChevronUp className="size-3.5" />
-              <span>Collapse</span>
+              <span>收起</span>
             </button>
           </div>}
 
@@ -592,7 +592,7 @@ export function NoteEditor({
             <EditorContent editor={editor} />
           ) : (
             <div className="flex min-h-[240px] items-center justify-center">
-              <span className="text-sm text-muted-foreground">Loading note...</span>
+              <span className="text-sm text-muted-foreground">笔记加载中...</span>
             </div>
           )}
         </div>
@@ -603,10 +603,10 @@ export function NoteEditor({
         embedded ? 'px-4 border-t border-border' : 'px-5 bg-background',
       )}>
         <span className="text-[10px] text-muted-foreground mr-3">
-          {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved' : ''}
+          {saveStatus === 'saving' ? '保存中...' : saveStatus === 'saved' ? '已保存' : ''}
         </span>
         <span className="text-[10px] text-muted-foreground tabular-nums">
-          {wordCount} {wordCount === 1 ? 'word' : 'words'}
+          {wordCount} 词
         </span>
       </div>
     </div>

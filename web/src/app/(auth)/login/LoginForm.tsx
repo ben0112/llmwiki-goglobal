@@ -56,12 +56,12 @@ function LoginFormInner() {
     <div className="flex min-h-screen items-center justify-center p-8">
       <div className="w-full max-w-sm space-y-6">
         <div className="text-center">
-          <h1 className="text-2xl font-bold">Sign in to LLM Wiki</h1>
+          <h1 className="text-2xl font-bold">登录 LLM Wiki</h1>
         </div>
 
         <form onSubmit={handleLogin} className="space-y-4">
           <div>
-            <label htmlFor="email" className="block text-sm font-medium">Email</label>
+            <label htmlFor="email" className="block text-sm font-medium">邮箱</label>
             <input
               id="email"
               type="email"
@@ -72,7 +72,7 @@ function LoginFormInner() {
             />
           </div>
           <div>
-            <label htmlFor="password" className="block text-sm font-medium">Password</label>
+            <label htmlFor="password" className="block text-sm font-medium">密码</label>
             <input
               id="password"
               type="password"
@@ -88,18 +88,18 @@ function LoginFormInner() {
             disabled={loading}
             className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? 'Signing in...' : 'Sign in'}
+            {loading ? '登录中...' : '登录'}
           </button>
         </form>
         <p className="text-center text-sm text-muted-foreground">
-          Don&apos;t have an account?{' '}
-          <a href="/signup" className="font-medium text-foreground underline">Sign up</a>
+          还没有账号?{' '}
+          <a href="/signup" className="font-medium text-foreground underline">注册</a>
         </p>
         <p className="text-center text-xs text-muted-foreground/60">
-          By signing in, you agree to our{' '}
-          <a href="/terms" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">Terms of Service</a>
-          {' '}and{' '}
-          <a href="/privacy" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">Privacy Policy</a>.
+          登录即表示您同意我们的{' '}
+          <a href="/terms" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">服务条款</a>
+          {' '}与{' '}
+          <a href="/privacy" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:text-muted-foreground transition-colors">隐私政策</a>.
         </p>
       </div>
     </div>

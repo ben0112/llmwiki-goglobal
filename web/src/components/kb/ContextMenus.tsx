@@ -50,7 +50,7 @@ export function SourceContextMenu({
         className="flex items-center gap-2 w-full rounded-sm px-2 py-1.5 text-sm hover:bg-accent cursor-pointer"
       >
         <Pencil className="size-3.5" />
-        Rename
+        重命名
       </button>
       <div className="h-px bg-border -mx-1 my-1" />
       <button
@@ -58,7 +58,7 @@ export function SourceContextMenu({
         className="flex items-center gap-2 w-full rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10 cursor-pointer"
       >
         <Trash2 className="size-3.5" />
-        Delete
+        删除
       </button>
     </div>,
     document.body,
@@ -84,14 +84,14 @@ export function SourceAreaContextMenu({
         className="flex items-center gap-2 w-full rounded-sm px-2 py-1.5 text-sm hover:bg-accent cursor-pointer"
       >
         <NotepadText className="size-3.5" />
-        New Note
+        新建笔记
       </button>
       <button
         onClick={onNewFolder}
         className="flex items-center gap-2 w-full rounded-sm px-2 py-1.5 text-sm hover:bg-accent cursor-pointer"
       >
         <Folder className="size-3.5" />
-        New Folder
+        新建文件夹
       </button>
       <div className="h-px bg-border -mx-1 my-1" />
       <button
@@ -99,7 +99,7 @@ export function SourceAreaContextMenu({
         className="flex items-center gap-2 w-full rounded-sm px-2 py-1.5 text-sm hover:bg-accent cursor-pointer"
       >
         <Upload className="size-3.5" />
-        Upload Files
+        上传文件
       </button>
     </div>,
     document.body,

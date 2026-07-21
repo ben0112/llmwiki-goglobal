@@ -48,14 +48,14 @@ function ErrorMessage({ message }: { message: string }) {
 
 export function PdfDocViewer({ documentId, title, initialPage, hideToolbar }: { documentId: string; title: string; initialPage?: number; hideToolbar?: boolean }) {
   const { url, error } = useDocumentUrl(documentId)
-  if (error) return <ErrorMessage message="Failed to load PDF" />
+  if (error) return <ErrorMessage message="PDF 加载失败" />
   if (!url) return <LoadingSpinner />
   return <PdfViewer fileUrl={url} documentId={documentId} title={title} initialPage={initialPage} hideToolbar={hideToolbar} />
 }
 
 export function ImageViewer({ documentId, title }: { documentId: string; title: string }) {
   const { url, error } = useDocumentUrl(documentId)
-  if (error) return <ErrorMessage message="Failed to load image" />
+  if (error) return <ErrorMessage message="图片加载失败" />
   if (!url) return <LoadingSpinner />
 
   return (
@@ -77,7 +77,7 @@ export function HtmlDocViewer({ documentId, title: _title }: { documentId: strin
  *  future "View original" toggle; not the default surface for clips. */
 export function HtmlOriginalViewer({ documentId, title: _title }: { documentId: string; title: string }) {
   const { url, error } = useDocumentUrl(documentId)
-  if (error) return <ErrorMessage message="Failed to load HTML" />
+  if (error) return <ErrorMessage message="HTML 加载失败" />
   if (!url) return <LoadingSpinner />
   return <HtmlViewer fileUrl={url} className="h-full" />
 }
@@ -96,7 +96,7 @@ export function ContentViewer({ documentId, title, fileType }: { documentId: str
     return () => { cancelled = true }
   }, [documentId, token])
 
-  if (error) return <ErrorMessage message="Failed to load content" />
+  if (error) return <ErrorMessage message="内容加载失败" />
   if (content === null) return <LoadingSpinner />
 
   const isHtml = fileType === 'html' || fileType === 'htm'
@@ -129,7 +129,7 @@ export function UnsupportedViewer({ title }: { title: string }) {
       </div>
       <div className="text-center">
         <h1 className="text-lg font-medium">{title}</h1>
-        <p className="text-xs text-muted-foreground mt-2">File viewer coming soon</p>
+        <p className="text-xs text-muted-foreground mt-2">暂不支持预览此文件类型</p>
       </div>
     </div>
   )
@@ -141,7 +141,7 @@ export function ProcessingViewer({ title }: { title: string }) {
       <Loader2 className="size-8 animate-spin text-muted-foreground" />
       <div className="text-center">
         <h1 className="text-lg font-medium">{title}</h1>
-        <p className="text-xs text-muted-foreground mt-2">Processing document...</p>
+        <p className="text-xs text-muted-foreground mt-2">文档处理中...</p>
       </div>
     </div>
   )
@@ -155,7 +155,7 @@ export function FailedViewer({ title, errorMessage }: { title: string; errorMess
       </div>
       <div className="text-center">
         <h1 className="text-lg font-medium">{title}</h1>
-        <p className="text-xs text-destructive mt-2">Processing failed</p>
+        <p className="text-xs text-destructive mt-2">处理失败</p>
         {errorMessage && (
           <p className="text-xs text-muted-foreground mt-1 max-w-sm">{errorMessage}</p>
         )}

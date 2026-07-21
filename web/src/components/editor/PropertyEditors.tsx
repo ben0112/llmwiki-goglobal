@@ -86,7 +86,7 @@ function DatePropertyEditor({
               value ? 'text-foreground' : 'text-muted-foreground/40'
             )}
           >
-            {dateObj ? format(dateObj, 'PPP') : 'Pick a date'}
+            {dateObj ? format(dateObj, 'PPP') : '选择日期'}
           </button>
         </PopoverTrigger>
         <PopoverContent className="w-auto p-0" align="start">
@@ -169,7 +169,7 @@ function SelectPropertyEditor({
               }
             }
           }}
-          placeholder="Search or add..."
+          placeholder="搜索或新增..."
           className="w-full text-sm bg-transparent border-none outline-none px-2 py-1.5 placeholder:text-muted-foreground/40"
           autoFocus
         />
@@ -226,7 +226,7 @@ export function PropertyValueEditor({
           type="text"
           value={(property.value as string) ?? ''}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="Empty"
+          placeholder="空"
           className="text-sm text-foreground bg-transparent border-none outline-none flex-1 h-7 px-1.5 placeholder:text-muted-foreground/30"
         />
       )
@@ -236,7 +236,7 @@ export function PropertyValueEditor({
           type="number"
           value={property.value != null ? String(property.value) : ''}
           onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))}
-          placeholder="Empty"
+          placeholder="空"
           className="text-sm text-foreground bg-transparent border-none outline-none flex-1 h-7 px-1.5 placeholder:text-muted-foreground/30 [&::-webkit-inner-spin-button]:appearance-none"
         />
       )
@@ -338,7 +338,7 @@ export function TagsRow({
             onChange={(e) => onTagInputChange(e.target.value)}
             onKeyDown={onTagKeyDown}
             onBlur={onAddTag}
-            placeholder={tags.length === 0 ? 'Add tags...' : '+'}
+            placeholder={tags.length === 0 ? '添加标签...' : '+'}
             className="text-sm bg-transparent border-none outline-none text-muted-foreground placeholder:text-muted-foreground/30 w-16 shrink-0"
           />
         </div>
@@ -403,27 +403,27 @@ export function AddPropertyButton({ onAdd }: { onAdd: (type: PropertyType) => vo
       <DropdownMenuTrigger asChild>
         <button className="flex items-center gap-2 h-7 text-sm text-muted-foreground/40 hover:text-muted-foreground transition-colors cursor-pointer">
           <Plus className="size-3.5" />
-          <span>Add property</span>
+          <span>添加属性</span>
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
         <DropdownMenuItem onClick={() => onAdd('text')}>
-          <Type className="size-4" />Text
+          <Type className="size-4" />文本
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAdd('number')}>
-          <Hash className="size-4" />Number
+          <Hash className="size-4" />数字
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAdd('date')}>
-          <CalendarIcon className="size-4" />Date
+          <CalendarIcon className="size-4" />日期
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAdd('checkbox')}>
-          <CheckSquare className="size-4" />Checkbox
+          <CheckSquare className="size-4" />勾选框
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAdd('select')}>
-          <List className="size-4" />Select
+          <List className="size-4" />选项
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAdd('url')}>
-          <LinkIcon className="size-4" />URL
+          <LinkIcon className="size-4" />链接
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

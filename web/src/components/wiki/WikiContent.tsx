@@ -212,7 +212,7 @@ function TableOfContents({ items }: { items: TocItem[] }) {
   return (
     <nav>
       <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/50 mb-3 px-1">
-        On this page
+        本页目录
       </p>
       <div className="relative">
         <div className="absolute left-[3px] top-1.5 bottom-1.5 w-px bg-border" aria-hidden />
@@ -849,7 +849,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                   <button
                     onClick={handleCopy}
                     className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                    title="Copy markdown"
+                    title="复制 Markdown"
                   >
                     {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
                   </button>
@@ -857,7 +857,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
                     <button
                       onClick={onGraphClick}
                       className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                      title="Show in graph"
+                      title="在图谱中查看"
                     >
                       <Network className="size-3.5" />
                     </button>
@@ -881,14 +881,14 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
               <div className="mt-12 pt-6 border-t border-border flex items-center justify-between gap-4">
                 <div className="text-[13px] text-muted-foreground">
                   {lessonsComplete > 0
-                    ? `${lessonsComplete} of ${lessonsTotal} lessons complete`
-                    : `${lessonsTotal} ${lessonsTotal === 1 ? 'lesson' : 'lessons'}`}
+                    ? `已完成 ${lessonsComplete} / ${lessonsTotal} 课时`
+                    : `共 ${lessonsTotal} 课时`}
                 </div>
                 <button
                   onClick={() => onLessonNavigate?.(resumeLesson.path)}
                   className="inline-flex items-center gap-2 rounded-md bg-foreground text-background font-semibold text-[13px] px-4 py-2 hover:opacity-90 transition-opacity cursor-pointer"
                 >
-                  {lessonsTotal > 0 && lessonsComplete >= lessonsTotal ? 'Review course' : lessonsComplete > 0 ? 'Continue' : 'Start course'}
+                  {lessonsTotal > 0 && lessonsComplete >= lessonsTotal ? '回顾课程' : lessonsComplete > 0 ? '继续学习' : '开始学习'}
                   <ArrowRight className="size-4" />
                 </button>
               </div>
