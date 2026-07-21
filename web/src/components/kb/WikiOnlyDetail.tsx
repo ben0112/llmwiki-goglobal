@@ -445,7 +445,7 @@ export function WikiOnlyDetail({
                   className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90"
                 >
                   <UploadIcon className="size-3.5 opacity-60" />
-                  Upload Sources
+                  上传源文件
                 </button>
                 <a
                   href="https://claude.ai"
@@ -453,7 +453,7 @@ export function WikiOnlyDetail({
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium transition-colors hover:bg-accent"
                 >
-                  Open Claude
+                  打开 Claude
                   <ArrowUpRight className="size-3.5 opacity-60" />
                 </a>
               </div>

@@ -633,70 +633,135 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     })
   }, [kbId, kbSlug, addUpload, setUploadProgress, markUploadProcessing, markUploadFailed])
 
-  const uploadFiles = React.useCallback((files: File[], targetPath: string = '/') => {
+  const uploadFiles = React.useCallback(async (files: File[], targetPath: string = '/') => {
     const t = getToken()
     if (!t || !userId) return
 
-    // Client-side duplicate check — documents are already loaded
+    // 重复文件校验:与目标位置现有文件同名(不区分大小写)的,确认后跳过
     const existingNames = new Set(
       documents
         .filter((d) => d.path === targetPath && !d.archived)
         .map((d) => d.filename.toLowerCase()),
     )
     const duplicates = files.filter((f) => existingNames.has(f.name.toLowerCase()))
+    let toUpload = files
     if (duplicates.length > 0) {
-      const names = duplicates.map((f) => f.name).join(', ')
-      toast.error(`已存在:${names}`)
-      if (duplicates.length === files.length) return
-      files = files.filter((f) => !existingNames.has(f.name.toLowerCase()))
+      if (duplicates.length === files.length) {
+        toast.error(`未上传:所选 ${files.length} 个文件均与现有文件重名`, {
+          description: duplicates.slice(0, 5).map((f) => f.name).join('、')
+            + (duplicates.length > 5 ? ` 等 ${duplicates.length} 个` : ''),
+        })
+        return
+      }
+      const ok = window.confirm(
+        `${duplicates.length} 个文件与目标位置的现有文件重名,将被跳过:\n\n`
+        + duplicates.slice(0, 10).map((f) => f.name).join('\n')
+        + (duplicates.length > 10 ? `\n…等 ${duplicates.length} 个` : '')
+        + `\n\n点击"确定"继续上传其余 ${files.length - duplicates.length} 个文件。`,
+      )
+      if (!ok) return
+      toUpload = files.filter((f) => !existingNames.has(f.name.toLowerCase()))
     }
 
-    const uploads = files.map(async (file) => {
+    const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
+    const results: { name: string; ok: boolean }[] = []
+    let unsupported = 0
+
+    const uploadOne = async (file: File): Promise<boolean | null> => {
       const ext = file.name.split('.').pop()?.toLowerCase()
       if (ext === 'md' || ext === 'txt') {
-        const content = await file.text()
-        const title = file.name.replace(/\.(md|txt)$/i, '')
+        // 文本文件走笔记导入,也进上传面板,让批量上传有统一进度
+        const uploadId = crypto.randomUUID()
+        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
         try {
+          const content = await file.text()
+          const title = file.name.replace(/\.(md|txt)$/i, '')
           const data = await apiFetch<DocumentListItem>(`/v1/knowledge-bases/${kbId}/documents/note`, t, {
             method: 'POST',
             body: JSON.stringify({ filename: file.name, title, content, path: targetPath }),
           })
           setDocuments((prev) => [data, ...prev])
-        } catch { toast.error(`导入 ${file.name} 失败`) }
-      } else {
-        const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
-        if (ext && supportedTypes.has(ext)) {
-          if (process.env.NEXT_PUBLIC_MODE === 'local') {
-            const uploadId = crypto.randomUUID()
-            addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
-            const formData = new FormData()
-            formData.append('file', file)
-            formData.append('path', targetPath)
-            try {
-              const res = await fetch(`${apiUrl()}/v1/upload`, { method: 'POST', body: formData })
-              if (!res.ok) throw new Error(`上传失败:${res.status}`)
-              const data = await res.json()
-              setDocuments((prev) => [data, ...prev])
-              markUploadProcessing(uploadId)
-            } catch { markUploadFailed(uploadId) }
-          } else {
-            await tusUploadFile(file, targetPath)
-          }
-        } else {
-          toast.info(`暂不支持 ${ext} 文件`)
+          setUploadProgress(uploadId, 1)
+          markUploadProcessing(uploadId)
+          return true
+        } catch {
+          markUploadFailed(uploadId, '导入失败')
+          return false
         }
       }
-    })
-    Promise.all(uploads).then(() => {
-      const textFiles = files.filter((f) => /\.(md|txt)$/i.test(f.name))
-      if (textFiles.length > 0) toast.success(`已导入 ${textFiles.length} 个文件`)
-      // Navigate to files view after first upload
-      if (sourceDocs.length === 0) {
-        setActiveView('files')
-        navigateToView('files')
+      if (!ext || !supportedTypes.has(ext)) {
+        unsupported += 1
+        toast.info(`暂不支持 ${ext ?? '未知'} 文件:${file.name}`)
+        return null
       }
-    })
-  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, markUploadProcessing, markUploadFailed])
+      if (process.env.NEXT_PUBLIC_MODE === 'local') {
+        // XHR 而非 fetch:浏览器上传进度事件驱动面板进度条
+        const uploadId = crypto.randomUUID()
+        addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: targetPath })
+        const formData = new FormData()
+        formData.append('file', file)
+        formData.append('path', targetPath)
+        try {
+          const data = await new Promise<DocumentListItem>((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            xhr.open('POST', `${apiUrl()}/v1/upload`)
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) setUploadProgress(uploadId, e.loaded / e.total)
+            }
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                try { resolve(JSON.parse(xhr.responseText)) } catch { reject(new Error('响应解析失败')) }
+              } else reject(new Error(`上传失败:${xhr.status}`))
+            }
+            xhr.onerror = () => reject(new Error('网络错误'))
+            xhr.send(formData)
+          })
+          setDocuments((prev) => [data, ...prev])
+          markUploadProcessing(uploadId)
+          return true
+        } catch (err) {
+          markUploadFailed(uploadId, err instanceof Error ? err.message : null)
+          return false
+        }
+      }
+      try {
+        await tusUploadFile(file, targetPath)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    await Promise.all(toUpload.map(async (file) => {
+      const ok = await uploadOne(file)
+      if (ok !== null) results.push({ name: file.name, ok })
+    }))
+
+    // 完成汇总:成功/失败数量确认(+ 跳过的重名与不支持类型)
+    const okCount = results.filter((r) => r.ok).length
+    const failed = results.filter((r) => !r.ok).map((r) => r.name)
+    const extras = [
+      duplicates.length > 0 ? `跳过重名 ${duplicates.length} 个` : '',
+      unsupported > 0 ? `不支持 ${unsupported} 个` : '',
+    ].filter(Boolean).join(',')
+    const suffix = extras ? `(${extras})` : ''
+    if (results.length > 0) {
+      if (failed.length === 0) {
+        toast.success(`上传完成:${okCount} 个文件全部成功${suffix}`)
+      } else {
+        toast.error(`上传完成:成功 ${okCount} 个,失败 ${failed.length} 个${suffix}`, {
+          description: failed.slice(0, 5).join('、') + (failed.length > 5 ? ` 等 ${failed.length} 个` : ''),
+          duration: 10000,
+        })
+      }
+    }
+
+    // Navigate to files view after first upload
+    if (sourceDocs.length === 0 && okCount > 0) {
+      setActiveView('files')
+      navigateToView('files')
+    }
+  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadFailed])
 
   React.useEffect(() => {
     reconcileUploads(kbId, documents)
