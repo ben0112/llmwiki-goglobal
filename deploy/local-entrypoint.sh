@@ -11,6 +11,10 @@ set -e
 export WORKSPACE_PATH MODE=local DATABASE_URL=""
 mkdir -p "$WORKSPACE_PATH"
 
+# First boot: scaffold the workspace (index.db + wiki/overview.md + log.md),
+# same as the CLI's `llmwiki init`, so the wiki isn't empty on first open.
+[ -f "$WORKSPACE_PATH/.llmwiki/index.db" ] || python3 /app/llmwiki init "$WORKSPACE_PATH"
+
 (cd /app/api && exec uvicorn main:app --host 0.0.0.0 --port "$API_PORT") &
 api_pid=$!
 (cd /app/web && exec env HOSTNAME=0.0.0.0 PORT="$WEB_PORT" node server.js) &
