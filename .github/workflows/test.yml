@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [master]
+    branches: [master, "claude/**"]
   pull_request:
-    branches: [master]
+    branches: [master, "claude/**"]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
