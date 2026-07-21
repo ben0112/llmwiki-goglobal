@@ -203,7 +203,9 @@ def cmd_serve(workspace: str, open_browser: bool = True) -> None:
         print(f"Workspace not initialized. Run: llmwiki init {ws}", file=sys.stderr)
         sys.exit(1)
 
-    api_port = os.environ.get("API_PORT", "8010")
+    # Default stays 8000: the Chrome extension's local mode and the docs
+    # assume http://localhost:8000. Set API_PORT to override (see start.sh).
+    api_port = os.environ.get("API_PORT", "8000")
     env = os.environ.copy()
     env["MODE"] = "local"
     env["WORKSPACE_PATH"] = str(ws)

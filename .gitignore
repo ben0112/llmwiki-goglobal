@@ -57,3 +57,6 @@ supabase/.temp/
 
 # Local-only developer scripts (apply_migration.sh, one-shot utilities)
 scripts/
+
+# Default workspace created by ./start.sh — personal corpus, never committed
+workspace/
