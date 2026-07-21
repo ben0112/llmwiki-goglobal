@@ -158,3 +158,39 @@ def test_run_batch_failure_isolated_and_retried(tmp_path, monkeypatch):
     assert _states(ws)[bad] == ("failed", 3)
     result4 = asyncio.run(pl.run_batch(ws, cfg))
     assert result4.picked == 0
+
+
+def test_resolve_auto_precedence():
+    from corpus.pipeline import resolve_auto
+
+    class Env:
+        CORPUS_AUTOCLASSIFY = True
+        CORPUS_AUTO_INTERVAL = 300
+
+    # 设置页显式关闭要压过环境变量的开启
+    assert resolve_auto({"auto_enabled": False}, Env) == {"enabled": False, "interval": 300}
+    assert resolve_auto({}, Env)["enabled"] is True
+    assert resolve_auto({"auto_enabled": True, "auto_interval": 45}, Env) == {
+        "enabled": True, "interval": 45}
+    # 间隔下限 30s
+    assert resolve_auto({"auto_interval": 5}, Env)["interval"] == 30
+
+
+def test_run_batch_reports_progress_and_today_count(tmp_path):
+    from corpus.llm import LLMConfig
+    from corpus.pipeline import run_batch, status_counts, _connect
+
+    ws = _init_ws(tmp_path)
+    _insert_source(ws, "0001_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
+    _insert_source(ws, "0002_口号.txt", "欢迎关注", "关注我们,共创辉煌。")
+
+    seen = []
+    asyncio.run(run_batch(ws, LLMConfig(base_url="mock"),
+                          on_progress=lambda d, t: seen.append((d, t))))
+    assert seen == [(1, 2), (2, 2)]
+
+    conn = _connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        assert status_counts(conn)["imported_today"] == 1
+    finally:
+        conn.close()

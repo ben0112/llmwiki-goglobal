@@ -5,6 +5,7 @@
 // Business view: 7 类需求 → 27 场景 navigation derived from the same entries.
 
 import * as React from 'react'
+import { PipelineStrip } from './PipelineStrip'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, LayoutGrid, ListFilter, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -137,6 +138,8 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
           </button>
         </div>
       </div>
+
+      <PipelineStrip />
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">加载中…</div>

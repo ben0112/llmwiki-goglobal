@@ -100,12 +100,17 @@ def status_counts(conn: sqlite3.Connection) -> dict:
     retryable = conn.execute(
         "SELECT COUNT(*) FROM corpus_pipeline WHERE state='failed' AND attempts < ?",
         (MAX_ATTEMPTS,)).fetchone()[0]
+    imported_today = conn.execute(
+        "SELECT COUNT(*) FROM corpus_pipeline p JOIN documents d ON d.id = p.doc_id "
+        "WHERE p.state='imported' AND p.updated_at >= date('now')").fetchone()[0]
     return {"pending": pending + retryable, "imported": counts.get("imported", 0),
+            "imported_today": imported_today,
             "excluded": counts.get("excluded", 0), "failed": counts.get("failed", 0)}
 
 
 async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None,
-                    version: str = DEFAULT_VERSION) -> RunResult:
+                    version: str = DEFAULT_VERSION,
+                    on_progress=None) -> RunResult:
     """跑一轮:最多处理 limit(缺省=端点感知默认)条候选。逐条隔离失败。"""
     result = RunResult(started_at=_now())
     limit = limit or config.effective_batch_limit
@@ -127,6 +132,7 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
         candidates = select_candidates(conn, limit)
         result.picked = len(candidates)
 
+        done = 0
         for doc in candidates:
             relpath = doc["relative_path"]
             try:
@@ -166,6 +172,13 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
                 _set_state(conn, doc["id"], "failed", error=msg[:500])
                 result.failed += 1
                 result.errors.append((relpath, msg[:200]))
+            finally:
+                done += 1
+                if on_progress:
+                    try:
+                        on_progress(done, result.picked)
+                    except Exception:
+                        pass
     finally:
         conn.close()
 
@@ -202,3 +215,14 @@ def resolve_config(stored: dict, env) -> LLMConfig:
         timeout=float(stored.get("timeout") or getattr(env, "CORPUS_LLM_TIMEOUT", 120) or 120),
         batch_limit=int(stored.get("batch_limit") or getattr(env, "CORPUS_BATCH_LIMIT", 0) or 0),
     )
+
+
+def resolve_auto(stored: dict, env) -> dict:
+    """自动分类开关与轮询间隔;设置页显式值(含显式关闭)优先于环境变量。"""
+    if "auto_enabled" in stored:
+        enabled = bool(stored["auto_enabled"])
+    else:
+        enabled = bool(getattr(env, "CORPUS_AUTOCLASSIFY", False))
+    interval = int(stored.get("auto_interval")
+                   or getattr(env, "CORPUS_AUTO_INTERVAL", 120) or 120)
+    return {"enabled": enabled, "interval": max(30, interval)}

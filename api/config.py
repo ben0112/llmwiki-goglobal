@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     CORPUS_LLM_API_KEY: str = ""
     CORPUS_LLM_TIMEOUT: float = 120.0
     CORPUS_BATCH_LIMIT: int = 0  # 0 = 端点感知默认(本地20/云端100)
+    CORPUS_AUTOCLASSIFY: bool = False  # 自动分类默认关(设置页可开)
+    CORPUS_AUTO_INTERVAL: int = 120  # 自动分类轮询间隔(秒)
 
     @property
     def listen_database_url(self) -> str:

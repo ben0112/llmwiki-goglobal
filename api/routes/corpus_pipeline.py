@@ -48,6 +48,8 @@ class LLMConfigIn(BaseModel):
     api_key: str | None = None   # None/缺省 = 沿用现值;空串 = 清除
     timeout: float | None = None
     batch_limit: int | None = Field(default=None, ge=0)
+    auto_enabled: bool | None = None
+    auto_interval: int | None = Field(default=None, ge=30)
 
 
 def _masked(key: str) -> str:
@@ -68,6 +70,7 @@ def _config_out(stored: dict, request: Request) -> dict:
         "batch_limit": cfg.batch_limit,
         "effective_batch_limit": cfg.effective_batch_limit,
         "is_local_endpoint": corpus_llm.is_local_endpoint(cfg.base_url),
+        "auto": corpus_pipeline.resolve_auto(stored, env),
         "source": "settings" if stored.get("base_url") else ("env" if getattr(env, "CORPUS_LLM_BASE_URL", "") else "default"),
     }
 
@@ -101,6 +104,10 @@ async def put_llm_config(request: Request, body: LLMConfigIn):
             stored["timeout"] = body.timeout
         if body.batch_limit is not None:      # 0 = 恢复端点感知默认
             stored["batch_limit"] = body.batch_limit
+        if body.auto_enabled is not None:
+            stored["auto_enabled"] = body.auto_enabled
+        if body.auto_interval is not None:
+            stored["auto_interval"] = body.auto_interval
         corpus_pipeline.save_llm_settings(conn, stored)
     finally:
         conn.close()
@@ -125,13 +132,11 @@ class RunIn(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=10000)
 
 
-@router.post("/pipeline/run", status_code=202)
-async def run_pipeline(request: Request, body: RunIn | None = None):
-    workspace = _require_local(request)
-    corpus_llm, corpus_pipeline = _corpus()
+def start_run(state, workspace: Path, limit: int | None = None) -> dict:
+    """单飞启动一轮(手动端点与自动循环共用)。"""
+    _, corpus_pipeline = _corpus()
     from config import settings as env
 
-    state = request.app.state
     task = getattr(state, "corpus_pipeline_task", None)
     if task is not None and not task.done():
         return {"started": False, "running": True, "detail": "已有一轮在运行"}
@@ -142,16 +147,53 @@ async def run_pipeline(request: Request, body: RunIn | None = None):
     finally:
         conn.close()
     cfg = corpus_pipeline.resolve_config(stored, env)
-    limit = body.limit if body and body.limit else None
+
+    def _progress(done: int, total: int) -> None:
+        state.corpus_pipeline_progress = {"done": done, "total": total}
 
     async def _run():
-        result = await corpus_pipeline.run_batch(workspace, cfg, limit=limit)
-        state.corpus_pipeline_last_run = result.summary()
-        return result
+        state.corpus_pipeline_progress = {"done": 0, "total": 0}
+        try:
+            result = await corpus_pipeline.run_batch(
+                workspace, cfg, limit=limit, on_progress=_progress)
+            state.corpus_pipeline_last_run = result.summary()
+            return result
+        finally:
+            state.corpus_pipeline_progress = None
 
     state.corpus_pipeline_task = asyncio.create_task(_run())
     return {"started": True, "running": True,
             "limit": limit or cfg.effective_batch_limit}
+
+
+@router.post("/pipeline/run", status_code=202)
+async def run_pipeline(request: Request, body: RunIn | None = None):
+    workspace = _require_local(request)
+    limit = body.limit if body and body.limit else None
+    return start_run(request.app.state, workspace, limit)
+
+
+async def auto_loop(app) -> None:
+    """自动分类轮询:开着且有待分类文档、无在飞轮次时,静默起一轮。"""
+    _, corpus_pipeline = _corpus()
+    from config import settings as env
+    workspace = Path(app.state.workspace_path)
+    interval = 120
+    while True:
+        try:
+            conn = _db(workspace)
+            try:
+                stored = corpus_pipeline.load_llm_settings(conn)
+                auto = corpus_pipeline.resolve_auto(stored, env)
+                pending = corpus_pipeline.status_counts(conn)["pending"] if auto["enabled"] else 0
+            finally:
+                conn.close()
+            interval = auto["interval"]
+            if auto["enabled"] and pending > 0:
+                start_run(app.state, workspace)
+        except Exception:   # 自动循环绝不因单次异常退出
+            pass
+        await asyncio.sleep(interval)
 
 
 @router.get("/pipeline/status")
@@ -165,8 +207,16 @@ async def pipeline_status(request: Request):
         counts = corpus_pipeline.status_counts(conn)
     finally:
         conn.close()
+    from config import settings as env
+    conn2 = _db(workspace)
+    try:
+        stored = corpus_pipeline.load_llm_settings(conn2)
+    finally:
+        conn2.close()
     return {
         "running": bool(task is not None and not task.done()),
+        "progress": getattr(state, "corpus_pipeline_progress", None),
+        "auto": corpus_pipeline.resolve_auto(stored, env),
         "counts": counts,
         "last_run": getattr(state, "corpus_pipeline_last_run", None),
     }

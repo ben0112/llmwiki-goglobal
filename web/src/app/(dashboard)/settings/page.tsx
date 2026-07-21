@@ -117,11 +117,140 @@ export default function SettingsPage() {
 
       {/* MCP Config */}
       {process.env.NEXT_PUBLIC_MODE === 'local' ? (
-        <LocalMcpSection />
+        <>
+          <LocalMcpSection />
+          <div className="h-px bg-border my-8" />
+          <CorpusPipelineSection />
+        </>
       ) : (
         <ApiKeysSection />
       )}
     </div>
+  )
+}
+
+interface PipelineConfig {
+  base_url: string
+  model: string
+  api_key_masked: string
+  batch_limit: number
+  effective_batch_limit: number
+  is_local_endpoint: boolean
+  auto: { enabled: boolean; interval: number }
+}
+
+// 语料分类流水线设置(仅本地模式):LLM 端点前端可配,测试连接,自动分类开关。
+// 优先级:此处保存的值 > 部署环境变量 > 内置默认。
+function CorpusPipelineSection() {
+  const token = useUserStore((s) => s.accessToken)
+  const [cfg, setCfg] = React.useState<PipelineConfig | null>(null)
+  const [baseUrl, setBaseUrl] = React.useState('')
+  const [model, setModel] = React.useState('')
+  const [apiKey, setApiKey] = React.useState('')
+  const [batchLimit, setBatchLimit] = React.useState('')
+  const [saving, setSaving] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
+  const [notice, setNotice] = React.useState<{ ok: boolean; text: string } | null>(null)
+
+  const load = React.useCallback(() => {
+    if (!token) return
+    apiFetch<PipelineConfig>('/v1/corpus/llm-config', token)
+      .then((c) => {
+        setCfg(c)
+        setBaseUrl(c.base_url)
+        setModel(c.model)
+        setBatchLimit(String(c.batch_limit || ''))
+      })
+      .catch(() => {})
+  }, [token])
+
+  React.useEffect(() => { load() }, [load])
+
+  const save = async (extra: Record<string, unknown> = {}) => {
+    if (!token || saving) return
+    setSaving(true)
+    setNotice(null)
+    try {
+      const body: Record<string, unknown> = {
+        base_url: baseUrl.trim(), model: model.trim(),
+        batch_limit: batchLimit === '' ? 0 : Math.max(0, parseInt(batchLimit, 10) || 0),
+        ...extra,
+      }
+      if (apiKey !== '') body.api_key = apiKey
+      const c = await apiFetch<PipelineConfig>('/v1/corpus/llm-config', token, {
+        method: 'PUT', body: JSON.stringify(body),
+      })
+      setCfg(c)
+      setApiKey('')
+      setNotice({ ok: true, text: '设置已保存' })
+    } catch {
+      setNotice({ ok: false, text: '保存失败' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const test = async () => {
+    if (!token || testing) return
+    setTesting(true)
+    setNotice(null)
+    try {
+      const r = await apiFetch<{ ok: boolean; latency_ms: number; detail: string }>(
+        '/v1/corpus/llm-config/test', token, { method: 'POST' })
+      setNotice({ ok: r.ok, text: r.ok ? `连接正常(${r.latency_ms}ms)· ${r.detail}` : `连接失败:${r.detail}` })
+    } catch {
+      setNotice({ ok: false, text: '测试请求失败' })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  if (!cfg) return null
+
+  return (
+    <section>
+      <h2 className="text-base font-medium">语料分类流水线</h2>
+      <p className="mt-2 text-sm text-muted-foreground">
+        新语料的审核与八维标注所用的 LLM 端点(OpenAI 兼容)。批量上限留空或填
+        0 时按端点自动取默认:本地端点 20/轮,云端 100/轮。
+      </p>
+
+      <div className="mt-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="http://host.docker.internal:8000/v1"
+            className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-1 focus:ring-ring" />
+          <button onClick={test} disabled={testing}
+            className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap">
+            {testing ? '测试中…' : '测试连接'}
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型名称"
+            className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
+          <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password"
+            placeholder={cfg.api_key_masked ? `API Key(现值 ${cfg.api_key_masked},留空沿用)` : 'API Key(可选)'}
+            className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
+          <input value={batchLimit} onChange={(e) => setBatchLimit(e.target.value)} inputMode="numeric"
+            placeholder={`批量/轮(默认 ${cfg.effective_batch_limit})`}
+            className="w-40 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
+        </div>
+        <div className="flex items-center gap-3">
+          <button onClick={() => save()} disabled={saving}
+            className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50">
+            保存设置
+          </button>
+          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input type="checkbox" checked={cfg.auto.enabled}
+              onChange={(e) => save({ auto_enabled: e.target.checked })} />
+            自动分类(新语料入索引后台自动标注,每 {cfg.auto.interval}s 检查)
+          </label>
+        </div>
+        {notice && (
+          <p className={`text-xs ${notice.ok ? 'text-emerald-600' : 'text-destructive'}`}>{notice.text}</p>
+        )}
+      </div>
+    </section>
   )
 }
 

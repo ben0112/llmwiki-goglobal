@@ -164,6 +164,10 @@ async def _local_lifespan(app: FastAPI):
     from domain.local_processor import reconcile_workspace
     reconcile_task = asyncio.create_task(reconcile_workspace(reconcile_db, workspace))
 
+    # 语料自动分类轮询(默认关;设置页/环境变量开启后才会真正跑)
+    from routes.corpus_pipeline import auto_loop
+    corpus_auto_task = asyncio.create_task(auto_loop(app))
+
     watcher_task = None
     try:
         from domain.watcher import watch_workspace
@@ -175,6 +179,11 @@ async def _local_lifespan(app: FastAPI):
     try:
         yield
     finally:
+        corpus_auto_task.cancel()
+        try:
+            await corpus_auto_task
+        except asyncio.CancelledError:
+            pass
         reconcile_task.cancel()
         try:
             await reconcile_task
