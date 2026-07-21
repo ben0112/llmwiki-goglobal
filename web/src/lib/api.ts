@@ -1,5 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const WS_URL = API_URL.replace(/^http/, 'ws')
+import { apiUrl } from './runtime-env'
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
 /** Thrown by apiFetch on non-2xx responses. Callers can branch on `.status`
@@ -65,7 +64,7 @@ export async function apiFetch<T>(
   }
 
   try {
-    const res = await fetch(`${API_URL}${path}`, {
+    const res = await fetch(`${apiUrl()}${path}`, {
       ...fetchOptions,
       headers,
       signal: timeout.signal,
@@ -89,5 +88,5 @@ export async function apiFetch<T>(
 }
 
 export function getDocumentsWsUrl(kbId: string): string {
-  return `${WS_URL}/v1/ws/documents/${kbId}`
+  return `${apiUrl().replace(/^http/, 'ws')}/v1/ws/documents/${kbId}`
 }

@@ -20,8 +20,12 @@ services:
       dockerfile: Dockerfile.local
     container_name: llmwiki
     ports:
-      - "8000:8000"   # API(浏览器与 Chrome 扩展本地模式访问)
-      - "3000:3000"   # Web 应用
+      # 换端口:LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 docker compose up -d
+      # (PUBLIC_API_URL 会随 LLMWIKI_API_PORT 自动对齐,浏览器才能找到 API)
+      - "${LLMWIKI_API_PORT:-8000}:8000"   # API(浏览器与 Chrome 扩展本地模式访问)
+      - "${LLMWIKI_WEB_PORT:-3000}:3000"   # Web 应用
+    environment:
+      PUBLIC_API_URL: http://localhost:${LLMWIKI_API_PORT:-8000}
     volumes:
       - ${LLMWIKI_WORKSPACE:-./workspace}:/workspace
     restart: unless-stopped

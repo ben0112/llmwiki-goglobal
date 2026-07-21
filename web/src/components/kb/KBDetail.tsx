@@ -8,6 +8,7 @@ import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2 } from 'lucide-re
 import { useUserStore, useUploadStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
+import { apiUrl } from '@/lib/runtime-env'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { SelectionActionBar } from '@/components/kb/SelectionActionBar'
@@ -15,7 +16,6 @@ import { WikiContent } from '@/components/wiki/WikiContent'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
 import type { ViewMode } from '@/components/kb/viewMode'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 const FilesGrid = dynamic(() => import('@/components/kb/FilesGrid').then((mod) => mod.FilesGrid), {
   ssr: false,
@@ -621,7 +621,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     const { Upload } = await import('tus-js-client')
     return new Promise((resolve, reject) => {
       const upload = new Upload(file, {
-        endpoint: `${API_URL}/v1/uploads`,
+        endpoint: `${apiUrl()}/v1/uploads`,
         retryDelays: [0, 1000, 3000, 5000],
         metadata: { filename: file.name, knowledge_base_id: kbId, path: targetPath },
         headers: { Authorization: `Bearer ${t}` },
@@ -673,7 +673,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             formData.append('file', file)
             formData.append('path', targetPath)
             try {
-              const res = await fetch(`${API_URL}/v1/upload`, { method: 'POST', body: formData })
+              const res = await fetch(`${apiUrl()}/v1/upload`, { method: 'POST', body: formData })
               if (!res.ok) throw new Error(`上传失败:${res.status}`)
               const data = await res.json()
               setDocuments((prev) => [data, ...prev])

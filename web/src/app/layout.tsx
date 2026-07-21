@@ -73,6 +73,10 @@ export default function RootLayout({
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <head>
+        {/* Runtime env override (Docker: written by the entrypoint from
+            PUBLIC_API_URL). 404s harmlessly when absent — see lib/runtime-env.ts. */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+        <script src="/__llmwiki_env.js" />
         <script
           dangerouslySetInnerHTML={{ __html: themeScript }}
           suppressHydrationWarning

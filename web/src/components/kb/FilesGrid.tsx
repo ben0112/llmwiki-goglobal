@@ -18,6 +18,7 @@ import {
   DropdownMenuSubTrigger, DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { apiUrl } from '@/lib/runtime-env'
 import { NoteEditor } from '@/components/editor/NoteEditor'
 import { NoteFormattingButtons } from '@/components/editor/NoteToolbar'
 import type { Editor } from '@tiptap/react'
@@ -583,7 +584,7 @@ export function FilesGrid({
             <button onClick={() => { /* TODO: trigger search in PDF viewer */ }} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="文档内查找">
               <Search className="size-3.5" />
             </button>
-            <a href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="下载">
+            <a href={`${apiUrl()}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="下载">
               <Download className="size-3.5" />
             </a>
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">

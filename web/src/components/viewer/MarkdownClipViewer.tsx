@@ -5,6 +5,7 @@ import { useEditor, EditorContent } from '@tiptap/react'
 import { Check, Loader2, MessageSquarePlus, Pencil, X } from 'lucide-react'
 
 import { apiFetch, getDocumentsWsUrl } from '@/lib/api'
+import { apiUrl } from '@/lib/runtime-env'
 import { refreshAccessToken } from '@/lib/auth-token'
 import { useUserStore } from '@/stores'
 import { cn } from '@/lib/utils'
@@ -52,7 +53,6 @@ interface EditorSelection {
 }
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const HIGHLIGHT_POLL_INTERVAL = 2000
 
 // Source .md files (e.g. classified corpus entries) may carry YAML frontmatter.
@@ -515,7 +515,7 @@ function localWebclipFileUrl(doc: Document | null, src: string): string | null {
   if (!key) return null
 
   const encodedKey = key.split('/').map(encodeURIComponent).join('/')
-  return `${API_URL.replace(/\/+$/, '')}/v1/files/${encodedKey}`
+  return `${apiUrl()}/v1/files/${encodedKey}`
 }
 
 async function resolveWebclipAssetUrls(doc: Document, token: string): Promise<Record<string, string>> {

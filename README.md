@@ -59,7 +59,9 @@
 >     -v ~/goglobal-ws:/workspace benjaminzhang/llmwiki-local:latest
 > ```
 >
-> 打开 [localhost:3000](http://localhost:3000) 即用(compose 默认把工作区挂在 `./workspace`,用 `LLMWIKI_WORKSPACE=~/goglobal-ws` 换目录);Claude Desktop 的 MCP 配置改为经容器 stdio:
+> 打开 [localhost:3000](http://localhost:3000) 即用(compose 默认把工作区挂在 `./workspace`,用 `LLMWIKI_WORKSPACE=~/goglobal-ws` 换目录)。
+>
+> **换端口**:`LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 docker compose up -d`;裸 `docker run` 换端口时需同时告知浏览器侧 API 地址:`-p 9000:8000 -e PUBLIC_API_URL=http://localhost:9000`。Claude Desktop 的 MCP 配置改为经容器 stdio:
 >
 > ```json
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
