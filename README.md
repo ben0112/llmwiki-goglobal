@@ -61,11 +61,19 @@
 >
 > 打开 [localhost:3000](http://localhost:3000) 即用(compose 默认把工作区挂在 `./workspace`,用 `LLMWIKI_WORKSPACE=~/goglobal-ws` 换目录)。
 >
-> **换端口**:`LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 docker compose up -d`;裸 `docker run` 换端口时需同时告知浏览器侧 API 地址:`-p 9000:8000 -e PUBLIC_API_URL=http://localhost:9000`。Claude Desktop 的 MCP 配置改为经容器 stdio:
+> **连接 Claude**:容器同时以 Streamable HTTP 暴露 MCP(默认 `http://localhost:8080/mcp`,无需认证),启动完成后 `docker compose logs llmwiki` 会打印带真实端口的可粘贴配置。最快的一条命令:
+>
+> ```bash
+> claude mcp add --transport http llmwiki http://localhost:8080/mcp
+> ```
+>
+> 仅支持 stdio 的客户端(如 Claude Desktop)用容器桥接:
 >
 > ```json
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
 > ```
+>
+> **换端口**:`LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认只绑定 127.0.0.1(本地实例无鉴权),局域网访问设 `LLMWIKI_BIND=0.0.0.0`。
 >
 > 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
 

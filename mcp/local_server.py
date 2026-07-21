@@ -27,6 +27,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM Wiki local MCP server")
     parser.add_argument("workspace", nargs="?", default=".", help="Path to workspace folder")
     parser.add_argument("--workspace", dest="workspace_flag", default=None, help="Path to workspace folder")
+    parser.add_argument("--http", action="store_true",
+                        help="Serve streamable HTTP on --port instead of stdio (Docker deployments)")
+    parser.add_argument("--port", type=int, default=8080, help="Port for --http mode")
     return parser.parse_args()
 
 
@@ -108,6 +111,9 @@ def main():
             "and documents that you can read, search, edit, and organize. "
             "Call the `guide` tool first to see available knowledge bases and learn the full workflow."
         ),
+        # HTTP mode is stateless like the hosted server: every request is
+        # self-contained, so curl checks and client reconnects just work.
+        stateless_http=args.http,
     )
 
     def _get_user_id(ctx):
@@ -119,8 +125,26 @@ def main():
     async def ping() -> str:
         return "pong"
 
-    logger.info("Local MCP server ready — workspace: %s", workspace)
-    asyncio.run(mcp.run_stdio_async())
+    if args.http:
+        # No auth: local mode is single-user and the API on the neighbouring
+        # port is equally open — bind/publish on loopback unless you mean to
+        # share it (the compose file defaults to 127.0.0.1).
+        import uvicorn
+        from starlette.requests import Request
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        app = mcp.streamable_http_app()
+
+        async def health(request: Request) -> PlainTextResponse:
+            return PlainTextResponse("ok")
+
+        app.router.routes.insert(0, Route("/health", health))
+        logger.info("Local MCP server (HTTP) ready — workspace: %s, port: %d", workspace, args.port)
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+    else:
+        logger.info("Local MCP server ready — workspace: %s", workspace)
+        asyncio.run(mcp.run_stdio_async())
 
 
 if __name__ == "__main__":

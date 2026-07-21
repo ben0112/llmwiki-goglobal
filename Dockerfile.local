@@ -71,7 +71,7 @@ ENV MODE=local \
     NODE_ENV=production
 
 VOLUME /workspace
-EXPOSE 8000 3000
+EXPOSE 8000 3000 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD curl -fsS http://localhost:8000/health || exit 1
 

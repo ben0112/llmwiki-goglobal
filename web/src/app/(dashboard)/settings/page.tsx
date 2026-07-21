@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
 import { buildApiKeyMcpConfig, MCP_URL } from '@/lib/mcp'
+import { runtimeMcpUrl } from '@/lib/runtime-env'
 import { useUserStore } from '@/stores'
 
 interface Usage {
@@ -116,19 +117,58 @@ export default function SettingsPage() {
 
       {/* MCP Config */}
       {process.env.NEXT_PUBLIC_MODE === 'local' ? (
-        <section>
-          <h2 className="text-base font-medium">连接 Claude</h2>
-          <p className="mt-2 text-sm text-muted-foreground">
-            运行以下命令获取此工作区的 Claude Desktop / Claude Code MCP 配置:
-          </p>
-          <pre className="mt-4 rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
-            llmwiki mcp-config &lt;workspace-path&gt;
-          </pre>
-        </section>
+        <LocalMcpSection />
       ) : (
         <ApiKeysSection />
       )}
     </div>
+  )
+}
+
+// 本地模式的"连接 Claude":Docker 部署时入口脚本会经 /__llmwiki_env.js 注入
+// MCP 的 HTTP 地址(runtimeMcpUrl),直接展示可粘贴配置;源码运行时回退到
+// CLI 命令(stdio)。用 effect 读取以避免 SSR/客户端首帧不一致。
+function LocalMcpSection() {
+  const [mcpUrl, setMcpUrl] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    setMcpUrl(runtimeMcpUrl())
+  }, [])
+
+  if (mcpUrl) {
+    const config = JSON.stringify({ mcpServers: { llmwiki: { url: mcpUrl } } }, null, 2)
+    return (
+      <section>
+        <h2 className="text-base font-medium">连接 Claude (MCP)</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          本实例的 MCP 服务已通过 HTTP 暴露,任何支持 Streamable HTTP 的 MCP
+          客户端(Claude Code、Claude Desktop 等)都可直接连接,无需认证:
+        </p>
+        <div className="relative mt-4">
+          <pre className="rounded-lg bg-muted border border-border p-4 text-xs font-mono overflow-x-auto text-foreground">
+            {config}
+          </pre>
+          <CopyButton text={config} />
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          Claude Code 一条命令:{' '}
+          <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">
+            claude mcp add --transport http llmwiki {mcpUrl}
+          </code>
+        </p>
+      </section>
+    )
+  }
+
+  return (
+    <section>
+      <h2 className="text-base font-medium">连接 Claude</h2>
+      <p className="mt-2 text-sm text-muted-foreground">
+        运行以下命令获取此工作区的 Claude Desktop / Claude Code MCP 配置:
+      </p>
+      <pre className="mt-4 rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
+        llmwiki mcp-config &lt;workspace-path&gt;
+      </pre>
+    </section>
   )
 }
 

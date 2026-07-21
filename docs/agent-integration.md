@@ -98,7 +98,13 @@ curl -sS -X DELETE "https://api.example.com/v1/api-keys/<id>" -H "Authorization:
 
 一个工作区一个 server 条目;多工作区就加多条。重启 Claude Desktop 生效。
 
-若本地部署跑在 Docker 里(README 的"Docker 一键运行",容器名 `llmwiki`),stdio 命令改为经容器执行:
+若本地部署跑在 Docker 里(README 的"Docker 一键运行",容器名 `llmwiki`),容器还直接以 **Streamable HTTP** 暴露 MCP(默认 `http://localhost:8080/mcp`,本机回环、无需认证)——支持 HTTP 传输的客户端首选它;启动日志(`docker compose logs llmwiki`)与 Web 设置页都会给出带真实端口的可粘贴配置:
+
+```bash
+claude mcp add --transport http llmwiki http://localhost:8080/mcp
+```
+
+仅支持 stdio 的客户端改为经容器执行:
 
 ```json
 {

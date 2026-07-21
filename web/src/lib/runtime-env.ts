@@ -5,7 +5,7 @@
 
 declare global {
   interface Window {
-    __LLMWIKI_ENV__?: { API_URL?: string }
+    __LLMWIKI_ENV__?: { API_URL?: string; MCP_URL?: string }
   }
 }
 
@@ -14,4 +14,12 @@ export function apiUrl(): string {
     return window.__LLMWIKI_ENV__.API_URL.replace(/\/+$/, '')
   }
   return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+}
+
+/** Docker 部署注入的本地 MCP(Streamable HTTP)地址;源码运行时为 null(走 stdio)。 */
+export function runtimeMcpUrl(): string | null {
+  if (typeof window !== 'undefined' && window.__LLMWIKI_ENV__?.MCP_URL) {
+    return window.__LLMWIKI_ENV__.MCP_URL
+  }
+  return null
 }
