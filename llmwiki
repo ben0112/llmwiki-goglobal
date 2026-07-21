@@ -203,22 +203,23 @@ def cmd_serve(workspace: str, open_browser: bool = True) -> None:
         print(f"Workspace not initialized. Run: llmwiki init {ws}", file=sys.stderr)
         sys.exit(1)
 
+    api_port = os.environ.get("API_PORT", "8010")
     env = os.environ.copy()
     env["MODE"] = "local"
     env["WORKSPACE_PATH"] = str(ws)
     env["DATABASE_URL"] = ""
     env["APP_URL"] = "http://localhost:3000"
-    env["API_URL"] = "http://localhost:8000"
+    env["API_URL"] = f"http://localhost:{api_port}"
 
     print(f"Starting LLM Wiki for: {ws}")
-    print(f"  API: http://localhost:8000")
+    print(f"  API: http://localhost:{api_port}")
     print(f"  Web: http://localhost:3000")
     print(f"  MCP: llmwiki mcp-config {ws}")
     print()
 
     # Start API server
     api_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", api_port],
         cwd=str(API_DIR),
         env=env,
     )
@@ -226,7 +227,7 @@ def cmd_serve(workspace: str, open_browser: bool = True) -> None:
     # Start web dev server
     web_env = env.copy()
     web_env["NEXT_PUBLIC_MODE"] = "local"
-    web_env["NEXT_PUBLIC_API_URL"] = "http://localhost:8000"
+    web_env["NEXT_PUBLIC_API_URL"] = f"http://localhost:{api_port}"
     npm = shutil.which("pnpm") or shutil.which("npm")
     if npm is None:
         print(
