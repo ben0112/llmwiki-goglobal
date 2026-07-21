@@ -1,5 +1,35 @@
+# LLM Wiki — 本地模式一键部署(单用户,SQLite + 文件系统,一体化镜像)。
+#
+#   docker compose up -d
+#   open http://localhost:3000
+#
+# 镜像:默认拉取 Docker Hub 发布镜像 benjaminzhang/llmwiki-local
+# (由 .github/workflows/docker-publish.yml 在 master 推送 / v* tag 时发布);
+# 需要从源码构建时:docker compose build 或 LLMWIKI_IMAGE=llmwiki-local:dev。
+#
+# 工作区默认挂载 ./workspace(已被 .gitignore 忽略);换别的文件夹:
+#   LLMWIKI_WORKSPACE=~/goglobal-ws docker compose up -d
+#
+# 多用户自部署(Postgres + MinIO 全栈)见 deploy/docker-compose.selfhost.yml。
+
 services:
+  llmwiki:
+    image: ${LLMWIKI_IMAGE:-benjaminzhang/llmwiki-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: llmwiki
+    ports:
+      - "8000:8000"   # API(浏览器与 Chrome 扩展本地模式访问)
+      - "3000:3000"   # Web 应用
+    volumes:
+      - ${LLMWIKI_WORKSPACE:-./workspace}:/workspace
+    restart: unless-stopped
+
+  # 上游保留的开发辅助:hosted 模式开发用的裸 Postgres。
+  # 默认不启动;需要时:docker compose --profile hosted-dev up -d db
   db:
+    profiles: ["hosted-dev"]
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: supavault
@@ -13,3 +43,7 @@ services:
 
 volumes:
   pgdata:
+
+# Claude Desktop 的 MCP 配置(容器运行时,stdio 经 docker exec):
+#   {"mcpServers": {"llmwiki": {"command": "docker",
+#     "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}

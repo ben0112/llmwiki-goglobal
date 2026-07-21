@@ -53,11 +53,13 @@
 > **Docker 一键运行(免装任何依赖)** — 镜像内置全部运行时(Python、Node、JRE、LibreOffice、Noto CJK 字体):
 >
 > ```bash
+> docker compose up -d        # 使用发布镜像 benjaminzhang/llmwiki-local:latest
+> # 或不用 compose:
 > docker run -d --name llmwiki -p 8000:8000 -p 3000:3000 \
->     -v ~/goglobal-ws:/workspace <dockerhub-user>/llmwiki-local:latest
+>     -v ~/goglobal-ws:/workspace benjaminzhang/llmwiki-local:latest
 > ```
 >
-> 打开 [localhost:3000](http://localhost:3000) 即用;Claude Desktop 的 MCP 配置改为经容器 stdio:
+> 打开 [localhost:3000](http://localhost:3000) 即用(compose 默认把工作区挂在 `./workspace`,用 `LLMWIKI_WORKSPACE=~/goglobal-ws` 换目录);Claude Desktop 的 MCP 配置改为经容器 stdio:
 >
 > ```json
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
