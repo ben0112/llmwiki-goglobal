@@ -4,7 +4,6 @@ import importlib.util
 import os
 from pathlib import Path
 
-import logfire
 import sentry_sdk
 import uvicorn
 from urllib.parse import urlparse
@@ -45,9 +44,6 @@ if settings.SENTRY_DSN:
         environment=settings.STAGE,
     )
 
-if settings.LOGFIRE_TOKEN:
-    logfire.configure(token=settings.LOGFIRE_TOKEN, service_name="supavault-mcp")
-    logfire.instrument_asyncpg()
 
 def _build_allowed_hosts(mcp_url: str) -> list[str]:
     """Build the allowed_hosts list for TransportSecuritySettings.

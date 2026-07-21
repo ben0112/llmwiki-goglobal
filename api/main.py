@@ -33,10 +33,6 @@ if settings.SENTRY_DSN:
         environment=settings.STAGE,
     )
 
-if settings.LOGFIRE_TOKEN:
-    import logfire
-    logfire.configure(token=settings.LOGFIRE_TOKEN, service_name="supavault-api")
-    logfire.instrument_asyncpg()
 
 from routes.health import router as health_router
 from routes.knowledge_bases import router as knowledge_bases_router
@@ -223,9 +219,6 @@ app.add_middleware(
     ],
 )
 
-if settings.LOGFIRE_TOKEN:
-    import logfire
-    logfire.instrument_fastapi(app)
 
 app.include_router(health_router)
 app.include_router(me_router)

@@ -115,20 +115,6 @@ export default function App() {
     setAuth(accessToken ? { status: "signed_in", accessToken } : { status: "signed_out" });
   }
 
-  async function handleSignIn() {
-    setAuthError(null);
-    setAuth({ status: "loading" });
-    const result = await chrome.runtime.sendMessage({
-      type: "SIGN_IN_WITH_GOOGLE",
-    });
-    if (result.success) {
-      await checkSession();
-      showAuthNotice("Signed in to LLM Wiki");
-    } else {
-      setAuthError(result.error ?? "Sign in failed");
-      setAuth({ status: "signed_out" });
-    }
-  }
 
   async function handlePasswordSignIn(email: string, password: string) {
     setAuthError(null);
@@ -255,7 +241,6 @@ export default function App() {
             </div>
           )}
           <AuthGate
-            onSignIn={handleSignIn}
             onPasswordSignIn={handlePasswordSignIn}
           />
         </>

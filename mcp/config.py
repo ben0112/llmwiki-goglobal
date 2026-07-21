@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     # endpoint. Empty = AWS S3. Mirrors api/config.py.
     S3_ENDPOINT_URL: str = ""
     S3_FORCE_PATH_STYLE: bool = False
-    LOGFIRE_TOKEN: str = ""
     STAGE: str = "dev"
     APP_URL: str = "http://localhost:3000"
     API_URL: str = "http://localhost:8000"

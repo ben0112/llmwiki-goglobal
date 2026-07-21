@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     # a direct connection sidesteps that. Falls back to DATABASE_URL when unset.
     DIRECT_DATABASE_URL: str = ""
     SUPABASE_URL: str = ""
-    LOGFIRE_TOKEN: str = ""
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"

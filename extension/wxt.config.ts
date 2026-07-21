@@ -6,7 +6,7 @@ export default defineConfig({
   srcDir: "src",
   modules: ["@wxt-dev/module-react"],
   // Dev runner config:
-  //   - Persistent profile so the Google/Supabase sign-in survives reloads
+  //   - Persistent profile so the Supabase sign-in survives reloads
   //   - Opens a known testbed URL so we can verify the content script bootstraps
   //     against a real site (CSP, CORS, real DOM)
   //   - Uses your actual Chrome binary, in a separate profile dir, so this
@@ -23,7 +23,7 @@ export default defineConfig({
     name: "LLM Wiki",
     description: "Save any web page or PDF to your LLM Wiki knowledge base",
     version: "0.1.0",
-    permissions: ["activeTab", "identity", "storage", "scripting"],
+    permissions: ["activeTab", "storage", "scripting"],
     // The page is reached via activeTab on the toolbar click; host_permissions
     // is only the API origin so the extension can call its own backend.
     host_permissions: [`${apiOrigin}/*`, "http://localhost/*"],

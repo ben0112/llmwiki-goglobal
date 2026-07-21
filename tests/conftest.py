@@ -7,7 +7,6 @@ os.environ["SUPABASE_JWT_SECRET"] = "test-jwt-secret-that-is-at-least-32-charact
 os.environ["AWS_ACCESS_KEY_ID"] = ""
 os.environ["AWS_SECRET_ACCESS_KEY"] = ""
 os.environ["S3_BUCKET"] = ""
-os.environ["LOGFIRE_TOKEN"] = ""
 os.environ["SENTRY_DSN"] = ""
 os.environ["APP_URL"] = "http://localhost:3000"
 os.environ["GLOBAL_MAX_USERS"] = "1000"

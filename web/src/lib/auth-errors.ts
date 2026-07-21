@@ -2,10 +2,6 @@ export function getAuthErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error ?? 'Unknown error')
   const lower = message.toLowerCase()
 
-  if (lower.includes('unsupported provider') || (lower.includes('provider') && lower.includes('not enabled'))) {
-    return "Google sign-in isn't configured on this server. Please sign in with email and password."
-  }
-
   if (
     lower.includes('failed to fetch') ||
     lower.includes('networkerror') ||

@@ -7,7 +7,7 @@ LLM Wiki is operated by Polybius, L.L.C., a Delaware limited liability company (
 ## What we collect
 
 ### Account information
-When you sign up, we collect your email address and display name via Supabase Auth. If you sign in with Google OAuth, we receive your name, email, and profile photo from Google. We do not store your Google password.
+When you sign up, we collect your email address and display name via Supabase Auth.
 
 ### Content you upload
 Documents, notes, PDFs, and other files you add to your knowledge bases are stored on our infrastructure. This includes the original files, extracted text, and generated wiki pages. This is the core function of the service — we store your content so you and your connected AI tools can access it.
@@ -59,10 +59,6 @@ LLM Wiki connects to AI assistants (such as Claude by Anthropic) via the Model C
 - You can disconnect Claude at any time by removing the MCP connector in your Claude settings
 
 We do not control how Anthropic processes content sent through Claude conversations. Refer to Anthropic's privacy policy for details on their data handling.
-
-## Google API Limited Use
-
-Our use of information received from Google APIs adheres to the [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/user-data-faq), including the Limited Use requirements. We use Google account data only to authenticate you and provide the service. We do not sell it, use it for advertising, or use it to train AI models.
 
 ## What we do NOT do
 
