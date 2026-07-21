@@ -1,0 +1,20 @@
+# Context for Dockerfile.local (repo root). Service Dockerfiles (api/, mcp/,
+# web/, converter/) use their own subdirectory contexts and ignore this file.
+.git
+.github
+.venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+**/.next
+**/.wxt
+workspace/
+extension/
+tests/
+docs/
+deploy/
+!deploy/local-entrypoint.sh
+supabase/
+converter/
+*.png
+start.sh

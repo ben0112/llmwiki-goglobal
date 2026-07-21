@@ -1,0 +1,78 @@
+# All-in-one image for LOCAL mode (single user, SQLite + filesystem).
+# Ships every runtime dependency: Python API + MCP, the built web app, a JRE
+# for opendataloader-pdf, LibreOffice for Office extraction, and CJK fonts.
+#
+#   docker build -f Dockerfile.local -t llmwiki-local .
+#   docker run -d --name llmwiki -p 8000:8000 -p 3000:3000 \
+#       -v llmwiki-workspace:/workspace llmwiki-local
+#
+# Claude Desktop MCP (stdio via the running container):
+#   {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}
+#
+# NEXT_PUBLIC_* values are baked into the web bundle at build time; override
+# NEXT_PUBLIC_API_URL only if the API will not be published on localhost:8000.
+
+# ── Stage 1: web bundle ─────────────────────────────────────────────────────
+FROM node:22-alpine AS webbuilder
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ .
+ENV NEXT_PUBLIC_MODE=local
+ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+RUN npm run build
+
+# ── Stage 2: node runtime binary (glibc, matches bookworm) ─────────────────
+FROM node:22-bookworm-slim AS noderuntime
+
+# ── Stage 3: runtime ────────────────────────────────────────────────────────
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+
+# Extraction toolchain: JRE for opendataloader-pdf, LibreOffice for
+# Office→PDF conversion, Noto CJK so Chinese documents render correctly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        default-jre-headless \
+        libreoffice-writer libreoffice-impress libreoffice-calc \
+        fonts-noto-cjk fonts-liberation \
+        curl libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node runtime for the Next.js standalone server
+COPY --from=noderuntime /usr/local/bin/node /usr/local/bin/node
+
+# Python deps — the documented local-mode install (api + mcp share one env)
+COPY api/requirements.txt /tmp/api-requirements.txt
+COPY mcp/requirements.txt /tmp/mcp-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/api-requirements.txt -r /tmp/mcp-requirements.txt \
+    && rm /tmp/api-requirements.txt /tmp/mcp-requirements.txt
+
+# Application code (repo layout preserved so the llmwiki CLI works)
+COPY shared/ shared/
+COPY corpus/ corpus/
+COPY api/ api/
+COPY mcp/ mcp/
+COPY llmwiki llmwiki
+COPY deploy/local-entrypoint.sh /app/entrypoint.sh
+
+# Web standalone bundle
+COPY --from=webbuilder /web/.next/standalone /app/web/
+COPY --from=webbuilder /web/.next/static /app/web/.next/static
+COPY --from=webbuilder /web/public /app/web/public
+
+RUN chmod +x /app/entrypoint.sh /app/llmwiki
+
+ENV MODE=local \
+    WORKSPACE_PATH=/workspace \
+    APP_URL=http://localhost:3000 \
+    API_URL=http://localhost:8000 \
+    NODE_ENV=production
+
+VOLUME /workspace
+EXPOSE 8000 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

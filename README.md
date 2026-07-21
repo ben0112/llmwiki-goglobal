@@ -50,6 +50,21 @@
 
 **要求**:Python 3.11+、Node.js 20+。可选:[LibreOffice](https://www.libreoffice.org/)(抽取 Word/PPT)、`MISTRAL_API_KEY`(更高质量的 PDF OCR;默认用本地 opendataloader,无需联网)。
 
+> **Docker 一键运行(免装任何依赖)** — 镜像内置全部运行时(Python、Node、JRE、LibreOffice、Noto CJK 字体):
+>
+> ```bash
+> docker run -d --name llmwiki -p 8000:8000 -p 3000:3000 \
+>     -v ~/goglobal-ws:/workspace <dockerhub-user>/llmwiki-local:latest
+> ```
+>
+> 打开 [localhost:3000](http://localhost:3000) 即用;Claude Desktop 的 MCP 配置改为经容器 stdio:
+>
+> ```json
+> {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
+> ```
+>
+> 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
+
 **1. 安装**
 
 ```bash

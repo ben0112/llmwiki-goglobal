@@ -98,6 +98,19 @@ curl -sS -X DELETE "https://api.example.com/v1/api-keys/<id>" -H "Authorization:
 
 一个工作区一个 server 条目;多工作区就加多条。重启 Claude Desktop 生效。
 
+若本地部署跑在 Docker 里(README 的"Docker 一键运行",容器名 `llmwiki`),stdio 命令改为经容器执行:
+
+```json
+{
+  "mcpServers": {
+    "llmwiki": {
+      "command": "docker",
+      "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]
+    }
+  }
+}
+```
+
 **托管模式** — `claude_desktop_config.json` 的 `mcpServers` 只拉起本地进程,连远程服务需用 [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) 桥接(stdio ↔ Streamable HTTP,并注入认证头):
 
 ```json
