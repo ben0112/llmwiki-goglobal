@@ -3,7 +3,7 @@
 # for opendataloader-pdf, LibreOffice for Office extraction, and CJK fonts.
 #
 #   docker build -f Dockerfile.local -t llmwiki-local .
-#   docker run -d --name llmwiki -p 8000:8000 -p 3000:3000 \
+#   docker run -d --name llmwiki -p 9000:8000 -p 3000:3000 \
 #       -v llmwiki-workspace:/workspace llmwiki-local
 #
 # Claude Desktop MCP (stdio via the running container):

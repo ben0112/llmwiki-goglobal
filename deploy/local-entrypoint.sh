@@ -18,11 +18,13 @@ mkdir -p "$WORKSPACE_PATH"
 [ -f "$WORKSPACE_PATH/.llmwiki/index.db" ] || python3 /app/llmwiki init "$WORKSPACE_PATH"
 
 # Browser/客户端-facing origins. NEXT_PUBLIC_* is baked into the web bundle at
-# build time, so remapped host ports (e.g. -p 9000:8000) need runtime
+# build time, so remapped host ports (e.g. -p 9100:8000) need runtime
 # overrides: PUBLIC_API_URL reaches the browser via /__llmwiki_env.js and is
 # also used by the API for asset URLs; PUBLIC_MCP_URL is what MCP clients on
 # the host should connect to.
-PUBLIC_API_URL="${PUBLIC_API_URL:-http://localhost:8000}"
+# Fallback matches the documented bare `docker run -p 9000:8000` (compose
+# always passes PUBLIC_API_URL explicitly); the in-container port stays 8000.
+PUBLIC_API_URL="${PUBLIC_API_URL:-http://localhost:9000}"
 PUBLIC_MCP_URL="${PUBLIC_MCP_URL:-http://localhost:8080/mcp}"
 export API_URL="$PUBLIC_API_URL"
 printf 'window.__LLMWIKI_ENV__={API_URL:%s,MCP_URL:%s};\n' \

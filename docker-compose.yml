@@ -20,11 +20,12 @@ services:
       dockerfile: Dockerfile.local
     container_name: llmwiki
     ports:
-      # 换端口:LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 docker compose up -d
+      # 换端口:LLMWIKI_API_PORT=9100 LLMWIKI_WEB_PORT=9300 docker compose up -d
       # (PUBLIC_*_URL 会随端口变量自动对齐,浏览器/MCP 客户端才能找到服务)
       # 默认只绑定本机回环(本地单用户实例,API/MCP 无鉴权);
       # 需要局域网访问时:LLMWIKI_BIND=0.0.0.0
-      - "${LLMWIKI_BIND:-127.0.0.1}:${LLMWIKI_API_PORT:-8000}:8000"   # API(浏览器访问)
+      # API 宿主机默认 9000(容器内固定 8000),避开本机 LLM 推理栈常占的 8000
+      - "${LLMWIKI_BIND:-127.0.0.1}:${LLMWIKI_API_PORT:-9000}:8000"   # API(浏览器访问)
       - "${LLMWIKI_BIND:-127.0.0.1}:${LLMWIKI_WEB_PORT:-3000}:3000"   # Web 应用
       - "${LLMWIKI_BIND:-127.0.0.1}:${LLMWIKI_MCP_PORT:-8080}:8080"   # MCP(Streamable HTTP)
     environment:
@@ -32,7 +33,7 @@ services:
       #   CORPUS_LLM_BASE_URL: http://host.docker.internal:8000/v1   # OpenAI 兼容端点
       #   CORPUS_LLM_MODEL / CORPUS_LLM_API_KEY / CORPUS_BATCH_LIMIT
       #   CORPUS_AUTOCLASSIFY: "true"   # 自动分类(默认关)
-      PUBLIC_API_URL: http://localhost:${LLMWIKI_API_PORT:-8000}
+      PUBLIC_API_URL: http://localhost:${LLMWIKI_API_PORT:-9000}
       PUBLIC_MCP_URL: http://localhost:${LLMWIKI_MCP_PORT:-8080}/mcp
       PUBLIC_WEB_URL: http://localhost:${LLMWIKI_WEB_PORT:-3000}
     volumes:

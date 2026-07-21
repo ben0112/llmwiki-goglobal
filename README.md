@@ -53,7 +53,7 @@
 > ```bash
 > docker compose up -d        # 使用发布镜像 benjaminzhang/llmwiki-local:latest
 > # 或不用 compose:
-> docker run -d --name llmwiki -p 8000:8000 -p 3000:3000 \
+> docker run -d --name llmwiki -p 9000:8000 -p 3000:3000 \
 >     -v ~/goglobal-ws:/workspace benjaminzhang/llmwiki-local:latest
 > ```
 >
@@ -71,7 +71,7 @@
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
 > ```
 >
-> **换端口**:`LLMWIKI_API_PORT=9000 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认只绑定 127.0.0.1(本地实例无鉴权),局域网访问设 `LLMWIKI_BIND=0.0.0.0`。
+> **端口**:API 宿主机默认 `9000`(容器内固定 8000,避开本机 LLM 推理栈常占的 8000)、Web `3000`、MCP `8080`。换端口:`LLMWIKI_API_PORT=9100 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认只绑定 127.0.0.1(本地实例无鉴权),局域网访问设 `LLMWIKI_BIND=0.0.0.0`。
 >
 > 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
 
