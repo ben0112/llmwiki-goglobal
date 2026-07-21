@@ -103,40 +103,6 @@ class TestWriteIsolationWithoutRLS:
         )
         assert resp.status_code == 404
 
-    async def test_create_webclip_in_other_kb_returns_404(self, client_no_rls):
-        resp = await client_no_rls.post(
-            f"/v1/knowledge-bases/{KB_B_ID}/documents/web",
-            headers=auth_headers(USER_A_ID),
-            json={
-                "url": "https://example.com/bob",
-                "title": "Injected",
-                "html": "<article><p>pwned</p></article>",
-                "path": "/webclipper/",
-            },
-        )
-        assert resp.status_code == 404
-
-    async def test_create_webclip_in_other_kb_does_not_insert(self, client_no_rls, pool):
-        before = await pool.fetchval(
-            "SELECT COUNT(*) FROM documents WHERE knowledge_base_id = $1",
-            KB_B_ID,
-        )
-        await client_no_rls.post(
-            f"/v1/knowledge-bases/{KB_B_ID}/documents/web",
-            headers=auth_headers(USER_A_ID),
-            json={
-                "url": "https://example.com/bob",
-                "title": "Injected",
-                "html": "<article><p>pwned</p></article>",
-                "path": "/webclipper/research/",
-            },
-        )
-        after = await pool.fetchval(
-            "SELECT COUNT(*) FROM documents WHERE knowledge_base_id = $1",
-            KB_B_ID,
-        )
-        assert after == before
-
     async def test_update_content_cross_tenant_returns_404(self, client_no_rls):
         resp = await client_no_rls.put(
             f"/v1/documents/{DOC_B_ID}/content",

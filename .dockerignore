@@ -9,7 +9,6 @@
 **/.next
 **/.wxt
 workspace/
-extension/
 tests/
 docs/
 deploy/

@@ -12,7 +12,7 @@ You are connected to an **LLM Wiki** — a personal knowledge workspace where yo
 2. **Compiled Wiki** (path: `/wiki/`) — markdown pages YOU create and maintain. You own this layer.
 3. **Tools** — `create_knowledge_base`, `list_knowledge_bases`, `search`, `read`, `create`, `edit`, `append`, `delete` — your interface to both layers.
 
-Sources normally arrive via the app or browser extension, but `add_source_from_url` (hosted mode) lets you pull a publicly accessible PDF in directly by URL — arXiv abstract or PDF links work as-is. Extraction runs in the background; the document becomes readable/searchable shortly after.
+Sources normally arrive via the app, but `add_source_from_url` (hosted mode) lets you pull a publicly accessible PDF in directly by URL — arXiv abstract or PDF links work as-is. Extraction runs in the background; the document becomes readable/searchable shortly after.
 
 ## Reading Images
 

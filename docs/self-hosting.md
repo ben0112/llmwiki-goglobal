@@ -28,7 +28,7 @@ and the Railway/Netlify config files are inert.
                        ┌──────────────── reverse proxy (TLS) ────────────────┐
   browsers ──────────► │ app.example.com      → web:3000        (Next.js)    │
   Claude (MCP) ──────► │ mcp.example.com/mcp  → mcp:8080/mcp    (FastMCP)    │
-  browsers + ext ────► │ api.example.com      → api:8000        (FastAPI)    │
+  browsers ──────────► │ api.example.com      → api:8000        (FastAPI)    │
   browsers ──────────► │ s3.example.com       → minio:9000      (presigned)  │
                        │ supabase.example.com → kong:8000       (/auth/v1/*) │
                        └─────────────────────────────────────────────────────┘
@@ -155,21 +155,7 @@ server {
 # supabase.example.com → your Supabase kong port
 ```
 
-## 6. Chrome extension (optional)
-
-The published extension points at llmwiki.app. For your deployment, rebuild it
-with your endpoints (`extension/.env`):
-
-```
-VITE_API_BASE_URL=https://api.example.com
-VITE_SUPABASE_URL=https://supabase.example.com
-VITE_SUPABASE_ANON_KEY=eyJ...
-```
-
-`cd extension && npm ci && npm run zip`, then distribute the zip via your
-organization's Chrome policy (or load unpacked for testing).
-
-## 7. Verification checklist
+## 6. Verification checklist
 
 ```bash
 curl -fsS https://api.example.com/health            # {"status":"ok"}
@@ -183,7 +169,7 @@ without a page reload (exercises LISTEN/NOTIFY → WebSocket) → search for a
 term from the PDF (exercises PGroonga) → connect Claude via MCP and run the
 `guide` tool.
 
-## 8. Operations
+## 7. Operations
 
 - **Backups**: `pg_dump` the Supabase database + mirror the MinIO bucket
   (`mc mirror`). The database is the source of truth in hosted mode; S3 holds
@@ -213,7 +199,7 @@ term from the PDF (exercises PGroonga) → connect Claude via MCP and run the
 ## Notes on auth
 
 - **Email/password** login works with stock GoTrue and is the only login
-  method — Google OAuth has been removed from the web app and extension, so
+  method — Google OAuth has been removed from the web app, so
   no external identity provider is involved.
 - **MCP and API access use API keys** — no OAuth-capable auth server is
   required. Each user creates a key in **Settings → Connect Claude (MCP)**;

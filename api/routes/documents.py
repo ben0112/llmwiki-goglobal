@@ -8,8 +8,7 @@ from deps import get_document_service
 from infra.rate_limit import limiter
 from services.base import DocumentService
 from services.types import (
-    BulkDelete, CreateFromUrl, CreateNote, CreateWebClip,
-    ReplaceHighlights, UpdateContent, UpdateMetadata, UpsertHighlight,
+    BulkDelete, CreateFromUrl, CreateNote,     ReplaceHighlights, UpdateContent, UpdateMetadata, UpsertHighlight,
 )
 from services.url_ingest import UrlIngestService
 
@@ -23,17 +22,6 @@ async def list_documents(
     path: str | None = Query(None),
 ):
     return await service.list(str(kb_id), path)
-
-
-@router.get("/v1/documents/by-url")
-async def get_document_by_url(
-    service: Annotated[DocumentService, Depends(get_document_service)],
-    url: str = Query(..., max_length=2048),
-):
-    row = await service.get_by_source_url(url)
-    if not row:
-        raise HTTPException(status_code=404, detail="No document found for URL")
-    return row
 
 
 @router.get("/v1/documents/{doc_id}")
@@ -67,20 +55,6 @@ async def create_note(
     service: Annotated[DocumentService, Depends(get_document_service)],
 ):
     return await service.create_note(str(kb_id), body.filename, body.path, body.content)
-
-
-@router.post("/v1/knowledge-bases/{kb_id}/documents/web", status_code=201)
-@limiter.limit("30/minute")
-async def create_web_clip(
-    request: Request,
-    kb_id: UUID,
-    body: CreateWebClip,
-    service: Annotated[DocumentService, Depends(get_document_service)],
-):
-    highlights = [h.model_dump() for h in body.highlights] if body.highlights else None
-    return await service.create_web_clip(
-        str(kb_id), body.url, body.title, body.html, highlights, body.path,
-    )
 
 
 @router.post("/v1/documents/from-url", status_code=201)

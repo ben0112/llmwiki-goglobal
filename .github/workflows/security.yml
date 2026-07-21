@@ -58,12 +58,12 @@ jobs:
           comment-summary-in-pr: always
 
   npm-audit:
-    name: npm audit (web + extension)
+    name: npm audit (web)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        package_dir: [web, extension]
+        package_dir: [web]
     steps:
       - uses: actions/checkout@v4
 

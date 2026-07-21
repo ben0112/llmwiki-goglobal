@@ -13,7 +13,6 @@ import asyncpg
 from config import settings
 from fastapi import HTTPException
 from services.chunker import chunk_text, store_chunks
-from services.webclip_assets import materialize_webclip_assets
 
 from .base import DocumentService, KBService, PublicWikiService, ServiceFactory, UserService
 from .parsers import parse_frontmatter, title_from_filename
@@ -297,24 +296,6 @@ def _doc_dict(row) -> dict:
 _WEBCLIP_ROOT = "/webclipper/"
 
 
-def _normalize_webclip_path(path: str | None) -> str:
-    missing = path is None or not path.strip()
-    raw = _WEBCLIP_ROOT if missing else path.strip()
-    if "\\" in raw or "\x00" in raw:
-        raise HTTPException(status_code=400, detail="Invalid folder path")
-    raw = "/" + raw.strip("/") + "/"
-    raw = re.sub(r"/+", "/", raw)
-    parts = [p for p in raw.split("/") if p]
-    if not parts and not missing:
-        raise HTTPException(status_code=400, detail="Web clips must be stored under /webclipper/")
-    if any(p in {".", ".."} for p in parts):
-        raise HTTPException(status_code=400, detail="Invalid folder path")
-    normalized = "/" + "/".join(parts) + "/" if parts else _WEBCLIP_ROOT
-    if normalized != _WEBCLIP_ROOT and not normalized.startswith(_WEBCLIP_ROOT):
-        raise HTTPException(status_code=400, detail="Web clips must be stored under /webclipper/")
-    return normalized
-
-
 def _merge_highlights_by_id(existing: list[dict], incoming: list[dict]) -> list[dict]:
     merged: dict[str, dict] = {}
     order: list[str] = []
@@ -425,167 +406,6 @@ class HostedDocumentService(DocumentService):
             await self.pool.release(conn)
         return _doc_dict(row)
 
-    async def create_web_clip(
-        self, kb_id: str, url: str, title: str, html: str,
-        highlights: list[dict] | None = None, path: str = "/webclipper/",
-    ) -> dict:
-        from html_parser import Parser
-
-        await self._validate_kb(kb_id)
-        path = _normalize_webclip_path(path)
-
-        parser = Parser(html, url=url, content_only=True)
-        result = parser.parse(highlights=highlights or [])
-
-        existing_preview = await self.pool.fetchrow(
-            "SELECT id::text, filename FROM documents "
-            "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
-            "AND metadata->>'source_url' = $3 "
-            "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
-            "ORDER BY updated_at DESC LIMIT 1",
-            kb_id, self.user_id, url,
-        )
-
-        if existing_preview:
-            filename = existing_preview["filename"]
-        else:
-            filename = self._slugify_filename(title, "md")
-            filename = await self._dedupe_filename(kb_id, path, filename, "md")
-        stem = filename.rsplit(".", 1)[0]
-        markdown, assets = await materialize_webclip_assets(
-            result.content,
-            result.images,
-            f"{stem}.assets",
-        )
-        markdown_size = len((markdown or "").encode("utf-8"))
-        file_size = markdown_size + sum(len(asset.data) for asset in assets)
-        # Best-effort fast-fail for obvious quota errors. The in-transaction
-        # check below runs under the advisory lock and is authoritative.
-        await self._check_storage_available(file_size)
-
-        enriched = self._merge_text_anchors(highlights or [], result.highlights)
-        parent_doc_id = str(existing_preview["id"]) if existing_preview else str(uuid.uuid4())
-        for asset in assets:
-            asset.document_id = str(uuid.uuid4())
-
-        parent_metadata = {
-            "source_url": url,
-            "clip_kind": "web",
-            "assets": [asset.metadata() for asset in assets],
-        }
-
-        if self.s3:
-            for asset in assets:
-                await self.s3.upload_bytes(
-                    f"{self.user_id}/{asset.document_id}/source.{asset.file_type}",
-                    asset.data,
-                    asset.content_type,
-                )
-
-        old_asset_ids: list[str] = []
-        conn = await self.pool.acquire()
-        try:
-            async with conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", self.user_id)
-                await self._check_storage_available(file_size, conn=conn)
-                existing = None
-                if existing_preview:
-                    existing = await conn.fetchrow(
-                        "SELECT id::text, version, highlights FROM documents "
-                        "WHERE id = $1 AND user_id = $2 FOR UPDATE",
-                        parent_doc_id, self.user_id,
-                    )
-                if not existing:
-                    existing = await conn.fetchrow(
-                        "SELECT id::text, version, highlights FROM documents "
-                        "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
-                        "AND metadata->>'source_url' = $3 "
-                        "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
-                        "ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
-                        kb_id, self.user_id, url,
-                    )
-
-                if existing:
-                    parent_doc_id = str(existing["id"])
-                    current_highlights = self._parse_highlights(existing["highlights"])
-                    next_highlights = _merge_highlights_by_id(current_highlights, enriched)
-                    row = await conn.fetchrow(
-                        f"UPDATE documents SET path = $1, title = $2, file_size = $3, "
-                        f"status = 'ready', content = $4, metadata = $5::jsonb, "
-                        f"highlights = $6::jsonb, version = version + 1, updated_at = now() "
-                        f"WHERE id = $7 AND user_id = $8 "
-                        f"RETURNING {_DOC_COLUMNS}",
-                        path, title, markdown_size, markdown, json.dumps(parent_metadata),
-                        json.dumps(next_highlights), parent_doc_id, self.user_id,
-                    )
-                    # Re-clip of the same URL: clear the previous asset docs so
-                    # the fresh assets don't collide on (kb, path, filename).
-                    old_asset_ids = [
-                        r["id"] for r in await conn.fetch(
-                            "SELECT id::text FROM documents WHERE user_id = $1 "
-                            "AND metadata->>'parent_document_id' = $2",
-                            self.user_id, parent_doc_id,
-                        )
-                    ]
-                    if old_asset_ids:
-                        await conn.execute(
-                            "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
-                            old_asset_ids, self.user_id,
-                        )
-                else:
-                    next_highlights = enriched
-                    row = await conn.fetchrow(
-                        f"INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                        f"file_type, file_size, status, content, tags, metadata, highlights) "
-                        f"VALUES ($1, $2, $3, $4, $5, $6, 'md', $7, 'ready', $8, $9, $10, $11::jsonb) "
-                        f"RETURNING {_DOC_COLUMNS}",
-                        parent_doc_id, kb_id, self.user_id, filename, path, title, markdown_size, markdown,
-                        [], json.dumps(parent_metadata), json.dumps(next_highlights),
-                    )
-                for asset in assets:
-                    await conn.execute(
-                        "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-                        "file_type, file_size, status, content, tags, metadata) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', NULL, $9, $10::jsonb)",
-                        asset.document_id,
-                        kb_id,
-                        self.user_id,
-                        asset.filename,
-                        f"{path}{stem}.assets/",
-                        asset.filename,
-                        asset.file_type,
-                        len(asset.data),
-                        [],
-                        json.dumps({
-                            "asset": True,
-                            "hidden": True,
-                            "parent_document_id": parent_doc_id,
-                            "source_url": url,
-                            **asset.metadata(),
-                        }),
-                    )
-                chunks = chunk_text(markdown) if markdown else []
-                if chunks:
-                    await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
-                else:
-                    await conn.execute("DELETE FROM document_chunks WHERE document_id = $1", str(row["id"]))
-                # Materialize the highlights we just persisted into the
-                # freshly-created chunks. Without this, comments on a
-                # clipped-with-highlights doc would not be searchable until
-                # the user touched the highlight again.
-                if next_highlights:
-                    await self._recompute_chunks_for_doc(
-                        conn, str(row["id"]), [], next_highlights,
-                    )
-        finally:
-            await self.pool.release(conn)
-
-        await self._purge_s3(old_asset_ids)
-
-        response = _doc_dict(row)
-        response["highlights"] = next_highlights
-        return response
-
     @staticmethod
     def _merge_text_anchors(payloads: list[dict], mapped) -> list[dict]:
         """Merge parser-computed text_anchors back onto the original highlight
@@ -610,23 +430,6 @@ class HostedDocumentService(DocumentService):
                 }
             merged.append(entry)
         return merged
-
-    async def get_by_source_url(self, url: str) -> dict | None:
-        row = await self.pool.fetchrow(
-            "SELECT id::text, knowledge_base_id::text, title, path, filename, "
-            "version, highlights "
-            "FROM documents "
-            "WHERE user_id = $1 AND NOT archived "
-            "AND metadata->>'source_url' = $2 "
-            "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
-            "ORDER BY updated_at DESC LIMIT 1",
-            self.user_id, url,
-        )
-        if not row:
-            return None
-        result = dict(row)
-        result["highlights"] = self._parse_highlights(result.get("highlights"))
-        return result
 
     async def get_highlights(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(

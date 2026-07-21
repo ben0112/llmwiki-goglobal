@@ -130,16 +130,6 @@ class CreateFromUrl(BaseModel):
     path: str = Field(default="/", max_length=256)
 
 
-class CreateWebClip(BaseModel):
-    # 10 MB is generous for HTML; a typical blog article is <100 KB.
-    # Bounds the BeautifulSoup parsing surface to keep one upload from
-    # DoS-ing the API.
-    url: str = Field(max_length=2048)
-    title: str = Field(max_length=512)
-    html: str = Field(max_length=10 * 1024 * 1024)
-    path: str = Field(default="/webclipper/", max_length=256)
-    highlights: list[Highlight] | None = Field(default=None, max_length=500)
-
 
 class UpdateContent(BaseModel):
     content: str

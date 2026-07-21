@@ -32,12 +32,6 @@ export const metadata: Metadata = {
     description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 Claude 直接构建持续积累的维基。",
     images: ["/og.png"],
   },
-  // Signal to the LLM Wiki Chrome extension that this IS the wiki app — the
-  // content script should bail out and let the in-app highlight UI run alone.
-  // Works for prod (llmwiki.app), dev (localhost), and any future host.
-  other: {
-    "llmwiki-app": "true",
-  },
 };
 
 // Script to prevent theme flash - runs before React hydrates

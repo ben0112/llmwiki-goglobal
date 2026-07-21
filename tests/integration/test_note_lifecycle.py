@@ -415,33 +415,3 @@ class TestDeleteS3Purge:
         assert await HostedKBService(pool, USER_ID, s3).delete(KB_ID) is True
 
         assert f"{USER_ID}/{doc_id}/" in s3.deleted
-
-
-class TestWebClipReclip:
-
-    async def test_reclip_same_url_replaces_assets_without_500(self, client, pool):
-        png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-        body = {
-            "url": "https://example.com/reclip",
-            "title": "Reclip",
-            "html": f'<article><p>Body text here, long enough to chunk.</p>'
-                    f'<img src="data:image/png;base64,{png}"></article>',
-            "path": "/webclipper/",
-        }
-        headers = auth_headers(USER_ID)
-
-        r1 = await client.post(f"/v1/knowledge-bases/{KB_ID}/documents/web", headers=headers, json=body)
-        assert r1.status_code == 201
-
-        # Re-clipping the same URL must update, not 500 on the asset unique index.
-        r2 = await client.post(f"/v1/knowledge-bases/{KB_ID}/documents/web", headers=headers, json=body)
-        assert r2.status_code == 201
-        assert r2.json()["id"] == r1.json()["id"]
-
-        # Old asset cleared, new one inserted — exactly one asset doc remains.
-        asset_count = await pool.fetchval(
-            "SELECT COUNT(*) FROM documents WHERE knowledge_base_id = $1 "
-            "AND COALESCE(metadata->>'asset', 'false') = 'true'",
-            KB_ID,
-        )
-        assert asset_count == 1

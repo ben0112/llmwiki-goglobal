@@ -15,7 +15,7 @@
 | 方向 | 内容 |
 |---|---|
 | **八维语料层** | 受控码表(独立版本号,只增不改)、`EntryRecord` 八维条目模型与校验、标注明细 CSV 导入器(本地/托管双模式)、分面检索(15 个分面键,SQLite/Postgres 同一套)、中文全文检索(FTS5 trigram)、`lint` 完备性检查 + 覆盖率账本、Web 语料库视图(知识/业务双视图 + 覆盖率矩阵)、关系层五类边 + 复审工作清单 + KPI 仪表盘。详见 [`corpus/README.md`](corpus/README.md) |
-| **前端中文化** | Web 应用与 Chrome 扩展的全部用户界面文本为简体中文(法律条款页除外) |
+| **前端中文化** | Web 应用的全部用户界面文本为简体中文(法律条款页除外) |
 | **去 SaaS 化** | 移除 Google OAuth、Pydantic Logfire、OpenReplay;MCP/API 认证改为**平台内生成的 API 密钥**(`sv_` 前缀 Bearer),不再依赖 GoTrue 的 OAuth 2.1 服务;对象存储支持任意 S3 兼容端点(MinIO 等) |
 | **自部署** | `deploy/docker-compose.selfhost.yml` + [`docs/self-hosting.md`](docs/self-hosting.md) 完整部署指南(自托管 Supabase + MinIO + docker compose) |
 
@@ -23,7 +23,6 @@
 
 - **MCP 连接** — Claude.ai、Claude Cowork、Claude Code 或任何 MCP 兼容客户端读写、检索语料与维基
 - **八维语料库** — 每条语料一张"身份证"(阶段×大类主/副 + 六分面),按货架落位,分面检索、覆盖率账本、业务视图 7 类 27 场景导航
-- **Chrome 扩展** — 剪藏网页与 PDF,高亮、批注,Claude 经 MCP 可见
 - **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等
 - **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)
 - **治理闭环** — `lint` 八维检查、复审到期工作清单、KPI 仪表盘(分面完备率/货架覆盖率/时效达标率/引用溯源率)
@@ -33,10 +32,9 @@
 ```
   Claude  ──MCP──►  MCP 服务 ─┐
                               │               本地模式  →  SQLite + 本机文件系统
-  Web 端 ──HTTP─►  API ───────┼──►  VaultFS ─┤
-                              │               托管模式  →  Postgres + S3(MinIO)
-  扩展   ──HTTP─►  API ───────┘
-                    └──►  Converter(PDF / Office 文本抽取)
+  Web 端 ──HTTP─►  API ───────┴──►  VaultFS ─┤
+                                   │          托管模式  →  Postgres + S3(MinIO)
+                                   └──►  Converter(PDF / Office 文本抽取)
 ```
 
 `VaultFS` 是统一抽象:同一套维基/语料操作,本地跑在 SQLite + 文件系统上,托管跑在 Postgres + S3 上,Claude 的工具行为完全一致。
@@ -141,7 +139,7 @@ python3 -m corpus.import_annotations \
 
 **6. 让它自我维护(可选)** — 用 Claude Routine 定时执行,例如每晚:
 
-> *先读 guide。找出上次运行以来工作区新增的内容(上传、笔记、剪藏与高亮),逐一阅读并更新维基:该建页建页、该并入并入、修正受影响的交叉引用。用 `search(mode="references", query="due")` 拉取复审到期清单并处理。最后在 `wiki/log.md` 追加一条变更摘要。*
+> *先读 guide。找出上次运行以来工作区新增的内容(上传、笔记与高亮),逐一阅读并更新维基:该建页建页、该并入并入、修正受影响的交叉引用。用 `search(mode="references", query="due")` 拉取复审到期清单并处理。最后在 `wiki/log.md` 追加一条变更摘要。*
 
 ---
 
@@ -181,7 +179,6 @@ curl -fsS https://mcp.example.com/health     # ok
 - **MCP / API 用 API 密钥**:每个用户在 **设置 → 连接 Claude (MCP)** 生成 `sv_` 密钥,作为静态 `Authorization: Bearer` 头同时通行 MCP 与 REST API(SHA-256 哈希存储、可吊销、记录最近使用时间)。无需 OAuth 服务。
 - **`api` 只跑一个副本**(TUS 上传状态、WebSocket 连接与图谱重建锁为进程内状态)。
 - **converter 与 Postgres 不得暴露公网**;MinIO 的 S3 端口需公网可达(浏览器直传预签名 URL)。
-- **Chrome 扩展**:用你的端点重新构建(`extension/.env` 填 `VITE_API_BASE_URL` / `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY`,`npm run zip` 后按组织策略分发)。
 
 **托管模式导入语料** — 直接写入 Postgres,条目落入指定账号的知识库,分面检索/Web 语料库/lint/关系层即刻可用:
 

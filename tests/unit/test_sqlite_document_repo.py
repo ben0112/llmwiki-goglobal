@@ -64,25 +64,3 @@ async def test_find_by_path_matches_without_kb_columns():
         await db.close()
 
 
-@pytest.mark.asyncio
-async def test_get_by_source_url_reports_workspace_as_kb():
-    db = await _init_db()
-    try:
-        from infra.db.sqlite import SQLiteDocumentRepository
-
-        repo = SQLiteDocumentRepository(db)
-        await _insert_doc(db)
-        await _insert_doc(
-            db, id="d2", filename="failed.md", relative_path="webclipper/failed.md",
-            status="failed",
-        )
-
-        doc = await repo.get_by_source_url("https://example.com/article")
-        assert doc is not None
-        assert doc["id"] == "d1"  # failed docs are skipped
-        # Local mode reports the singleton workspace id as the knowledge base id.
-        assert doc["knowledge_base_id"] == "ws1"
-
-        assert await repo.get_by_source_url("https://example.com/unknown") is None
-    finally:
-        await db.close()

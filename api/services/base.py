@@ -68,15 +68,6 @@ class DocumentService(ABC):
     async def create_note(self, kb_id: str, filename: str, path: str, content: str) -> dict: ...
 
     @abstractmethod
-    async def create_web_clip(
-        self, kb_id: str, url: str, title: str, html: str,
-        highlights: list[dict] | None = None, path: str = "/webclipper/",
-    ) -> dict: ...
-
-    @abstractmethod
-    async def get_by_source_url(self, url: str) -> dict | None: ...
-
-    @abstractmethod
     async def get_highlights(self, doc_id: str) -> dict | None: ...
 
     @abstractmethod

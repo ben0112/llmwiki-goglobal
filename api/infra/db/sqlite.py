@@ -328,23 +328,6 @@ class SQLiteDocumentRepository:
         row = await cursor.fetchone()
         return row[0] if row else None
 
-    async def get_by_source_url(self, url: str) -> dict | None:
-        cursor = await self._db.execute(
-            "SELECT id, (SELECT id FROM workspace LIMIT 1) AS knowledge_base_id, "
-            "title, path, filename, version, highlights "
-            "FROM documents "
-            "WHERE status != 'failed' "
-            "AND json_extract(metadata, '$.source_url') = ? "
-            "ORDER BY updated_at DESC LIMIT 1",
-            (url,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return None
-        result = _row_to_dict(cursor, row)
-        result["highlights"] = self._parse_highlights(result.get("highlights"))
-        return result
-
     async def get_highlights(self, doc_id: str) -> dict | None:
         cursor = await self._db.execute(
             "SELECT id, version, highlights FROM documents WHERE id = ?", (doc_id,),
