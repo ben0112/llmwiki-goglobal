@@ -54,3 +54,26 @@ def test_extract_references_matches_hyphenated_version_source():
     )
 
     assert edges == [{"target_id": "source-1", "type": "cites", "page": 5}]
+
+
+def test_parse_citation_chinese_article_suffix_strips_but_keeps_no_page():
+    parse_citation_filename = _references_module().parse_citation_filename
+    assert parse_citation_filename(
+        "00033_《境外投资管理办法》(商务部令2014年第3号)_平台_0f0e072c0a.txt, 第2条"
+    ) == ("00033_《境外投资管理办法》(商务部令2014年第3号)_平台_0f0e072c0a.txt", None)
+
+
+def test_parse_citation_chinese_page_suffix_maps_to_page_number():
+    parse_citation_filename = _references_module().parse_citation_filename
+    assert parse_citation_filename("白皮书.pdf, 第12页") == ("白皮书.pdf", 12)
+
+
+def test_parse_citation_chinese_suffix_fullwidth_comma_and_numerals():
+    parse_citation_filename = _references_module().parse_citation_filename
+    assert parse_citation_filename("条例.txt,第十三条") == ("条例.txt", None)
+    assert parse_citation_filename("指南.txt, 第3章") == ("指南.txt", None)
+
+
+def test_parse_citation_ascii_page_still_wins():
+    parse_citation_filename = _references_module().parse_citation_filename
+    assert parse_citation_filename("paper.pdf, p.3") == ("paper.pdf", 3)

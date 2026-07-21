@@ -96,6 +96,15 @@ class TestCitationParsing:
         from tools.references import _parse_citation_filename
         assert _parse_citation_filename("paper.pdf") == ("paper.pdf", None)
 
+    def test_chinese_article_suffix_resolves_filename(self):
+        from tools.references import _parse_citation_filename
+        assert _parse_citation_filename("办法.txt, 第2条") == ("办法.txt", None)
+        assert _parse_citation_filename("条例.txt,第十三条") == ("条例.txt", None)
+
+    def test_chinese_page_suffix_maps_to_page(self):
+        from tools.references import _parse_citation_filename
+        assert _parse_citation_filename("白皮书.pdf, 第12页") == ("白皮书.pdf", 12)
+
     def test_strips_markdown_link(self):
         from tools.references import _parse_citation_filename
         name, _ = _parse_citation_filename("[Paper Title](http://example.com)")

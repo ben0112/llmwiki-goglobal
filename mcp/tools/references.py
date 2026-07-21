@@ -23,10 +23,16 @@ def _parse_citation_filename(raw: str) -> tuple[str, int | None]:
     if page_match:
         filename = raw[:page_match.start()].strip()
         page = int(page_match.group(1))
-    else:
-        filename = raw
-        page = None
-    return filename, page
+        return filename, page
+    # 中文定位后缀:第X条/页/章/节/款(全角/半角逗号均可)。条款类定位不映射为
+    # 页码(仅剥离以解析文件名,定位信息保留在脚注原文里);"第N页"按页码处理。
+    zh_match = re.search(r"[,,]\s*第\s*([0-9〇零一二三四五六七八九十百千]+)\s*([条页章节款])", raw)
+    if zh_match:
+        filename = raw[:zh_match.start()].strip()
+        num = zh_match.group(1)
+        page = int(num) if zh_match.group(2) == "页" and num.isdigit() else None
+        return filename, page
+    return raw, None
 
 
 def _parse_wiki_links(content: str, current_dir: str) -> list[str]:
