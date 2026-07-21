@@ -181,7 +181,9 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
         <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
           <p className="text-sm font-medium">还没有已分类语料</p>
           <p className="text-xs text-muted-foreground max-w-md">
-            用 <code className="rounded bg-muted px-1">corpus/import_annotations.py</code> 导入八维标注明细后,条目会出现在这里。
+            点击上方状态条的<span className="font-medium text-foreground">立即分类</span>让流水线自动标注工作区文件
+            (先在 设置 → 语料分类流水线 配好 LLM 端点),或用{' '}
+            <code className="rounded bg-muted px-1">corpus/import_annotations.py</code> 导入现成的八维标注明细。
           </p>
         </div>
       ) : view === 'business' ? (

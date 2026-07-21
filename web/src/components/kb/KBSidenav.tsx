@@ -83,9 +83,10 @@ export function KBSidenav({
   const pathname = usePathname()
   const params = useParams<{ slug?: string }>()
 
-  // 语料库 view is only offered when classified corpus entries exist
-  // (metadata written by corpus/import_annotations.py).
-  const hasCorpus = React.useMemo(
+  // 语料库 entry shows when classified entries exist, or (local mode) when the
+  // classification pipeline has pending documents — otherwise a fresh workspace
+  // full of unclassified files has no way to reach the 立即分类 button.
+  const hasEntries = React.useMemo(
     () =>
       sourceDocs.some((d) => {
         const meta = d.metadata as Record<string, unknown> | null
@@ -93,6 +94,8 @@ export function KBSidenav({
       }),
     [sourceDocs],
   )
+  const pipelinePending = usePipelinePending()
+  const hasCorpus = hasEntries || pipelinePending > 0
   const corpusViewActive = pathname?.endsWith('/corpus') ?? false
   const onCorpusToggle = React.useCallback(() => {
     if (params.slug) router.push(`/wikis/${params.slug}/corpus`)
@@ -198,15 +201,16 @@ export function KBSidenav({
               {hasCorpus && (
                 <button
                   onClick={onCorpusToggle}
-                  title="语料库"
+                  title={pipelinePending > 0 ? `语料库(待分类 ${pipelinePending})` : '语料库'}
                   className={cn(
-                    'flex items-center justify-center size-8 rounded-md transition-colors cursor-pointer',
+                    'relative flex items-center justify-center size-8 rounded-md transition-colors cursor-pointer',
                     corpusViewActive
                       ? 'bg-accent text-foreground'
                       : 'text-muted-foreground/50 hover:text-muted-foreground hover:bg-accent',
                   )}
                 >
                   <LayoutGrid className="size-3.5" />
+                  <PendingBadge count={pipelinePending} />
                 </button>
               )}
               <button
@@ -283,14 +287,15 @@ export function KBSidenav({
           <button
             onClick={onCorpusToggle}
             className={cn(
-              'flex items-center justify-center size-8 shrink-0 border rounded-md transition-colors cursor-pointer',
+              'relative flex items-center justify-center size-8 shrink-0 border rounded-md transition-colors cursor-pointer',
               corpusViewActive
                 ? 'bg-accent text-foreground border-border'
                 : 'text-muted-foreground/50 hover:text-muted-foreground border-border hover:bg-accent',
             )}
-            title="语料库"
+            title={pipelinePending > 0 ? `语料库(待分类 ${pipelinePending})` : '语料库'}
           >
             <LayoutGrid className="size-3" />
+            <PendingBadge count={pipelinePending} />
           </button>
         )}
       </div>
@@ -819,3 +824,33 @@ function PageUsageBar() {
   )
 }
 
+
+
+// 本地模式:轮询分类流水线的待分类计数,驱动语料库入口与角标。
+// 非本地模式或端点不可用时恒为 0,不影响原有行为。
+function usePipelinePending(): number {
+  const token = useUserStore((s) => s.accessToken)
+  const [pending, setPending] = React.useState(0)
+  React.useEffect(() => {
+    if (process.env.NEXT_PUBLIC_MODE !== 'local' || !token) return
+    let cancelled = false
+    const poll = () => {
+      apiFetch<{ counts: { pending: number } }>('/v1/corpus/pipeline/status', token)
+        .then((s) => { if (!cancelled) setPending(s.counts.pending) })
+        .catch(() => {})
+    }
+    poll()
+    const t = setInterval(poll, 60000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [token])
+  return pending
+}
+
+function PendingBadge({ count }: { count: number }) {
+  if (count <= 0) return null
+  return (
+    <span className="absolute -top-1 -right-1 min-w-4 rounded-full bg-amber-500 px-1 text-center text-[9px] leading-4 text-white">
+      {count > 99 ? '99+' : count}
+    </span>
+  )
+}
