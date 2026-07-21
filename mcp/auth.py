@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 
 import jwt as pyjwt
@@ -8,6 +9,8 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+API_KEY_PREFIX = "sv_"
 
 _jwks_client: PyJWKClient | None = None
 
@@ -23,9 +26,39 @@ def _get_jwks_client() -> PyJWKClient:
 _EXPECTED_ISSUER = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
 
 
+async def _verify_api_key(raw_key: str) -> AccessToken | None:
+    """Verify an `sv_` API key (created via /v1/api-keys) by SHA-256 lookup.
+
+    Static bearer credentials keep MCP clients working on self-hosted
+    deployments whose auth server has no OAuth 2.1 support. Mirrors
+    api/auth.py verify_api_key; last_used_at is updated in the same statement.
+    """
+    from db import service_queryrow
+
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    try:
+        row = await service_queryrow(
+            "UPDATE api_keys SET last_used_at = now() "
+            "WHERE key_hash = $1 AND revoked_at IS NULL "
+            "RETURNING user_id",
+            key_hash,
+        )
+    except Exception as e:
+        logger.warning("MCP auth rejected: api-key lookup failed: %s", e)
+        return None
+    if row is None:
+        logger.info("MCP auth rejected: unknown or revoked API key")
+        return None
+    user_id = str(row["user_id"])
+    logger.info("MCP auth (api key): %s", user_id)
+    return AccessToken(token=raw_key, client_id=user_id, scopes=[])
+
+
 class SupabaseTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        if token.startswith(API_KEY_PREFIX):
+            return await _verify_api_key(token)
         try:
             signing_key = await asyncio.to_thread(
                 _get_jwks_client().get_signing_key_from_jwt, token

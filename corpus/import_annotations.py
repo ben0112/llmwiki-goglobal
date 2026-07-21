@@ -26,6 +26,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -235,20 +236,9 @@ def write_reports(report_dir: Path, records: list, stats: ImportStats, table: Co
 # Main
 # ---------------------------------------------------------------------------
 
-def run(csv_path: Path, workspace: Path, raw_root: Path | None = None,
-        version: str = DEFAULT_VERSION, dry_run: bool = False,
-        today: date | None = None) -> ImportStats:
-    table = load(version)
+def load_records(csv_path: Path, table: CodeTable, today: date) -> tuple[list[EntryRecord], ImportStats]:
+    """Parse + dedupe an annotation CSV. Shared by the local and hosted paths."""
     stats = ImportStats()
-    today = today or date.today()
-    imported_on = today.isoformat()
-
-    db_path = workspace / ".llmwiki" / "index.db"
-    if not dry_run and not db_path.exists():
-        raise SystemExit(
-            f"工作区未初始化: {db_path} 不存在。先运行: ./llmwiki init {workspace}"
-        )
-
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     stats.total = len(rows)
@@ -267,6 +257,23 @@ def run(csv_path: Path, workspace: Path, raw_root: Path | None = None,
         stats.warnings += sum(1 for i in rec.issues if i.level != ERROR)
         if rec.needs_review:
             stats.review += 1
+    return records, stats
+
+
+def run(csv_path: Path, workspace: Path, raw_root: Path | None = None,
+        version: str = DEFAULT_VERSION, dry_run: bool = False,
+        today: date | None = None) -> ImportStats:
+    table = load(version)
+    today = today or date.today()
+    imported_on = today.isoformat()
+
+    db_path = workspace / ".llmwiki" / "index.db"
+    if not dry_run and not db_path.exists():
+        raise SystemExit(
+            f"工作区未初始化: {db_path} 不存在。先运行: ./llmwiki init {workspace}"
+        )
+
+    records, stats = load_records(csv_path, table, today)
 
     conn = None
     user_id = None
@@ -302,21 +309,46 @@ def run(csv_path: Path, workspace: Path, raw_root: Path | None = None,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="导入八维标注明细到 LLM Wiki 工作区")
+    ap = argparse.ArgumentParser(
+        description="导入八维标注明细 — 本地工作区(--workspace)或 hosted 部署(--database-url)",
+    )
     ap.add_argument("--csv", required=True, help="标注明细.csv 或 标注明细_业务视图.csv")
-    ap.add_argument("--workspace", required=True, help="LLM Wiki 工作区目录(已 init)")
+    ap.add_argument("--workspace", default=None, help="本地模式: LLM Wiki 工作区目录(已 init)")
+    ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", ""),
+                    help="hosted 模式: Postgres 连接串(或环境变量 DATABASE_URL)")
+    ap.add_argument("--user-email", default=None, help="hosted 模式: 语料归属账号邮箱(须已注册)")
+    ap.add_argument("--kb", default="goglobal-corpus", help="hosted 模式: 知识库 slug(不存在则创建)")
     ap.add_argument("--raw", default=None, help="收录语料根目录(可选;提供则正文入条目)")
     ap.add_argument("--codetable", default=DEFAULT_VERSION, help=f"码表版本(默认 {SPEC_VERSION})")
     ap.add_argument("--dry-run", action="store_true", help="只校验并出报告,不写入")
     args = ap.parse_args()
 
-    stats = run(
-        csv_path=Path(args.csv).resolve(),
-        workspace=Path(args.workspace).resolve(),
-        raw_root=Path(args.raw).resolve() if args.raw else None,
-        version=args.codetable,
-        dry_run=args.dry_run,
-    )
+    hosted = bool(args.database_url and args.user_email)
+    if not hosted and not args.workspace:
+        ap.error("需要 --workspace(本地)或 --database-url + --user-email(hosted)")
+
+    raw_root = Path(args.raw).resolve() if args.raw else None
+    if hosted:
+        import asyncio
+
+        from .hosted_import import run_hosted
+        stats = asyncio.run(run_hosted(
+            csv_path=Path(args.csv).resolve(),
+            database_url=args.database_url,
+            user_email=args.user_email,
+            kb_slug=args.kb,
+            raw_root=raw_root,
+            version=args.codetable,
+            dry_run=args.dry_run,
+        ))
+    else:
+        stats = run(
+            csv_path=Path(args.csv).resolve(),
+            workspace=Path(args.workspace).resolve(),
+            raw_root=raw_root,
+            version=args.codetable,
+            dry_run=args.dry_run,
+        )
     mode = "校验" if args.dry_run else "导入"
     print(f"[✓] {mode}完成: {stats.imported}/{stats.total} 条"
           f" · 复核队列 {stats.review} · 错误 {stats.errors} · 提示 {stats.warnings}")

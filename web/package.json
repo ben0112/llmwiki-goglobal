@@ -8,7 +8,6 @@
     "start": "next start"
   },
   "dependencies": {
-    "@openreplay/tracker": "17.2.6",
     "@radix-ui/react-context-menu": "2.2.16",
     "@radix-ui/react-dialog": "1.1.15",
     "@radix-ui/react-dropdown-menu": "2.1.16",
@@ -66,8 +65,8 @@
     "@tiptap/pm": "3.22.2"
   },
   "optionalDependencies": {
-    "lightningcss-linux-x64-gnu": "1.32.0",
-    "@tailwindcss/oxide-linux-x64-gnu": "4.2.2"
+    "@tailwindcss/oxide-linux-x64-gnu": "4.2.2",
+    "lightningcss-linux-x64-gnu": "1.32.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.2.2",

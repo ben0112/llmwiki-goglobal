@@ -45,6 +45,21 @@ python3 -m corpus.import_annotations \
 
 `标注明细.csv`(未派生业务视图)同样可导;业务四列缺省即空。
 
+**Hosted(自部署多用户)模式**:直接导入 Postgres,条目落入指定账号的知识库
+(文档 + 检索分块一步到位,分面检索/Web 语料库/lint/关系层即刻可用):
+
+```bash
+python3 -m corpus.import_annotations \
+    --csv 标注结果/标注明细_业务视图.csv \
+    --database-url "$DATABASE_URL" \
+    --user-email corpus-admin@example.com \
+    --kb goglobal-corpus \
+    --raw 审核结果_deepseek/收录
+```
+
+账号须已注册;知识库不存在则自动创建;整个导入在单事务内(失败不留半态);
+重跑幂等,内容变化才 bump version 并重建分块。详见 `docs/self-hosting.md`。
+
 ## 导入后的形态
 
 - **文件即真相源**:每条语料一个 markdown 文件,按货架落位

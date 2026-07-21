@@ -15,11 +15,6 @@ class Settings(BaseSettings):
     # a direct connection sidesteps that. Falls back to DATABASE_URL when unset.
     DIRECT_DATABASE_URL: str = ""
     SUPABASE_URL: str = ""
-    SUPABASE_JWT_SECRET: str = ""
-    VOYAGE_API_KEY: str = ""
-    TURBOPUFFER_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "voyage-4-lite"
-    EMBEDDING_DIM: int = 512
     LOGFIRE_TOKEN: str = ""
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""

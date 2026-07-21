@@ -13,10 +13,6 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = ""
     SUPABASE_URL: str = ""
-    VOYAGE_API_KEY: str = ""
-    TURBOPUFFER_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "voyage-4-lite"
-    EMBEDDING_DIM: int = 512
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"

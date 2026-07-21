@@ -1,11 +1,11 @@
 'use client'
 
 import * as React from 'react'
-import { Copy, Check, ArrowLeft } from 'lucide-react'
+import { Copy, Check, ArrowLeft, KeyRound, Trash2 } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
-import { buildOAuthMcpConfig, MCP_URL } from '@/lib/mcp'
+import { buildApiKeyMcpConfig, MCP_URL } from '@/lib/mcp'
 import { useUserStore } from '@/stores'
 
 interface Usage {
@@ -14,6 +14,14 @@ interface Usage {
   document_count: number
   max_pages: number
   max_storage_bytes: number
+}
+
+interface ApiKey {
+  id: string
+  name: string | null
+  key_prefix: string
+  created_at: string
+  last_used_at: string | null
 }
 
 function formatBytes(bytes: number): string {
@@ -29,9 +37,6 @@ export default function SettingsPage() {
   const token = useUserStore((s) => s.accessToken)
   const [usage, setUsage] = React.useState<Usage | null>(null)
   const [loading, setLoading] = React.useState(true)
-  const [configCopied, setConfigCopied] = React.useState(false)
-
-  const oauthConfigJson = buildOAuthMcpConfig()
 
   React.useEffect(() => {
     if (!token) return
@@ -40,16 +45,6 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [token])
-
-  const handleCopyConfig = async () => {
-    try {
-      await navigator.clipboard.writeText(oauthConfigJson)
-      setConfigCopied(true)
-      setTimeout(() => setConfigCopied(false), 2000)
-    } catch {
-      console.error('Failed to copy')
-    }
-  }
 
   return (
     <div className="max-w-2xl mx-auto p-8">
@@ -120,45 +115,167 @@ export default function SettingsPage() {
       {usage && <div className="h-px bg-border my-8" />}
 
       {/* MCP Config */}
-      <section>
-        <h2 className="text-base font-medium">
-          {process.env.NEXT_PUBLIC_MODE === 'local' ? 'Connect Claude' : 'Connect via OAuth'}
-        </h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          {process.env.NEXT_PUBLIC_MODE === 'local'
-            ? 'Run this command to get the Claude Desktop / Claude Code MCP config for this workspace:'
-            : 'Add this configuration to your MCP client. On first connection, it should prompt you to sign in with Supabase.'
-          }
-        </p>
-        <div className="relative mt-4">
-          <pre className="rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
-            {process.env.NEXT_PUBLIC_MODE === 'local'
-              ? 'llmwiki mcp-config <workspace-path>'
-              : oauthConfigJson
-            }
-          </pre>
-          {process.env.NEXT_PUBLIC_MODE !== 'local' && (
-            <button
-              onClick={handleCopyConfig}
-              className={cn(
-                'absolute top-3 right-3 flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs transition-colors cursor-pointer',
-                configCopied
-                  ? 'bg-green-500/10 text-green-600 dark:text-green-400'
-                  : 'bg-background border border-border text-muted-foreground hover:text-foreground hover:bg-accent'
-              )}
-            >
-              {configCopied ? <><Check size={12} />Copied</> : <><Copy size={12} />Copy</>}
-            </button>
-          )}
-        </div>
-        {process.env.NEXT_PUBLIC_MODE !== 'local' && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            MCP URL:
-            {' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{MCP_URL}</code>
+      {process.env.NEXT_PUBLIC_MODE === 'local' ? (
+        <section>
+          <h2 className="text-base font-medium">Connect Claude</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Run this command to get the Claude Desktop / Claude Code MCP config for this workspace:
           </p>
-        )}
-      </section>
+          <pre className="mt-4 rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
+            llmwiki mcp-config &lt;workspace-path&gt;
+          </pre>
+        </section>
+      ) : (
+        <ApiKeysSection />
+      )}
     </div>
+  )
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = React.useState(false)
+  return (
+    <button
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(text)
+          setCopied(true)
+          setTimeout(() => setCopied(false), 2000)
+        } catch {
+          console.error('Failed to copy')
+        }
+      }}
+      className={cn(
+        'absolute top-3 right-3 flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs transition-colors cursor-pointer',
+        copied
+          ? 'bg-green-500/10 text-green-600 dark:text-green-400'
+          : 'bg-background border border-border text-muted-foreground hover:text-foreground hover:bg-accent'
+      )}
+    >
+      {copied ? <><Check size={12} />Copied</> : <><Copy size={12} />Copy</>}
+    </button>
+  )
+}
+
+// API keys are the MCP/API credential: they work as Bearer tokens anywhere a
+// session JWT does, and need no OAuth-capable auth server — which keeps
+// self-hosted deployments working (see docs/self-hosting.md).
+function ApiKeysSection() {
+  const token = useUserStore((s) => s.accessToken)
+  const [keys, setKeys] = React.useState<ApiKey[]>([])
+  const [name, setName] = React.useState('')
+  const [creating, setCreating] = React.useState(false)
+  const [newKey, setNewKey] = React.useState<string | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const refresh = React.useCallback(() => {
+    if (!token) return
+    apiFetch<ApiKey[]>('/v1/api-keys', token)
+      .then(setKeys)
+      .catch(() => {})
+  }, [token])
+
+  React.useEffect(() => {
+    refresh()
+  }, [refresh])
+
+  const createKey = async () => {
+    if (!token || creating) return
+    setCreating(true)
+    setError(null)
+    try {
+      const res = await apiFetch<ApiKey & { key: string }>('/v1/api-keys', token, {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim() || 'Default' }),
+      })
+      setNewKey(res.key)
+      setName('')
+      refresh()
+    } catch {
+      setError('Failed to create API key')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const revokeKey = async (id: string) => {
+    if (!token) return
+    try {
+      await apiFetch(`/v1/api-keys/${id}`, token, { method: 'DELETE' })
+      refresh()
+    } catch {
+      setError('Failed to revoke API key')
+    }
+  }
+
+  return (
+    <section>
+      <h2 className="text-base font-medium">Connect Claude (MCP)</h2>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Create an API key and add the configuration below to your MCP client
+        (Claude Desktop, Claude Code, or claude.ai custom connectors). The key
+        authenticates as you — treat it like a password and revoke it when no
+        longer needed.
+      </p>
+
+      <div className="mt-4 flex items-center gap-2">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Key name (e.g. claude-desktop)"
+          className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
+        />
+        <button
+          onClick={createKey}
+          disabled={creating}
+          className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
+        >
+          <KeyRound size={14} />
+          Create key
+        </button>
+      </div>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+      {newKey && (
+        <div className="mt-4">
+          <p className="text-xs text-amber-600 dark:text-amber-500">
+            This key is shown once — copy the config now and store it safely.
+          </p>
+          <div className="relative mt-2">
+            <pre className="rounded-lg bg-muted border border-border p-4 text-xs font-mono overflow-x-auto text-foreground">
+              {buildApiKeyMcpConfig(newKey)}
+            </pre>
+            <CopyButton text={buildApiKeyMcpConfig(newKey)} />
+          </div>
+        </div>
+      )}
+
+      {keys.length > 0 && (
+        <div className="mt-5 divide-y divide-border rounded-lg border border-border">
+          {keys.map((k) => (
+            <div key={k.id} className="flex items-center gap-3 px-3 py-2 text-sm">
+              <span className="font-medium">{k.name || 'Default'}</span>
+              <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{k.key_prefix}…</code>
+              <span className="flex-1 text-xs text-muted-foreground">
+                created {k.created_at.slice(0, 10)}
+                {k.last_used_at ? ` · last used ${k.last_used_at.slice(0, 10)}` : ' · never used'}
+              </span>
+              <button
+                onClick={() => revokeKey(k.id)}
+                title="Revoke"
+                className="p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-accent transition-colors cursor-pointer"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p className="mt-3 text-xs text-muted-foreground">
+        MCP URL:{' '}
+        <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{MCP_URL}</code>
+      </p>
+    </section>
   )
 }

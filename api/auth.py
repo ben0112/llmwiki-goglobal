@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import time
 
@@ -10,6 +11,8 @@ from fastapi import HTTPException, Request
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+API_KEY_PREFIX = "sv_"
 
 # Bounded TTL ensures we periodically pick up Supabase key rotations.
 _jwks_cache: dict[str, PyJWK] = {}
@@ -114,6 +117,26 @@ async def verify_token(token: str) -> str:
     return user_id
 
 
+async def verify_api_key(pool, raw_key: str) -> str:
+    """Verify an `sv_` API key against its stored SHA-256 hash.
+
+    Returns the owning user_id; raises ValueError for unknown/revoked keys.
+    Created by /v1/api-keys; usable anywhere a Supabase JWT is (API + MCP),
+    which keeps self-hosted deployments independent of OAuth-capable auth
+    servers. last_used_at is updated in the same statement.
+    """
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    row = await pool.fetchrow(
+        "UPDATE api_keys SET last_used_at = now() "
+        "WHERE key_hash = $1 AND revoked_at IS NULL "
+        "RETURNING user_id",
+        key_hash,
+    )
+    if row is None:
+        raise ValueError("Unknown or revoked API key")
+    return str(row["user_id"])
+
+
 async def get_current_user(request: Request) -> str:
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -121,6 +144,8 @@ async def get_current_user(request: Request) -> str:
 
     token = auth_header.removeprefix("Bearer ").strip()
     try:
+        if token.startswith(API_KEY_PREFIX):
+            return await verify_api_key(request.app.state.pool, token)
         return await verify_token(token)
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token")
