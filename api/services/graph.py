@@ -103,9 +103,12 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
 
     # Atomic: transaction wraps the delete + all inserts
     async with conn.transaction():
+        # Only content-derived edges are rebuilt; curated relation-layer edges
+        # (is_a/next/routes_to/governed_by/serves) are preserved.
         await conn.execute(
             "DELETE FROM document_references "
             "WHERE knowledge_base_id = $1 "
+            "AND reference_type IN ('cites', 'links_to') "
             "AND knowledge_base_id IN (SELECT id FROM knowledge_bases WHERE user_id = $2)",
             kb_id, user_id,
         )
@@ -197,7 +200,10 @@ async def rebuild_local(db, user_id: str) -> dict:
     # failure so a mid-rebuild error can't leave the graph wiped.
     async with serialized_write():
         try:
-            await db.execute("DELETE FROM document_references")
+            # Curated relation-layer edges survive; only derived edges rebuild.
+            await db.execute(
+                "DELETE FROM document_references WHERE reference_type IN ('cites', 'links_to')"
+            )
 
             total_cites = 0
             total_links = 0

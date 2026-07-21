@@ -211,7 +211,7 @@ class PostgresVaultFS(VaultFS):
         facet_sql = "".join(f" AND {c}" for c in conds)
         return await scoped_query(
             self.user_id,
-            "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at "
+            "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at, metadata "
             "FROM documents d WHERE knowledge_base_id = $1 AND NOT archived AND user_id = $2 "
             "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
             f"{facet_sql} "
@@ -349,12 +349,29 @@ class PostgresVaultFS(VaultFS):
         pass
 
 
-    async def delete_references(self, source_doc_id: str) -> None:
-        await scoped_execute(
+    async def delete_references(self, source_doc_id: str, ref_types: tuple | None = None) -> None:
+        if ref_types:
+            await scoped_execute(
+                self.user_id,
+                "DELETE FROM document_references WHERE source_document_id = $1 "
+                "AND reference_type = ANY($2::text[])",
+                source_doc_id, list(ref_types),
+            )
+        else:
+            await scoped_execute(
+                self.user_id,
+                "DELETE FROM document_references WHERE source_document_id = $1",
+                source_doc_id,
+            )
+
+    async def delete_reference(self, source_id: str, target_id: str, ref_type: str) -> bool:
+        result = await scoped_execute(
             self.user_id,
-            "DELETE FROM document_references WHERE source_document_id = $1",
-            source_doc_id,
+            "DELETE FROM document_references WHERE source_document_id = $1 "
+            "AND target_document_id = $2 AND reference_type = $3",
+            source_id, target_id, ref_type,
         )
+        return bool(result) and result.split()[-1] != "0"
 
     async def upsert_reference(self, source_id: str, target_id: str, kb_id: str, ref_type: str, page: int | None) -> None:
         try:

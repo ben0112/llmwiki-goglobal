@@ -1,10 +1,13 @@
 """Search tool — browse, search, and query references in the knowledge vault."""
 
+import json
 import logging
+from datetime import date
 from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from vaultfs import VaultFS
+from vaultfs.base import RELATION_TYPES
 from vaultfs.facets import UnknownFacetError
 
 from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
@@ -128,7 +131,40 @@ class SearchHandler:
             return await self._find_uncited()
         if query == "stale":
             return await self._find_stale()
+        if query == "due":
+            return await self._find_due()
         return await self._document_references(path)
+
+    async def _find_due(self) -> str:
+        """Corpus review worklist: overdue review_due + 待复核 entries."""
+        docs = await self.fs.list_documents(self.kb_id)
+        today = date.today().isoformat()
+        due: list[tuple[str, dict, dict]] = []
+        for doc in docs:
+            meta = doc.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            if not isinstance(meta, dict) or "spec_version" not in meta or "stage" not in meta:
+                continue
+            review_due = str(meta.get("review_due") or "")[:10]
+            if meta.get("lifecycle_state") == "待复核":
+                due.append(("待复核", doc, meta))
+            elif review_due and review_due < today:
+                due.append((f"复审到期 {review_due}", doc, meta))
+        if not due:
+            return "复审工作清单为空 — 没有到期或待复核的语料条目。"
+        due.sort(key=lambda item: str(item[2].get("review_due") or ""))
+        lines = [f"**复审工作清单 ({len(due)} 条)** — 按 review_due 升序:\n"]
+        for reason, doc, meta in due:
+            lines.append(
+                f"  {doc['path']}{doc['filename']} — {reason} "
+                f"({meta.get('entry_id', '?')} · {meta.get('timeliness', '?')})"
+            )
+        lines.append("\n复核后请更新条目的 lifecycle_state 与 review_due (重导入或编辑 frontmatter)。")
+        return "\n".join(lines)
 
     async def _find_uncited(self) -> str:
         """Find source documents not cited by any wiki page."""
@@ -174,6 +210,7 @@ class SearchHandler:
         if forward:
             cites = [r for r in forward if r["reference_type"] == "cites"]
             links = [r for r in forward if r["reference_type"] == "links_to"]
+            relations = [r for r in forward if r["reference_type"] in RELATION_TYPES]
             if cites:
                 lines.append(f"**Cites ({len(cites)} sources):**")
                 for r in cites:
@@ -183,6 +220,14 @@ class SearchHandler:
                 lines.append(f"\n**Links to ({len(links)} pages):**")
                 for r in links:
                     lines.append(f"  {r['path']}{r['filename']} ({r.get('title') or r['filename']})")
+            if relations:
+                lines.append(f"\n**Relations ({len(relations)}, curated):**")
+                for r in relations:
+                    label = RELATION_TYPES[r["reference_type"]]
+                    lines.append(
+                        f"  —{r['reference_type']} ({label})→ {r['path']}{r['filename']} "
+                        f"({r.get('title') or r['filename']})"
+                    )
         else:
             lines.append("No outgoing references.")
 
@@ -190,7 +235,11 @@ class SearchHandler:
         if backlinks:
             lines.append(f"**Referenced by ({len(backlinks)} pages):**")
             for r in backlinks:
-                ref = "cites" if r["reference_type"] == "cites" else "links to"
+                ref_type = r["reference_type"]
+                if ref_type in RELATION_TYPES:
+                    ref = f"{ref_type} ({RELATION_TYPES[ref_type]})"
+                else:
+                    ref = "cites" if ref_type == "cites" else "links to"
                 lines.append(f"  {r['path']}{r['filename']} ({r.get('title') or r['filename']}) — {ref}")
         else:
             lines.append("No incoming references (backlinks).")
@@ -296,7 +345,11 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "- `search(mode=\"references\", path=\"/wiki/concepts/scaling.md\")` — what it cites + what links to it\n"
             "- `search(mode=\"references\", path=\"paper.pdf\")` — which wiki pages cite this source\n"
             "- `search(mode=\"references\", query=\"uncited\")` — sources with no wiki citations\n"
-            "- `search(mode=\"references\", query=\"stale\")` — pages flagged as potentially stale\n\n"
+            "- `search(mode=\"references\", query=\"stale\")` — pages flagged as potentially stale\n"
+            "- `search(mode=\"references\", query=\"due\")` — corpus review worklist "
+            "(overdue review_due + 待复核 entries)\n"
+            "Reference output includes curated relation edges (see the `relate` tool): "
+            "is_a 上下位, next 前后置, routes_to 路径衔接, governed_by 归口映射, serves 阶段服务包.\n\n"
             "Use `path` to scope: `*` for root, `/wiki/**` for wiki only, `*.pdf` for PDFs, etc.\n"
             "Use `tags` to filter by document tags.\n\n"
             "Corpus facet filtering (list + search modes): when the knowledge base holds "

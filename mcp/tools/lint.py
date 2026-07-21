@@ -113,7 +113,11 @@ class LintHandler:
 
         report = self._format_report(issues, docs)
         if corpus_entries:
-            report += "\n\n" + self._format_coverage_ledger(corpus_entries)
+            uncited_paths = {
+                f"{r['path']}{r['filename']}"
+                for r in await self.fs.find_uncited_sources(self.kb_id)
+            }
+            report += "\n\n" + self._format_coverage_ledger(corpus_entries, uncited_paths)
         return report
 
     # ----- selection -------------------------------------------------------
@@ -373,21 +377,43 @@ class LintHandler:
 
         return issues
 
-    def _format_coverage_ledger(self, entries: list[tuple[dict, dict]]) -> str:
-        """货架覆盖率账本: 主阶段 × 大类层 grid over classified corpus entries."""
+    def _format_coverage_ledger(self, entries: list[tuple[dict, dict]], uncited_paths: set[str]) -> str:
+        """货架覆盖率账本 + 质量 KPI (spec §5.4) over classified corpus entries."""
         stages = sorted(_CORPUS_STAGES)
         grid = {s: dict.fromkeys(_CORPUS_LAYERS, 0) for s in stages}
         pending = 0
-        for _doc, meta in entries:
+        complete = 0
+        on_time = 0
+        cited = 0
+        today = date.today().isoformat()
+        for doc, meta in entries:
             stage = meta.get("stage")
             domain = str(meta.get("domain") or "X9")
             if stage in grid and domain[:1] in _CORPUS_LAYERS:
                 grid[stage][domain[:1]] += 1
             if meta.get("lifecycle_state") == "待复核":
                 pending += 1
+            if all(meta.get(f) for f in _CORPUS_REQUIRED):
+                complete += 1
+            review_due = str(meta.get("review_due") or "")[:10]
+            if review_due and review_due >= today:
+                on_time += 1
+            if self._doc_path(doc) not in uncited_paths:
+                cited += 1
+
+        n = len(entries)
+        filled = sum(1 for s in stages for layer in ("G", "C", "O", "Z") if grid[s][layer] > 0)
+        total_cells = len(stages) * 4
+
+        def pct(x: int) -> str:
+            return f"{x / n * 100:.0f}%" if n else "—"
 
         lines = [
-            f"**覆盖率账本** ({len(entries)} 条语料; 待复核 {pending}):",
+            f"**覆盖率账本** ({n} 条语料; 待复核 {pending}):",
+            "",
+            f"KPI: 分面完备率 {pct(complete)} · 货架覆盖率 {filled}/{total_cells}格 "
+            f"({filled / total_cells * 100:.0f}%) · 时效达标率 {pct(on_time)} · "
+            f"引用溯源率 {pct(cited)}",
             "",
             "| 阶段＼层 | G政府 | C合规 | O运营 | Z专项 | X兜底 |",
             "|---|---|---|---|---|---|",
@@ -523,7 +549,8 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
             "For classified corpus entries (八维标注) it additionally checks dimension "
             "completeness (公理一), code-table membership, overdue reviews (review_due), "
             "and pending manual reviews — and appends the 阶段×大类 coverage ledger "
-            "(货架覆盖率) with empty shelf cells to guide the next collection round.\n\n"
+            "(货架覆盖率) with empty shelf cells to guide the next collection round, plus "
+            "quality KPIs: 分面完备率, 货架覆盖率, 时效达标率, 引用溯源率.\n\n"
             "Use `path` to scope the run, e.g. `*`, `/wiki/**`, or `/wiki/concepts/*.md`."
         ),
     )

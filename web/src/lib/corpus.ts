@@ -322,6 +322,63 @@ export function businessPendingCount(entries: CorpusEntry[]): number {
 }
 
 // ---------------------------------------------------------------------------
+// Quality KPIs (spec §5.4 质量 KPI)
+// ---------------------------------------------------------------------------
+
+const REQUIRED_DIMENSIONS: Array<keyof CorpusMeta> = [
+  'stage', 'domain', 'genre', 'evidence', 'origin', 'gov_dept',
+  'timeliness', 'lifecycle_state', 'review_due',
+]
+
+export interface CorpusKpis {
+  total: number
+  /** 分面完备率: entries with every required dimension non-empty. */
+  completeness: number
+  /** 货架覆盖率: non-empty stage × G/C/O/Z cells. */
+  shelfFilled: number
+  shelfTotal: number
+  /** 时效达标率: entries whose review_due has not passed. */
+  onTime: number
+  /** 引用溯源率: entries cited by at least one wiki page (null until graph loads). */
+  cited: number | null
+  pendingReview: number
+}
+
+export function computeKpis(
+  entries: CorpusEntry[],
+  citedDocIds: Set<string> | null,
+  todayIso?: string,
+): CorpusKpis {
+  const today = todayIso ?? new Date().toISOString().slice(0, 10)
+  let completeness = 0
+  let onTime = 0
+  let pendingReview = 0
+  let cited = 0
+  for (const { doc, meta } of entries) {
+    const complete = REQUIRED_DIMENSIONS.every((f) => {
+      const v = meta[f]
+      return Array.isArray(v) ? v.length > 0 : Boolean(v)
+    })
+    if (complete) completeness += 1
+    if (meta.review_due && meta.review_due.slice(0, 10) >= today) onTime += 1
+    if (meta.lifecycle_state === '待复核') pendingReview += 1
+    if (citedDocIds?.has(doc.id)) cited += 1
+  }
+  const grid = buildCoverageGrid(entries)
+  const shelfTotal = STAGES.length * 4 // X 兜底 excluded — it is not a target shelf
+  const shelfFilled = shelfTotal - grid.emptyCells.length
+  return {
+    total: entries.length,
+    completeness,
+    shelfFilled,
+    shelfTotal,
+    onTime,
+    cited: citedDocIds ? cited : null,
+    pendingReview,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle / review status
 // ---------------------------------------------------------------------------
 

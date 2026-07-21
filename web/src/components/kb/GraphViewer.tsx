@@ -24,7 +24,9 @@ interface GraphNode {
 interface GraphEdge {
   source: string
   target: string
-  type: 'cites' | 'links_to'
+  // 'cites' | 'links_to' plus the curated relation-layer types
+  // (is_a/next/routes_to/governed_by/serves) added by the `relate` MCP tool.
+  type: string
   page?: number
 }
 
@@ -103,7 +105,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
   // out — flip the source layer on rather than claiming nothing is indexed.
   React.useEffect(() => {
     if (!graphData || focusNodeId) return
-    const hasWikiLinks = graphData.edges.some((e) => e.type === 'links_to')
+    const hasWikiLinks = graphData.edges.some((e) => e.type !== 'cites')
     if (!hasWikiLinks && graphData.edges.length > 0) setShowSources(true)
   }, [graphData, focusNodeId])
 
@@ -168,10 +170,11 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
         (e) => e.source === focusNodeId || e.target === focusNodeId,
       )
     } else {
-      // Global mode: wiki-to-wiki links; the source layer brings citation edges with it
+      // Global mode: wiki links + curated relations; the source layer brings
+      // citation edges with it.
       const hubTitles = new Set(['overview', 'log'])
       relevantEdges = relevantEdges.filter(
-        (e) => e.type === 'links_to' || (showSources && e.type === 'cites'),
+        (e) => e.type !== 'cites' || showSources,
       )
       relevantNodes = relevantNodes.filter((n) => {
         if (n.source_kind !== 'wiki' && !showSources) return false

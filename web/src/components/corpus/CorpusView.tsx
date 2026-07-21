@@ -8,6 +8,8 @@ import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, LayoutGrid, ListFilter, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { apiFetch } from '@/lib/api'
+import { useUserStore } from '@/stores'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
 import {
   buildBusinessView,
@@ -15,6 +17,7 @@ import {
   businessPendingCount,
   collectCorpusEntries,
   collectFacetOptions,
+  computeKpis,
   entryMatches,
   FACET_LABELS,
   filterEntries,
@@ -28,6 +31,12 @@ import {
   type FacetSelections,
 } from '@/lib/corpus'
 
+interface GraphEdge {
+  source: string
+  target: string
+  type: string
+}
+
 const PANEL_FACETS: FacetKey[] = [
   'stage', 'domain', 'genre', 'rule', 'evidence', 'origin',
   'dept', 'geo', 'industry', 'timeliness', 'state',
@@ -37,15 +46,38 @@ const MAX_CHIPS = 12
 
 export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: string; kbName: string }) {
   const router = useRouter()
+  const token = useUserStore((s) => s.accessToken)
   const { documents, loading } = useKBDocuments(kbId)
   const [view, setView] = React.useState<'knowledge' | 'business'>('knowledge')
   const [selections, setSelections] = React.useState<FacetSelections>({})
+  const [citedDocIds, setCitedDocIds] = React.useState<Set<string> | null>(null)
+
+  // Citation targets from the reference graph power the 引用溯源率 KPI.
+  React.useEffect(() => {
+    let cancelled = false
+    apiFetch<{ edges: GraphEdge[] }>(`/v1/knowledge-bases/${kbId}/graph`, token ?? '')
+      .then((res) => {
+        if (cancelled) return
+        const cited = new Set<string>()
+        for (const edge of res.edges ?? []) {
+          if (edge.type === 'cites') cited.add(edge.target)
+        }
+        setCitedDocIds(cited)
+      })
+      .catch(() => {
+        // KPI simply shows — when the graph is unavailable.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [kbId, token])
 
   const entries = React.useMemo(() => collectCorpusEntries(documents), [documents])
   const filtered = React.useMemo(() => filterEntries(entries, selections), [entries, selections])
   const coverage = React.useMemo(() => buildCoverageGrid(entries), [entries])
   const businessClasses = React.useMemo(() => buildBusinessView(entries), [entries])
   const pendingBusiness = React.useMemo(() => businessPendingCount(entries), [entries])
+  const kpis = React.useMemo(() => computeKpis(entries, citedDocIds), [entries, citedDocIds])
 
   const toggleFacet = React.useCallback((key: FacetKey, value: string) => {
     setSelections((prev) => {
@@ -165,6 +197,8 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
                 </div>
               )}
 
+              <KpiStrip kpis={kpis} onShowPending={() => setSelections({ state: '待复核' })} />
+
               <CoverageMatrix
                 coverage={coverage}
                 selections={selections}
@@ -248,6 +282,59 @@ function FacetGroup({
           </button>
         )}
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+function KpiStrip({ kpis, onShowPending }: { kpis: ReturnType<typeof computeKpis>; onShowPending: () => void }) {
+  const pct = (x: number) => (kpis.total ? `${Math.round((x / kpis.total) * 100)}%` : '—')
+  const cells: Array<{ label: string; value: string; hint: string; alert?: boolean; onClick?: () => void }> = [
+    { label: '分面完备率', value: pct(kpis.completeness), hint: '八维必填维度全非空的条目占比 (公理一)' },
+    {
+      label: '货架覆盖率',
+      value: `${kpis.shelfFilled}/${kpis.shelfTotal}`,
+      hint: '主阶段×大类层非空格子数 — 空格即补采方向',
+    },
+    { label: '时效达标率', value: pct(kpis.onTime), hint: '复审未逾期条目占比 (review_due)' },
+    {
+      label: '引用溯源率',
+      value: kpis.cited === null ? '—' : pct(kpis.cited),
+      hint: '被至少一个 wiki 页面引用的条目占比',
+    },
+    {
+      label: '待复核',
+      value: String(kpis.pendingReview),
+      hint: '人工复核队列条目数 — 点击筛选',
+      alert: kpis.pendingReview > 0,
+      onClick: kpis.pendingReview > 0 ? onShowPending : undefined,
+    },
+  ]
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+      {cells.map((cell) => (
+        <button
+          key={cell.label}
+          onClick={cell.onClick}
+          disabled={!cell.onClick}
+          title={cell.hint}
+          className={cn(
+            'rounded-lg border border-border px-3 py-2 text-left',
+            cell.onClick ? 'cursor-pointer hover:bg-accent transition-colors' : 'cursor-default',
+          )}
+        >
+          <div className="text-[11px] text-muted-foreground">{cell.label}</div>
+          <div
+            className={cn(
+              'mt-0.5 text-lg font-medium tabular-nums',
+              cell.alert && 'text-amber-600 dark:text-amber-500',
+            )}
+          >
+            {cell.value}
+          </div>
+        </button>
+      ))}
     </div>
   )
 }

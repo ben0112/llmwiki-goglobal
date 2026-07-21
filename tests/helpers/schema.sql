@@ -136,7 +136,10 @@ CREATE TABLE document_references (
     source_document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     target_document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     knowledge_base_id UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    reference_type TEXT NOT NULL CHECK (reference_type IN ('cites', 'links_to')),
+    reference_type TEXT NOT NULL CHECK (reference_type IN (
+        'cites', 'links_to',
+        'is_a', 'next', 'routes_to', 'governed_by', 'serves'
+    )),  -- mirrors supabase/migrations/009_relation_types.sql
     page INTEGER,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     UNIQUE(source_document_id, target_document_id, reference_type)

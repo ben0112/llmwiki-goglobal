@@ -4,6 +4,7 @@ import re
 import logging
 
 from vaultfs import VaultFS
+from vaultfs.base import CITATION_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,9 @@ async def update_references(fs: VaultFS, kb_id: str, document_id: str, content: 
         if target and str(target["id"]) != document_id:
             edges.append((str(target["id"]), "links_to", None))
 
-    await fs.delete_references(document_id)
+    # Only content-derived edges are rebuilt; curated relation-layer edges
+    # (is_a/next/routes_to/governed_by/serves) survive page edits.
+    await fs.delete_references(document_id, ref_types=CITATION_TYPES)
 
     seen = set()
     for target_id, ref_type, page in edges:

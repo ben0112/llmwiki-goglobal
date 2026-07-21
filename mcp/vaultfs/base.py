@@ -1,5 +1,18 @@
 from abc import ABC, abstractmethod
 
+# Content-derived edge types, rebuilt from wiki page text on every write.
+CITATION_TYPES = ("cites", "links_to")
+
+# Curated relation-layer edges (corpus spec v2026.06 §2.5) — created via the
+# `relate` tool and preserved across content-driven rebuilds.
+RELATION_TYPES = {
+    "is_a": "上下位",
+    "next": "前后置",
+    "routes_to": "路径衔接",
+    "governed_by": "归口映射",
+    "serves": "阶段服务包",
+}
+
 
 class DuplicateDocumentError(Exception):
     """Raised when create_document hits a uniqueness constraint on (kb, path, filename)."""
@@ -79,7 +92,16 @@ class VaultFS(ABC):
     def delete_from_disk(self, docs: list[dict]) -> None: ...
 
     @abstractmethod
-    async def delete_references(self, source_doc_id: str) -> None: ...
+    async def delete_references(self, source_doc_id: str, ref_types: tuple | None = None) -> None:
+        """Delete outgoing references; `ref_types` scopes deletion (None = all).
+
+        Content-driven rebuilds pass CITATION_TYPES so curated relation-layer
+        edges survive page edits.
+        """
+
+    @abstractmethod
+    async def delete_reference(self, source_id: str, target_id: str, ref_type: str) -> bool:
+        """Delete one edge; returns True when a row was removed."""
 
     @abstractmethod
     async def upsert_reference(self, source_id: str, target_id: str, kb_id: str, ref_type: str, page: int | None) -> None: ...

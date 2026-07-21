@@ -74,11 +74,20 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     UNIQUE(document_id, chunk_index)
 );
 
+-- Reference types: 'cites'/'links_to' are derived from page content on every
+-- write; the five relation-layer types (关系层, corpus spec v2026.06 §2.5) are
+-- curated via the MCP `relate` tool and must survive content-driven rebuilds —
+-- rebuild paths only delete the derived citation types.
+--   is_a 上下位 · next 前后置 · routes_to 路径衔接 ·
+--   governed_by 归口映射 · serves 阶段服务包
 CREATE TABLE IF NOT EXISTS document_references (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     target_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    reference_type TEXT NOT NULL CHECK (reference_type IN ('cites', 'links_to')),
+    reference_type TEXT NOT NULL CHECK (reference_type IN (
+        'cites', 'links_to',
+        'is_a', 'next', 'routes_to', 'governed_by', 'serves'
+    )),
     page INTEGER,
     UNIQUE(source_document_id, target_document_id, reference_type)
 );

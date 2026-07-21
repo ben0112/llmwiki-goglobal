@@ -100,8 +100,35 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
         await _migrate_fts_tokenizer(db, schema)
+        await _migrate_reference_types(db, schema)
         await db.commit()
     return db
+
+
+async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> None:
+    """Rebuild document_references when an existing DB has the old CHECK.
+
+    SQLite cannot ALTER a CHECK constraint, so pre-existing databases (which
+    only allow 'cites'/'links_to') are rebuilt to accept the five relation-layer
+    types (is_a/next/routes_to/governed_by/serves). Mirrored in
+    mcp/vaultfs/sqlite.py init.
+    """
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_references'"
+    )
+    row = await cur.fetchone()
+    if not row or "governed_by" in (row[0] or ""):
+        return
+    await db.execute("DROP INDEX IF EXISTS idx_refs_source")
+    await db.execute("DROP INDEX IF EXISTS idx_refs_target")
+    await db.execute("ALTER TABLE document_references RENAME TO document_references_old")
+    await db.executescript(schema)
+    await db.execute(
+        "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type, page) "
+        "SELECT id, source_document_id, target_document_id, reference_type, page FROM document_references_old"
+    )
+    await db.execute("DROP TABLE document_references_old")
+    logger.info("Rebuilt document_references with relation-layer types")
 
 
 async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:

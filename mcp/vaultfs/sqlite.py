@@ -100,6 +100,33 @@ async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:
     logger.info("Rebuilt chunks_fts with trigram tokenizer")
 
 
+async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> None:
+    """Rebuild document_references when an existing DB has the old CHECK.
+
+    SQLite cannot ALTER a CHECK constraint, so pre-existing databases (which
+    only allow 'cites'/'links_to') are rebuilt to accept the five relation-layer
+    types. Mirrored in api/infra/db/sqlite.py create_pool.
+    """
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_references'"
+    )
+    row = await cur.fetchone()
+    if not row or "governed_by" in (row[0] or ""):
+        return
+    # Indexes are dropped first so the schema re-run recreates them on the new
+    # table (IF NOT EXISTS would otherwise skip them while attached to the old).
+    await db.execute("DROP INDEX IF EXISTS idx_refs_source")
+    await db.execute("DROP INDEX IF EXISTS idx_refs_target")
+    await db.execute("ALTER TABLE document_references RENAME TO document_references_old")
+    await db.executescript(schema)
+    await db.execute(
+        "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type, page) "
+        "SELECT id, source_document_id, target_document_id, reference_type, page FROM document_references_old"
+    )
+    await db.execute("DROP TABLE document_references_old")
+    logger.info("Rebuilt document_references with relation-layer types")
+
+
 def _build_fts_match(query: str) -> str | None:
     """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
 
@@ -146,6 +173,7 @@ class SqliteVaultFS(VaultFS):
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)
             await _migrate_fts_tokenizer(_db, schema)
+            await _migrate_reference_types(_db, schema)
             await _db.commit()
         logger.info("SQLite initialized: %s", db_path)
 
@@ -346,7 +374,7 @@ class SqliteVaultFS(VaultFS):
     async def list_documents(self, kb_id: str, facets: dict | None = None) -> list[dict]:
         db = self._db_or_raise()
         sql = (
-            "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at "
+            "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at, metadata "
             "FROM documents d WHERE status != 'failed' "
             "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
         )
@@ -535,10 +563,30 @@ class SqliteVaultFS(VaultFS):
         return path is not None and path.exists()
 
 
-    async def delete_references(self, source_doc_id: str) -> None:
+    async def delete_references(self, source_doc_id: str, ref_types: tuple | None = None) -> None:
         db = self._db_or_raise()
-        await db.execute("DELETE FROM document_references WHERE source_document_id = ?", (source_doc_id,))
+        if ref_types:
+            placeholders = ",".join("?" for _ in ref_types)
+            await db.execute(
+                f"DELETE FROM document_references WHERE source_document_id = ? "
+                f"AND reference_type IN ({placeholders})",
+                (source_doc_id, *ref_types),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM document_references WHERE source_document_id = ?", (source_doc_id,)
+            )
         await db.commit()
+
+    async def delete_reference(self, source_id: str, target_id: str, ref_type: str) -> bool:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "DELETE FROM document_references WHERE source_document_id = ? "
+            "AND target_document_id = ? AND reference_type = ?",
+            (source_id, target_id, ref_type),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
     async def upsert_reference(self, source_id: str, target_id: str, kb_id: str, ref_type: str, page: int | None) -> None:
         db = self._db_or_raise()
