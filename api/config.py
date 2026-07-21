@@ -42,6 +42,13 @@ class Settings(BaseSettings):
 
     SENTRY_DSN: str = ""
 
+    # 语料分类流水线(本地模式;设置页存储优先于这些环境变量)
+    CORPUS_LLM_BASE_URL: str = ""
+    CORPUS_LLM_MODEL: str = ""
+    CORPUS_LLM_API_KEY: str = ""
+    CORPUS_LLM_TIMEOUT: float = 120.0
+    CORPUS_BATCH_LIMIT: int = 0  # 0 = 端点感知默认(本地20/云端100)
+
     @property
     def listen_database_url(self) -> str:
         """Connection for the LISTEN loop — direct if configured, else the pooler."""

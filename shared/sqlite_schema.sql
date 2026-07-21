@@ -131,3 +131,19 @@ CREATE INDEX IF NOT EXISTS idx_chunks_annotated
   ON document_chunks(document_id) WHERE has_highlight = 1;
 CREATE INDEX IF NOT EXISTS idx_refs_source ON document_references(source_document_id);
 CREATE INDEX IF NOT EXISTS idx_refs_target ON document_references(target_document_id);
+
+-- 语料分类流水线:逐源文档状态(L3-P1)
+CREATE TABLE IF NOT EXISTS corpus_pipeline (
+    doc_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (state IN ('imported', 'excluded', 'failed')),
+    attempts INTEGER DEFAULT 1,
+    error TEXT DEFAULT '',
+    entry_id TEXT DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 工作区级键值设置(如 corpus_llm:分类 LLM 端点,前端可配)
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
