@@ -56,9 +56,11 @@
   "overrides": {
     "postcss": "8.5.10",
     "uuid": "14.0.0",
-    "fast-uri": "3.1.2",
+    "fast-uri": "3.1.4",
     "ws": "8.21.0",
-    "dompurify": "3.4.11",
+    "dompurify": "3.4.12",
+    "linkify-it": "5.0.2",
+    "sharp": "0.35.3",
     "markdown-it": "14.2.0",
     "@babel/core": "7.29.7",
     "@tiptap/core": "3.22.2",
