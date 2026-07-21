@@ -6,6 +6,10 @@
 
 本项目基于 [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki)(Andrej Karpathy [LLM Wiki 概念](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)的开源实现)深度改造:在"上传资料 → Claude 通过 MCP 编译维基"的原有能力之上,落地了出海服务语料的**八维分类、分面检索、覆盖率治理与关系层**,前端全量中文化,并剥离全部外部 SaaS 依赖,可完全离线本地运行或在自有基础设施上多用户部署。
 
+<p align="center">
+  <img src="wiki-page.png" alt="LLM Wiki — 已编译的维基页面,带脚注引用与本页目录" width="820" />
+</p>
+
 ## 与上游的差异
 
 | 方向 | 内容 |
