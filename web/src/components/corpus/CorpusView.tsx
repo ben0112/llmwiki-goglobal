@@ -6,6 +6,10 @@
 
 import * as React from 'react'
 import { PipelineStrip } from './PipelineStrip'
+import {
+  CodetableOptions, ReviewActions, ReviewBadges, ReviewDialog,
+  isMandatoryReview, reviewEntry,
+} from './ReviewBar'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, LayoutGrid, ListFilter, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -48,10 +52,36 @@ const MAX_CHIPS = 12
 export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: string; kbName: string }) {
   const router = useRouter()
   const token = useUserStore((s) => s.accessToken)
-  const { documents, loading } = useKBDocuments(kbId)
+  const { documents, loading, refetchDocuments } = useKBDocuments(kbId)
   const [view, setView] = React.useState<'knowledge' | 'business'>('knowledge')
   const [selections, setSelections] = React.useState<FacetSelections>({})
   const [citedDocIds, setCitedDocIds] = React.useState<Set<string> | null>(null)
+  const [codetable, setCodetable] = React.useState<CodetableOptions | null>(null)
+  const [editing, setEditing] = React.useState<CorpusEntry | null>(null)
+  const [batchBusy, setBatchBusy] = React.useState(false)
+
+  // 复核对话框的码表取值(本地模式;端点不存在时静默,操作按钮不受影响)
+  React.useEffect(() => {
+    if (!token || codetable) return
+    apiFetch<CodetableOptions>('/v1/corpus/codetable', token)
+      .then(setCodetable)
+      .catch(() => {})
+  }, [token, codetable])
+
+  const onReviewed = React.useCallback(() => { refetchDocuments() }, [refetchDocuments])
+
+  const batchApprove = React.useCallback(async (targets: CorpusEntry[]) => {
+    if (!token || batchBusy) return
+    setBatchBusy(true)
+    try {
+      for (const e of targets) {
+        await reviewEntry(token, e.doc.id, 'approve', undefined, '批量通过(低风险)')
+      }
+    } catch { /* 剩余条目留在队列 */ } finally {
+      setBatchBusy(false)
+      refetchDocuments()
+    }
+  }, [token, batchBusy, refetchDocuments])
 
   // Citation targets from the reference graph power the 引用溯源率 KPI.
   React.useEffect(() => {
@@ -140,6 +170,10 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
       </div>
 
       <PipelineStrip />
+      {editing && codetable && (
+        <ReviewDialog docId={editing.doc.id} meta={editing.meta} options={codetable}
+          onClose={() => setEditing(null)} onDone={onReviewed} />
+      )}
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">加载中…</div>
@@ -214,7 +248,23 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
                 }
               />
 
-              <EntryTable entries={filtered} onOpen={openEntry} />
+              {selections.state === '待复核' && (() => {
+                const lowRisk = filtered.filter(
+                  (e) => reviewStatus(e.meta) === 'pending_review' && !isMandatoryReview(e.meta))
+                return lowRisk.length > 0 ? (
+                  <div className="mb-2 flex items-center justify-between rounded-md border border-border bg-muted/30 px-3 py-1.5 text-xs">
+                    <span className="text-muted-foreground">
+                      低风险条目可批量通过;法律 C1 / 数据出境 R1 须逐条复核。
+                    </span>
+                    <button onClick={() => batchApprove(lowRisk)} disabled={batchBusy}
+                      className="rounded-md border border-border px-2 py-0.5 hover:bg-accent transition-colors cursor-pointer disabled:opacity-50">
+                      {batchBusy ? '处理中…' : `批量通过 ${lowRisk.length} 条低风险`}
+                    </button>
+                  </div>
+                ) : null
+              })()}
+              <EntryTable entries={filtered} onOpen={openEntry}
+                onReviewed={onReviewed} onEdit={setEditing} />
             </div>
           </div>
         </div>
@@ -424,31 +474,52 @@ function CoverageMatrix({
 
 // ---------------------------------------------------------------------------
 
-function EntryTable({ entries, onOpen }: { entries: CorpusEntry[]; onOpen: (e: CorpusEntry) => void }) {
+function EntryTable({ entries, onOpen, onReviewed, onEdit }: {
+  entries: CorpusEntry[]
+  onOpen: (e: CorpusEntry) => void
+  onReviewed: () => void
+  onEdit: (e: CorpusEntry) => void
+}) {
   if (entries.length === 0) {
     return <div className="py-8 text-center text-xs text-muted-foreground">当前筛选无匹配条目。</div>
   }
   return (
     <div className="divide-y divide-border rounded-lg border border-border">
       {entries.map((entry) => (
-        <EntryRow key={entry.doc.id} entry={entry} onOpen={() => onOpen(entry)} />
+        <EntryRow key={entry.doc.id} entry={entry} onOpen={() => onOpen(entry)}
+          onReviewed={onReviewed} onEdit={() => onEdit(entry)} />
       ))}
     </div>
   )
 }
 
-function EntryRow({ entry, onOpen }: { entry: CorpusEntry; onOpen: () => void }) {
+function EntryRow({ entry, onOpen, onReviewed, onEdit }: {
+  entry: CorpusEntry
+  onOpen: () => void
+  onReviewed: () => void
+  onEdit: () => void
+}) {
   const { meta, doc } = entry
   const status = reviewStatus(meta)
   const geo = [...meta.geo_region, ...meta.geo_country_names].join('·') || '通用'
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onOpen}
+      onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
       className="block w-full px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
     >
       <div className="flex items-center gap-2">
         <span className="truncate text-[13px] font-medium">{doc.title || doc.filename}</span>
         {status === 'pending_review' && <StateBadge tone="warn">待复核</StateBadge>}
+        {status === 'pending_review' && <ReviewBadges meta={meta} />}
+        {status === 'pending_review' && (
+          <>
+            <span className="flex-1" />
+            <ReviewActions docId={doc.id} meta={meta} onDone={onReviewed} onEdit={onEdit} />
+          </>
+        )}
         {status === 'overdue' && <StateBadge tone="alert">复审到期</StateBadge>}
         {(meta.lifecycle_state === '已过期' || meta.lifecycle_state === '待更新') && (
           <StateBadge tone="alert">{meta.lifecycle_state}</StateBadge>
@@ -472,7 +543,7 @@ function EntryRow({ entry, onOpen }: { entry: CorpusEntry; onOpen: () => void })
           </span>
         )}
       </div>
-    </button>
+    </div>
   )
 }
 

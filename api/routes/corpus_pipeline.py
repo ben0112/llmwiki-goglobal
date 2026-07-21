@@ -220,3 +220,34 @@ async def pipeline_status(request: Request):
         "counts": counts,
         "last_run": getattr(state, "corpus_pipeline_last_run", None),
     }
+
+
+# ── 复核队列(L3-P3) ─────────────────────────────────────────────
+
+class ReviewIn(BaseModel):
+    action: str  # approve | update | exclude
+    labels: dict | None = None
+    note: str = ""
+
+
+@router.get("/codetable")
+async def get_codetable(request: Request):
+    _require_local(request)
+    _corpus()
+    from corpus.review import codetable_options
+    return codetable_options()
+
+
+@router.post("/entries/{doc_id}/review")
+async def review_entry(request: Request, doc_id: str, body: ReviewIn):
+    workspace = _require_local(request)
+    _corpus()
+    from corpus.review import ReviewError, apply_review
+
+    try:
+        result = await asyncio.to_thread(
+            apply_review, workspace, doc_id, body.action,
+            body.labels, body.note)
+    except ReviewError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
