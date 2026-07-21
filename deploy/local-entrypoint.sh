@@ -48,12 +48,23 @@ trap term TERM INT
     sleep 1
   done
   web_url="${PUBLIC_WEB_URL:-${PUBLIC_API_URL%:*}:${WEB_PORT}}"
+  pipe_line=$(curl -fsS "http://localhost:$API_PORT/v1/corpus/pipeline/status" \
+      -H "Authorization: Bearer local" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    c, a = d["counts"], d["auto"]
+    auto = "开" if a["enabled"] else "关(设置页可开)"
+    print("待分类 %d · 今日入库 %d · 自动分类%s" % (c["pending"], c["imported_today"], auto))
+except Exception:
+    pass' 2>/dev/null)
   cat <<BANNER
 
 ============================= LLM Wiki 已就绪 =============================
   Web 应用:  ${web_url}
   API:       ${PUBLIC_API_URL}
   MCP(HTTP): ${PUBLIC_MCP_URL}
+  语料流水线: ${pipe_line:-未就绪}
 
   连接 Claude —— 任选其一:
 

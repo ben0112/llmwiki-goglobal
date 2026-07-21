@@ -384,3 +384,13 @@ CREATE UNIQUE INDEX idx_knowledge_bases_share_token
 CREATE INDEX idx_knowledge_bases_public_lookup
     ON knowledge_bases (public_slug, updated_at)
     WHERE visibility = 'public';
+
+-- 010: corpus pipeline state (hosted parity)
+CREATE TABLE IF NOT EXISTS corpus_pipeline (
+    doc_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (state IN ('imported', 'excluded', 'failed')),
+    attempts INTEGER DEFAULT 1,
+    error TEXT DEFAULT '',
+    entry_id TEXT DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT now()
+);

@@ -226,3 +226,167 @@ def resolve_auto(stored: dict, env) -> dict:
     interval = int(stored.get("auto_interval")
                    or getattr(env, "CORPUS_AUTO_INTERVAL", 120) or 120)
     return {"enabled": enabled, "interval": max(30, interval)}
+
+
+async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
+                           config: LLMConfig, limit: int | None = None,
+                           version: str = DEFAULT_VERSION,
+                           on_progress=None) -> RunResult:
+    """托管(Postgres)模式跑一轮:候选=目标知识库中未分类的文本源文档。
+
+    条目经 hosted_import 的事务化 upsert 落库(文档+检索分块一步到位);
+    状态存 Postgres 版 corpus_pipeline 表(migration 010)。
+    """
+    import asyncpg
+
+    from .hosted_import import _load_chunker, _resolve_target, _upsert_entry
+
+    result = RunResult(started_at=_now())
+    limit = limit or config.effective_batch_limit
+    table = load(version)
+    today = date.today()
+    imported_on = today.isoformat()
+    chunker = _load_chunker()
+
+    conn = await asyncpg.connect(database_url)
+    try:
+        target = await _resolve_target(conn, user_email, kb_slug)
+        rows = await conn.fetch(
+            "SELECT d.id, d.title, d.filename, d.path, COALESCE(d.content, '') AS content "
+            "FROM documents d LEFT JOIN corpus_pipeline p ON p.doc_id = d.id "
+            "WHERE d.knowledge_base_id = $1 AND d.user_id = $2 AND NOT d.archived "
+            "AND d.status = 'ready' AND COALESCE(d.content, '') <> '' "
+            "AND (d.metadata IS NULL OR d.metadata->>'entry_id' IS NULL) "
+            "AND (p.doc_id IS NULL OR (p.state = 'failed' AND p.attempts < $3)) "
+            "ORDER BY d.created_at LIMIT $4",
+            target.kb_id, target.user_id, MAX_ATTEMPTS, limit)
+        result.picked = len(rows)
+
+        async def set_state(doc_id, state, error="", entry_id=""):
+            await conn.execute(
+                "INSERT INTO corpus_pipeline (doc_id, state, attempts, error, entry_id, updated_at) "
+                "VALUES ($1, $2, 1, $3, $4, now()) "
+                "ON CONFLICT (doc_id) DO UPDATE SET state = EXCLUDED.state, "
+                "attempts = corpus_pipeline.attempts + 1, error = EXCLUDED.error, "
+                "entry_id = EXCLUDED.entry_id, updated_at = now()",
+                doc_id, state, error, entry_id)
+
+        done = 0
+        for doc in rows:
+            relpath = f"{doc['path'].strip('/')}/{doc['filename']}".strip("/")
+            content_src = doc["content"]
+            try:
+                title = extract_title(content_src) or doc["title"] or doc["filename"]
+                include, reason = await audit(config, title, content_src)
+                if not include:
+                    await set_state(doc["id"], "excluded", error=reason)
+                    result.excluded += 1
+                    continue
+
+                row = await classify(config, title, content_src, relpath)
+                apply_business_view(row)
+                rec = parse_row(row, table, today=today)
+                entry_content = render_entry_markdown(rec, content_src, imported_on)
+                rel_path = entry_relative_path(rec)
+                async with conn.transaction():
+                    await _upsert_entry(conn, target, rec, rel_path, entry_content, chunker)
+                await set_state(doc["id"], "imported", entry_id=rec.entry_id)
+                result.imported += 1
+                if rec.needs_review:
+                    result.review += 1
+            except Exception as e:  # noqa: BLE001 — 逐条隔离,任何失败不拖累整轮
+                msg = f"{type(e).__name__}: {e}"
+                await set_state(doc["id"], "failed", error=msg[:500])
+                result.failed += 1
+                result.errors.append((relpath, msg[:200]))
+            finally:
+                done += 1
+                if on_progress:
+                    try:
+                        on_progress(done, result.picked)
+                    except Exception:
+                        pass
+    finally:
+        await conn.close()
+
+    result.finished_at = _now()
+    return result
+
+
+class _EnvShim:
+    """CLI 场景下从 os.environ 读 CORPUS_* 配置(与 api settings 同名)。"""
+
+    def __getattr__(self, name):
+        import os
+        v = os.environ.get(name, "")
+        if name in ("CORPUS_BATCH_LIMIT", "CORPUS_AUTO_INTERVAL"):
+            return int(v) if v else 0
+        if name == "CORPUS_LLM_TIMEOUT":
+            return float(v) if v else 120.0
+        if name == "CORPUS_AUTOCLASSIFY":
+            return v.lower() in ("1", "true", "yes")
+        return v
+
+
+def main() -> None:
+    """CLI:本地(--workspace)/托管(--database-url)双模式,配 cron 即定时分类。"""
+    import argparse
+    import asyncio as aio
+
+    ap = argparse.ArgumentParser(description="语料分类流水线(审核→八维标注→业务派生→入库)")
+    ap.add_argument("--workspace", default=None, help="本地模式: LLM Wiki 工作区目录")
+    ap.add_argument("--database-url", default=None, help="hosted 模式: Postgres 连接串")
+    ap.add_argument("--user-email", default=None, help="hosted 模式: 语料归属账号邮箱")
+    ap.add_argument("--kb", default="goglobal-corpus", help="hosted 模式: 知识库 slug")
+    ap.add_argument("--limit", type=int, default=None, help="本轮批量上限(缺省=端点感知默认)")
+    ap.add_argument("--mock", action="store_true", help="规则桩自测,无需 LLM 端点")
+    ap.add_argument("--base-url", default=None, help="覆盖 LLM 端点")
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--api-key", default=None)
+    ap.add_argument("--codetable", default=DEFAULT_VERSION, help=f"码表版本(默认 {DEFAULT_VERSION})")
+    args = ap.parse_args()
+
+    if bool(args.workspace) == bool(args.database_url):
+        ap.error("二选一:--workspace(本地)或 --database-url(hosted)")
+
+    env = _EnvShim()
+    stored: dict = {}
+    if args.workspace:
+        db = Path(args.workspace) / ".llmwiki" / "index.db"
+        if db.exists():
+            conn = _connect(str(db))
+            try:
+                stored = load_llm_settings(conn)
+            except sqlite3.Error:
+                stored = {}
+            finally:
+                conn.close()
+    config = resolve_config(stored, env)
+    if args.mock:
+        config.base_url = "mock"
+    if args.base_url:
+        config.base_url = args.base_url
+    if args.model:
+        config.model = args.model
+    if args.api_key:
+        config.api_key = args.api_key
+
+    if args.workspace:
+        result = aio.run(run_batch(Path(args.workspace).resolve(), config,
+                                   limit=args.limit, version=args.codetable))
+    else:
+        if not args.user_email:
+            ap.error("hosted 模式需要 --user-email")
+        result = aio.run(run_batch_hosted(args.database_url, args.user_email, args.kb,
+                                          config, limit=args.limit, version=args.codetable))
+
+    s = result.summary()
+    print(f"[✓] 本轮 {s['picked']} 条: 入库 {s['imported']}(待复核 {s['review']}) "
+          f"排除 {s['excluded']} 失败 {s['failed']}")
+    for relpath, msg in s["errors"]:
+        print(f"    ✗ {relpath}: {msg}")
+    raise SystemExit(1 if s["failed"] and not s["imported"] else 0)
+
+
+if __name__ == "__main__":
+    main()

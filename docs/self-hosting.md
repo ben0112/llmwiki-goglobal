@@ -72,7 +72,7 @@ self-hosting compose — you do **not** need most of its services.
 
 ### Apply the migrations
 
-Run `supabase/migrations/001…009` in order against the stack's database:
+Run `supabase/migrations/001…010` in order against the stack's database:
 
 ```bash
 for f in supabase/migrations/*.sql; do
@@ -228,7 +228,27 @@ python3 -m corpus.import_annotations \
 ```
 
 The account must exist (sign in once first); the knowledge base is created on
-first import. Re-imports are idempotent. S3 is not involved: corpus entries
+first import. Re-imports are idempotent.
+
+### Automated classification (pipeline CLI)
+
+Instead of importing pre-annotated CSVs, the pipeline CLI can audit +
+classify raw text documents already sitting in a hosted knowledge base
+(uploaded via the app or MCP), using any OpenAI-compatible LLM endpoint:
+
+```bash
+python3 -m corpus.pipeline \
+    --database-url "$DATABASE_URL" \
+    --user-email corpus-admin@example.com \
+    --kb goglobal-corpus \
+    --base-url https://api.deepseek.com/v1 --model deepseek-chat --api-key "$KEY"
+```
+
+State lives in the `corpus_pipeline` table (migration 010): re-runs are
+idempotent, failures retry up to 3 times, entries land with search chunks
+in one transaction. Schedule it with cron for continuous ingestion;
+`--mock` runs a rule-stub end-to-end test without an LLM.
+ S3 is not involved: corpus entries
 are markdown and hosted mode stores text content in Postgres — S3 only holds
 binary sources, which the annotation pipeline does not produce.
 

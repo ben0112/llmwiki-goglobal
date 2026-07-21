@@ -179,6 +179,14 @@ async def _local_lifespan(app: FastAPI):
     try:
         yield
     finally:
+        pipeline_task = getattr(app.state, "corpus_pipeline_task", None)
+        if pipeline_task is not None and not pipeline_task.done():
+            # 逐条状态即时落库,取消只丢弃当前未完成的单条,下轮自动续跑
+            pipeline_task.cancel()
+            try:
+                await pipeline_task
+            except asyncio.CancelledError:
+                pass
         corpus_auto_task.cancel()
         try:
             await corpus_auto_task
