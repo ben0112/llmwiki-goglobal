@@ -560,6 +560,9 @@ export function FilesGrid({
                 <ExternalLink className="size-3.5" />
               </button>
             )}
+            <button onClick={() => onDeleteDocument(activeDoc.id)} className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-accent rounded-md transition-colors cursor-pointer" title="删除">
+              <Trash2 className="size-3.5" />
+            </button>
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
@@ -575,6 +578,9 @@ export function FilesGrid({
                 <ExternalLink className="size-3.5" />
               </button>
             )}
+            <button onClick={() => onDeleteDocument(activeDoc.id)} className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-accent rounded-md transition-colors cursor-pointer" title="删除">
+              <Trash2 className="size-3.5" />
+            </button>
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
@@ -587,6 +593,9 @@ export function FilesGrid({
             <a href={`${apiUrl()}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="下载">
               <Download className="size-3.5" />
             </a>
+            <button onClick={() => onDeleteDocument(activeDoc.id)} className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-accent rounded-md transition-colors cursor-pointer" title="删除">
+              <Trash2 className="size-3.5" />
+            </button>
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="关闭">
               <X className="size-3.5" />
             </button>
@@ -789,6 +798,24 @@ function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListIt
           <div className="relative flex items-center justify-center bg-muted/30 aspect-square overflow-hidden">
             <span className={cn('text-muted-foreground/40', isProcessing && 'opacity-40')}>{docIcon(doc.file_type)}</span>
             {isProcessing && <div className="absolute inset-0 flex items-center justify-center"><Loader2 className="size-5 text-muted-foreground animate-spin" /></div>}
+            {/* 悬停操作菜单:右键菜单的可见入口(重命名/删除) */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  onClick={(e) => e.stopPropagation()}
+                  aria-label="文件操作"
+                  className="absolute top-1 right-1 flex items-center justify-center size-6 rounded-md bg-background/80 text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 hover:text-foreground hover:bg-background transition-opacity cursor-pointer"
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+                <DropdownMenuItem onClick={onOpen}><ExternalLink className="size-3.5 mr-2" />打开</DropdownMenuItem>
+                <DropdownMenuItem onClick={startRename}><Pencil className="size-3.5 mr-2" />重命名</DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onClick={onDelete}><Trash2 className="size-3.5 mr-2" />删除</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
           <div className="px-2 py-1.5 flex flex-col gap-0.5">
             {renaming ? (

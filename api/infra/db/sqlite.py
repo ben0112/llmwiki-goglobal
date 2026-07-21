@@ -6,6 +6,7 @@ All queries use native SQLite syntax — no translation layer.
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import uuid
@@ -251,12 +252,15 @@ class SQLiteDocumentRepository:
         row = await cursor.fetchone()
         doc_number = row[0]
 
+        # 与 watcher/上传路由同口径:content_hash = 磁盘文件原始字节的 SHA-256
+        # (笔记落盘为 UTF-8 文本),上传去重按内容比对依赖它。
+        content_hash = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
         await self._db.execute(
             "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-            "file_type, status, content, tags, version, document_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'md', 'ready', ?, ?, 0, ?)",
+            "file_type, status, content, tags, version, document_number, content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'md', 'ready', ?, ?, 0, ?, ?)",
             (doc_id, user_id, filename, title, path, relative_path, source_kind,
-             content, json.dumps(tags), doc_number),
+             content, json.dumps(tags), doc_number, content_hash),
         )
         await self._db.commit()
         return await self.get(doc_id)

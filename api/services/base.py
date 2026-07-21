@@ -100,6 +100,10 @@ class DocumentService(ABC):
     @abstractmethod
     async def bulk_delete(self, doc_ids: list[str]) -> int: ...
 
+    async def delete_impact(self, doc_ids: list[str]) -> dict:
+        """删除影响预估:引用这些文档的维基页面。默认无(托管模式由代理端维护维基)。"""
+        return {"pages": [], "count": 0}
+
 
 class ServiceFactory(ABC):
 

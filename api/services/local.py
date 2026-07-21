@@ -12,6 +12,7 @@ from config import settings
 from domain.watcher import mark_written
 from infra.db.sqlite import SQLiteDocumentRepository, SQLiteChunkRepository, serialized_write
 from services.chunker import chunk_text
+from services.wiki_regen import find_citing_wiki_pages, schedule_regeneration
 from .base import UserService, KBService, DocumentService, ServiceFactory
 from .parsers import parse_frontmatter, title_from_filename, extract_tags
 
@@ -312,22 +313,46 @@ class LocalDocumentService(DocumentService):
 
     async def delete(self, doc_id: str) -> bool:
         doc = await self.doc_repo.get(doc_id)
+        citing: list[dict] = []
         if doc:
+            # 归档会级联删掉引用边,受影响的维基页面必须在删除前反查
+            if doc.get("source_kind") == "source":
+                citing = await find_citing_wiki_pages(self.db, [doc_id])
             file_path = _doc_to_disk_path(doc)
             if file_path and file_path.is_file():
                 mark_written(str(file_path))
                 file_path.unlink()
-        return await self.doc_repo.archive(doc_id, self.user_id)
+        ok = await self.doc_repo.archive(doc_id, self.user_id)
+        if ok and citing:
+            schedule_regeneration(self.db, self.user_id, citing, [doc["filename"]])
+        return ok
 
     async def bulk_delete(self, doc_ids: list[str]) -> int:
+        deleted_names: list[str] = []
+        source_ids: list[str] = []
         for doc_id in doc_ids:
             doc = await self.doc_repo.get(doc_id)
             if doc:
+                if doc.get("source_kind") == "source":
+                    source_ids.append(doc_id)
+                    deleted_names.append(doc["filename"])
                 file_path = _doc_to_disk_path(doc)
                 if file_path and file_path.is_file():
                     mark_written(str(file_path))
                     file_path.unlink()
-        return await self.doc_repo.bulk_archive(doc_ids, self.user_id)
+        deleted_set = set(doc_ids)
+        citing = [p for p in await find_citing_wiki_pages(self.db, source_ids)
+                  if p["id"] not in deleted_set]
+        count = await self.doc_repo.bulk_archive(doc_ids, self.user_id)
+        if citing:
+            schedule_regeneration(self.db, self.user_id, citing, deleted_names)
+        return count
+
+    async def delete_impact(self, doc_ids: list[str]) -> dict:
+        deleted_set = set(doc_ids)
+        pages = [p for p in await find_citing_wiki_pages(self.db, doc_ids)
+                 if p["id"] not in deleted_set]
+        return {"pages": pages, "count": len(pages)}
 
 
 class LocalServiceFactory(ServiceFactory):

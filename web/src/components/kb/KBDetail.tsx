@@ -12,6 +12,7 @@ import { apiUrl } from '@/lib/runtime-env'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { SelectionActionBar } from '@/components/kb/SelectionActionBar'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { WikiContent } from '@/components/wiki/WikiContent'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
 import type { ViewMode } from '@/components/kb/viewMode'
@@ -386,18 +387,89 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [selectedIds.size, clearSelection])
 
-  const handleDeleteSelected = async () => {
+  // ─── 删除(带引用影响预估 + 受影响维基页面自动重生成)────────
+  const [deleteRequest, setDeleteRequest] = React.useState<{
+    ids: string[]
+    names: string[]
+    impact: { id: string; title: string | null; path: string; filename: string }[]
+    fromSelection: boolean
+  } | null>(null)
+  const [deleting, setDeleting] = React.useState(false)
+
+  const requestDelete = React.useCallback(async (ids: string[], fromSelection = false) => {
+    const t = getToken()
+    if (!t || ids.length === 0) return
+    const names = ids
+      .map((id) => documents.find((d) => d.id === id)?.filename)
+      .filter((n): n is string => !!n)
+    let impact: { id: string; title: string | null; path: string; filename: string }[] = []
+    try {
+      const res = await apiFetch<{ pages: typeof impact; count: number }>(
+        '/v1/documents/delete-impact', t,
+        { method: 'POST', body: JSON.stringify({ ids }) },
+      )
+      impact = res.pages ?? []
+    } catch { /* 影响预估失败不阻断删除流程 */ }
+    setDeleteRequest({ ids, names, impact, fromSelection })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documents])
+
+  // 删除后后台重生成的完成提示:先见 running=true 再等落回 false;
+  // 任务太快结束时用 finished_at(同机时钟,容忍 60s 偏差)兜底。
+  const pollRegenCompletion = React.useCallback((expectedPages: number) => {
+    if (process.env.NEXT_PUBLIC_MODE !== 'local') return
     const t = getToken()
     if (!t) return
-    const ids = Array.from(selectedIds)
-    if (!window.confirm(`确定删除选中的 ${ids.length} 个文档?`)) return
-    const results = await Promise.allSettled(ids.map((id) => apiFetch(`/v1/documents/${id}`, t, { method: 'DELETE' })))
-    const succeeded = ids.filter((_, i) => results[i].status === 'fulfilled')
-    const failed = ids.filter((_, i) => results[i].status === 'rejected')
-    if (succeeded.length > 0) setDocuments((prev) => prev.filter((d) => !succeeded.includes(d.id)))
-    if (failed.length > 0) toast.error(`${failed.length} 个文档删除失败`)
-    clearSelection()
-  }
+    const startedAt = Date.now()
+    let sawRunning = false
+    const timer = window.setInterval(async () => {
+      if (Date.now() - startedAt > 5 * 60_000) { window.clearInterval(timer); return }
+      try {
+        const s = await apiFetch<{ running: boolean; total: number; done: number; failed: number; finished_at: number | null }>(
+          '/v1/documents/regen-status', t)
+        if (s.running) { sawRunning = true; return }
+        const justFinished = s.finished_at != null && s.finished_at * 1000 >= startedAt - 60_000
+        if (sawRunning || justFinished) {
+          window.clearInterval(timer)
+          if (s.failed > 0) {
+            toast.warning(`维基页面重新生成完成:成功 ${s.total - s.failed} 个,失败 ${s.failed} 个`)
+          } else {
+            toast.success(`已自动重新生成 ${s.total || expectedPages} 个引用维基页面`)
+          }
+        }
+      } catch { /* 轮询失败静默重试 */ }
+    }, 2000)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const performDelete = React.useCallback(async () => {
+    if (!deleteRequest) return
+    const t = getToken()
+    if (!t) return
+    setDeleting(true)
+    const { ids, impact, fromSelection } = deleteRequest
+    try {
+      if (ids.length === 1) {
+        await apiFetch(`/v1/documents/${ids[0]}`, t, { method: 'DELETE' })
+      } else {
+        await apiFetch('/v1/documents/bulk-delete', t, { method: 'POST', body: JSON.stringify({ ids }) })
+      }
+      setDocuments((prev) => prev.filter((d) => !ids.includes(d.id)))
+      if (impact.length > 0 && process.env.NEXT_PUBLIC_MODE === 'local') {
+        toast.info(`已删除 ${ids.length} 个文件;${impact.length} 个引用维基页面正在后台重新生成`)
+        pollRegenCompletion(impact.length)
+      }
+      if (fromSelection) clearSelection()
+      setDeleteRequest(null)
+    } catch {
+      toast.error('删除文件失败')
+    } finally {
+      setDeleting(false)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deleteRequest, clearSelection, pollRegenCompletion, setDocuments])
+
+  const handleDeleteSelected = () => { requestDelete(Array.from(selectedIds), true) }
 
   // ─── Navigation handlers ─────────────────────────────────────
 
@@ -584,12 +656,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   }
 
   const handleDeleteDocument = async (docId: string) => {
-    const t = getToken()
-    if (!t) return
-    try {
-      await apiFetch(`/v1/documents/${docId}`, t, { method: 'DELETE' })
-      setDocuments((prev) => prev.filter((d) => d.id !== docId))
-    } catch { toast.error('删除文档失败') }
+    await requestDelete([docId])
   }
 
   const handleRenameDocument = async (docId: string, newTitle: string) => {
@@ -637,30 +704,51 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     const t = getToken()
     if (!t || !userId) return
 
-    // 重复文件校验:与目标位置现有文件同名(不区分大小写)的,确认后跳过
+    // 双层去重,自动跳过(不打断上传,仅在完成报告中提及):
+    // 第一层:目标位置同名文件(不区分大小写);
+    // 第二层:文件内容 SHA-256 与库内任意既有文件相同(本地模式;
+    // 后端 content_hash 即原始字节哈希),同批内重复内容也只传一份。
     const existingNames = new Set(
       documents
         .filter((d) => d.path === targetPath && !d.archived)
         .map((d) => d.filename.toLowerCase()),
     )
-    const duplicates = files.filter((f) => existingNames.has(f.name.toLowerCase()))
-    let toUpload = files
-    if (duplicates.length > 0) {
-      if (duplicates.length === files.length) {
-        toast.error(`未上传:所选 ${files.length} 个文件均与现有文件重名`, {
-          description: duplicates.slice(0, 5).map((f) => f.name).join('、')
-            + (duplicates.length > 5 ? ` 等 ${duplicates.length} 个` : ''),
-        })
-        return
+    const existingHashes = new Set(
+      documents.filter((d) => !d.archived && d.content_hash).map((d) => d.content_hash as string),
+    )
+    const canHash = process.env.NEXT_PUBLIC_MODE === 'local'
+      && typeof crypto !== 'undefined' && !!crypto.subtle
+    const skippedByName: string[] = []
+    const skippedByContent: string[] = []
+    const batchHashes = new Set<string>()
+    const toUpload: File[] = []
+    for (const file of files) {
+      if (existingNames.has(file.name.toLowerCase())) {
+        skippedByName.push(file.name)
+        continue
       }
-      const ok = window.confirm(
-        `${duplicates.length} 个文件与目标位置的现有文件重名,将被跳过:\n\n`
-        + duplicates.slice(0, 10).map((f) => f.name).join('\n')
-        + (duplicates.length > 10 ? `\n…等 ${duplicates.length} 个` : '')
-        + `\n\n点击"确定"继续上传其余 ${files.length - duplicates.length} 个文件。`,
-      )
-      if (!ok) return
-      toUpload = files.filter((f) => !existingNames.has(f.name.toLowerCase()))
+      if (canHash) {
+        try {
+          const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
+          const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+          if (existingHashes.has(hex) || batchHashes.has(hex)) {
+            skippedByContent.push(file.name)
+            continue
+          }
+          batchHashes.add(hex)
+        } catch { /* 哈希失败不阻断上传 */ }
+      }
+      toUpload.push(file)
+    }
+    const skippedTotal = skippedByName.length + skippedByContent.length
+    if (toUpload.length === 0) {
+      if (skippedTotal > 0) {
+        const names = [...skippedByName, ...skippedByContent]
+        toast.info(`未上传:所选 ${files.length} 个文件均为重复文件(重名 ${skippedByName.length} 个,内容相同 ${skippedByContent.length} 个)`, {
+          description: names.slice(0, 5).join('、') + (names.length > 5 ? ` 等 ${names.length} 个` : ''),
+        })
+      }
+      return
     }
 
     const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
@@ -737,20 +825,28 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       if (ok !== null) results.push({ name: file.name, ok })
     }))
 
-    // 完成汇总:成功/失败数量确认(+ 跳过的重名与不支持类型)
+    // 完成汇总:成功/失败数量确认(+ 自动跳过的重复文件与不支持类型)
     const okCount = results.filter((r) => r.ok).length
     const failed = results.filter((r) => !r.ok).map((r) => r.name)
     const extras = [
-      duplicates.length > 0 ? `跳过重名 ${duplicates.length} 个` : '',
+      skippedByName.length > 0 ? `跳过重名 ${skippedByName.length} 个` : '',
+      skippedByContent.length > 0 ? `跳过内容相同 ${skippedByContent.length} 个` : '',
       unsupported > 0 ? `不支持 ${unsupported} 个` : '',
     ].filter(Boolean).join(',')
     const suffix = extras ? `(${extras})` : ''
+    const skippedNames = [...skippedByName, ...skippedByContent]
+    const skippedDesc = skippedNames.length > 0
+      ? `已跳过:${skippedNames.slice(0, 5).join('、')}${skippedNames.length > 5 ? ` 等 ${skippedNames.length} 个` : ''}`
+      : undefined
     if (results.length > 0) {
       if (failed.length === 0) {
-        toast.success(`上传完成:${okCount} 个文件全部成功${suffix}`)
+        toast.success(`上传完成:${okCount} 个文件全部成功${suffix}`, { description: skippedDesc })
       } else {
         toast.error(`上传完成:成功 ${okCount} 个,失败 ${failed.length} 个${suffix}`, {
-          description: failed.slice(0, 5).join('、') + (failed.length > 5 ? ` 等 ${failed.length} 个` : ''),
+          description: [
+            failed.slice(0, 5).join('、') + (failed.length > 5 ? ` 等 ${failed.length} 个` : ''),
+            skippedDesc,
+          ].filter(Boolean).join(';'),
           duration: 10000,
         })
       }
@@ -994,7 +1090,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                     className="inline-flex items-center gap-2 rounded-full bg-foreground text-background px-5 py-2 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
                   >
                     <UploadIcon className="size-3.5 opacity-60" />
-                    Upload Sources
+                    上传源文件
                   </button>
                   <a
                     href="https://claude.ai"
@@ -1002,7 +1098,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium hover:bg-accent transition-colors"
                   >
-                    Open Claude
+                    打开 Claude
                     <ArrowUpRight className="size-3.5 opacity-60" />
                   </a>
                 </div>
@@ -1011,6 +1107,54 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
           </AnimatePresence>
         </div>
       </div>
+
+      <Dialog open={!!deleteRequest} onOpenChange={(open) => { if (!open && !deleting) setDeleteRequest(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>删除文件</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>
+              将永久删除{' '}
+              {deleteRequest?.ids.length === 1 ? (
+                <strong className="text-foreground">{deleteRequest.names[0] ?? '该文件'}</strong>
+              ) : (
+                <>选中的 <strong className="text-foreground">{deleteRequest?.ids.length}</strong> 个文件</>
+              )}
+              ,此操作不可恢复。
+            </p>
+            {deleteRequest && deleteRequest.impact.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-700 dark:text-amber-400">
+                <p className="font-medium">
+                  {deleteRequest.impact.length} 个维基页面引用了这些文件,删除后将自动重新生成:
+                </p>
+                <ul className="mt-1 list-disc pl-4">
+                  {deleteRequest.impact.slice(0, 5).map((p) => (
+                    <li key={p.id}>{p.title || p.filename}</li>
+                  ))}
+                  {deleteRequest.impact.length > 5 && <li>…等 {deleteRequest.impact.length} 个页面</li>}
+                </ul>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <button
+              onClick={() => setDeleteRequest(null)}
+              disabled={deleting}
+              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent cursor-pointer"
+            >
+              取消
+            </button>
+            <button
+              onClick={performDelete}
+              disabled={deleting}
+              className="rounded-lg bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer"
+            >
+              {deleting ? '删除中…' : '删除'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <SelectionActionBar
         count={selectedIds.size}

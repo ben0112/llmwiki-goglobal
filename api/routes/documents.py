@@ -24,6 +24,17 @@ async def list_documents(
     return await service.list(str(kb_id), path)
 
 
+@router.get("/v1/documents/regen-status")
+async def regen_status(request: Request):
+    """删除源文件后维基页面后台重生成的进度(本地模式;前端轮询)。
+
+    必须先于 /v1/documents/{doc_id} 声明,否则会被 UUID 路径参数吞掉。"""
+    if getattr(request.app.state, "mode", "") != "local":
+        return {"running": False, "total": 0, "done": 0, "failed": 0, "pages": [], "mode": "", "finished_at": None}
+    from services.wiki_regen import regen_status as _regen_status
+    return _regen_status()
+
+
 @router.get("/v1/documents/{doc_id}")
 async def get_document(doc_id: UUID, service: Annotated[DocumentService, Depends(get_document_service)]):
     row = await service.get(str(doc_id))
@@ -171,6 +182,17 @@ async def update_document_metadata(
 
 
 _BULK_DELETE_MAX_IDS = 100
+
+
+@router.post("/v1/documents/delete-impact")
+async def delete_impact(
+    body: BulkDelete,
+    service: Annotated[DocumentService, Depends(get_document_service)],
+):
+    """删除前预估影响:哪些维基页面引用了这些文档(删除后将自动重生成)。"""
+    if not body.ids or len(body.ids) > _BULK_DELETE_MAX_IDS:
+        return {"pages": [], "count": 0}
+    return await service.delete_impact(body.ids)
 
 
 @router.post("/v1/documents/bulk-delete", status_code=204)

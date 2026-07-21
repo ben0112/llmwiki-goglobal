@@ -73,16 +73,16 @@ async def chat_json(config: LLMConfig, system_prompt: str, user_prompt: str,
     return obj
 
 
-async def _chat_once(config: LLMConfig, system_prompt: str, user_prompt: str,
-                     required_keys: tuple[str, ...]) -> dict | None:
+async def _complete_raw(config: LLMConfig, system_prompt: str, user_prompt: str,
+                        *, max_tokens: int, temperature: float) -> str:
     payload = {
         "model": config.model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.1,
-        "max_tokens": 1024,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
         "stream": False,
         # 本地推理栈(MLX/vLLM 等)支持时关闭思考模式,省时省 token
         "chat_template_kwargs": {"enable_thinking": False},
@@ -101,10 +101,35 @@ async def _chat_once(config: LLMConfig, system_prompt: str, user_prompt: str,
     except httpx.HTTPError as e:
         raise LLMError(f"端点请求失败: {e}") from e
     try:
-        content = data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"响应结构异常: {e}") from e
+
+
+async def _chat_once(config: LLMConfig, system_prompt: str, user_prompt: str,
+                     required_keys: tuple[str, ...]) -> dict | None:
+    content = await _complete_raw(
+        config, system_prompt, user_prompt, max_tokens=1024, temperature=0.1,
+    )
     return extract_flat_json(content, required_keys)
+
+
+async def chat_text(config: LLMConfig, system_prompt: str, user_prompt: str,
+                    *, max_tokens: int = 8192, temperature: float = 0.2) -> str:
+    """一次对话补全,返回纯文本(维基页面重写等长文本任务用)。"""
+    content = await _complete_raw(
+        config, system_prompt, user_prompt,
+        max_tokens=max_tokens, temperature=temperature,
+    )
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+    # 剥掉模型习惯性包裹的整段代码栅栏
+    if content.startswith("```"):
+        content = re.sub(r"^```[a-zA-Z]*\n", "", content)
+        content = re.sub(r"\n```\s*$", "", content)
+        content = content.strip()
+    if not content:
+        raise LLMError("响应为空")
+    return content
 
 
 def extract_flat_json(content: str, required_keys: tuple[str, ...]) -> dict | None:

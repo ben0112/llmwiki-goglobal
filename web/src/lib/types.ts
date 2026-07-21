@@ -32,6 +32,8 @@ export interface Document {
   document_number: number | null
   sort_order: number | null
   archived: boolean
+  // 原始文件字节的 SHA-256(本地模式;上传内容去重用)
+  content_hash?: string | null
   created_at: string
   updated_at: string
 }
