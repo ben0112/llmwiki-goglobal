@@ -31,7 +31,7 @@ services:
     environment:
       # 语料分类流水线(可选;设置页里配置的值优先于这些环境变量):
       #   CORPUS_LLM_BASE_URL: http://host.docker.internal:8000/v1   # OpenAI 兼容端点
-      #   CORPUS_LLM_MODEL / CORPUS_LLM_API_KEY / CORPUS_BATCH_LIMIT
+      #   CORPUS_LLM_MODEL / CORPUS_LLM_API_KEY / CORPUS_LLM_CONCURRENCY
       #   CORPUS_AUTOCLASSIFY: "true"   # 自动分类(默认关)
       PUBLIC_API_URL: http://localhost:${LLMWIKI_API_PORT:-9000}
       PUBLIC_MCP_URL: http://localhost:${LLMWIKI_MCP_PORT:-8080}/mcp

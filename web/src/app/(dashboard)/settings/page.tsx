@@ -133,8 +133,8 @@ interface PipelineConfig {
   base_url: string
   model: string
   api_key_masked: string
-  batch_limit: number
-  effective_batch_limit: number
+  concurrency: number
+  effective_concurrency: number
   is_local_endpoint: boolean
   auto: { enabled: boolean; interval: number }
 }
@@ -147,7 +147,7 @@ function CorpusPipelineSection() {
   const [baseUrl, setBaseUrl] = React.useState('')
   const [model, setModel] = React.useState('')
   const [apiKey, setApiKey] = React.useState('')
-  const [batchLimit, setBatchLimit] = React.useState('')
+  const [concurrency, setConcurrency] = React.useState('')
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
   const [notice, setNotice] = React.useState<{ ok: boolean; text: string } | null>(null)
@@ -159,7 +159,7 @@ function CorpusPipelineSection() {
         setCfg(c)
         setBaseUrl(c.base_url)
         setModel(c.model)
-        setBatchLimit(String(c.batch_limit || ''))
+        setConcurrency(String(c.concurrency || ''))
       })
       .catch(() => {})
   }, [token])
@@ -173,7 +173,7 @@ function CorpusPipelineSection() {
     try {
       const body: Record<string, unknown> = {
         base_url: baseUrl.trim(), model: model.trim(),
-        batch_limit: batchLimit === '' ? 0 : Math.max(0, parseInt(batchLimit, 10) || 0),
+        concurrency: concurrency === '' ? 0 : Math.max(0, parseInt(concurrency, 10) || 0),
         ...extra,
       }
       if (apiKey !== '') body.api_key = apiKey
@@ -211,8 +211,9 @@ function CorpusPipelineSection() {
     <section>
       <h2 className="text-base font-medium">语料分类流水线</h2>
       <p className="mt-2 text-sm text-muted-foreground">
-        新语料的审核与八维标注所用的 LLM 端点(OpenAI 兼容)。批量上限留空或填
-        0 时按端点自动取默认:本地端点 20/轮,云端 100/轮。
+        新语料的审核与八维标注所用的 LLM 端点(OpenAI 兼容)。并发数为同时向端点
+        发起的请求数,留空或填 0 时按端点自动取默认:本地端点 2,云端 8。每轮处理
+        全部待分类语料。
       </p>
 
       <div className="mt-4 space-y-3">
@@ -231,9 +232,9 @@ function CorpusPipelineSection() {
           <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password"
             placeholder={cfg.api_key_masked ? `API Key(现值 ${cfg.api_key_masked},留空沿用)` : 'API Key(可选)'}
             className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
-          <input value={batchLimit} onChange={(e) => setBatchLimit(e.target.value)} inputMode="numeric"
-            placeholder={`批量/轮(默认 ${cfg.effective_batch_limit})`}
-            className="w-40 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
+          <input value={concurrency} onChange={(e) => setConcurrency(e.target.value)} inputMode="numeric"
+            placeholder={`LLM 并发数(默认 ${cfg.effective_concurrency})`}
+            className="w-44 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
         </div>
         <div className="flex items-center gap-3">
           <button onClick={() => save()} disabled={saving}
@@ -243,7 +244,7 @@ function CorpusPipelineSection() {
           <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
             <input type="checkbox" checked={cfg.auto.enabled}
               onChange={(e) => save({ auto_enabled: e.target.checked })} />
-            自动分类(新语料入索引后台自动标注,每 {cfg.auto.interval}s 检查)
+            自动分类(每 {cfg.auto.interval}s 检查待分类队列,有积压即自动处理)
           </label>
         </div>
         {notice && (

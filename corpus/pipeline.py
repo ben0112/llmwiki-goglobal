@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -72,7 +73,7 @@ def _set_state(conn: sqlite3.Connection, doc_id: str, state: str,
     conn.commit()
 
 
-def select_candidates(conn: sqlite3.Connection, limit: int) -> list[dict]:
+def select_candidates(conn: sqlite3.Connection, limit: int | None = None) -> list[dict]:
     rows = conn.execute(
         "SELECT d.id, d.title, d.filename, d.relative_path, COALESCE(d.content, '') "
         "FROM documents d LEFT JOIN corpus_pipeline p ON p.doc_id = d.id "
@@ -80,7 +81,7 @@ def select_candidates(conn: sqlite3.Connection, limit: int) -> list[dict]:
         "AND d.relative_path NOT LIKE 'corpus/%' "
         "AND (p.doc_id IS NULL OR (p.state = 'failed' AND p.attempts < ?)) "
         "ORDER BY d.created_at LIMIT ?",
-        (MAX_ATTEMPTS, limit),
+        (MAX_ATTEMPTS, -1 if limit is None else limit),  # SQLite: 负数 = 不限
     ).fetchall()
     return [
         {"id": r[0], "title": r[1] or r[2], "relative_path": r[3], "content": r[4]}
@@ -111,18 +112,28 @@ def status_counts(conn: sqlite3.Connection) -> dict:
 async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None,
                     version: str = DEFAULT_VERSION,
                     on_progress=None, on_file_written=None) -> RunResult:
-    """跑一轮:最多处理 limit(缺省=端点感知默认)条候选。逐条隔离失败。
+    """跑一轮:处理全部待分类候选(limit 仅在显式传入时截断,如 CLI --limit)。
+
+    对 LLM 端点的请求并发数 = config.effective_concurrency,逐条隔离失败;
+    SQLite 连接为多个 worker 共享,所有写库经 db_lock 串行。
 
     on_file_written(path): 落盘前回调 —— API 进程内传 watcher.mark_written,
     避免文件监视器与流水线自身的入库写产生 UNIQUE 竞态。"""
     result = RunResult(started_at=_now())
-    limit = limit or config.effective_batch_limit
     db_path = str(workspace / ".llmwiki" / "index.db")
     table = load(version)
     today = date.today()
     imported_on = today.isoformat()
 
     conn = _connect(db_path)
+    db_lock = threading.Lock()
+
+    async def _set(doc_id: str, state: str, error: str = "", entry_id: str = "") -> None:
+        def _do() -> None:
+            with db_lock:
+                _set_state(conn, doc_id, state, error=error, entry_id=entry_id)
+        await asyncio.to_thread(_do)
+
     try:
         user_row = conn.execute("SELECT user_id FROM workspace LIMIT 1").fetchone()
         if user_row is None:
@@ -136,15 +147,17 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
         result.picked = len(candidates)
 
         done = 0
-        for doc in candidates:
+        next_index = 0
+
+        async def _process(doc: dict) -> None:
             relpath = doc["relative_path"]
             try:
                 title = extract_title(doc["content"]) or doc["title"]
                 include, reason = await audit(config, title, doc["content"])
                 if not include:
-                    _set_state(conn, doc["id"], "excluded", error=reason)
+                    await _set(doc["id"], "excluded", error=reason)
                     result.excluded += 1
-                    continue
+                    return
 
                 row = await classify(config, title, doc["content"], relpath)
                 apply_business_view(row)
@@ -163,29 +176,42 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
                     if on_file_written:
                         on_file_written(str(full))
                     full.write_text(content, encoding="utf-8")
-                    upsert_document(conn, user_id, rec, rel_path, content,
-                                    full.stat().st_mtime_ns)
-                    conn.commit()
+                    with db_lock:
+                        upsert_document(conn, user_id, rec, rel_path, content,
+                                        full.stat().st_mtime_ns)
+                        conn.commit()
 
                 await asyncio.to_thread(_import)
-                _set_state(conn, doc["id"], "imported", entry_id=rec.entry_id)
+                await _set(doc["id"], "imported", entry_id=rec.entry_id)
                 result.imported += 1
                 if rec.needs_review:
                     result.review += 1
             except (LLMError, RuntimeError, OSError, sqlite3.Error) as e:
                 msg = f"{type(e).__name__}: {e}"
-                _set_state(conn, doc["id"], "failed", error=msg[:500])
+                await _set(doc["id"], "failed", error=msg[:500])
                 result.failed += 1
                 result.errors.append((relpath, msg[:200]))
             finally:
+                nonlocal done
                 done += 1
                 if on_progress:
                     try:
                         on_progress(done, result.picked)
                     except Exception:
                         pass
+
+        async def _worker() -> None:
+            nonlocal next_index
+            while next_index < len(candidates):
+                doc = candidates[next_index]
+                next_index += 1
+                await _process(doc)
+
+        workers = min(config.effective_concurrency, len(candidates)) or 1
+        await asyncio.gather(*(_worker() for _ in range(workers)))
     finally:
-        conn.close()
+        with db_lock:   # 等在飞的入库写完再关连接(含被取消的场景)
+            conn.close()
 
     result.finished_at = _now()
     return result
@@ -218,7 +244,8 @@ def resolve_config(stored: dict, env) -> LLMConfig:
         model=stored.get("model") or getattr(env, "CORPUS_LLM_MODEL", ""),
         api_key=stored.get("api_key") or getattr(env, "CORPUS_LLM_API_KEY", ""),
         timeout=float(stored.get("timeout") or getattr(env, "CORPUS_LLM_TIMEOUT", 120) or 120),
-        batch_limit=int(stored.get("batch_limit") or getattr(env, "CORPUS_BATCH_LIMIT", 0) or 0),
+        concurrency=int(stored.get("concurrency")
+                        or getattr(env, "CORPUS_LLM_CONCURRENCY", 0) or 0),
     )
 
 
@@ -229,7 +256,7 @@ def resolve_auto(stored: dict, env) -> dict:
     else:
         enabled = bool(getattr(env, "CORPUS_AUTOCLASSIFY", False))
     interval = int(stored.get("auto_interval")
-                   or getattr(env, "CORPUS_AUTO_INTERVAL", 120) or 120)
+                   or getattr(env, "CORPUS_AUTO_INTERVAL", 30) or 30)
     return {"enabled": enabled, "interval": max(30, interval)}
 
 
@@ -239,21 +266,23 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
                            on_progress=None) -> RunResult:
     """托管(Postgres)模式跑一轮:候选=目标知识库中未分类的文本源文档。
 
-    条目经 hosted_import 的事务化 upsert 落库(文档+检索分块一步到位);
-    状态存 Postgres 版 corpus_pipeline 表(migration 010)。
+    与本地版同口径:处理全部候选(limit 显式传入才截断),LLM 请求并发
+    = config.effective_concurrency;单条 asyncpg 连接不支持并发查询,
+    所有库操作经 asyncio.Lock 串行。条目经 hosted_import 的事务化 upsert
+    落库(文档+检索分块一步到位);状态存 Postgres 版 corpus_pipeline 表。
     """
     import asyncpg
 
     from .hosted_import import _load_chunker, _resolve_target, _upsert_entry
 
     result = RunResult(started_at=_now())
-    limit = limit or config.effective_batch_limit
     table = load(version)
     today = date.today()
     imported_on = today.isoformat()
     chunker = _load_chunker()
 
     conn = await asyncpg.connect(database_url)
+    db_lock = asyncio.Lock()
     try:
         target = await _resolve_target(conn, user_email, kb_slug)
         rows = await conn.fetch(
@@ -264,20 +293,23 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
             "AND (d.metadata IS NULL OR d.metadata->>'entry_id' IS NULL) "
             "AND (p.doc_id IS NULL OR (p.state = 'failed' AND p.attempts < $3)) "
             "ORDER BY d.created_at LIMIT $4",
-            target.kb_id, target.user_id, MAX_ATTEMPTS, limit)
+            target.kb_id, target.user_id, MAX_ATTEMPTS, limit)  # limit=None → 不限
         result.picked = len(rows)
 
         async def set_state(doc_id, state, error="", entry_id=""):
-            await conn.execute(
-                "INSERT INTO corpus_pipeline (doc_id, state, attempts, error, entry_id, updated_at) "
-                "VALUES ($1, $2, 1, $3, $4, now()) "
-                "ON CONFLICT (doc_id) DO UPDATE SET state = EXCLUDED.state, "
-                "attempts = corpus_pipeline.attempts + 1, error = EXCLUDED.error, "
-                "entry_id = EXCLUDED.entry_id, updated_at = now()",
-                doc_id, state, error, entry_id)
+            async with db_lock:
+                await conn.execute(
+                    "INSERT INTO corpus_pipeline (doc_id, state, attempts, error, entry_id, updated_at) "
+                    "VALUES ($1, $2, 1, $3, $4, now()) "
+                    "ON CONFLICT (doc_id) DO UPDATE SET state = EXCLUDED.state, "
+                    "attempts = corpus_pipeline.attempts + 1, error = EXCLUDED.error, "
+                    "entry_id = EXCLUDED.entry_id, updated_at = now()",
+                    doc_id, state, error, entry_id)
 
         done = 0
-        for doc in rows:
+        next_index = 0
+
+        async def _process(doc) -> None:
             relpath = f"{doc['path'].strip('/')}/{doc['filename']}".strip("/")
             content_src = doc["content"]
             try:
@@ -286,15 +318,16 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
                 if not include:
                     await set_state(doc["id"], "excluded", error=reason)
                     result.excluded += 1
-                    continue
+                    return
 
                 row = await classify(config, title, content_src, relpath)
                 apply_business_view(row)
                 rec = parse_row(row, table, today=today)
                 entry_content = render_entry_markdown(rec, content_src, imported_on)
                 rel_path = entry_relative_path(rec)
-                async with conn.transaction():
-                    await _upsert_entry(conn, target, rec, rel_path, entry_content, chunker)
+                async with db_lock:
+                    async with conn.transaction():
+                        await _upsert_entry(conn, target, rec, rel_path, entry_content, chunker)
                 await set_state(doc["id"], "imported", entry_id=rec.entry_id)
                 result.imported += 1
                 if rec.needs_review:
@@ -305,12 +338,23 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
                 result.failed += 1
                 result.errors.append((relpath, msg[:200]))
             finally:
+                nonlocal done
                 done += 1
                 if on_progress:
                     try:
                         on_progress(done, result.picked)
                     except Exception:
                         pass
+
+        async def _worker() -> None:
+            nonlocal next_index
+            while next_index < len(rows):
+                doc = rows[next_index]
+                next_index += 1
+                await _process(doc)
+
+        workers = min(config.effective_concurrency, len(rows)) or 1
+        await asyncio.gather(*(_worker() for _ in range(workers)))
     finally:
         await conn.close()
 
@@ -324,7 +368,7 @@ class _EnvShim:
     def __getattr__(self, name):
         import os
         v = os.environ.get(name, "")
-        if name in ("CORPUS_BATCH_LIMIT", "CORPUS_AUTO_INTERVAL"):
+        if name in ("CORPUS_LLM_CONCURRENCY", "CORPUS_AUTO_INTERVAL"):
             return int(v) if v else 0
         if name == "CORPUS_LLM_TIMEOUT":
             return float(v) if v else 120.0
@@ -343,7 +387,9 @@ def main() -> None:
     ap.add_argument("--database-url", default=None, help="hosted 模式: Postgres 连接串")
     ap.add_argument("--user-email", default=None, help="hosted 模式: 语料归属账号邮箱")
     ap.add_argument("--kb", default="goglobal-corpus", help="hosted 模式: 知识库 slug")
-    ap.add_argument("--limit", type=int, default=None, help="本轮批量上限(缺省=端点感知默认)")
+    ap.add_argument("--limit", type=int, default=None, help="本轮条数上限(缺省=处理全部待分类)")
+    ap.add_argument("--concurrency", type=int, default=None,
+                    help="LLM 请求并发数(缺省=端点感知默认:本地2/云端8)")
     ap.add_argument("--mock", action="store_true", help="规则桩自测,无需 LLM 端点")
     ap.add_argument("--base-url", default=None, help="覆盖 LLM 端点")
     ap.add_argument("--model", default=None)
@@ -375,6 +421,8 @@ def main() -> None:
         config.model = args.model
     if args.api_key:
         config.api_key = args.api_key
+    if args.concurrency:
+        config.concurrency = args.concurrency
 
     if args.workspace:
         result = aio.run(run_batch(Path(args.workspace).resolve(), config,

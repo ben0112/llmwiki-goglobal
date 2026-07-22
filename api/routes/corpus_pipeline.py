@@ -2,7 +2,8 @@
 
 - GET/PUT  /v1/corpus/llm-config       分类 LLM 端点配置(前端可配;密钥只写不读)
 - POST     /v1/corpus/llm-config/test  测试连接
-- POST     /v1/corpus/pipeline/run     手动触发一轮(单飞;limit 可覆盖批量上限)
+- POST     /v1/corpus/pipeline/run     手动触发一轮(单飞;处理全部待分类,limit 可截断)
+- POST     /v1/corpus/pipeline/stop    停止队列(取消在飞轮次 + 关闭自动分类)
 - GET      /v1/corpus/pipeline/status  各状态计数 + 当前/上次运行摘要
 """
 
@@ -47,7 +48,7 @@ class LLMConfigIn(BaseModel):
     model: str = ""
     api_key: str | None = None   # None/缺省 = 沿用现值;空串 = 清除
     timeout: float | None = None
-    batch_limit: int | None = Field(default=None, ge=0)
+    concurrency: int | None = Field(default=None, ge=0)  # 0 = 恢复端点感知默认
     auto_enabled: bool | None = None
     auto_interval: int | None = Field(default=None, ge=30)
 
@@ -67,8 +68,8 @@ def _config_out(stored: dict, request: Request) -> dict:
         "model": cfg.model,
         "api_key_masked": _masked(cfg.api_key),
         "timeout": cfg.timeout,
-        "batch_limit": cfg.batch_limit,
-        "effective_batch_limit": cfg.effective_batch_limit,
+        "concurrency": cfg.concurrency,
+        "effective_concurrency": cfg.effective_concurrency,
         "is_local_endpoint": corpus_llm.is_local_endpoint(cfg.base_url),
         "auto": corpus_pipeline.resolve_auto(stored, env),
         "source": "settings" if stored.get("base_url") else ("env" if getattr(env, "CORPUS_LLM_BASE_URL", "") else "default"),
@@ -102,8 +103,8 @@ async def put_llm_config(request: Request, body: LLMConfigIn):
             stored["api_key"] = body.api_key.strip()
         if body.timeout is not None:
             stored["timeout"] = body.timeout
-        if body.batch_limit is not None:      # 0 = 恢复端点感知默认
-            stored["batch_limit"] = body.batch_limit
+        if body.concurrency is not None:      # 0 = 恢复端点感知默认
+            stored["concurrency"] = body.concurrency
         if body.auto_enabled is not None:
             stored["auto_enabled"] = body.auto_enabled
         if body.auto_interval is not None:
@@ -160,12 +161,16 @@ def start_run(state, workspace: Path, limit: int | None = None) -> dict:
                 on_file_written=mark_written)
             state.corpus_pipeline_last_run = result.summary()
             return result
+        except asyncio.CancelledError:
+            prog = getattr(state, "corpus_pipeline_progress", None) or {}
+            state.corpus_pipeline_last_run = {"stopped": True, **prog}
+            raise
         finally:
             state.corpus_pipeline_progress = None
 
     state.corpus_pipeline_task = asyncio.create_task(_run())
     return {"started": True, "running": True,
-            "limit": limit or cfg.effective_batch_limit}
+            "concurrency": cfg.effective_concurrency}
 
 
 @router.post("/pipeline/run", status_code=202)
@@ -175,12 +180,37 @@ async def run_pipeline(request: Request, body: RunIn | None = None):
     return start_run(request.app.state, workspace, limit)
 
 
+@router.post("/pipeline/stop")
+async def stop_pipeline(request: Request):
+    """停止分类队列:取消在飞轮次,并关闭自动分类(否则 30s 内会自动重启)。
+
+    被取消的条目不落任何状态,留在待分类队列,重新开始时继续处理。
+    """
+    workspace = _require_local(request)
+    _, corpus_pipeline = _corpus()
+    state = request.app.state
+
+    task = getattr(state, "corpus_pipeline_task", None)
+    was_running = bool(task is not None and not task.done())
+    if was_running:
+        task.cancel()
+
+    conn = _db(workspace)
+    try:
+        stored = corpus_pipeline.load_llm_settings(conn)
+        stored["auto_enabled"] = False
+        corpus_pipeline.save_llm_settings(conn, stored)
+    finally:
+        conn.close()
+    return {"stopped": was_running, "auto_disabled": True}
+
+
 async def auto_loop(app) -> None:
     """自动分类轮询:开着且有待分类文档、无在飞轮次时,静默起一轮。"""
     _, corpus_pipeline = _corpus()
     from config import settings as env
     workspace = Path(app.state.workspace_path)
-    interval = 120
+    interval = 30
     while True:
         try:
             conn = _db(workspace)

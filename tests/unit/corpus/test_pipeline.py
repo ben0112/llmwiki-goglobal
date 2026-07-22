@@ -50,16 +50,19 @@ def _states(ws: Path) -> dict:
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
-def test_endpoint_aware_batch_default():
-    from corpus.llm import LLMConfig, default_batch_limit, is_local_endpoint
+def test_endpoint_aware_concurrency_default():
+    from corpus.llm import LLMConfig, default_concurrency, is_local_endpoint
 
     assert is_local_endpoint("http://localhost:8000/v1")
     assert is_local_endpoint("http://host.docker.internal:8000/v1")
     assert is_local_endpoint("mock")
     assert not is_local_endpoint("https://api.deepseek.com/v1")
-    assert default_batch_limit("http://127.0.0.1:1234/v1") == 20
-    assert default_batch_limit("https://api.deepseek.com/v1") == 100
-    assert LLMConfig(base_url="https://api.deepseek.com/v1", batch_limit=7).effective_batch_limit == 7
+    assert default_concurrency("http://127.0.0.1:1234/v1") == 2
+    assert default_concurrency("https://api.deepseek.com/v1") == 8
+    assert LLMConfig(base_url="https://api.deepseek.com/v1", concurrency=7).effective_concurrency == 7
+    # 上下限保护:离谱的配置钳制到 [1, 32]
+    assert LLMConfig(base_url="mock", concurrency=1000).effective_concurrency == 32
+    assert LLMConfig(base_url="mock", concurrency=-3).effective_concurrency == 1
 
 
 def test_resolve_config_precedence():
@@ -70,14 +73,14 @@ def test_resolve_config_precedence():
         CORPUS_LLM_MODEL = "env-model"
         CORPUS_LLM_API_KEY = "env-key"
         CORPUS_LLM_TIMEOUT = 60
-        CORPUS_BATCH_LIMIT = 5
+        CORPUS_LLM_CONCURRENCY = 5
 
     stored = {"base_url": "http://ui:2/v1", "model": "ui-model"}
     cfg = resolve_config(stored, Env)
     assert cfg.base_url == "http://ui:2/v1"      # 设置页 > 环境变量
     assert cfg.model == "ui-model"
     assert cfg.api_key == "env-key"              # 未在 UI 配置的字段回退环境变量
-    assert cfg.batch_limit == 5
+    assert cfg.concurrency == 5
 
     cfg2 = resolve_config({}, Env)
     assert cfg2.base_url == "http://env:1/v1"    # 环境变量 > 内置默认
@@ -172,8 +175,56 @@ def test_resolve_auto_precedence():
     assert resolve_auto({}, Env)["enabled"] is True
     assert resolve_auto({"auto_enabled": True, "auto_interval": 45}, Env) == {
         "enabled": True, "interval": 45}
-    # 间隔下限 30s
+    # 间隔下限 30s;无任何配置时默认 30s
     assert resolve_auto({"auto_interval": 5}, Env)["interval"] == 30
+    assert resolve_auto({}, type("Empty", (), {})())["interval"] == 30
+
+
+def test_run_batch_processes_whole_queue_and_limit_caps(tmp_path):
+    """缺省处理全部待分类(哪怕超过并发数);limit 显式传入才截断。"""
+    from corpus.llm import LLMConfig
+    from corpus.pipeline import run_batch
+
+    ws = _init_ws(tmp_path)
+    for i in range(5):
+        _insert_source(ws, f"000{i}_通知{i}.txt", f"境外投资备案通知{i}", POLICY_BODY)
+
+    cfg = LLMConfig(base_url="mock", concurrency=2)
+    result = asyncio.run(run_batch(ws, cfg, limit=2))
+    assert result.picked == 2                     # 显式 limit 截断
+
+    result2 = asyncio.run(run_batch(ws, cfg))
+    assert result2.picked == 3                    # 缺省吃掉剩余全部队列
+
+
+def test_run_batch_llm_calls_are_concurrent(tmp_path, monkeypatch):
+    """并发数生效:同时在飞的 LLM 审核请求峰值应达到配置值,而非串行 1。"""
+    import corpus.pipeline as pl
+    from corpus.llm import LLMConfig
+
+    ws = _init_ws(tmp_path)
+    for i in range(4):
+        _insert_source(ws, f"000{i}_通知{i}.txt", f"境外投资备案通知{i}", POLICY_BODY)
+
+    real_audit = pl.audit
+    active = 0
+    peak = 0
+
+    async def tracking_audit(config, title, body):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.05)   # 撑开时间窗,让并发可观测
+            return await real_audit(config, title, body)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(pl, "audit", tracking_audit)
+
+    result = asyncio.run(pl.run_batch(ws, LLMConfig(base_url="mock", concurrency=2)))
+    assert result.picked == 4 and result.failed == 0
+    assert peak == 2                              # 串行实现下 peak 只会是 1
 
 
 def test_run_batch_reports_progress_and_today_count(tmp_path):

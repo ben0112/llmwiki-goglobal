@@ -32,9 +32,12 @@ def is_local_endpoint(base_url: str) -> bool:
     return host in _LOCAL_HOSTS or host.endswith(".local") or host.endswith(".internal")
 
 
-def default_batch_limit(base_url: str) -> int:
-    """端点感知的每轮批量默认值:本地共享算力保守,云端放宽。"""
-    return 20 if is_local_endpoint(base_url) else 100
+MAX_CONCURRENCY = 32
+
+
+def default_concurrency(base_url: str) -> int:
+    """端点感知的 LLM 并发默认值:本地共享算力保守,云端放宽。"""
+    return 2 if is_local_endpoint(base_url) else 8
 
 
 @dataclass
@@ -43,11 +46,12 @@ class LLMConfig:
     model: str = DEFAULT_MODEL
     api_key: str = ""
     timeout: float = DEFAULT_TIMEOUT
-    batch_limit: int = 0  # 0 = 端点感知默认
+    concurrency: int = 0  # 同时向端点发起的请求数;0 = 端点感知默认
 
     @property
-    def effective_batch_limit(self) -> int:
-        return self.batch_limit or default_batch_limit(self.base_url)
+    def effective_concurrency(self) -> int:
+        return max(1, min(self.concurrency or default_concurrency(self.base_url),
+                          MAX_CONCURRENCY))
 
     @property
     def is_mock(self) -> bool:

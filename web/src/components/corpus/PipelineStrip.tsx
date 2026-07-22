@@ -1,10 +1,11 @@
 'use client'
 
 // 语料分类流水线状态条(仅本地模式):待分类 / 运行进度 / 今日入库 / 失败,
-// 附"立即分类"按钮。轮询 /v1/corpus/pipeline/status,运行中加密轮询。
+// 附"立即分类/停止分类"按钮(停止会同时关闭自动分类,避免队列被自动重启)。
+// 轮询 /v1/corpus/pipeline/status,运行中加密轮询。
 
 import * as React from 'react'
-import { Loader2, Play } from 'lucide-react'
+import { Loader2, Play, Square } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
 
@@ -21,6 +22,7 @@ export function PipelineStrip() {
   const token = useUserStore((s) => s.accessToken)
   const [status, setStatus] = React.useState<PipelineStatus | null>(null)
   const [starting, setStarting] = React.useState(false)
+  const [stopping, setStopping] = React.useState(false)
 
   const refresh = React.useCallback(() => {
     if (!token) return
@@ -48,6 +50,17 @@ export function PipelineStrip() {
       refresh()
     } catch { /* 状态条下轮刷新即可 */ } finally {
       setStarting(false)
+    }
+  }
+
+  const stopRun = async () => {
+    if (!token || stopping) return
+    setStopping(true)
+    try {
+      await apiFetch('/v1/corpus/pipeline/stop', token, { method: 'POST' })
+      refresh()
+    } catch { /* 状态条下轮刷新即可 */ } finally {
+      setStopping(false)
     }
   }
 
@@ -79,6 +92,16 @@ export function PipelineStrip() {
         >
           <Play className="size-3" />
           立即分类
+        </button>
+      )}
+      {status.running && (
+        <button
+          onClick={stopRun}
+          disabled={stopping}
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-destructive hover:bg-destructive/10 transition-colors cursor-pointer disabled:opacity-50"
+        >
+          <Square className="size-3" />
+          {stopping ? '停止中…' : '停止分类'}
         </button>
       )}
     </div>
