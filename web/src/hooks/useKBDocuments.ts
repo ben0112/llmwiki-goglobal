@@ -8,7 +8,10 @@ import { useUserStore } from '@/stores'
 import type { DocumentListItem } from '@/lib/types'
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
-const POLL_INTERVAL = 2000
+// 本地轮询是全量列表拉取,间隔随库规模自适应:几万文档时每 2s 一次
+// 数十 MB 的序列化/传输会拖垮 API 与浏览器,也和提取写入抢 SQLite。
+const pollInterval = (docCount: number) =>
+  docCount > 10000 ? 15000 : docCount > 2000 ? 6000 : 2000
 const WS_RECONNECT_BASE = 1000
 const WS_RECONNECT_MAX = 30000
 const WS_CLOSE_AUTH = 4001
@@ -63,6 +66,8 @@ export function useKBDocuments(knowledgeBaseId: string) {
   const reconnectTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectDelay = React.useRef(WS_RECONNECT_BASE)
   const debounceTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const docCountRef = React.useRef(0)
+  React.useEffect(() => { docCountRef.current = documents.length }, [documents.length])
 
   const fetchDocs = React.useCallback(async () => {
     if (!knowledgeBaseId || !accessToken) return
@@ -98,8 +103,22 @@ export function useKBDocuments(knowledgeBaseId: string) {
     if (!knowledgeBaseId || !accessToken) return
 
     if (isLocal) {
-      const interval = setInterval(fetchDocs, POLL_INTERVAL)
-      return () => clearInterval(interval)
+      let stopped = false
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const tick = async () => {
+        if (stopped) return
+        if (!document.hidden) await fetchDocs()   // 后台标签页不拉全量列表
+        if (stopped) return
+        timer = setTimeout(tick, pollInterval(docCountRef.current))
+      }
+      timer = setTimeout(tick, pollInterval(docCountRef.current))
+      const onVisible = () => { if (!document.hidden) fetchDocs() }
+      document.addEventListener('visibilitychange', onVisible)
+      return () => {
+        stopped = true
+        if (timer) clearTimeout(timer)
+        document.removeEventListener('visibilitychange', onVisible)
+      }
     }
 
     // Hosted mode — connect to API WebSocket

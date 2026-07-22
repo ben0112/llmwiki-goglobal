@@ -7,6 +7,7 @@ Respects PDF_BACKEND config and optional Mistral/LibreOffice backends.
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -28,7 +29,9 @@ logger = logging.getLogger(__name__)
 
 # Cap concurrent fire-and-forget extractions so a burst of dropped files can't
 # spawn one LibreOffice/OCR job (and connection) per file at once.
-PROCESS_CONCURRENCY = 4
+# 每路提取 = 一个 LibreOffice 或 JVM 进程(CPU+内存双重开销),默认按核数
+# 取半、上限 8;大批量导入可用环境变量 EXTRACT_CONCURRENCY 显式调高。
+PROCESS_CONCURRENCY = settings.EXTRACT_CONCURRENCY or max(2, min(8, (os.cpu_count() or 4) // 2))
 _process_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 
 

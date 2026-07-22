@@ -76,8 +76,10 @@ def _set_state(conn: sqlite3.Connection, doc_id: str, state: str,
 
 
 def select_candidates(conn: sqlite3.Connection, limit: int | None = None) -> list[dict]:
+    """候选只带元信息,正文由 worker 逐条惰性读取 —— 数万文档的全队列
+    一次性携带全文会把索引库整库拉进内存。"""
     rows = conn.execute(
-        "SELECT d.id, d.title, d.filename, d.relative_path, COALESCE(d.content, '') "
+        "SELECT d.id, d.title, d.filename, d.relative_path "
         "FROM documents d LEFT JOIN corpus_pipeline p ON p.doc_id = d.id "
         "WHERE d.source_kind = 'source' AND d.status = 'ready' "
         "AND d.relative_path NOT LIKE 'corpus/%' "
@@ -86,7 +88,7 @@ def select_candidates(conn: sqlite3.Connection, limit: int | None = None) -> lis
         (MAX_ATTEMPTS, -1 if limit is None else limit),  # SQLite: 负数 = 不限
     ).fetchall()
     return [
-        {"id": r[0], "title": r[1] or r[2], "relative_path": r[3], "content": r[4]}
+        {"id": r[0], "title": r[1] or r[2], "relative_path": r[3]}
         for r in rows
     ]
 
@@ -136,6 +138,15 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
                 _set_state(conn, doc_id, state, error=error, entry_id=entry_id)
         await asyncio.to_thread(_do)
 
+    async def _fetch_content(doc_id: str) -> str:
+        def _do() -> str:
+            with db_lock:
+                row = conn.execute(
+                    "SELECT COALESCE(content, '') FROM documents WHERE id = ?", (doc_id,),
+                ).fetchone()
+            return row[0] if row else ""
+        return await asyncio.to_thread(_do)
+
     try:
         user_row = conn.execute("SELECT user_id FROM workspace LIMIT 1").fetchone()
         if user_row is None:
@@ -158,21 +169,22 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
         async def _process(doc: dict) -> None:
             relpath = doc["relative_path"]
             try:
-                title = extract_title(doc["content"]) or doc["title"]
-                include, reason = await audit(config, title, doc["content"])
+                content_src = await _fetch_content(doc["id"])
+                title = extract_title(content_src) or doc["title"]
+                include, reason = await audit(config, title, content_src)
                 if not include:
                     await _set(doc["id"], "excluded", error=reason)
                     result.excluded += 1
                     return
 
-                row = await classify(config, title, doc["content"], relpath)
+                row = await classify(config, title, content_src, relpath)
                 apply_business_view(row)
                 rec = parse_row(row, table, today=today)
                 if any(i.level == ERROR for i in rec.issues):
                     # 校验错误仍入库(公理一,parse_row 已兜底并标待复核)
                     pass
 
-                body = doc["content"] or None
+                body = content_src or None
                 content = render_entry_markdown(rec, body, imported_on)
                 rel_path = entry_relative_path(rec)
 
@@ -294,8 +306,9 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
     db_lock = asyncio.Lock()
     try:
         target = await _resolve_target(conn, user_email, kb_slug)
+        # 候选只带元信息,正文逐条惰性读取(与本地版同理,防整库进内存)
         rows = await conn.fetch(
-            "SELECT d.id, d.title, d.filename, d.path, COALESCE(d.content, '') AS content "
+            "SELECT d.id, d.title, d.filename, d.path "
             "FROM documents d LEFT JOIN corpus_pipeline p ON p.doc_id = d.id "
             "WHERE d.knowledge_base_id = $1 AND d.user_id = $2 AND NOT d.archived "
             "AND d.status = 'ready' AND COALESCE(d.content, '') <> '' "
@@ -320,8 +333,12 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
 
         async def _process(doc) -> None:
             relpath = f"{doc['path'].strip('/')}/{doc['filename']}".strip("/")
-            content_src = doc["content"]
             try:
+                async with db_lock:
+                    row_c = await conn.fetchrow(
+                        "SELECT COALESCE(content, '') AS c FROM documents WHERE id = $1",
+                        doc["id"])
+                content_src = row_c["c"] if row_c else ""
                 title = extract_title(content_src) or doc["title"] or doc["filename"]
                 include, reason = await audit(config, title, content_src)
                 if not include:

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     CORPUS_LLM_API_KEY: str = ""
     CORPUS_LLM_TIMEOUT: float = 120.0
     CORPUS_LLM_CONCURRENCY: int = 0  # LLM 请求并发数;0 = 端点感知默认(本地2/云端8)
+    EXTRACT_CONCURRENCY: int = 0  # 文档提取并发(LibreOffice/JVM);0 = CPU 感知默认
     CORPUS_AUTOCLASSIFY: bool = False  # 自动分类默认关(设置页可开)
     CORPUS_AUTO_INTERVAL: int = 30  # 自动分类轮询间隔(秒)
 
