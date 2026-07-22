@@ -15,6 +15,8 @@ openpyxl==3.1.5
 beautifulsoup4==4.13.4
 lxml==6.1.0
 opendataloader-pdf==2.3.0
+pypdf==6.14.2
+xlrd==2.0.2
 aiosqlite==0.22.1
 watchfiles==1.1.0
 slowapi==0.1.9

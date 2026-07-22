@@ -142,6 +142,29 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
         except Exception:
             logger.exception("Reconcile: failed to process %s", doc_id[:8])
 
+    # 曾提取失败的文档每次启动重试一次:镜像修复/依赖补齐后无需手工干预。
+    # 真坏的文件每次启动会再失败一次,代价有界(仅启动时、逐个串行)。
+    placeholders = ",".join("?" for _ in EXTRACTION_TYPES)
+    cursor = await db.execute(
+        f"SELECT id FROM documents WHERE status = 'failed' AND source_kind != 'asset' "
+        f"AND file_type IN ({placeholders})",
+        tuple(EXTRACTION_TYPES),
+    )
+    failed_ids = [r[0] for r in await cursor.fetchall()]
+    for doc_id in failed_ids:
+        try:
+            await db.execute(
+                "UPDATE documents SET status = 'pending', error_message = NULL, "
+                "updated_at = datetime('now') WHERE id = ? AND status = 'failed'",
+                (doc_id,),
+            )
+            await db.commit()
+            await process_document(db, doc_id, workspace)
+        except Exception:
+            logger.exception("Reconcile: retry of failed doc %s", doc_id[:8])
+    if failed_ids:
+        logger.info("Reconcile: retried %d previously failed docs", len(failed_ids))
+
     text_docs = await _unchunked_text_docs(db)
     for doc_id, content in text_docs:
         try:
@@ -279,7 +302,11 @@ async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path
     with tempfile.TemporaryDirectory() as tmpdir:
         result = await asyncio.to_thread(
             subprocess.run,
-            [lo, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, str(file_path)],
+            [lo, "--headless", "--norestore",
+             # 每次调用独立用户配置目录:并发转换共用 ~/.config/libreoffice
+             # 会互踩配置锁,后来者直接失败(批量导入时成片报错的根因)
+             f"-env:UserInstallation=file://{tmpdir}/lo-profile",
+             "--convert-to", "pdf", "--outdir", tmpdir, str(file_path)],
             capture_output=True, timeout=120,
         )
         if result.returncode != 0:
@@ -332,21 +359,39 @@ async def _process_pdf_mistral(db: aiosqlite.Connection, doc_id: str, file_path:
 
 # ── Spreadsheet processing ────────────────────────────────────────────────
 
-async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path: Path) -> None:
-    """Extract spreadsheet data via openpyxl. Stores pages AND chunks for search."""
+def _read_sheet_rows(file_path: Path) -> list[tuple[str, list[str]]]:
+    """按表读出 (表名, 行文本列表)。老式 .xls 走 xlrd,其余走 openpyxl。"""
+    if file_path.suffix.lower() == ".xls":
+        import xlrd
+        book = xlrd.open_workbook(str(file_path))
+        return [
+            (sheet.name,
+             [" | ".join("" if c.value is None else str(c.value) for c in sheet.row(r))
+              for r in range(sheet.nrows)])
+            for sheet in book.sheets()
+        ]
     from openpyxl import load_workbook
+    wb = load_workbook(str(file_path), read_only=True, data_only=True)
+    try:
+        return [
+            (name,
+             [" | ".join(str(c) if c is not None else "" for c in row)
+              for row in wb[name].iter_rows(values_only=True)])
+            for name in wb.sheetnames
+        ]
+    finally:
+        wb.close()
 
-    wb = await asyncio.to_thread(load_workbook, str(file_path), read_only=True, data_only=True)
+
+async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path: Path) -> None:
+    """Extract spreadsheet data (openpyxl / xlrd). Stores pages AND chunks for search."""
+    sheets = await asyncio.to_thread(_read_sheet_rows, file_path)
 
     await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
 
     all_content = []
     page_contents = []
-    for i, sheet_name in enumerate(wb.sheetnames, 1):
-        ws = wb[sheet_name]
-        rows = []
-        for row in ws.iter_rows(values_only=True):
-            rows.append(" | ".join(str(c) if c is not None else "" for c in row))
+    for i, (sheet_name, rows) in enumerate(sheets, 1):
         content = "\n".join(rows)
         elements = json.dumps({"sheet_name": sheet_name})
 
@@ -358,18 +403,18 @@ async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path:
         all_content.append(f"## {sheet_name}\n\n{content}")
         page_contents.append((i, content))
 
-    num_sheets = len(wb.sheetnames)
-    wb.close()
+    num_sheets = len(sheets)
     full_content = "\n\n".join(all_content)
 
     from services.chunker import chunk_pages
     chunks = chunk_pages(page_contents)
     await _store_chunks(db, doc_id, chunks)
 
+    parser = "xlrd" if file_path.suffix.lower() == ".xls" else "openpyxl"
     await db.execute(
         "UPDATE documents SET status = 'ready', content = ?, page_count = ?, "
-        "parser = 'openpyxl', updated_at = datetime('now') WHERE id = ?",
-        (full_content, num_sheets, doc_id),
+        "parser = ?, updated_at = datetime('now') WHERE id = ?",
+        (full_content, num_sheets, parser, doc_id),
     )
     await db.commit()
 

@@ -246,7 +246,9 @@ class OCRService:
                 await self._s3.download_to_file(s3_source_key, str(source_path))
                 result = await asyncio.to_thread(
                     subprocess.run,
-                    ["libreoffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", tmpdir, str(source_path)],
+                    ["libreoffice", "--headless", "--norestore",
+                     f"-env:UserInstallation=file://{tmpdir}/lo-profile",  # 并发转换各用独立配置,防互踩锁
+                     "--convert-to", "pdf", "--outdir", tmpdir, str(source_path)],
                     capture_output=True, timeout=120,
                 )
                 if result.returncode != 0:
@@ -266,7 +268,9 @@ class OCRService:
 
             result = await asyncio.to_thread(
                 subprocess.run,
-                ["libreoffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", tmpdir, str(source_path)],
+                ["libreoffice", "--headless", "--norestore",
+                 f"-env:UserInstallation=file://{tmpdir}/lo-profile",  # 并发转换各用独立配置,防互踩锁
+                 "--convert-to", "pdf", "--outdir", tmpdir, str(source_path)],
                 capture_output=True, timeout=120,
             )
             if result.returncode != 0:
@@ -500,6 +504,19 @@ class OCRService:
             with open(path, newline="", encoding="utf-8", errors="replace") as f:
                 rows = [[c for c in row] for row in csv.reader(f)]
             return [("Sheet1", OCRService._rows_to_markdown(rows))]
+
+        if ext == "xls":  # 老式二进制格式,openpyxl 不支持
+            try:
+                import xlrd
+            except ImportError:
+                return [("Error", "(xlrd not installed)")]
+            book = xlrd.open_workbook(path)
+            return [
+                (sheet.name, OCRService._rows_to_markdown(
+                    [["" if c.value is None else str(c.value) for c in sheet.row(r)]
+                     for r in range(sheet.nrows)]))
+                for sheet in book.sheets() if sheet.nrows
+            ]
 
         try:
             import openpyxl

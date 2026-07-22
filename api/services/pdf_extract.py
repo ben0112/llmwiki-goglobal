@@ -1,4 +1,4 @@
-"""PDF extraction via opendataloader-pdf.
+"""PDF extraction via opendataloader-pdf, with a pypdf text-layer fallback.
 
 Shared module used by both the hosted OCR service and the local processor.
 No server-specific dependencies (no asyncpg, S3, httpx).
@@ -6,11 +6,14 @@ No server-specific dependencies (no asyncpg, S3, httpx).
 
 import base64
 import json
+import logging
 import tempfile
 from collections import defaultdict
 from pathlib import Path
 
 import opendataloader_pdf
+
+logger = logging.getLogger(__name__)
 
 
 def _element_to_markdown(el: dict) -> str:
@@ -98,13 +101,33 @@ def _elements_to_pages(
     return pages
 
 
+def _extract_pdf_fallback(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
+    """pypdf 文本层兜底:无版面结构/图片,但比整份失败强。"""
+    from pypdf import PdfReader
+
+    reader = PdfReader(pdf_path)
+    if reader.is_encrypted:
+        reader.decrypt("")   # 空口令加密(常见于政务附件);真加密会抛错
+    pages: list[tuple[int, str, list[dict]]] = []
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            text = ""
+        pages.append((i, text, []))
+    if not any(md for _, md, _ in pages):
+        raise RuntimeError("pypdf 兜底也未提取到文本")
+    return pages
+
+
 def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
     """Run opendataloader-pdf and return per-page markdown with images.
 
     Returns list of (page_num, markdown, images) where images is a list of
     {"id": str, "bytes": bytes, "format": str} dicts.
 
-    Raises RuntimeError if extraction fails (Java missing, corrupt PDF, etc.).
+    opendataloader 失败(损坏/非标准 PDF、Java 异常)时回退 pypdf 文本层;
+    两者都失败才抛 RuntimeError。
     """
     try:
         with tempfile.TemporaryDirectory() as extract_dir:
@@ -126,7 +149,12 @@ def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
         total_pages = data.get("number of pages", 0)
         elements = data.get("kids", [])
         return _elements_to_pages(elements, total_pages)
-    except RuntimeError:
-        raise
     except Exception as e:
-        raise RuntimeError(f"PDF extraction failed: {e}") from e
+        primary = e if isinstance(e, RuntimeError) else RuntimeError(f"PDF extraction failed: {e}")
+        try:
+            pages = _extract_pdf_fallback(pdf_path)
+        except Exception as fb:
+            raise RuntimeError(f"{primary}(pypdf 兜底亦失败: {fb})") from e
+        logger.warning("opendataloader failed for %s, used pypdf fallback: %s",
+                       Path(pdf_path).name, primary)
+        return pages
