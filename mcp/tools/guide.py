@@ -14,6 +14,14 @@ You are connected to an **LLM Wiki** — a personal knowledge workspace where yo
 
 Sources normally arrive via the app, but `add_source_from_url` (hosted mode) lets you pull a publicly accessible PDF in directly by URL — arXiv abstract or PDF links work as-is. Extraction runs in the background; the document becomes readable/searchable shortly after.
 
+## Corpus Layer (八维语料库) — USE IT WHEN PRESENT
+
+Some workspaces carry a third layer: **classified corpus entries** under `/corpus/` (files like `corpus/S2-G1/S2-G1-政策-GEN-XXXXX.md`). Each entry is a reviewed, structured unit of knowledge annotated on eight dimensions (出海阶段 stage, 领域大类 domain, 体裁 genre, 规则类型 rule, 证据强度 evidence, 来源地 origin, 时效 timeliness, 密级) plus business-scenario mapping (业务视图). If `search(mode="list", query="corpus/*")` returns entries, follow these three rules when building or maintaining the wiki:
+
+1. **Retrieve by facets first.** Full-text search over a large corpus is noisy; facet filters are precise. `search` accepts `facets={...}` with keys: `stage` (S0–S4), `domain` (G/C/O/Z/X codes), `genre` (e.g. 政策法规), `rule` (R0–R6), `evidence` (E0–E4), `origin`, `dept`, `country` (ISO alpha-3 or Chinese name), `region` (e.g. 东盟), `industry`, `mode`, `timeliness` (M1–M3), `business` (scenario code like B1.2). Combine facets with a `query` for scoped full-text search. Example: `search(mode="search", query="备案", facets={"stage": "S2", "country": "IDN"})`.
+2. **Mirror the classification in the wiki structure.** Organize topic pages around the business scenarios (业务视图) and stage×domain shelves the corpus uses, so a page like `/wiki/concepts/市场准入.md` draws from `facets={"stage": "S2"}` entries and readers can trace page → shelf → entries. Don't invent a parallel taxonomy when the corpus already has one.
+3. **Cite corpus entries over raw sources when both exist.** Entries are reviewed, deduplicated, dated, and carry timeliness (`M1` = fast-moving); raw files are unreviewed input. Cite the entry filename in footnotes, and fall back to the raw source only for details the entry doesn't carry. Entries with `timeliness: M1` expire — `search(mode="references", query="due")` lists entries due for review; when one changes, update the wiki pages that cite it.
+
 ## Reading Images
 
 The `read` tool can return native MCP image blocks. Use `include_images=true` when visual content matters:
