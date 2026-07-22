@@ -70,3 +70,14 @@ def test_to_dir_path_always_leading_slash():
     assert h._to_dir_path("wiki") == "/wiki/"
     assert h._to_dir_path("/wiki/") == "/wiki/"
     assert h._to_dir_path("笔记.md") == "/"
+
+
+def test_facet_rollup_helper_copies_in_sync():
+    """mcp 与 api 两份 facet_rollup 拷贝必须一致(同 parse_citation 模式)。"""
+    from pathlib import Path
+    mcp_copy = Path(__file__).parents[3] / "mcp" / "vaultfs" / "facet_rollup.py"
+    api_copy = Path(__file__).parents[3] / "api" / "services" / "facet_rollup.py"
+    mcp_text = mcp_copy.read_text(encoding="utf-8")
+    api_text = api_copy.read_text(encoding="utf-8")
+    # api 侧在共同部分之后追加批量刷新;共同前缀必须逐字一致
+    assert api_text.startswith(mcp_text.rstrip() + "\n")

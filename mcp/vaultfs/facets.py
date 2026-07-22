@@ -83,8 +83,16 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
     def array_contains(path: str) -> str:
         return f"EXISTS (SELECT 1 FROM json_each({meta}, '{path}') WHERE json_each.value = ?)"
 
+    # 维基页面经 facet_rollup(从引用条目聚合)也可被分面命中,
+    # 让"找覆盖 S2×IDN 的现有页面"这类查询直接可用。
     for key, value in facets.items():
-        if key in _SCALAR:
+        if key == "timeliness":
+            conds.append(
+                f"(json_extract({meta}, '$.timeliness') = ? "
+                f"OR json_extract({meta}, '$.facet_rollup.timeliness_worst') = ?)"
+            )
+            params.extend([value, value])
+        elif key in _SCALAR:
             conds.append(f"json_extract({meta}, '{_SCALAR[key]}') = ?")
             params.append(value)
         elif key in _ARRAY:
@@ -92,21 +100,31 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
             params.append(value)
         elif key in _PRIMARY_EXT:
             primary, ext = _PRIMARY_EXT[key]
-            conds.append(f"(json_extract({meta}, '{primary}') = ? OR {array_contains(ext)})")
-            params.extend([value, value])
+            conds.append(
+                f"(json_extract({meta}, '{primary}') = ? OR {array_contains(ext)} "
+                f"OR {array_contains(f'$.facet_rollup.{key}')})"
+            )
+            params.extend([value, value, value])
         elif key == "country":
-            conds.append(f"({array_contains('$.geo_country')} OR {array_contains('$.geo_country_names')})")
-            params.extend([value, value])
+            conds.append(
+                f"({array_contains('$.geo_country')} OR {array_contains('$.geo_country_names')} "
+                f"OR {array_contains('$.facet_rollup.country')})"
+            )
+            params.extend([value, value, value])
         elif key == "business":
             if "." in value:
-                conds.append(f"json_extract({meta}, '$.business.code') = ?")
-                params.append(value)
+                conds.append(
+                    f"(json_extract({meta}, '$.business.code') = ? "
+                    f"OR {array_contains('$.facet_rollup.business')})"
+                )
+                params.extend([value, value])
             else:
                 conds.append(
                     f"(json_extract({meta}, '$.business.code') = ? "
-                    f"OR json_extract({meta}, '$.business.code') LIKE ?)"
+                    f"OR json_extract({meta}, '$.business.code') LIKE ? "
+                    f"OR {array_contains('$.facet_rollup.business')})"
                 )
-                params.extend([value, f"{value}.%"])
+                params.extend([value, f"{value}.%", value])
     if conds:
         conds.insert(0, f"{raw_meta} IS NOT NULL")
     return conds, params
@@ -128,7 +146,13 @@ def postgres_facet_conditions(
         return n - 1
 
     for key, value in facets.items():
-        if key in _SCALAR:
+        if key == "timeliness":
+            i = nxt(value)
+            conds.append(
+                f"({meta}->>'timeliness' = ${i} "
+                f"OR {meta}#>>'{{facet_rollup,timeliness_worst}}' = ${i})"
+            )
+        elif key in _SCALAR:
             field = _SCALAR[key].removeprefix("$.")
             conds.append(f"{meta}->>'{field}' = ${nxt(value)}")
         elif key in _ARRAY:
@@ -137,15 +161,28 @@ def postgres_facet_conditions(
         elif key in _PRIMARY_EXT:
             primary, ext = (p.removeprefix("$.") for p in _PRIMARY_EXT[key])
             i = nxt(value)
-            conds.append(f"({meta}->>'{primary}' = ${i} OR {meta}->'{ext}' ? ${i})")
+            conds.append(
+                f"({meta}->>'{primary}' = ${i} OR {meta}->'{ext}' ? ${i} "
+                f"OR {meta}#>'{{facet_rollup,{key}}}' ? ${i})"
+            )
         elif key == "country":
             i = nxt(value)
-            conds.append(f"({meta}->'geo_country' ? ${i} OR {meta}->'geo_country_names' ? ${i})")
+            conds.append(
+                f"({meta}->'geo_country' ? ${i} OR {meta}->'geo_country_names' ? ${i} "
+                f"OR {meta}#>'{{facet_rollup,country}}' ? ${i})"
+            )
         elif key == "business":
             if "." in value:
-                conds.append(f"{meta}#>>'{{business,code}}' = ${nxt(value)}")
+                i = nxt(value)
+                conds.append(
+                    f"({meta}#>>'{{business,code}}' = ${i} "
+                    f"OR {meta}#>'{{facet_rollup,business}}' ? ${i})"
+                )
             else:
                 i = nxt(value)
                 j = nxt(f"{value}.%")
-                conds.append(f"({meta}#>>'{{business,code}}' = ${i} OR {meta}#>>'{{business,code}}' LIKE ${j})")
+                conds.append(
+                    f"({meta}#>>'{{business,code}}' = ${i} OR {meta}#>>'{{business,code}}' LIKE ${j} "
+                    f"OR {meta}#>'{{facet_rollup,business}}' ? ${i})"
+                )
     return conds, params

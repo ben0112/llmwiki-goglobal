@@ -148,8 +148,11 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
                     )
                     total_links += 1
 
-    logger.info("Rebuilt references for KB %s: %d citations, %d links", str(kb_id)[:8], total_cites, total_links)
-    return {"citations": total_cites, "links": total_links}
+    from services.facet_rollup import refresh_rollups_hosted
+    rollups = await refresh_rollups_hosted(conn, kb_id, user_id)
+
+    logger.info("Rebuilt references for KB %s: %d citations, %d links, %d rollups", str(kb_id)[:8], total_cites, total_links, rollups)
+    return {"citations": total_cites, "links": total_links, "facet_rollups": rollups}
 
 
 # ── Local (aiosqlite) ──
@@ -243,5 +246,9 @@ async def rebuild_local(db, user_id: str) -> dict:
             await db.rollback()
             raise
 
-    logger.info("Rebuilt references: %d citations, %d links", total_cites, total_links)
-    return {"citations": total_cites, "links": total_links}
+    # 引用边重建后同步重算页面分面聚合(rollup 与边同源,避免第二条更新路径)
+    from services.facet_rollup import refresh_rollups_local
+    rollups = await refresh_rollups_local(db)
+
+    logger.info("Rebuilt references: %d citations, %d links, %d rollups", total_cites, total_links, rollups)
+    return {"citations": total_cites, "links": total_links, "facet_rollups": rollups}

@@ -429,6 +429,46 @@ class PostgresVaultFS(VaultFS):
         except (ValueError, IndexError):
             return 0
 
+    async def refresh_facet_rollup(self, doc_id: str) -> None:
+        import json as _json
+        from datetime import date as _date
+
+        from .facet_rollup import apply_rollup, rollup_from_metas
+
+        rows = await scoped_query(
+            "SELECT d.metadata FROM document_references r "
+            "JOIN documents d ON d.id = r.target_document_id "
+            "WHERE r.source_document_id = $1 AND r.reference_type = 'cites' "
+            "AND d.path LIKE '/corpus/%'",
+            doc_id,
+        )
+        metas = []
+        for row in rows:
+            raw = row["metadata"]
+            try:
+                parsed = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                metas.append(parsed)
+        rollup = rollup_from_metas(metas, _date.today().isoformat())
+
+        page = await scoped_queryrow("SELECT metadata FROM documents WHERE id = $1", doc_id)
+        if page is None:
+            return
+        raw = page["metadata"]
+        try:
+            meta = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if apply_rollup(meta, rollup):
+            await service_execute(
+                "UPDATE documents SET metadata = $1::jsonb WHERE id = $2 AND user_id = $3",
+                _json.dumps(meta, ensure_ascii=False), doc_id, self.user_id,
+            )
+
     async def get_backlinks(self, doc_id: str) -> list[dict]:
         return await scoped_query(
             self.user_id,

@@ -633,6 +633,46 @@ class SqliteVaultFS(VaultFS):
         await db.commit()
         return cursor.rowcount
 
+    async def refresh_facet_rollup(self, doc_id: str) -> None:
+        from datetime import date as _date
+
+        from .facet_rollup import apply_rollup, rollup_from_metas
+
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT d.metadata FROM document_references r "
+            "JOIN documents d ON d.id = r.target_document_id "
+            "WHERE r.source_document_id = ? AND r.reference_type = 'cites' "
+            "AND d.relative_path LIKE 'corpus/%'",
+            (doc_id,),
+        )
+        metas = []
+        for (raw,) in await cursor.fetchall():
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else {}
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                metas.append(parsed)
+        rollup = rollup_from_metas(metas, _date.today().isoformat())
+
+        cursor = await db.execute("SELECT metadata FROM documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return
+        try:
+            meta = json.loads(row[0]) if row[0] else {}
+        except ValueError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if apply_rollup(meta, rollup):
+            await db.execute(
+                "UPDATE documents SET metadata = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), doc_id),
+            )
+            await db.commit()
+
     async def get_backlinks(self, doc_id: str) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(

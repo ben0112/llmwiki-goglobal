@@ -115,6 +115,10 @@ class VaultFS(ABC):
         语料条目复核变更/复审到期时的联动入口;返回新标记的页面数。"""
         return 0
 
+    async def refresh_facet_rollup(self, doc_id: str) -> None:
+        """重算单个维基页的 facet_rollup(从其引用的语料条目聚合八维)。"""
+        return None
+
     @abstractmethod
     async def get_backlinks(self, doc_id: str) -> list[dict]: ...
 

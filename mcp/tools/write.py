@@ -334,6 +334,8 @@ class WriteHandler:
         if dir_path.startswith("/wiki/") and file_type == "md":
             await update_references(self.fs, self.kb_id, doc_id, content, dir_path)
             await self.fs.propagate_staleness(doc_id)
+            # 引用边更新后立刻重算本页的分面聚合(facet_rollup)
+            await self.fs.refresh_facet_rollup(doc_id)
 
     async def _get_wiki_impact(self, doc_id: str, dir_path: str) -> str:
         """Return impact surface text for wiki pages, empty string otherwise."""

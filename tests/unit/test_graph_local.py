@@ -55,7 +55,7 @@ async def test_rebuild_local_builds_citation_edges():
 
     result = await rebuild_local(db, USER_ID)
 
-    assert result == {"citations": 1, "links": 0}
+    assert result == {"citations": 1, "links": 0, "facet_rollups": 0}
     cursor = await db.execute(
         "SELECT target_document_id, reference_type, page FROM document_references"
     )
