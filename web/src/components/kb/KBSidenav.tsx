@@ -203,7 +203,11 @@ export function KBSidenav({
     return items
   }, [wikiTree, sourceDocs])
 
-  const sourceCount = sourceDocs.length
+  // 计数只算原始文件:corpus/ 下由分类流水线生成的语料条目不计入,
+  // 避免与语料库视图的条目数口径混淆(条目文件在文件网格中仍可浏览)
+  const sourceCount = sourceDocs.filter(
+    (d) => !(d.relative_path?.startsWith('corpus/') || d.path.startsWith('/corpus/')),
+  ).length
 
   return (
     <div
@@ -514,7 +518,7 @@ export function KBSidenav({
             )}
           >
             <Library className="size-3.5" />
-            <span className="flex-1 text-left">源文件</span>
+            <span className="flex-1 text-left">原始文件</span>
             {sourceCount > 0 && (
               <span className="text-[10px] text-muted-foreground/30">{sourceCount}</span>
             )}
