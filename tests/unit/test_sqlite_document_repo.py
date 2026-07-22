@@ -64,3 +64,24 @@ async def test_find_by_path_matches_without_kb_columns():
         await db.close()
 
 
+
+
+@pytest.mark.asyncio
+async def test_list_survives_malformed_tags_row():
+    """一条 tags 非法 JSON 的坏行不应让整个文档列表 500(线上曾整页瘫痪)。"""
+    db = await _init_db()
+    try:
+        from infra.db.sqlite import SQLiteDocumentRepository
+
+        repo = SQLiteDocumentRepository(db)
+        await _insert_doc(db, id="ok1", filename="好行.md", tags="[\"a\"]")
+        await _insert_doc(db, id="bad", filename="坏行.md", relative_path="坏行.md",
+                          tags="not-json![", path="/")
+
+        docs = await repo.list_by_kb("ws1")
+        by_name = {d["filename"]: d for d in docs}
+        assert "好行.md" in by_name and by_name["好行.md"]["tags"] == ["a"]
+        # 坏行按容错解码保留,tags 退回空列表
+        assert "坏行.md" in by_name and by_name["坏行.md"]["tags"] == []
+    finally:
+        await db.close()

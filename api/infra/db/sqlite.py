@@ -32,7 +32,12 @@ def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
     cols = [d[0] for d in cursor.description]
     d = dict(zip(cols, row))
     if "tags" in d and isinstance(d["tags"], str):
-        d["tags"] = json.loads(d["tags"])
+        # 容错:tags 不是合法 JSON 时退回空列表,而不是让整个查询 500
+        # (与 mcp/vaultfs/sqlite.py 的同名函数保持一致)
+        try:
+            d["tags"] = json.loads(d["tags"])
+        except (json.JSONDecodeError, TypeError):
+            d["tags"] = []
     if "metadata" in d and isinstance(d["metadata"], str):
         try:
             d["metadata"] = json.loads(d["metadata"])
@@ -43,6 +48,10 @@ def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
             d["elements"] = json.loads(d["elements"])
         except (json.JSONDecodeError, TypeError):
             pass
+    # 兜底:异常写入的 BLOB 值转成字符串,避免 JSON 响应编码抛错
+    for k, v in d.items():
+        if isinstance(v, bytes):
+            d[k] = v.decode("utf-8", errors="replace")
     # Compatibility: add archived=False for local docs (never archived, just deleted)
     if "status" in d:
         d.setdefault("archived", False)
@@ -50,8 +59,18 @@ def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
 
 
 def rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
-    """Map a fetched result set to dicts, decoding JSON columns like _row_to_dict."""
-    return [_row_to_dict(cursor, r) for r in rows]
+    """Map a fetched result set to dicts, decoding JSON columns like _row_to_dict.
+
+    单行异常只丢弃该行并记录完整堆栈——一条坏数据不应让整个列表接口 500
+    (曾导致 /wikis/<slug> 整页无法加载)。
+    """
+    out: list[dict] = []
+    for r in rows:
+        try:
+            out.append(_row_to_dict(cursor, r))
+        except Exception:
+            logger.exception("跳过无法解码的行(cols=%s)", [d[0] for d in cursor.description])
+    return out
 
 
 # Local-mode requests share one aiosqlite connection, so a committing write
@@ -200,7 +219,7 @@ class SQLiteDocumentRepository:
                 "WHERE status != 'failed' ORDER BY filename",
             )
         rows = await cursor.fetchall()
-        return [_row_to_dict(cursor, r) for r in rows]
+        return rows_to_dicts(cursor, rows)
 
     async def get(self, doc_id: str) -> dict | None:
         cursor = await self._db.execute(
