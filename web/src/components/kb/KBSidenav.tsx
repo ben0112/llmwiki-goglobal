@@ -491,12 +491,10 @@ export function KBSidenav({
             <BookOpen className="size-6 text-muted-foreground/20 mx-auto mb-2" />
             <p className="text-xs text-muted-foreground mb-2">还没有维基</p>
             <a
-              href="https://claude.ai"
-              target="_blank"
-              rel="noopener noreferrer"
+              href="/settings"
               className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
             >
-              打开 Claude
+              连接 AI 助手
               <ArrowUpRight className="size-3" />
             </a>
           </div>

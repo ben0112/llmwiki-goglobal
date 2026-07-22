@@ -50,7 +50,7 @@ The Service includes PDF processing (OCR and text extraction) subject to per-use
 
 ## AI tool connections
 
-The Service allows you to connect third-party AI tools (such as Claude by Anthropic) via MCP. When connected:
+The Service allows you to connect third-party AI tools via MCP. When connected:
 
 - The AI tool can read, search, write, and modify content in your knowledge bases
 - AI-generated content (wiki pages, edits, notes) is stored in your knowledge base like any other content

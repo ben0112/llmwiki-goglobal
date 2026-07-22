@@ -1259,7 +1259,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                 <div className="text-center max-w-sm">
                   <h3 className="text-base font-medium mb-1.5">还没有维基</h3>
                   <p className="text-sm text-muted-foreground leading-relaxed">
-                    先添加一些资料,然后让 Claude 从中编译出一个维基。
+                    先添加一些资料,然后让已连接的 AI 助手从中编译出一个维基。
                   </p>
                 </div>
                 <div className="flex items-center gap-3 mt-2">
@@ -1271,12 +1271,10 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                     上传源文件
                   </button>
                   <a
-                    href="https://claude.ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
+                    href="/settings"
                     className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium hover:bg-accent transition-colors"
                   >
-                    打开 Claude
+                    连接 AI 助手
                     <ArrowUpRight className="size-3.5 opacity-60" />
                   </a>
                 </div>

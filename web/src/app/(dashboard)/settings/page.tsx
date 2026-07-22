@@ -270,7 +270,7 @@ function CorpusPipelineSection() {
   )
 }
 
-// 本地模式的"连接 Claude":Docker 部署时入口脚本会经 /__llmwiki_env.js 注入
+// 本地模式的"连接 AI 助手":Docker 部署时入口脚本会经 /__llmwiki_env.js 注入
 // MCP 的 HTTP 地址(runtimeMcpUrl),直接展示可粘贴配置;源码运行时回退到
 // CLI 命令(stdio)。用 effect 读取以避免 SSR/客户端首帧不一致。
 function LocalMcpSection() {
@@ -283,10 +283,10 @@ function LocalMcpSection() {
     const config = JSON.stringify({ mcpServers: { llmwiki: { url: mcpUrl } } }, null, 2)
     return (
       <section>
-        <h2 className="text-base font-medium">连接 Claude (MCP)</h2>
+        <h2 className="text-base font-medium">连接 AI 助手 (MCP)</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           本实例的 MCP 服务已通过 HTTP 暴露,任何支持 Streamable HTTP 的 MCP
-          客户端(Claude Code、Claude Desktop 等)都可直接连接,无需认证:
+          客户端都可直接连接,无需认证:
         </p>
         <div className="relative mt-4">
           <pre className="rounded-lg bg-muted border border-border p-4 text-xs font-mono overflow-x-auto text-foreground">
@@ -294,21 +294,16 @@ function LocalMcpSection() {
           </pre>
           <CopyButton text={config} />
         </div>
-        <p className="mt-3 text-xs text-muted-foreground">
-          Claude Code 一条命令:{' '}
-          <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">
-            claude mcp add --transport http llmwiki {mcpUrl}
-          </code>
-        </p>
+
       </section>
     )
   }
 
   return (
     <section>
-      <h2 className="text-base font-medium">连接 Claude</h2>
+      <h2 className="text-base font-medium">连接 AI 助手 (MCP)</h2>
       <p className="mt-2 text-sm text-muted-foreground">
-        运行以下命令获取此工作区的 Claude Desktop / Claude Code MCP 配置:
+        运行以下命令获取此工作区的 MCP 客户端配置:
       </p>
       <pre className="mt-4 rounded-lg bg-muted border border-border p-4 text-sm font-mono overflow-x-auto text-foreground">
         llmwiki mcp-config &lt;workspace-path&gt;
@@ -395,10 +390,10 @@ function ApiKeysSection() {
 
   return (
     <section>
-      <h2 className="text-base font-medium">连接 Claude (MCP)</h2>
+      <h2 className="text-base font-medium">连接 AI 助手 (MCP)</h2>
       <p className="mt-2 text-sm text-muted-foreground">
-        创建 API 密钥,并将下方配置添加到您的 MCP 客户端(Claude Desktop、Claude
-        Code 或 claude.ai 自定义连接器)。该密钥以您的身份进行认证——请像密码一样妥善
+        创建 API 密钥,并将下方配置添加到您的 MCP 客户端(桌面端或网页端的
+        自定义连接器均可)。该密钥以您的身份进行认证——请像密码一样妥善
         保管,不再需要时及时吊销。
       </p>
 
@@ -406,7 +401,7 @@ function ApiKeysSection() {
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="密钥名称(如 claude-desktop)"
+          placeholder="密钥名称(如 my-desktop)"
           className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
         />
         <button

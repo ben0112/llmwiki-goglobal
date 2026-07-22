@@ -45,20 +45,20 @@ All data is encrypted at rest (AES-256) and in transit (TLS 1.2+). Database acce
 | Amazon S3 | Raw uploaded files | File storage |
 | Railway | All data in transit through API | API and MCP server hosting |
 | Netlify | Frontend assets, request logs | Web application hosting |
-| Anthropic (Claude) | Document content during AI conversations | Wiki generation and knowledge base tools via MCP |
+| Your connected AI assistant provider | Document content during AI conversations | Wiki generation and knowledge base tools via MCP |
 
 We do not send your content to any service for the purpose of AI model training.
 
 ## How AI tools access your content
 
-LLM Wiki connects to AI assistants (such as Claude by Anthropic) via the Model Context Protocol (MCP). When you connect your Claude account:
+LLM Wiki connects to AI assistants via the Model Context Protocol (MCP). When you connect an AI assistant:
 
-- Claude can search, read, and write to your knowledge bases using MCP tools
-- Your content is sent to Claude through Anthropic's infrastructure as part of your conversations
-- This access is governed by your relationship with Anthropic and their privacy policy
-- You can disconnect Claude at any time by removing the MCP connector in your Claude settings
+- The assistant can search, read, and write to your knowledge bases using MCP tools
+- Your content is sent to the assistant provider's infrastructure as part of your conversations
+- This access is governed by your relationship with that provider and their privacy policy
+- You can disconnect at any time by removing the MCP connector in your assistant settings
 
-We do not control how Anthropic processes content sent through Claude conversations. Refer to Anthropic's privacy policy for details on their data handling.
+We do not control how assistant providers process content sent through their conversations. Refer to your provider's privacy policy for details on their data handling.
 
 ## What we do NOT do
 

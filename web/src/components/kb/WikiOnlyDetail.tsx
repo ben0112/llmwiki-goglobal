@@ -437,7 +437,7 @@ export function WikiOnlyDetail({
               <div className="max-w-sm text-center">
                 <h3 className="mb-1.5 text-base font-medium">还没有维基</h3>
                 <p className="text-sm leading-relaxed text-muted-foreground">
-                  先添加一些资料,然后让 Claude 从中编译出一个维基。
+                  先添加一些资料,然后让已连接的 AI 助手从中编译出一个维基。
                 </p>
               </div>
               <div className="mt-2 flex items-center gap-3">
@@ -449,12 +449,10 @@ export function WikiOnlyDetail({
                   上传源文件
                 </button>
                 <a
-                  href="https://claude.ai"
-                  target="_blank"
-                  rel="noopener noreferrer"
+                  href="/settings"
                   className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2 text-sm font-medium transition-colors hover:bg-accent"
                 >
-                  打开 Claude
+                  连接 AI 助手
                   <ArrowUpRight className="size-3.5 opacity-60" />
                 </a>
               </div>

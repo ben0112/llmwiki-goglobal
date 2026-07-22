@@ -152,7 +152,7 @@ export default function WikisPage() {
                 创建您的第一个维基
               </h1>
               <p className="mt-3 text-base text-muted-foreground leading-relaxed max-w-md mx-auto">
-                上传资料、连接 Claude,让它自动编纂出结构化的维基。
+                上传资料、连接 AI 助手,让它自动编纂出结构化的维基。
               </p>
             </div>
 
@@ -166,12 +166,12 @@ export default function WikisPage() {
                 {
                   step: '2',
                   title: '添加资料',
-                  desc: '上传 PDF、笔记、会议记录 — 任何想让 Claude 学习的内容。',
+                  desc: '上传 PDF、笔记、会议记录 — 任何想让 AI 学习的内容。',
                 },
                 {
                   step: '3',
-                  title: '交给 Claude',
-                  desc: 'Claude 阅读您的资料,编纂出带交叉引用与摘要的维基。',
+                  title: '交给 AI',
+                  desc: 'AI 助手阅读您的资料,编纂出带交叉引用与摘要的维基。',
                 },
               ].map((item, i) => (
                 <motion.div

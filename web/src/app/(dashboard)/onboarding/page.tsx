@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Copy, Check, Loader2, ArrowRight, ArrowLeft,
-  FileText, BookOpen, PenTool, ExternalLink,
+  FileText, BookOpen, PenTool,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
@@ -223,10 +223,10 @@ export default function OnboardingPage() {
               </button>
 
               <h1 className="text-2xl font-bold tracking-tight">
-                连接 Claude
+                连接 AI 助手 (MCP)
               </h1>
               <p className="mt-2 text-sm text-muted-foreground">
-                将 LLM Wiki 添加为连接器,让 Claude 可以读写您的维基。
+                将 LLM Wiki 添加为 MCP 连接器,让您的 AI 助手可以读写您的维基。
               </p>
 
               <div className="mt-8 space-y-6">
@@ -251,7 +251,7 @@ export default function OnboardingPage() {
                 {/* Steps */}
                 <div className="rounded-xl border border-border bg-card p-5">
                   <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/50 mb-3">
-                    在 Claude 中
+                    在支持 MCP 连接器的 AI 助手中
                   </p>
                   <ol className="space-y-2.5">
                     {[
@@ -308,7 +308,7 @@ export default function OnboardingPage() {
                 设置完成
               </h1>
               <p className="mt-3 text-sm text-muted-foreground leading-relaxed max-w-sm mx-auto">
-                上传一些资料到维基,然后让 Claude 将它们编纂为结构化页面。
+                上传一些资料到维基,然后让已连接的 AI 助手将它们编纂为结构化页面。
               </p>
 
               <button
@@ -319,17 +319,6 @@ export default function OnboardingPage() {
                 <ArrowRight className="size-3.5" />
               </button>
 
-              <div className="mt-6">
-                <a
-                  href="https://claude.ai"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <ExternalLink size={12} />
-                  打开 Claude
-                </a>
-              </div>
             </motion.div>
           )}
 

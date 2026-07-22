@@ -16,11 +16,11 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "LLM Wiki",
-  description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 Claude 直接构建持续积累的维基。",
+  description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 AI 智能体直接构建持续积累的维基。",
   metadataBase: new URL("https://llmwiki.app"),
   openGraph: {
     title: "LLM Wiki",
-    description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 Claude 直接构建持续积累的维基。",
+    description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 AI 智能体直接构建持续积累的维基。",
     url: "https://llmwiki.app",
     siteName: "LLM Wiki",
     type: "website",
@@ -29,7 +29,7 @@ export const metadata: Metadata = {
   twitter: {
     card: "summary_large_image",
     title: "LLM Wiki",
-    description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 Claude 直接构建持续积累的维基。",
+    description: "Karpathy LLM Wiki 的免费开源实现。上传文档,由 AI 智能体直接构建持续积累的维基。",
     images: ["/og.png"],
   },
 };

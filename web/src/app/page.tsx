@@ -25,7 +25,7 @@ const jsonLd = {
   offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
   url: 'https://llmwiki.app',
   description:
-    "Karpathy LLM Wiki 的免费开源实现。上传文档,由 Claude 直接构建持续积累的维基。",
+    "Karpathy LLM Wiki 的免费开源实现。上传文档,由 AI 智能体直接构建持续积累的维基。",
 }
 
 export default function LandingPage() {
