@@ -201,16 +201,23 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
         doc_number = row[0]
 
         status = "ready" if content is not None else "pending"
-        await db.execute(
-            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
-            "source_kind, file_type, file_size, status, content, tags, version, "
-            "content_hash, mtime_ns, last_indexed_at, document_number) "
-            "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, '[]', 0, ?, ?, datetime('now'), ?)",
-            (doc_id, filename, title, dir_path, relative, source_kind,
-             ext or "bin", stat.st_size, status, content, content_hash,
-             int(stat.st_mtime_ns), doc_number),
-        )
+        try:
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, file_size, status, content, tags, version, "
+                "content_hash, mtime_ns, last_indexed_at, document_number) "
+                "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, '[]', 0, ?, ?, datetime('now'), ?)",
+                (doc_id, filename, title, dir_path, relative, source_kind,
+                 ext or "bin", stat.st_size, status, content, content_hash,
+                 int(stat.st_mtime_ns), doc_number),
+            )
+        except aiosqlite.IntegrityError:
+            # watcher 与 sweep 对同一新文件 check-then-insert 竞态:
+            # 另一个写者已入索引,静默让位即可
+            await db.rollback()
+            logger.debug("Index race on %s — already indexed by another writer", relative)
+            return
         logger.info("Indexed (new): %s", relative)
         if status == "pending":
             from domain.local_processor import process_document_isolated
@@ -307,6 +314,7 @@ async def sweep_workspace(db: aiosqlite.Connection, workspace: Path) -> tuple[in
     indexed = {r[0]: r[1] for r in await cursor.fetchall()}
 
     swept = 0
+    busy_skipped = 0
     for relative, (path, mtime) in disk.items():
         if _is_recently_written(str(path)):
             continue
@@ -316,7 +324,12 @@ async def sweep_workspace(db: aiosqlite.Connection, workspace: Path) -> tuple[in
             await _index_file(db, workspace, path)
             swept += 1
         except Exception as e:
-            logger.warning("Sweep index error for %s: %s", relative, e)
+            if "database is locked" in str(e):
+                busy_skipped += 1   # 库忙属常态(批量提取中),下一轮自然补上
+            else:
+                logger.warning("Sweep index error for %s: %s", relative, e)
+    if busy_skipped:
+        logger.info("Sweep: %d files skipped (db busy), retrying next cycle", busy_skipped)
 
     removed = 0
     for relative in set(indexed) - set(disk):

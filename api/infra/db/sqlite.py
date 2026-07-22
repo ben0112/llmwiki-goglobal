@@ -111,9 +111,9 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
     db.row_factory = None
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
-    # 30s:处理器/语料流水线/外部 CLI 各持独立连接,写锁短暂重叠是常态;
-    # 超时过短会把"等一下就好"变成 database is locked 的 500(实测踩过)
-    await db.execute("PRAGMA busy_timeout=30000")
+    # 60s:处理器/语料流水线/外部 CLI 各持独立连接,批量导入期写锁重叠是
+    # 常态;超时过短会把"等一下就好"变成 database is locked(实测踩过两轮)
+    await db.execute("PRAGMA busy_timeout=60000")
     if init_schema:
         schema = _SCHEMA_PATH.read_text(encoding='utf-8')
         await db.executescript(schema)

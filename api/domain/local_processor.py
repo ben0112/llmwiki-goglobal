@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 PROCESS_CONCURRENCY = settings.EXTRACT_CONCURRENCY or max(2, min(8, (os.cpu_count() or 4) // 2))
 _process_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 
+# 重量级写(整份分页/分块入库,含中文 trigram FTS 索引)在进程内串行:
+# N 路提取的 CPU 段(OCR/LibreOffice)照常并行,但大事务写不再互相排队
+# 到超时 —— 批量导入时的 database is locked 风暴正源于此。
+_db_write_gate = asyncio.Lock()
+
 
 async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Path) -> None:
     """Atomically claim a pending document, then extract text, chunk, update index."""
@@ -98,12 +103,23 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
 
     except Exception as e:
         error_msg = str(e)[:500]
-        await db.execute(
-            "UPDATE documents SET status = 'failed', error_message = ?, "
-            "updated_at = datetime('now') WHERE id = ?",
-            (error_msg, doc_id),
-        )
-        await db.commit()
+        # 标失败本身也可能碰锁;异常若逃逸,文档会卡死在 processing 且
+        # 不再被任何路径重试。重试几轮,仍不行则留给启动回收复位。
+        for attempt in range(5):
+            try:
+                await db.execute(
+                    "UPDATE documents SET status = 'failed', error_message = ?, "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (error_msg, doc_id),
+                )
+                await db.commit()
+                break
+            except Exception:
+                if attempt == 4:
+                    logger.error("Could not mark %s failed (db busy); startup reconcile will reset it",
+                                 doc_id[:8])
+                else:
+                    await asyncio.sleep(2)
         logger.error("Failed to process %s: %s", doc["filename"], e)
 
 
@@ -122,14 +138,16 @@ async def chunk_text_document(db: aiosqlite.Connection, doc_id: str, content: st
     """Chunk an already-extracted text document so it becomes full-text searchable."""
     from services.chunker import chunk_text
 
-    await _store_chunks(db, doc_id, chunk_text(content or ""))
-    # `parser` doubles as the chunked-marker so reconcile skips docs that
-    # legitimately produce zero chunks (empty/short) instead of retrying them.
-    await db.execute(
-        "UPDATE documents SET parser = 'text', updated_at = datetime('now') WHERE id = ?",
-        (doc_id,),
-    )
-    await db.commit()
+    chunks = chunk_text(content or "")
+    async with _db_write_gate:
+        await _store_chunks(db, doc_id, chunks)
+        # `parser` doubles as the chunked-marker so reconcile skips docs that
+        # legitimately produce zero chunks (empty/short) instead of retrying them.
+        await db.execute(
+            "UPDATE documents SET parser = 'text', updated_at = datetime('now') WHERE id = ?",
+            (doc_id,),
+        )
+        await db.commit()
 
 
 async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
@@ -139,6 +157,21 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
     or building search chunks; this backfills both so a folder pointed at on
     first run is actually readable and searchable.
     """
+    # 锁风暴/崩溃中卡在 processing 的文档:进程重启后不可能仍在处理,
+    # 复位为 pending 并在本轮直接重跑(否则会永远滞留、无人重试)
+    cursor = await db.execute(
+        "SELECT id FROM documents WHERE status = 'processing'")
+    stuck_ids = [r[0] for r in await cursor.fetchall()]
+    if stuck_ids:
+        await db.execute("UPDATE documents SET status = 'pending' WHERE status = 'processing'")
+        await db.commit()
+        logger.info("Reconcile: reset %d docs stuck in 'processing'", len(stuck_ids))
+    for doc_id in stuck_ids:
+        try:
+            await process_document(db, doc_id, workspace)
+        except Exception:
+            logger.exception("Reconcile: retry of stuck doc %s", doc_id[:8])
+
     extract_ids = await _unchunked_extractable_ids(db)
     for doc_id in extract_ids:
         try:
@@ -258,27 +291,26 @@ async def _store_page_contents(
     """Store extracted pages, chunks, and update document status."""
     num_pages = len(page_contents)
 
-    await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
-    for page_num, content in page_contents:
-        elements = (page_elements or {}).get(page_num)
-        await db.execute(
-            "INSERT INTO document_pages (id, document_id, page, content, elements) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, page_num, content,
-             json.dumps(elements) if elements else None),
-        )
-
     full_content = "\n\n---\n\n".join(md for _, md in page_contents)
-
     from services.chunker import chunk_pages
-    chunks = chunk_pages(page_contents)
-    await _store_chunks(db, doc_id, chunks)
+    chunks = chunk_pages(page_contents)   # CPU 段在闸门外
 
-    await db.execute(
-        "UPDATE documents SET status = 'ready', content = ?, page_count = ?, "
-        "parser = ?, updated_at = datetime('now') WHERE id = ?",
-        (full_content, num_pages, parser, doc_id),
-    )
-    await db.commit()
+    async with _db_write_gate:
+        await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
+        for page_num, content in page_contents:
+            elements = (page_elements or {}).get(page_num)
+            await db.execute(
+                "INSERT INTO document_pages (id, document_id, page, content, elements) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), doc_id, page_num, content,
+                 json.dumps(elements) if elements else None),
+            )
+        await _store_chunks(db, doc_id, chunks)
+        await db.execute(
+            "UPDATE documents SET status = 'ready', content = ?, page_count = ?, "
+            "parser = ?, updated_at = datetime('now') WHERE id = ?",
+            (full_content, num_pages, parser, doc_id),
+        )
+        await db.commit()
 
 
 _HTML_SIGNATURES = (b"<!doc", b"<html", b"<head", b"<body", b"<?xml")
@@ -423,6 +455,12 @@ async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path:
     """Extract spreadsheet data (openpyxl / xlrd). Stores pages AND chunks for search."""
     sheets = await asyncio.to_thread(_read_sheet_rows, file_path)
 
+    async with _db_write_gate:
+        await _store_spreadsheet_rows(db, doc_id, sheets, file_path)
+
+
+async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
+                                  sheets: list[tuple[str, list[str]]], file_path: Path) -> None:
     await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
 
     all_content = []
@@ -481,14 +519,14 @@ async def _process_html(db: aiosqlite.Connection, doc_id: str, file_path: Path) 
 
     from services.chunker import chunk_text
     chunks = chunk_text(content)
-    await _store_chunks(db, doc_id, chunks)
-
-    await db.execute(
-        "UPDATE documents SET status = 'ready', content = ?, page_count = 1, "
-        "parser = 'webmd', updated_at = datetime('now') WHERE id = ?",
-        (content, doc_id),
-    )
-    await db.commit()
+    async with _db_write_gate:
+        await _store_chunks(db, doc_id, chunks)
+        await db.execute(
+            "UPDATE documents SET status = 'ready', content = ?, page_count = 1, "
+            "parser = 'webmd', updated_at = datetime('now') WHERE id = ?",
+            (content, doc_id),
+        )
+        await db.commit()
 
 
 # ── Reconciliation queries ────────────────────────────────────────────────

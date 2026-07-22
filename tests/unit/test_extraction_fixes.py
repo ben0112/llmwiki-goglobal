@@ -6,6 +6,7 @@
 - 曾失败文档 → 启动 reconcile 重试一次。
 """
 
+import asyncio
 import sqlite3
 import uuid
 from pathlib import Path
@@ -254,3 +255,80 @@ def test_maybe_ocr_noop_without_tools(monkeypatch):
     monkeypatch.setattr(px, "_ocr_available", lambda: False)
     pages = _mk_pages(3, 10)
     assert px._maybe_ocr("/tmp/x.pdf", pages) is pages
+
+
+async def test_reconcile_resets_stuck_processing(tmp_path, monkeypatch):
+    """锁风暴/崩溃后卡在 processing 的文档:启动 reconcile 复位并重跑。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        stuck_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, 'a.pdf', 'A', '/', 'a.pdf', 'source', 'pdf', 'processing', "
+            "'[]', 0, 1)", (stuck_id, USER_ID))
+        await db.commit()
+
+        processed: list[str] = []
+
+        async def fake_process(db_, doc_id, workspace_):
+            processed.append(doc_id)
+
+        monkeypatch.setattr(lp, "process_document", fake_process)
+        await lp.reconcile_workspace(db, ws)
+
+        assert stuck_id in processed
+        cursor = await db.execute("SELECT status FROM documents WHERE id = ?", (stuck_id,))
+        assert (await cursor.fetchone())[0] == "pending"   # 已复位(fake 未真正处理)
+    finally:
+        await db.close()
+
+
+async def test_heavy_writes_serialized_by_gate(tmp_path, monkeypatch):
+    """重量级入库写经进程级闸门串行:并发峰值必须为 1。"""
+    import domain.local_processor as lp
+
+    active = 0
+    peak = 0
+    real_store = lp._store_chunks
+
+    async def tracking_store(db, doc_id, chunks):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.02)
+            return await real_store(db, doc_id, chunks)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(lp, "_store_chunks", tracking_store)
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        ids = []
+        for i in range(4):
+            doc_id = str(uuid.uuid4())
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, status, tags, version, document_number) "
+                "VALUES (?, ?, ?, 'T', '/', ?, 'source', 'txt', 'ready', '[]', 0, ?)",
+                (doc_id, USER_ID, f"t{i}.txt", f"t{i}.txt", i + 1))
+            ids.append(doc_id)
+        await db.commit()
+
+        await asyncio.gather(*(lp.chunk_text_document(db, d, "境外投资内容。" * 50) for d in ids))
+        assert peak == 1   # 闸门生效:重写全程串行
+    finally:
+        await db.close()
