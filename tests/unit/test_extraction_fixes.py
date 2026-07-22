@@ -162,3 +162,48 @@ async def test_reconcile_retries_failed_docs(tmp_path, monkeypatch):
         assert status == "pending" and err is None
     finally:
         await db.close()
+
+
+def test_sniff_html_detects_disguised(tmp_path):
+    from domain.local_processor import _sniff_html
+
+    fake = tmp_path / "假装.pdf"
+    fake.write_bytes(b"\n  <!DOCTYPE html>\n<html><body>404</body></html>")
+    real = tmp_path / "真的.pdf"
+    real.write_bytes(b"%PDF-1.4\n...")
+    assert _sniff_html(fake) is True
+    assert _sniff_html(real) is False
+
+
+async def test_html_disguised_pdf_parsed_as_html(tmp_path):
+    """爬虫把网页存成 .pdf:应走 HTML 解析入库,而非两个引擎双双失败。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        (ws / "伪装网页.pdf").write_text(
+            "<!DOCTYPE html><html><body><h1>境外投资办事指南</h1><p>正文内容。</p></body></html>",
+            encoding="utf-8")
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '伪装网页.pdf', 'X', '/', '伪装网页.pdf', 'source', 'pdf', "
+            "'pending', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        await lp.process_document(db, doc_id, ws)
+
+        cursor = await db.execute(
+            "SELECT status, parser, content FROM documents WHERE id = ?", (doc_id,))
+        status, parser, content = await cursor.fetchone()
+        assert status == "ready" and parser == "webmd"
+        assert "境外投资办事指南" in (content or "")
+    finally:
+        await db.close()

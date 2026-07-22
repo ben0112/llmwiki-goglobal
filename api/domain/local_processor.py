@@ -71,7 +71,13 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
         return
 
     try:
-        if file_type in PDF_TYPES:
+        if file_type in (PDF_TYPES | OFFICE_TYPES) and _sniff_html(file_path):
+            # 爬虫常把网页(错误页/正文)直接存成 .pdf/.doc 扩展名;
+            # 按真实内容走 HTML 解析,而不是让两个提取引擎双双失败
+            logger.info("HTML disguised as .%s, parsing as HTML: %s",
+                        file_type, doc["filename"])
+            await _process_html(db, doc_id, file_path)
+        elif file_type in PDF_TYPES:
             await _process_pdf(db, doc_id, file_path, workspace)
         elif file_type in OFFICE_TYPES:
             await _process_office(db, doc_id, file_path, workspace)
@@ -275,13 +281,31 @@ async def _store_page_contents(
     await db.commit()
 
 
+_HTML_SIGNATURES = (b"<!doc", b"<html", b"<head", b"<body", b"<?xml")
+
+
+def _sniff_html(file_path: Path) -> bool:
+    """扩展名与内容不符的常见场景:网页被存成 .pdf/.doc 扩展名。"""
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(512).lstrip()[:64].lower()
+    except OSError:
+        return False
+    return head.startswith(_HTML_SIGNATURES) or b"<html" in head
+
+
 async def _process_pdf(db: aiosqlite.Connection, doc_id: str, file_path: Path, workspace: Path) -> None:
     """Extract PDF text. Uses opendataloader by default, Mistral if configured."""
     if settings.PDF_BACKEND == "mistral" and settings.MISTRAL_API_KEY:
         await _process_pdf_mistral(db, doc_id, file_path, workspace)
     else:
         from services.pdf_extract import extract_pdf
-        pages_with_images = await asyncio.to_thread(extract_pdf, str(file_path))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 短名软链再提取:opendataloader 以输入文件名派生输出名,
+            # 统一短名规避超长/特殊字符文件名的边界问题
+            src = Path(tmpdir) / "source.pdf"
+            os.symlink(file_path.resolve(), src)
+            pages_with_images = await asyncio.to_thread(extract_pdf, str(src))
         page_elements = await _save_local_images(db, doc_id, workspace, pages_with_images)
         page_contents = [(num, md) for num, md, _ in pages_with_images]
         await _store_page_contents(db, doc_id, page_contents, "opendataloader", page_elements)
@@ -303,13 +327,17 @@ async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # 短名软链再转换:让输出名可预期,规避超长/特殊字符文件名的边界问题
+        ext = file_path.suffix.lstrip(".") or "doc"
+        src = Path(tmpdir) / f"source.{ext}"
+        os.symlink(file_path.resolve(), src)
         result = await asyncio.to_thread(
             subprocess.run,
             [lo, "--headless", "--norestore",
              # 每次调用独立用户配置目录:并发转换共用 ~/.config/libreoffice
              # 会互踩配置锁,后来者直接失败(批量导入时成片报错的根因)
              f"-env:UserInstallation=file://{tmpdir}/lo-profile",
-             "--convert-to", "pdf", "--outdir", tmpdir, str(file_path)],
+             "--convert-to", "pdf", "--outdir", tmpdir, str(src)],
             capture_output=True, timeout=120,
         )
         if result.returncode != 0:
@@ -317,7 +345,12 @@ async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path
 
         pdf_files = list(Path(tmpdir).glob("*.pdf"))
         if not pdf_files:
-            raise RuntimeError("LibreOffice produced no PDF output")
+            # 载入失败(如加密/受保护文档)时 soffice 退出码为 0、原因只打在
+            # stdout —— 带出来让失败原因可诊断
+            detail = (result.stdout.decode(errors="replace")[:200]
+                      or result.stderr.decode(errors="replace")[:200]).strip()
+            raise RuntimeError(
+                f"LibreOffice produced no PDF output{(': ' + detail) if detail else ''}")
 
         converted_pdf = pdf_files[0]
 
