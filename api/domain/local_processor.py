@@ -222,14 +222,17 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
 
 
 async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> None:
-    """Store chunks into SQLite, replacing any existing ones."""
+    """Store chunks into SQLite, replacing any existing ones.
+
+    批量 executemany:OCR 长文档动辄数百 chunk,逐条 execute 的跨线程
+    往返会显著拉长写闸门内的临界区。"""
     await db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
-    for c in chunks:
-        await db.execute(
+    if chunks:
+        await db.executemany(
             "INSERT INTO document_chunks (id, document_id, chunk_index, content, source_content, page, "
             "start_char, token_count, header_breadcrumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
-             c.start_char, c.token_count, c.header_breadcrumb),
+            [(str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
+              c.start_char, c.token_count, c.header_breadcrumb) for c in chunks],
         )
 
 
@@ -297,12 +300,13 @@ async def _store_page_contents(
 
     async with _db_write_gate:
         await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
-        for page_num, content in page_contents:
-            elements = (page_elements or {}).get(page_num)
-            await db.execute(
+        if page_contents:
+            await db.executemany(
                 "INSERT INTO document_pages (id, document_id, page, content, elements) VALUES (?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), doc_id, page_num, content,
-                 json.dumps(elements) if elements else None),
+                [(str(uuid.uuid4()), doc_id, page_num, content,
+                  json.dumps((page_elements or {}).get(page_num))
+                  if (page_elements or {}).get(page_num) else None)
+                 for page_num, content in page_contents],
             )
         await _store_chunks(db, doc_id, chunks)
         await db.execute(
@@ -465,17 +469,18 @@ async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
 
     all_content = []
     page_contents = []
+    page_rows = []
     for i, (sheet_name, rows) in enumerate(sheets, 1):
         content = "\n".join(rows)
-        elements = json.dumps({"sheet_name": sheet_name})
-
-        await db.execute(
-            "INSERT INTO document_pages (id, document_id, page, content, elements) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, i, content, elements),
-        )
+        page_rows.append((str(uuid.uuid4()), doc_id, i, content,
+                          json.dumps({"sheet_name": sheet_name})))
         all_content.append(f"## {sheet_name}\n\n{content}")
         page_contents.append((i, content))
+    if page_rows:
+        await db.executemany(
+            "INSERT INTO document_pages (id, document_id, page, content, elements) "
+            "VALUES (?, ?, ?, ?, ?)", page_rows,
+        )
 
     num_sheets = len(sheets)
     full_content = "\n\n".join(all_content)

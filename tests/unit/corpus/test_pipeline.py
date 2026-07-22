@@ -284,3 +284,61 @@ def test_run_batch_reports_progress_and_today_count(tmp_path):
         assert status_counts(conn)["imported_today"] == 1
     finally:
         conn.close()
+
+
+def test_llm_client_reused_within_loop():
+    """同一事件循环内复用同一客户端;新循环自动换新(旧连接不可用)。"""
+    import corpus.llm as cl
+
+    async def grab():
+        return cl._get_client()
+
+    c1 = asyncio.run(grab())
+    # 同 loop 复用
+    async def two():
+        return cl._get_client() is cl._get_client()
+    assert asyncio.run(two()) is True
+    # 新 loop(asyncio.run 各建一个)必须换新客户端
+    c2 = asyncio.run(grab())
+    assert c2 is not c1
+
+
+def test_llm_requests_share_keepalive_connection():
+    """连 3 次 chat 补全只应建立 1 条 TCP 连接(keep-alive 复用)。"""
+    import http.server
+    import threading
+
+    import corpus.llm as cl
+
+    connections = set()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            connections.add(self.client_address[1])   # 客户端源端口 ≈ 连接标识
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = ('{"choices": [{"message": {"content": '
+                    '"{\\"ok\\": true}"}}]}').encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = cl.LLMConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", model="m")
+
+        async def go():
+            for _ in range(3):
+                await cl.chat_json(cfg, "s", "u", required_keys=("ok",), strict_retry=False)
+
+        asyncio.run(go())
+        assert len(connections) == 1, f"期望 1 条连接,实际 {len(connections)}"
+    finally:
+        srv.shutdown()

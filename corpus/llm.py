@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -62,6 +63,25 @@ class LLMError(Exception):
     pass
 
 
+# 进程级共享 HTTP 客户端:数万次分类请求逐次新建/关闭 AsyncClient 会把
+# TCP+TLS 握手做上数万遍。按事件循环缓存(CLI/测试可能多次 asyncio.run,
+# 旧 loop 的客户端不可复用),timeout 逐请求传入。
+_clients: dict[int, httpx.AsyncClient] = {}
+
+
+def _get_client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    client = _clients.get(loop_id)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+        )
+        # 只保留当前 loop 的条目;旧 loop 已关闭,其连接随之失效
+        _clients.clear()
+        _clients[loop_id] = client
+    return client
+
+
 async def chat_json(config: LLMConfig, system_prompt: str, user_prompt: str,
                     *, required_keys: tuple[str, ...], strict_retry: bool = True) -> dict:
     """一次对话补全并从回复中提取扁平 JSON;格式漂移时带提示重试一次。"""
@@ -95,13 +115,12 @@ async def _complete_raw(config: LLMConfig, system_prompt: str, user_prompt: str,
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
     try:
-        async with httpx.AsyncClient(timeout=config.timeout) as client:
-            resp = await client.post(
-                config.base_url.rstrip("/") + "/chat/completions",
-                json=payload, headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await _get_client().post(
+            config.base_url.rstrip("/") + "/chat/completions",
+            json=payload, headers=headers, timeout=config.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
     except httpx.HTTPError as e:
         raise LLMError(f"端点请求失败: {e}") from e
     try:
