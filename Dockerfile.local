@@ -6,7 +6,7 @@
 #   docker run -d --name llmwiki -p 9000:8000 -p 3000:3000 \
 #       -v llmwiki-workspace:/workspace llmwiki-local
 #
-# Claude Desktop MCP (stdio via the running container):
+# MCP client config (stdio via the running container):
 #   {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}
 #
 # NEXT_PUBLIC_* values are baked into the web bundle at build time; override
