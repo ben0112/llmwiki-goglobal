@@ -27,9 +27,22 @@ mkdir -p "$WORKSPACE_PATH"
 PUBLIC_API_URL="${PUBLIC_API_URL:-http://localhost:9000}"
 PUBLIC_MCP_URL="${PUBLIC_MCP_URL:-http://localhost:8080/mcp}"
 export API_URL="$PUBLIC_API_URL"
-printf 'window.__LLMWIKI_ENV__={API_URL:%s,MCP_URL:%s};\n' \
-  "\"$PUBLIC_API_URL\"" "\"$PUBLIC_MCP_URL\"" \
-  > /app/web/public/__llmwiki_env.js
+
+# 主机名为 localhost(未显式配置)时,注入"跟随浏览器地址栏主机名"的动态
+# 版本:同一实例可同时经 localhost、局域网 IP、组网 IP 访问,零配置。
+# 显式配置了非 localhost 主机(如反代域名)则按原值注入。
+api_host="${PUBLIC_API_URL#*://}"; api_host="${api_host%%[:/]*}"
+api_port="${PUBLIC_API_URL##*:}"; api_port="${api_port%%/*}"
+mcp_port_path="${PUBLIC_MCP_URL##*:}"   # 例: 8080/mcp
+if [ "$api_host" = "localhost" ]; then
+  printf '(function(){var o=location.protocol+"//"+location.hostname;window.__LLMWIKI_ENV__={API_URL:o+":%s",MCP_URL:o+":%s"};})();\n' \
+    "$api_port" "$mcp_port_path" \
+    > /app/web/public/__llmwiki_env.js
+else
+  printf 'window.__LLMWIKI_ENV__={API_URL:%s,MCP_URL:%s};\n' \
+    "\"$PUBLIC_API_URL\"" "\"$PUBLIC_MCP_URL\"" \
+    > /app/web/public/__llmwiki_env.js
+fi
 
 (cd /app/api && exec uvicorn main:app --host 0.0.0.0 --port "$API_PORT") &
 api_pid=$!

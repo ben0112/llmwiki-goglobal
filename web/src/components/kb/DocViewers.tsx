@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { resolveAssetUrl } from '@/lib/runtime-env'
 import { Loader2, FileText } from 'lucide-react'
 import { useUserStore } from '@/stores'
 import { apiFetch } from '@/lib/api'
@@ -22,7 +23,7 @@ function useDocumentUrl(documentId: string) {
     if (!token) return
     let cancelled = false
     apiFetch<{ url: string }>(`/v1/documents/${documentId}/url`, token)
-      .then((res) => { if (!cancelled) setUrl(res.url) })
+      .then((res) => { if (!cancelled) setUrl(resolveAssetUrl(res.url)) })
       .catch(() => { if (!cancelled) setError(true) })
     return () => { cancelled = true }
   }, [documentId, token])

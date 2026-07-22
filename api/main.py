@@ -247,10 +247,11 @@ if settings.MODE != "local":
 
 app.add_middleware(
     CORSMiddleware,
-    # Local mode is single-user on this machine; accept any localhost origin
-    # so remapped Docker port mappings (e.g. -p 9300:3000) keep working.
+    # Local mode is single-user with no auth and binds wherever the operator
+    # publishes it (localhost / LAN / overlay network) — accept any origin so
+    # the web app works from whichever address the browser used.
     **(
-        {"allow_origin_regex": r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"}
+        {"allow_origin_regex": r"^https?://.*$"}
         if settings.MODE == "local"
         else {"allow_origins": [settings.APP_URL]}
     ),

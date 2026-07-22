@@ -5,7 +5,7 @@ import { useEditor, EditorContent } from '@tiptap/react'
 import { Check, Loader2, MessageSquarePlus, Pencil, X } from 'lucide-react'
 
 import { apiFetch, getDocumentsWsUrl } from '@/lib/api'
-import { apiUrl } from '@/lib/runtime-env'
+import { apiUrl, resolveAssetUrl } from '@/lib/runtime-env'
 import { refreshAccessToken } from '@/lib/auth-token'
 import { useUserStore } from '@/stores'
 import { cn } from '@/lib/utils'
@@ -542,7 +542,7 @@ async function resolveWebclipAssetUrls(doc: Document, token: string): Promise<Re
       try {
         const res = await apiFetch<UrlResponse>(`/v1/documents/${asset.document_id}/url`, token)
         const keys = [asset.src, asset.path, asset.filename].filter(Boolean) as string[]
-        return { keys, url: res.url }
+        return { keys, url: resolveAssetUrl(res.url) }
       } catch {
         return null
       }

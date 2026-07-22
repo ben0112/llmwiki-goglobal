@@ -12,6 +12,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { FileText, Copy, Check, Network, ChevronLeft, ChevronRight, ArrowRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
+import { resolveAssetUrl } from '@/lib/runtime-env'
 import { useUserStore } from '@/stores'
 import { ExpandableMedia } from './DiagramViewer'
 import { WikiHighlighter } from './WikiHighlighter'
@@ -411,7 +412,7 @@ function WikiImage({
     } else if (isImageBinary) {
       // Binary images stored in S3 — use the /url endpoint
       apiFetch<{ url: string }>(`/v1/documents/${doc.id}/url`, token)
-        .then((res) => setImageUrl(res.url))
+        .then((res) => setImageUrl(resolveAssetUrl(res.url)))
         .catch(() => { /* silent fail */ })
         .finally(() => setLoading(false))
     } else {

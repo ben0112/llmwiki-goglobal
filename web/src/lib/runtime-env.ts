@@ -23,3 +23,10 @@ export function runtimeMcpUrl(): string | null {
   }
   return null
 }
+
+/** 服务端拼的绝对资产 URL(/v1/files/…)按当前 apiUrl 重写源:
+ * 服务端只知道自己配置的 API_URL(默认 localhost),从局域网/组网地址
+ * 访问时需换成浏览器实际可达的主机。 */
+export function resolveAssetUrl(url: string): string {
+  return url.replace(/^https?:\/\/[^/]+/, apiUrl())
+}
