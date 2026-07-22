@@ -27,7 +27,7 @@ and the Railway/Netlify config files are inert.
 ```
                        ┌──────────────── reverse proxy (TLS) ────────────────┐
   browsers ──────────► │ app.example.com      → web:3000        (Next.js)    │
-  Claude (MCP) ──────► │ mcp.example.com/mcp  → mcp:8080/mcp    (FastMCP)    │
+  Agent (MCP) ───────► │ mcp.example.com/mcp  → mcp:8080/mcp    (FastMCP)    │
   browsers ──────────► │ api.example.com      → api:8000        (FastAPI)    │
   browsers ──────────► │ s3.example.com       → minio:9000      (presigned)  │
                        │ supabase.example.com → kong:8000       (/auth/v1/*) │
@@ -167,7 +167,7 @@ curl -fsS https://supabase.example.com/auth/v1/.well-known/jwks.json | head -c 2
 Then end-to-end: sign up in the web app → create a wiki → upload a PDF
 (exercises TUS → MinIO → converter → chunking) → watch it turn "ready"
 without a page reload (exercises LISTEN/NOTIFY → WebSocket) → search for a
-term from the PDF (exercises PGroonga) → connect Claude via MCP and run the
+term from the PDF (exercises PGroonga) → connect an MCP agent and run the
 `guide` tool.
 
 ## 7. Operations
@@ -181,7 +181,7 @@ term from the PDF (exercises PGroonga) → connect Claude via MCP and run the
   (defaults 500 pages / 1 GiB, set by the signup trigger); adjust in SQL.
   `GLOBAL_MAX_USERS` caps registrations at KB-creation time.
 - **Timeliness**: `M1` corpus entries want frequent review — schedule a
-  nightly Claude routine against the MCP server and use
+  nightly agent routine against the MCP server and use
   `search(mode="references", query="due")` as its worklist.
 
 ### Security notes for an internal deployment
@@ -203,12 +203,12 @@ term from the PDF (exercises PGroonga) → connect Claude via MCP and run the
   method — Google OAuth has been removed from the web app, so
   no external identity provider is involved.
 - **MCP and API access use API keys** — no OAuth-capable auth server is
-  required. Each user creates a key in **Settings → Connect Claude (MCP)**;
+  required. Each user creates a key in **Settings → Connect AI Assistant (MCP)**;
   the generated config carries it as a static `Authorization: Bearer sv_…`
   header, which both the MCP server and the REST API verify against its
   stored SHA-256 hash (revocable in Settings, `last_used_at` tracked).
   Supabase JWTs are also accepted everywhere, so the web app is unaffected.
-- **Connecting agents** (Claude Desktop/Code, Codex CLI, Hermes, OpenClaw,
+- **Connecting agents** (desktop MCP clients, Codex CLI, Hermes, OpenClaw,
   or any other MCP client) to this deployment — including per-client config
   and headless key creation — is covered in
   [`docs/agent-integration.md`](agent-integration.md).

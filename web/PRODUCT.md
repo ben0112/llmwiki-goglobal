@@ -4,7 +4,7 @@ register: product
 
 ## Product purpose
 
-A local-first knowledge environment where Claude (over MCP) generates and maintains long-form content the user reads, annotates, and progresses through. Two content modes share one engine:
+A local-first knowledge environment where an AI agent (over MCP) generates and maintains long-form content the user reads, annotates, and progresses through. Two content modes share one engine:
 
 - **Wiki** — a reference graph compiled from the user's own sources. You dip in and out.
 - **Course** — an ordered journey with checkpoints and progress. You work through it.
@@ -43,5 +43,5 @@ The single most important payoff (the thing chat cannot do): **come back the nex
 2. **One engine, two modes.** Wiki and course differ in affordances (progress, checkpoints, completion), not in their visual language. Switching a KB's type must not feel like switching apps.
 3. **Progress is felt, not gamified.** A filling ring and a cleared checkpoint, not points and prizes.
 4. **Annotation is first-class.** Highlighting and noting what you read is core, not a bolt-on. It stays subtle: it marks the text, it does not decorate it.
-5. **Claude drives, the UI renders.** State lives in files (frontmatter, `.quiz`, KB metadata); Claude mutates it over MCP; the UI reflects it. The user starting a turn is the trigger; there is no reverse-trigger magic.
+5. **The agent drives, the UI renders.** State lives in files (frontmatter, `.quiz`, KB metadata); the agent mutates it over MCP; the UI reflects it. The user starting a turn is the trigger; there is no reverse-trigger magic.
 6. **Familiar patterns are features.** Sidebar nav, breadcrumbs, a reading column with a right-rail ToC. Do not invent a second navigation axis (no top tabs over a sidebar) for flavor.

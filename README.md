@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](https://opensource.org/licenses/Apache-2.0)
 
-本项目基于 [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki)(Andrej Karpathy [LLM Wiki 概念](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)的开源实现)深度改造:在"上传资料 → Claude 通过 MCP 编译维基"的原有能力之上,落地了出海服务语料的**八维分类、分面检索、覆盖率治理与关系层**,前端全量中文化,并剥离全部外部 SaaS 依赖,可完全离线本地运行或在自有基础设施上多用户部署。
+本项目基于 [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki)(Andrej Karpathy [LLM Wiki 概念](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)的开源实现)深度改造:在"上传资料 → AI 智能体通过 MCP 编译维基"的原有能力之上,落地了出海服务语料的**八维分类、分面检索、覆盖率治理与关系层**,前端全量中文化,并剥离全部外部 SaaS 依赖,可完全离线本地运行或在自有基础设施上多用户部署。
 
 <p align="center">
   <img src="wiki-page.png" alt="LLM Wiki — 已编译的维基页面,带脚注引用与本页目录" width="820" />
@@ -21,7 +21,7 @@
 
 # 功能
 
-- **MCP 连接** — Claude.ai、Claude Cowork、Claude Code 或任何 MCP 兼容客户端读写、检索语料与维基
+- **MCP 连接** — 任何 MCP 兼容客户端(桌面端、CLI、网页端智能体)读写、检索语料与维基
 - **八维语料库** — 每条语料一张"身份证"(阶段×大类主/副 + 六分面),按货架落位,分面检索、覆盖率账本、业务视图 7 类 27 场景导航
 - **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等
 - **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)
@@ -30,14 +30,14 @@
 # 两种运行模式
 
 ```
-  Claude  ──MCP──►  MCP 服务 ─┐
+  AI 智能体 ──MCP──►  MCP 服务 ─┐
                               │               本地模式  →  SQLite + 本机文件系统
   Web 端 ──HTTP─►  API ───────┴──►  VaultFS ─┤
                                    │          托管模式  →  Postgres + S3(MinIO)
                                    └──►  Converter(PDF / Office 文本抽取)
 ```
 
-`VaultFS` 是统一抽象:同一套维基/语料操作,本地跑在 SQLite + 文件系统上,托管跑在 Postgres + S3 上,Claude 的工具行为完全一致。
+`VaultFS` 是统一抽象:同一套维基/语料操作,本地跑在 SQLite + 文件系统上,托管跑在 Postgres + S3 上,MCP 工具行为完全一致。
 
 - **本地模式** — 单机单用户,零外部服务。指向一个文件夹即可,文件不搬家、不上传。
 - **托管(自部署)模式** — 多用户、账号体系、浏览器直传,全部组件跑在你自己的服务器上。
@@ -59,13 +59,13 @@
 >
 > 打开 [localhost:3000](http://localhost:3000) 即用(compose 默认把工作区挂在 `./workspace`,用 `LLMWIKI_WORKSPACE=~/goglobal-ws` 换目录)。
 >
-> **连接 Claude**:容器同时以 Streamable HTTP 暴露 MCP(默认 `http://localhost:8080/mcp`,无需认证),启动完成后 `docker compose logs llmwiki` 会打印带真实端口的可粘贴配置。最快的一条命令:
+> **连接 AI 助手(MCP)**:容器同时以 Streamable HTTP 暴露 MCP(默认 `http://localhost:8080/mcp`,无需认证),启动完成后 `docker compose logs llmwiki` 会打印带真实端口的可粘贴配置:
 >
-> ```bash
-> claude mcp add --transport http llmwiki http://localhost:8080/mcp
+> ```json
+> {"mcpServers": {"llmwiki": {"url": "http://localhost:8080/mcp"}}}
 > ```
 >
-> 仅支持 stdio 的客户端(如 Claude Desktop)用容器桥接:
+> 仅支持 stdio 的客户端用容器桥接:
 >
 > ```json
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
@@ -93,15 +93,15 @@ cd web && npm install && cd ..
 
 其他子命令:`init`(仅初始化)、`serve`(仅启动服务)、`reindex`(强制重建索引)。
 
-**3. 连接 Claude(MCP)**
+**3. 连接 AI 助手(MCP)**
 
 ```bash
 ./llmwiki mcp-config ~/goglobal-ws
 ```
 
-把输出的 JSON 粘贴到 `claude_desktop_config.json`(Claude Desktop)或 `.claude/settings.json`(Claude Code)。一个工作区对应一个 MCP server 条目。然后对 Claude 说:*"先读 guide,然后收录我的资料并开始构建维基。"*
+把输出的 JSON 合并进你所用 MCP 客户端的配置(`mcpServers` 段)。一个工作区对应一个 MCP server 条目。然后对智能体说:*"先读 guide,然后收录我的资料并开始构建维基。"*
 
-> 接入其他智能体(Codex CLI、Hermes、OpenClaw 等)以及托管模式的 API 密钥认证,见 **[`docs/agent-integration.md`](docs/agent-integration.md)**。
+> 各类智能体的接入方式(Codex CLI、Hermes、OpenClaw 等)以及托管模式的 API 密钥认证,见 **[`docs/agent-integration.md`](docs/agent-integration.md)**。
 
 **4. 导入标注语料(可选)** — 若已有 LLM 标注工具包产出的 `标注明细.csv`:
 
@@ -127,7 +127,7 @@ python3 -m corpus.import_annotations \
   papers/xxx.pdf
   notes.md
   corpus/S2-G1/S2-G1-政策-GEN-3F2A1.md   # 导入的语料条目(YAML frontmatter 携带八维)
-  wiki/                      # Claude 生成的维基页面(普通 markdown)
+  wiki/                      # AI 生成的维基页面(普通 markdown)
     overview.md
     log.md
   .llmwiki/                  # 检索索引 + 缓存 —— 可随时删除重建
@@ -137,7 +137,7 @@ python3 -m corpus.import_annotations \
 
 文件系统是真相源,索引只是加速层;后台 watcher 会同步你在外部编辑器里做的修改。
 
-**6. 让它自我维护(可选)** — 用 Claude Routine 定时执行,例如每晚:
+**6. 让它自我维护(可选)** — 用智能体的定时任务(Routines / cron)执行,例如每晚:
 
 > *先读 guide。找出上次运行以来工作区新增的内容(上传、笔记与高亮),逐一阅读并更新维基:该建页建页、该并入并入、修正受影响的交叉引用。用 `search(mode="references", query="due")` 拉取复审到期清单并处理。最后在 `wiki/log.md` 追加一条变更摘要。*
 
@@ -176,7 +176,7 @@ curl -fsS https://mcp.example.com/health     # ok
 **要点**:
 
 - **登录方式只有邮箱密码**(GoTrue 原生支持),无任何外部身份提供商。
-- **MCP / API 用 API 密钥**:每个用户在 **设置 → 连接 Claude (MCP)** 生成 `sv_` 密钥,作为静态 `Authorization: Bearer` 头同时通行 MCP 与 REST API(SHA-256 哈希存储、可吊销、记录最近使用时间)。无需 OAuth 服务。
+- **MCP / API 用 API 密钥**:每个用户在 **设置 → 连接 AI 助手 (MCP)** 生成 `sv_` 密钥,作为静态 `Authorization: Bearer` 头同时通行 MCP 与 REST API(SHA-256 哈希存储、可吊销、记录最近使用时间)。无需 OAuth 服务。
 - **`api` 只跑一个副本**(TUS 上传状态、WebSocket 连接与图谱重建锁为进程内状态)。
 - **converter 与 Postgres 不得暴露公网**;MinIO 的 S3 端口需公网可达(浏览器直传预签名 URL)。
 
@@ -197,7 +197,7 @@ python3 -m corpus.import_annotations \
 
 # 智能体能做什么(MCP 工具)
 
-任何 MCP 客户端(Claude、Codex CLI、Hermes、OpenClaw 等)均可调用下列工具;各客户端的配置与认证步骤见 [`docs/agent-integration.md`](docs/agent-integration.md)。
+任何 MCP 客户端(Codex CLI、Hermes、OpenClaw 等)均可调用下列工具;各客户端的配置与认证步骤见 [`docs/agent-integration.md`](docs/agent-integration.md)。
 
 | 工具 | 作用 |
 |------|------|
@@ -218,7 +218,7 @@ python3 -m corpus.import_annotations \
 | 表格 | `.xlsx` `.xls` | 逐表抽取 |
 | 网页 | `.html` `.htm` | 清洗为可读 Markdown,去导航与广告 |
 | 文本与数据 | `.md` `.txt` `.csv` `.json` `.xml` `.yaml` `.svg` 等 | 直接索引分块 |
-| 图片 | `.png` `.jpg` `.webp` `.gif` | 存储并内联展示,Claude 可按需读取 |
+| 图片 | `.png` `.jpg` `.webp` `.gif` | 存储并内联展示,智能体可按需读取 |
 
 # 许可证
 
