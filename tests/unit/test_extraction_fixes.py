@@ -332,3 +332,31 @@ async def test_heavy_writes_serialized_by_gate(tmp_path, monkeypatch):
         assert peak == 1   # 闸门生效:重写全程串行
     finally:
         await db.close()
+
+
+def test_ocr_pages_run_in_parallel(monkeypatch):
+    """页级并行:并发峰值 >1,结果按页号完整有序。"""
+    import time as _time
+
+    import services.pdf_extract as px
+
+    active = 0
+    peak = 0
+    lock = __import__("threading").Lock()
+
+    def fake_page(pdf, n, wd):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        _time.sleep(0.05)
+        with lock:
+            active -= 1
+        return f"第{n}页内容"
+
+    monkeypatch.setattr(px, "_ocr_single_page", fake_page)
+    monkeypatch.setattr(px, "OCR_WORKERS", 4)
+    pages = px._extract_pdf_ocr("/tmp/x.pdf", 8)
+    assert [p[0] for p in pages] == list(range(1, 9))          # 页序完整
+    assert [p[1] for p in pages] == [f"第{i}页内容" for i in range(1, 9)]
+    assert peak > 1                                             # 真并行
