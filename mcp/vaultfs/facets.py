@@ -72,7 +72,11 @@ def validate_facets(facets: dict | None) -> dict[str, str]:
 
 def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tuple[list[str], list]:
     """(conditions, params) for a SQLite WHERE clause. Facets must be validated."""
-    meta = f"{doc_alias}.metadata"
+    raw_meta = f"{doc_alias}.metadata"
+    # json_extract/json_each 遇到非法 JSON 或 BLOB 会让整条查询报错;
+    # 用 CASE(求值顺序有保证)把坏值替换为空对象,坏行仅不命中分面。
+    meta = (f"CASE WHEN typeof({raw_meta})='text' AND json_valid({raw_meta}) "
+            f"THEN {raw_meta} ELSE '{{}}' END")
     conds: list[str] = []
     params: list = []
 
@@ -104,7 +108,7 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
                 )
                 params.extend([value, f"{value}.%"])
     if conds:
-        conds.insert(0, f"{meta} IS NOT NULL")
+        conds.insert(0, f"{raw_meta} IS NOT NULL")
     return conds, params
 
 

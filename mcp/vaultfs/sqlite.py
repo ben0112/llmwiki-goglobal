@@ -376,7 +376,8 @@ class SqliteVaultFS(VaultFS):
         sql = (
             "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at, metadata "
             "FROM documents d WHERE status != 'failed' "
-            "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
+            "AND COALESCE(CASE WHEN typeof(metadata)='text' AND json_valid(metadata) "
+            "THEN json_extract(metadata, '$.asset') END, 0) != 1 "
         )
         params: list = []
         conds, facet_params = sqlite_facet_conditions(validate_facets(facets))
@@ -392,7 +393,8 @@ class SqliteVaultFS(VaultFS):
         cursor = await db.execute(
             "SELECT id, filename, title, path, content, tags, file_type, page_count, highlights, metadata, date "
             "FROM documents WHERE status != 'failed' "
-            "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
+            "AND COALESCE(CASE WHEN typeof(metadata)='text' AND json_valid(metadata) "
+            "THEN json_extract(metadata, '$.asset') END, 0) != 1 "
             "ORDER BY path, filename",
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())

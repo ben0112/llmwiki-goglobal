@@ -354,8 +354,11 @@ class WriteHandler:
         """Normalize a raw path into a directory path."""
         if _FILE_EXT_RE.search(path):
             last_slash = path.rfind("/")
-            return path[:last_slash + 1] if last_slash >= 0 else "/"
-        dir_path = path if path.endswith("/") else path + "/"
+            dir_path = path[:last_slash + 1] if last_slash >= 0 else "/"
+        else:
+            dir_path = path if path.endswith("/") else path + "/"
+        # 两个分支都要保证前导斜杠:曾有"wiki/x.md"形式的入参落库为
+        # path='wiki/',导致页面在 Web 维基导航与 /wiki/ 前缀判断中不可见。
         if not dir_path.startswith("/"):
             dir_path = "/" + dir_path
         return dir_path
