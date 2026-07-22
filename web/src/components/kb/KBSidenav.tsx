@@ -45,6 +45,7 @@ interface KBSidenavProps {
   wikiActivePath: string | null
   onWikiNavigate: (path: string, docNumber?: number | null) => void
   sourceDocs: DocumentListItem[]
+  wikiDocs?: DocumentListItem[]
   hasWiki: boolean
   loading: boolean
   onUpload: () => void
@@ -65,6 +66,7 @@ export function KBSidenav({
   wikiActivePath,
   onWikiNavigate,
   sourceDocs,
+  wikiDocs,
   hasWiki,
   loading,
   onUpload,
@@ -79,6 +81,48 @@ export function KBSidenav({
 }: KBSidenavProps) {
   const [searchOpen, setSearchOpen] = React.useState(false)
   const [collapsed, setCollapsed] = React.useState(false)
+
+  // ─── 分面过滤:按页面 facet_rollup(引用条目聚合的八维)过滤维基树 ───
+  const rollupByPath = React.useMemo(() => {
+    const map = new Map<string, { stage: string[]; country: string[] }>()
+    for (const d of wikiDocs ?? []) {
+      const meta = d.metadata as Record<string, unknown> | null
+      const r = meta?.facet_rollup as { stage?: string[]; country?: string[] } | undefined
+      if (!r) continue
+      const rel = (d.path + d.filename).replace(/^\/wiki\/?/, '')
+      map.set(rel, { stage: r.stage ?? [], country: r.country ?? [] })
+    }
+    return map
+  }, [wikiDocs])
+
+  const facetOptions = React.useMemo(() => {
+    const stages = new Set<string>()
+    const countries = new Set<string>()
+    for (const r of rollupByPath.values()) {
+      r.stage.forEach((s) => stages.add(s))
+      r.country.forEach((c) => countries.add(c))
+    }
+    return { stages: [...stages].sort(), countries: [...countries].sort().slice(0, 8) }
+  }, [rollupByPath])
+
+  const [facetStage, setFacetStage] = React.useState<string | null>(null)
+  const [facetCountry, setFacetCountry] = React.useState<string | null>(null)
+
+  const filteredWikiTree = React.useMemo(() => {
+    if (!facetStage && !facetCountry) return wikiTree
+    const match = (path?: string) => {
+      if (!path) return false
+      const r = rollupByPath.get(path)
+      if (!r) return false
+      if (facetStage && !r.stage.includes(facetStage)) return false
+      if (facetCountry && !r.country.includes(facetCountry)) return false
+      return true
+    }
+    const filterNodes = (nodes: WikiNode[]): WikiNode[] => nodes
+      .map((n) => (n.children && n.children.length > 0 ? { ...n, children: filterNodes(n.children) } : n))
+      .filter((n) => (n.children?.length ?? 0) > 0 || match(n.path))
+    return filterNodes(wikiTree)
+  }, [wikiTree, rollupByPath, facetStage, facetCountry])
   const router = useRouter()
   const pathname = usePathname()
   const params = useParams<{ slug?: string }>()
@@ -377,11 +421,51 @@ export function KBSidenav({
       {/* Wiki tree — top-level folders render as sections; pages grouped beneath a guide */}
       {!collapsed && (
       <>
+      {hasWiki && (facetOptions.stages.length > 0 || facetOptions.countries.length > 0) && (
+        <div className="shrink-0 px-3 pt-1.5 flex flex-wrap items-center gap-1">
+          {facetOptions.stages.map((code) => (
+            <button
+              key={`fs-${code}`}
+              onClick={() => setFacetStage(facetStage === code ? null : code)}
+              className={cn(
+                'rounded-full border px-1.5 py-px text-[10px] leading-4 transition-colors cursor-pointer',
+                facetStage === code
+                  ? 'border-foreground bg-foreground text-background'
+                  : 'border-border text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {code}
+            </button>
+          ))}
+          {facetOptions.countries.map((code) => (
+            <button
+              key={`fc-${code}`}
+              onClick={() => setFacetCountry(facetCountry === code ? null : code)}
+              className={cn(
+                'rounded-full border px-1.5 py-px text-[10px] leading-4 transition-colors cursor-pointer',
+                facetCountry === code
+                  ? 'border-sky-600 bg-sky-600 text-white'
+                  : 'border-sky-500/30 text-sky-700 dark:text-sky-400 hover:border-sky-500',
+              )}
+            >
+              {code}
+            </button>
+          ))}
+          {(facetStage || facetCountry) && (
+            <button
+              onClick={() => { setFacetStage(null); setFacetCountry(null) }}
+              className="text-[10px] text-muted-foreground/60 hover:text-foreground cursor-pointer"
+            >
+              清除
+            </button>
+          )}
+        </div>
+      )}
       <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-2 pt-1.5">
         {loading ? (
           <SidenavSkeleton lines={3} />
         ) : hasWiki ? (
-          wikiTree.map((node, i) =>
+          filteredWikiTree.map((node, i) =>
             node.children && node.children.length > 0 ? (
               <WikiSection
                 key={node.path ?? node.title ?? i}

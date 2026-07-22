@@ -510,6 +510,17 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
     if (!documentId || !documents) return null
     return documents.find((d) => d.id === documentId)?.stale_since ?? null
   }, [documentId, documents])
+  // 分面聚合徽章:本页引用的语料条目自动汇总的八维范围
+  const facetRollup = React.useMemo(() => {
+    if (!documentId || !documents) return null
+    const meta = documents.find((d) => d.id === documentId)?.metadata as
+      | Record<string, unknown> | null | undefined
+    const r = meta?.facet_rollup as {
+      stage?: string[]; domain?: string[]; country?: string[]; business?: string[]
+      timeliness_worst?: string | null; entry_count?: number
+    } | undefined
+    return r && (r.entry_count ?? 0) > 0 ? r : null
+  }, [documentId, documents])
   const [copied, setCopied] = React.useState(false)
 
   const handleCopy = React.useCallback(() => {
@@ -871,6 +882,23 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
               </div>
               {description && (
                 <p className="text-[15px] text-muted-foreground mt-2.5 leading-relaxed">{description}</p>
+              )}
+              {facetRollup && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                  {[...(facetRollup.stage ?? []), ...(facetRollup.domain ?? [])].map((code) => (
+                    <span key={`sd-${code}`} className="rounded-full border border-border px-1.5 py-px text-[10px] leading-4 text-muted-foreground">{code}</span>
+                  ))}
+                  {(facetRollup.country ?? []).slice(0, 6).map((code) => (
+                    <span key={`c-${code}`} className="rounded-full border border-sky-500/30 px-1.5 py-px text-[10px] leading-4 text-sky-700 dark:text-sky-400">{code}</span>
+                  ))}
+                  {(facetRollup.business ?? []).map((code) => (
+                    <span key={`b-${code}`} className="rounded-full border border-violet-500/30 px-1.5 py-px text-[10px] leading-4 text-violet-700 dark:text-violet-400">{code}</span>
+                  ))}
+                  {facetRollup.timeliness_worst === 'M1' && (
+                    <span className="rounded-full border border-amber-500/40 px-1.5 py-px text-[10px] leading-4 text-amber-600 dark:text-amber-400">M1 快变</span>
+                  )}
+                  <span className="text-[10px] text-muted-foreground/50">引用 {facetRollup.entry_count} 条语料</span>
+                </div>
               )}
               {staleSince && (
                 <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[13px] text-amber-700 dark:text-amber-400">

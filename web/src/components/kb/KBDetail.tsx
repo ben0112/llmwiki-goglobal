@@ -1076,6 +1076,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             wikiActivePath={filesViewActive || graphViewActive ? null : wikiActivePath}
             onWikiNavigate={handleWikiSelect}
             sourceDocs={sourceDocs}
+            wikiDocs={wikiDocs}
             hasWiki={hasNavigableWiki}
             loading={loading}
             onUpload={() => handleUploadClick()}

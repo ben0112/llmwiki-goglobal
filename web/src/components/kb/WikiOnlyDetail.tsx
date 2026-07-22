@@ -388,6 +388,7 @@ export function WikiOnlyDetail({
             wikiActivePath={wikiActivePath}
             onWikiNavigate={handleWikiSelect}
             sourceDocs={sourceDocs}
+            wikiDocs={wikiDocs}
             hasWiki={hasNavigableWiki}
             loading={loading}
             onUpload={() => router.push(`/wikis/${kbSlug}/files`)}
