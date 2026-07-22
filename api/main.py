@@ -168,9 +168,16 @@ async def _local_lifespan(app: FastAPI):
     # another writer's (or a request handler's) open transaction.
     reconcile_db = await create_sqlite_pool(db_path, init_schema=False)
     watcher_db = await create_sqlite_pool(db_path, init_schema=False)
+    sweep_db = await create_sqlite_pool(db_path, init_schema=False)
 
     from domain.local_processor import reconcile_workspace
     reconcile_task = asyncio.create_task(reconcile_workspace(reconcile_db, workspace))
+
+    # 磁盘↔索引定期对账:兜住 inotify 收不到的场景(Docker Desktop 宿主侧
+    # 拷入 bind mount、容器停机期间的增删),启动即扫一轮
+    from domain.watcher import sweep_loop
+    from infra.tasks import spawn_logged
+    sweep_task = spawn_logged(sweep_loop(sweep_db, workspace), "workspace-sweep")
 
     # 语料自动分类轮询(默认关;设置页/环境变量开启后才会真正跑)
     from routes.corpus_pipeline import auto_loop
@@ -205,6 +212,11 @@ async def _local_lifespan(app: FastAPI):
             await reconcile_task
         except asyncio.CancelledError:
             pass
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
         if watcher_task:
             watcher_task.cancel()
             try:
@@ -213,6 +225,7 @@ async def _local_lifespan(app: FastAPI):
                 pass
         await reconcile_db.close()
         await watcher_db.close()
+        await sweep_db.close()
         await db.close()
 
 

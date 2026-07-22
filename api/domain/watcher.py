@@ -151,14 +151,21 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
 
     # Check if document already exists at this path
     cursor = await db.execute(
-        "SELECT id, content_hash FROM documents WHERE relative_path = ?",
+        "SELECT id, content_hash, mtime_ns FROM documents WHERE relative_path = ?",
         (relative,),
     )
     existing = await cursor.fetchone()
 
     if existing:
-        doc_id, old_hash = existing
+        doc_id, old_hash, old_mtime = existing
         if old_hash == content_hash:
+            # 内容未变:仅刷新 mtime,让 sweep 的 mtime 快筛下一轮不再重查
+            if old_mtime != int(stat.st_mtime_ns):
+                await db.execute(
+                    "UPDATE documents SET mtime_ns = ? WHERE id = ?",
+                    (int(stat.st_mtime_ns), doc_id),
+                )
+                await db.commit()
             return  # No change
         # Update existing
         await db.execute(
@@ -270,3 +277,68 @@ async def watch_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
         expired = [k for k, v in _recently_written.items() if now - v > COOLDOWN_SECONDS * 2]
         for k in expired:
             _recently_written.pop(k, None)
+
+
+SWEEP_INTERVAL_SECONDS = 60
+
+
+async def sweep_workspace(db: aiosqlite.Connection, workspace: Path) -> tuple[int, int]:
+    """磁盘 ↔ 索引对账一轮:补录新增/离线修改的文件,清理已消失文件的索引行。
+
+    watcher 依赖 inotify,但 Docker Desktop(macOS/Windows)宿主侧拷入
+    bind mount 的文件常常不产生容器内事件;容器停机期间的增删也没有事件。
+    启动时与每 SWEEP_INTERVAL_SECONDS 各跑一轮兜底,让「直接把文件拷进
+    工作区目录」始终可用。mtime 快筛避免每轮重读文件内容。
+    """
+    disk: dict[str, tuple[Path, int]] = {}
+
+    def _walk() -> None:
+        for p in workspace.rglob("*"):
+            try:
+                if not p.is_file() or _should_ignore(p, workspace):
+                    continue
+                disk[str(p.relative_to(workspace))] = (p, p.stat().st_mtime_ns)
+            except OSError:
+                continue
+
+    await asyncio.to_thread(_walk)
+
+    cursor = await db.execute("SELECT relative_path, mtime_ns FROM documents")
+    indexed = {r[0]: r[1] for r in await cursor.fetchall()}
+
+    swept = 0
+    for relative, (path, mtime) in disk.items():
+        if _is_recently_written(str(path)):
+            continue
+        if indexed.get(relative) == mtime:
+            continue
+        try:
+            await _index_file(db, workspace, path)
+            swept += 1
+        except Exception as e:
+            logger.warning("Sweep index error for %s: %s", relative, e)
+
+    removed = 0
+    for relative in set(indexed) - set(disk):
+        path = workspace / relative
+        if _is_recently_written(str(path)) or path.exists():
+            continue
+        try:
+            await _remove_file(db, workspace, path)
+            removed += 1
+        except Exception as e:
+            logger.warning("Sweep remove error for %s: %s", relative, e)
+
+    if swept or removed:
+        logger.info("Workspace sweep: %d indexed/updated, %d removed", swept, removed)
+    return swept, removed
+
+
+async def sweep_loop(db: aiosqlite.Connection, workspace: Path) -> None:
+    """启动立即对账一轮(接住停机期间拷入的文件),之后定期兜底。"""
+    while True:
+        try:
+            await sweep_workspace(db, workspace)
+        except Exception:
+            logger.exception("Workspace sweep failed")
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
