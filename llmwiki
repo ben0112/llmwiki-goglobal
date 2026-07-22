@@ -5,8 +5,8 @@ Usage:
     llmwiki open <workspace>         Init if needed + serve + open browser
     llmwiki init <workspace>         Create .llmwiki/ + wiki/, index files
     llmwiki serve <workspace>        Start API + web on localhost
-    llmwiki mcp <workspace>          Run stdio MCP server (for Claude config)
-    llmwiki mcp-config <workspace>   Print claude_desktop_config.json snippet
+    llmwiki mcp <workspace>          Run stdio MCP server (for MCP clients)
+    llmwiki mcp-config <workspace>   Print MCP client config snippet
     llmwiki reindex <workspace>      Force full rebuild of index.db
 """
 
@@ -289,7 +289,7 @@ def cmd_mcp(workspace: str) -> None:
         cmd_init(str(ws))
 
     # local_server lives in mcp/; chdir so `python -m local_server` resolves
-    # the module no matter where the CLI was invoked from (Claude Desktop /
+    # the module no matter where the CLI was invoked from (MCP clients /
     # Code launches this with cwd set to ~ on macOS).
     os.chdir(str(MCP_DIR))
     os.execvp(
@@ -312,7 +312,7 @@ def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
         }
     }
 
-    print(f"# Add to claude_desktop_config.json:")
+    print(f"# Add to your MCP client config (mcpServers):")
     print(f"# This MCP server is scoped to: {ws}")
     print(f"# To use another workspace, add another server entry.")
     print()
@@ -366,7 +366,7 @@ def main():
     p_mcp = sub.add_parser("mcp", help="Run stdio MCP server")
     p_mcp.add_argument("workspace", help="Path to workspace folder")
 
-    p_config = sub.add_parser("mcp-config", help="Print Claude MCP config snippet")
+    p_config = sub.add_parser("mcp-config", help="Print MCP client config snippet")
     p_config.add_argument("workspace", help="Path to workspace folder")
     p_config.add_argument("--name", help="Custom server name")
 

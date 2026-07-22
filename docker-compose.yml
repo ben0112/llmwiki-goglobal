@@ -58,6 +58,6 @@ services:
 volumes:
   pgdata:
 
-# Claude Desktop 的 MCP 配置(容器运行时,stdio 经 docker exec):
+# MCP 客户端 stdio 配置(容器运行时,经 docker exec):
 #   {"mcpServers": {"llmwiki": {"command": "docker",
 #     "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}

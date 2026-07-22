@@ -1,4 +1,4 @@
-"""Local MCP server for stdio (Claude Desktop / Claude Code / Cursor).
+"""Local MCP server for stdio (any MCP-capable client).
 
 One workspace = one MCP server. Filesystem is truth. SQLite is the index.
 

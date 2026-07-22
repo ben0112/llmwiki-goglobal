@@ -2,7 +2,7 @@
 
 线上实测:文件夹批量上传后出现 metadata 非法 JSON 的文档行,
 json_extract 使 search(mode=list) 直接 "malformed JSON" 报错,
-Claude 因此拿不到任何源文件。
+MCP 客户端因此拿不到任何源文件。
 """
 
 import sqlite3

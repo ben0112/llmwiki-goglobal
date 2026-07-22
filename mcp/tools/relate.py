@@ -2,7 +2,7 @@
 
 The corpus spec (v2026.06 §2.5) models five relation types beyond the
 content-derived citation graph. These edges are created deliberately (by
-Claude or an operator), stored in document_references, and preserved across
+an AI assistant or an operator), stored in document_references, and preserved across
 content-driven rebuilds:
 
   is_a        上下位     concept hierarchy / controlled-vocabulary broader-narrower

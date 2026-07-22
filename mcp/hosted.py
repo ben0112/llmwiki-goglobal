@@ -1,4 +1,4 @@
-"""Supavault MCP Server — knowledge vault tools for Claude."""
+"""Supavault MCP Server — knowledge vault tools for MCP clients."""
 
 import importlib.util
 import os

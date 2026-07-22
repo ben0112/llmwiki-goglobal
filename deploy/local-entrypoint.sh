@@ -68,15 +68,12 @@ except Exception:
   MCP(HTTP): ${PUBLIC_MCP_URL}
   语料流水线: ${pipe_line:-未就绪}
 
-  连接 Claude —— 任选其一:
+  连接 AI 助手(MCP)—— 任选其一:
 
-  · Claude Code(一条命令):
-      claude mcp add --transport http llmwiki ${PUBLIC_MCP_URL}
-
-  · 任意支持 Streamable HTTP 的 MCP 客户端(配置 JSON):
+  · 支持 Streamable HTTP 的 MCP 客户端(配置 JSON):
       {"mcpServers": {"llmwiki": {"url": "${PUBLIC_MCP_URL}"}}}
 
-  · Claude Desktop(stdio,经容器;无需额外依赖):
+  · stdio 方式(经容器;无需额外依赖):
       {"mcpServers": {"llmwiki": {"command": "docker",
         "args": ["exec", "-i", "${LLMWIKI_CONTAINER_NAME:-llmwiki}", "/app/llmwiki", "mcp", "/workspace"]}}}
 ===========================================================================
