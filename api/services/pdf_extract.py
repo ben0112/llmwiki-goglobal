@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections import defaultdict
 from pathlib import Path
 
@@ -27,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 OCR_LANGS = os.environ.get("PDF_OCR_LANGS", "chi_sim+eng")
 OCR_MAX_PAGES = int(os.environ.get("PDF_OCR_MAX_PAGES", "300") or 300)
-# 页级并行度:渲染与识别按页独立,线程池并行(子进程释放 GIL);
-# 每个 tesseract 进程限制为单 OpenMP 线程,避免 N 页 × 4 线程超订
+# 全局 OCR 页并发预算:所有文档共享一个进程级线程池(子进程释放 GIL),
+# 总并发 = OCR_WORKERS,与同时 OCR 的文档数无关 —— 每文档各开线程池会让
+# 文档级并发 × 页级并发相乘超订 CPU(8 文档 × 4 页 = 32 路 tesseract)。
+# 每个 tesseract 进程限制为单 OpenMP 线程,预算即真实核占用。
 OCR_WORKERS = (int(os.environ.get("PDF_OCR_WORKERS", "0") or 0)
-               or max(2, min(4, (os.cpu_count() or 4) // 2)))
+               or max(2, min(8, (os.cpu_count() or 4) - 1)))
 OCR_DISABLED = os.environ.get("PDF_OCR_DISABLE", "").lower() in ("1", "true", "yes")
 _OCR_PROBE_TRIGGER_AVG = 400   # 文本层平均每页字符低于此值才启动探针
 _OCR_PROBE_PAGES = 3
@@ -162,16 +165,33 @@ def _ocr_single_page(pdf_path: str, page_num: int, workdir: Path) -> str:
         return ""
 
 
+_ocr_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_ocr_pool_lock = threading.Lock()
+
+
+def _ocr_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """进程级共享 OCR 线程池,首次使用时按 OCR_WORKERS 创建,进程存续期复用。"""
+    global _ocr_pool
+    with _ocr_pool_lock:
+        if _ocr_pool is None:
+            _ocr_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=OCR_WORKERS, thread_name_prefix="pdf-ocr")
+        return _ocr_pool
+
+
 def _ocr_pages_parallel(pdf_path: str, page_nums: list[int], workdir: Path) -> dict[int, str]:
-    """页级并行 OCR:每页(渲染→识别)一个任务,线程池并发跑子进程。"""
+    """页级并行 OCR:每页(渲染→识别)一个任务,提交到全局共享线程池。
+
+    多份文档同时 OCR 时自然分时共享预算;单份文档独跑时可用满全部预算。
+    任务本身不向池内再提交任务,无嵌套等待死锁风险。
+    """
     if not page_nums:
         return {}
+    ex = _ocr_executor()
+    futures = {ex.submit(_ocr_single_page, pdf_path, n, workdir): n for n in page_nums}
     results: dict[int, str] = {}
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(OCR_WORKERS, len(page_nums))) as ex:
-        futures = {ex.submit(_ocr_single_page, pdf_path, n, workdir): n for n in page_nums}
-        for fut in concurrent.futures.as_completed(futures):
-            results[futures[fut]] = fut.result()
+    for fut in concurrent.futures.as_completed(futures):
+        results[futures[fut]] = fut.result()
     return results
 
 

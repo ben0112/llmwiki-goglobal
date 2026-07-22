@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import json
 import sqlite3
 import uuid
 from pathlib import Path
@@ -356,6 +357,7 @@ def test_ocr_pages_run_in_parallel(monkeypatch):
 
     monkeypatch.setattr(px, "_ocr_single_page", fake_page)
     monkeypatch.setattr(px, "OCR_WORKERS", 4)
+    monkeypatch.setattr(px, "_ocr_pool", None)   # 以补丁后的 OCR_WORKERS 重建全局池
     pages = px._extract_pdf_ocr("/tmp/x.pdf", 8)
     assert [p[0] for p in pages] == list(range(1, 9))          # 页序完整
     assert [p[1] for p in pages] == [f"第{i}页内容" for i in range(1, 9)]
@@ -441,5 +443,185 @@ async def test_kick_pending_backlog_skips_inflight(tmp_path, monkeypatch):
 
         assert kicked == 1
         assert processed == [lost_id]
+    finally:
+        await db.close()
+
+
+def test_ocr_budget_shared_across_documents(monkeypatch):
+    """全局 OCR 预算:两份文档同时 OCR,总并发不超过 OCR_WORKERS,
+    不随文档数相乘(曾经 8 文档 × 4 页 = 32 路 tesseract 超订)。"""
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    import services.pdf_extract as px
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_page(pdf, n, wd):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        _time.sleep(0.05)
+        with lock:
+            active -= 1
+        return f"{pdf}:{n}"
+
+    monkeypatch.setattr(px, "_ocr_single_page", fake_page)
+    monkeypatch.setattr(px, "OCR_WORKERS", 2)
+    monkeypatch.setattr(px, "_ocr_pool", None)
+    with concurrent.futures.ThreadPoolExecutor(2) as caller:
+        f1 = caller.submit(px._ocr_pages_parallel, "a.pdf", [1, 2, 3, 4], Path("/tmp"))
+        f2 = caller.submit(px._ocr_pages_parallel, "b.pdf", [1, 2, 3, 4], Path("/tmp"))
+        r1, r2 = f1.result(), f2.result()
+    assert set(r1) == {1, 2, 3, 4} and set(r2) == {1, 2, 3, 4}   # 都完整
+    assert peak <= 2                                             # 共享预算,无乘性超订
+
+
+async def test_save_local_images_batch_single_commit(tmp_path):
+    """图片资产批量入库:一个事务一次 commit,编号连续,父 metadata 一次更新。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '报告.pdf', 'R', '/', '报告.pdf', 'source', 'pdf', 'processing', "
+            "'[]', 0, 7)", (doc_id, USER_ID))
+        await db.commit()
+
+        commits = 0
+        orig_commit = db.commit
+
+        async def counting_commit():
+            nonlocal commits
+            commits += 1
+            await orig_commit()
+
+        db.commit = counting_commit
+        pages = [
+            (1, "第一页", [{"id": "img_1_0.png", "bytes": b"PNG1", "format": "png"},
+                          {"id": "img_1_1.png", "bytes": b"PNG2", "format": "png"}]),
+            (2, "第二页", [{"id": "img_2_2.png", "bytes": b"PNG3", "format": "png"}]),
+        ]
+        page_elements = await lp._save_local_images(db, doc_id, ws, pages)
+        db.commit = orig_commit
+
+        assert commits == 1                       # 单事务单提交
+        cursor = await db.execute(
+            "SELECT document_number FROM documents WHERE source_kind = 'asset' "
+            "ORDER BY document_number")
+        numbers = [r[0] for r in await cursor.fetchall()]
+        assert numbers == [8, 9, 10]              # 批量取号连续
+        cursor = await db.execute("SELECT metadata FROM documents WHERE id = ?", (doc_id,))
+        meta = json.loads((await cursor.fetchone())[0])
+        assert len(meta["assets"]) == 3           # 父文档 metadata 一次写全
+        assert page_elements                      # 页面元素照常返回
+        pngs = list(ws.rglob("*.png"))
+        assert len(pngs) == 3                     # 文件已落盘
+    finally:
+        await db.close()
+
+
+async def test_failed_doc_quarantined_after_retry_limit(tmp_path, monkeypatch):
+    """失败退避:extraction_attempts 达上限的文档不再随启动自动重试。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        fresh_id, worn_id = str(uuid.uuid4()), str(uuid.uuid4())
+        for n, (doc_id, attempts) in enumerate(((fresh_id, 1), (worn_id, 3)), 1):
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, status, extraction_attempts, tags, version, "
+                "document_number) "
+                "VALUES (?, ?, ?, 'D', '/', ?, 'source', 'docx', 'failed', ?, '[]', 0, ?)",
+                (doc_id, USER_ID, f"f{n}.docx", f"f{n}.docx", attempts, n))
+        await db.commit()
+
+        processed: list[str] = []
+
+        async def fake_process(db_, d, workspace_):
+            processed.append(d)
+
+        monkeypatch.setattr(lp, "process_document", fake_process)
+        await lp.reconcile_workspace(db, ws)
+
+        assert processed == [fresh_id]            # 满 3 次的隔离,未满的重试
+        cursor = await db.execute("SELECT status FROM documents WHERE id = ?", (worn_id,))
+        assert (await cursor.fetchone())[0] == "failed"
+    finally:
+        await db.close()
+
+
+async def test_failure_marking_increments_attempts(tmp_path):
+    """每次提取失败 extraction_attempts +1(文件缺失路径)。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, 'ghost.pdf', 'G', '/', 'ghost.pdf', 'source', 'pdf', 'pending', "
+            "'[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        await lp.process_document(db, doc_id, ws)
+
+        cursor = await db.execute(
+            "SELECT status, extraction_attempts FROM documents WHERE id = ?", (doc_id,))
+        status, attempts = await cursor.fetchone()
+        assert status == "failed" and attempts == 1
+    finally:
+        await db.close()
+
+
+async def test_extraction_attempts_migration_on_old_db(tmp_path):
+    """旧库无 extraction_attempts 列:create_pool 启动时自动补列(默认 0)。"""
+    from infra.db.sqlite import create_pool
+
+    db_path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db_path)
+    old_schema = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        "    extraction_attempts INTEGER NOT NULL DEFAULT 0,\n", "")
+    assert "extraction_attempts" not in old_schema   # 确认真的模拟了旧库
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+        "source_kind, file_type, status, tags, version, document_number) "
+        "VALUES ('d1', 'u1', 'a.pdf', 'A', '/', 'a.pdf', 'source', 'pdf', 'failed', '[]', 0, 1)")
+    conn.commit()
+    conn.close()
+
+    db = await create_pool(db_path)
+    try:
+        cur = await db.execute(
+            "SELECT extraction_attempts FROM documents WHERE id = 'd1'")
+        assert (await cur.fetchone())[0] == 0        # 已补列,存量行默认 0
     finally:
         await db.close()

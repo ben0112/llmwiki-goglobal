@@ -65,21 +65,22 @@ class LLMError(Exception):
 
 # 进程级共享 HTTP 客户端:数万次分类请求逐次新建/关闭 AsyncClient 会把
 # TCP+TLS 握手做上数万遍。按事件循环缓存(CLI/测试可能多次 asyncio.run,
-# 旧 loop 的客户端不可复用),timeout 逐请求传入。
-_clients: dict[int, httpx.AsyncClient] = {}
+# 旧 loop 的客户端不可复用),timeout 逐请求传入。持 loop 对象比较身份
+# 而非 id() 作键 —— 强引用在手,对象 ID 不可能被复用;旧 loop 已关闭时
+# 其客户端无法异步 close,连接随 loop 失效,残骸交给 GC。
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_client() -> httpx.AsyncClient:
-    loop_id = id(asyncio.get_running_loop())
-    client = _clients.get(loop_id)
-    if client is None or client.is_closed:
-        client = httpx.AsyncClient(
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
+        _client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         )
-        # 只保留当前 loop 的条目;旧 loop 已关闭,其连接随之失效
-        _clients.clear()
-        _clients[loop_id] = client
-    return client
+        _client_loop = loop
+    return _client
 
 
 async def chat_json(config: LLMConfig, system_prompt: str, user_prompt: str,

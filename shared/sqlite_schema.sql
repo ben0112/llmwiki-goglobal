@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS documents (
     date TEXT,
     metadata TEXT,
     error_message TEXT,
+    extraction_attempts INTEGER NOT NULL DEFAULT 0,
     version INTEGER DEFAULT 0,
     parser TEXT,
     content_hash TEXT,

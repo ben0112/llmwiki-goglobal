@@ -252,6 +252,7 @@ def prepare_reprocess(workspace: Path, doc_id: str) -> dict:
         conn.execute("DELETE FROM corpus_pipeline WHERE doc_id = ?", (source_id,))
         conn.execute(
             "UPDATE documents SET status = 'pending', error_message = NULL, "
+            "extraction_attempts = 0, "   # 手动重来 = 解除失败隔离
             "updated_at = datetime('now') WHERE id = ?", (source_id,))
         stale_pages = _mark_pages_stale(conn, citing)
         conn.commit()

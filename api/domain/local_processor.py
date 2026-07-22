@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 PROCESS_CONCURRENCY = settings.EXTRACT_CONCURRENCY or max(2, min(8, (os.cpu_count() or 4) // 2))
 _process_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 
+# 失败满 N 次进入隔离:不再随启动自动重试(真坏的文件每次重启都会白跑
+# 一遍 LibreOffice/JVM/OCR)。「重新识别」或文件内容变化时清零计数。
+FAILED_RETRY_LIMIT = 3
+
 # 重量级写(整份分页/分块入库,含中文 trigram FTS 索引)在进程内串行:
 # N 路提取的 CPU 段(OCR/LibreOffice)照常并行,但大事务写不再互相排队
 # 到超时 —— 批量导入时的 database is locked 风暴正源于此。
@@ -75,6 +79,7 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
     if not file_path.is_file():
         await db.execute(
             "UPDATE documents SET status = 'failed', error_message = 'File not found', "
+            "extraction_attempts = extraction_attempts + 1, "
             "updated_at = datetime('now') WHERE id = ?",
             (doc_id,),
         )
@@ -115,6 +120,7 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
             try:
                 await db.execute(
                     "UPDATE documents SET status = 'failed', error_message = ?, "
+                    "extraction_attempts = extraction_attempts + 1, "
                     "updated_at = datetime('now') WHERE id = ?",
                     (error_msg, doc_id),
                 )
@@ -212,8 +218,8 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
         placeholders = ",".join("?" for _ in EXTRACTION_TYPES)
         cursor = await db.execute(
             f"SELECT id FROM documents WHERE status = 'failed' AND source_kind != 'asset' "
-            f"AND file_type IN ({placeholders})",
-            tuple(EXTRACTION_TYPES),
+            f"AND extraction_attempts < ? AND file_type IN ({placeholders})",
+            (FAILED_RETRY_LIMIT, *EXTRACTION_TYPES),
         )
         failed_ids = [r[0] for r in await cursor.fetchall()]
         if failed_ids:
@@ -306,7 +312,13 @@ async def _save_local_images(
     db: aiosqlite.Connection, doc_id: str, workspace: Path,
     pages_with_images: list[tuple[int, str, list[dict]]],
 ) -> dict[int, dict]:
-    """Save extracted images as hidden sibling assets and return page metadata."""
+    """Save extracted images as hidden sibling assets and return page metadata.
+
+    文件落盘(IO 段)在写闸门外完成;库操作合并为闸门内单事务:删旧
+    资产 + 批量取号插入 + 父文档 metadata 更新,一次 commit。多图报告
+    曾经每图一个事务(取号/插入/提交/整行回读),数百图即数百次独立
+    提交,且走 Repository 锁而非写闸门,与页面/chunk 写入交叉争锁。
+    """
     repo = SQLiteDocumentRepository(db)
     doc = await repo.get(doc_id)
     if not doc:
@@ -321,32 +333,45 @@ async def _save_local_images(
     if not assets:
         return {}
 
-    await db.execute(
-        "DELETE FROM documents WHERE source_kind = 'asset' AND metadata LIKE ?",
-        (f'%"parent_document_id": "{doc_id}"%',),
-    )
-    await db.commit()
-
-    asset_metadata = []
     for asset in assets:
         relative_asset = (asset.path.rstrip("/") + "/" + asset.filename).lstrip("/")
         local_asset = workspace / relative_asset
         local_asset.parent.mkdir(parents=True, exist_ok=True)
         mark_written(str(local_asset))
         local_asset.write_bytes(asset.data)
-        await repo.create_asset(
-            asset.document_id,
-            doc["user_id"],
-            asset.filename,
-            asset.path,
-            asset.filename,
-            asset.file_type,
-            len(asset.data),
-            asset.metadata(),
-        )
-        asset_metadata.append(asset.metadata())
 
-    await repo.set_metadata_field(doc_id, "assets", asset_metadata)
+    asset_metadata = [a.metadata() for a in assets]   # 含 sha256,闸门外算完
+    async with _db_write_gate:
+        await db.execute(
+            "DELETE FROM documents WHERE source_kind = 'asset' AND metadata LIKE ?",
+            (f'%"parent_document_id": "{doc_id}"%',),
+        )
+        # DELETE 已持写锁,MAX 取号到批量插入之间不会有其他连接插队
+        cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) FROM documents")
+        base_number = (await cursor.fetchone())[0]
+        await db.executemany(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, file_size, status, content, tags, version, "
+            "document_number, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'asset', ?, ?, 'ready', NULL, '[]', 0, ?, ?)",
+            [(a.document_id, doc["user_id"], a.filename, a.filename, a.path,
+              (a.path.rstrip("/") + "/" + a.filename).lstrip("/"),
+              a.file_type, len(a.data), base_number + i + 1, json.dumps(m))
+             for i, (a, m) in enumerate(zip(assets, asset_metadata))],
+        )
+        # 父文档 metadata 并入同一事务(等价 set_metadata_field,不单独提交)
+        cursor = await db.execute("SELECT metadata FROM documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        try:
+            parent_meta = json.loads(row[0]) if row and row[0] else {}
+        except (json.JSONDecodeError, TypeError):
+            parent_meta = {}
+        parent_meta["assets"] = asset_metadata
+        await db.execute(
+            "UPDATE documents SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(parent_meta), doc_id),
+        )
+        await db.commit()
     return page_elements
 
 

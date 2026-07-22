@@ -180,6 +180,7 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
         if ext not in SIMPLE_TEXT_TYPES and ext:
             await db.execute(
                 "UPDATE documents SET status = 'pending', parser = NULL, error_message = NULL, "
+                "extraction_attempts = 0, "   # 内容已变,失败隔离随之解除
                 "updated_at = datetime('now') WHERE id = ?",
                 (doc_id,),
             )

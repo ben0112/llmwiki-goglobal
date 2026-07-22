@@ -121,6 +121,10 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         cur = await db.execute("PRAGMA table_info(workspace)")
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
+        cur = await db.execute("PRAGMA table_info(documents)")
+        if "extraction_attempts" not in {row[1] for row in await cur.fetchall()}:
+            await db.execute(
+                "ALTER TABLE documents ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0")
         await _migrate_fts_tokenizer(db, schema)
         await _migrate_reference_types(db, schema)
         await db.commit()

@@ -193,6 +193,8 @@ def test_prepare_reprocess_full_reset(tmp_path):
     conn.execute(
         "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type) "
         "VALUES (?, ?, ?, 'cites')", (str(uuid.uuid4()), page_id, entry_id))
+    # 源文档带上失败计数,验证重新识别会解除隔离
+    conn.execute("UPDATE documents SET extraction_attempts = 3 WHERE id = ?", (src_id,))
     conn.commit()
     conn.close()
 
@@ -202,7 +204,8 @@ def test_prepare_reprocess_full_reset(tmp_path):
     conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
     assert conn.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (entry_id,)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM corpus_pipeline WHERE doc_id = ?", (src_id,)).fetchone()[0] == 0
-    assert conn.execute("SELECT status FROM documents WHERE id = ?", (src_id,)).fetchone()[0] == "pending"
+    assert conn.execute("SELECT status, extraction_attempts FROM documents WHERE id = ?",
+                        (src_id,)).fetchone() == ("pending", 0)   # 回 pending 且隔离解除
     assert conn.execute("SELECT stale_since FROM documents WHERE id = ?", (page_id,)).fetchone()[0] is not None
     conn.close()
     assert not entry_rel.exists()                     # 条目文件已删除
