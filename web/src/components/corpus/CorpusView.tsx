@@ -125,7 +125,9 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
 
   const openEntry = React.useCallback(
     (entry: CorpusEntry) => {
-      router.push(`/wikis/${kbSlug}/files?doc=${entry.doc.id}`)
+      // 文件视图的 ?doc= 约定为 document_number(整数),不是 UUID
+      const search = entry.doc.document_number != null ? `?doc=${entry.doc.document_number}` : ''
+      router.push(`/wikis/${kbSlug}/files${search}`)
     },
     [router, kbSlug],
   )
