@@ -178,7 +178,8 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
             )
             await db.commit()
             from domain.local_processor import process_document_isolated
-            asyncio.create_task(process_document_isolated(workspace, doc_id))
+            from infra.tasks import spawn_logged
+            spawn_logged(process_document_isolated(workspace, doc_id), f"reindex:{doc_id[:8]}")
         elif content is not None:
             from domain.local_processor import chunk_text_document
             await chunk_text_document(db, doc_id, content)
@@ -206,7 +207,8 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
         logger.info("Indexed (new): %s", relative)
         if status == "pending":
             from domain.local_processor import process_document_isolated
-            asyncio.create_task(process_document_isolated(workspace, doc_id))
+            from infra.tasks import spawn_logged
+            spawn_logged(process_document_isolated(workspace, doc_id), f"index:{doc_id[:8]}")
 
     await db.commit()
 

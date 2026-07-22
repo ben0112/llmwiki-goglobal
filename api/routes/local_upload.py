@@ -98,7 +98,9 @@ async def _ingest_bytes(db, relative: str, content_bytes: bytes) -> dict:
         await chunk_repo.store(doc_id, "", "", chunks)
     elif needs_processing:
         from domain.local_processor import process_document_isolated
-        asyncio.create_task(process_document_isolated(_workspace_root(), doc_id))
+        from infra.tasks import spawn_logged
+        spawn_logged(process_document_isolated(_workspace_root(), doc_id),
+                     f"upload-process:{doc_id[:8]}")
 
     return await doc_repo.get(doc_id)
 

@@ -1,5 +1,4 @@
 import json
-import re
 import time
 import asyncio
 import logging
@@ -13,11 +12,23 @@ from starlette.requests import ClientDisconnect
 
 from auth import get_current_user
 from config import settings
+from infra.tasks import spawn_logged
 
 logger = logging.getLogger(__name__)
 
 # Bytes buffered in memory before flushing a PATCH body to the temp file.
 FLUSH_SIZE = 1_048_576
+
+
+def sanitize_upload_path(raw: str) -> str:
+    """Normalize a client-supplied logical path to `/a/b/` form.
+
+    逐段过滤(丢弃空段、`.`、`..`)而非正则替换:re.sub 不回扫,
+    `../..` 这类输入曾在单轮替换后仍残留 `/../`。
+    """
+    parts = [p for p in (raw or "").strip().replace("\\", "/").split("/")
+             if p not in ("", ".", "..")]
+    return "/" + "/".join(parts) + "/" if parts else "/"
 
 
 def _append_file(path: Path, data: bytes):
@@ -242,7 +253,8 @@ async def _finalize(upload: TusUpload, app_state) -> str:
 
     ocr_service = app_state.ocr_service
     if ocr_service:
-        asyncio.create_task(ocr_service.process_document(document_id, user_id))
+        spawn_logged(ocr_service.process_document(document_id, user_id),
+                     f"tus-process:{document_id[:8]}")
 
     logger.info("TUS finalized: doc=%s file=%s", document_id[:8], upload.filename)
     return document_id
@@ -350,12 +362,7 @@ async def tus_create(request: Request):
     temp_path.touch()
 
     # Sanitize path: must start with /, no traversal, no double slashes
-    raw_path = metadata.get("path", "/").strip() or "/"
-    upload_path = "/" + raw_path.replace("\\", "/").strip("/") + "/"
-    upload_path = re.sub(r"/\.\.(/|$)", "/", upload_path)  # strip traversal
-    upload_path = re.sub(r"/+", "/", upload_path)  # collapse double slashes
-    if upload_path == "//":
-        upload_path = "/"
+    upload_path = sanitize_upload_path(metadata.get("path", "/"))
 
     upload = TusUpload(
         upload_id=upload_id,

@@ -111,7 +111,9 @@ class UrlIngestService:
             await self._delete_document_row(document_id)
             raise HTTPException(status_code=502, detail="Could not store the downloaded PDF — try again")
 
-        asyncio.create_task(self.ocr.process_document(document_id, user_id))
+        from infra.tasks import spawn_logged
+        spawn_logged(self.ocr.process_document(document_id, user_id),
+                     f"url-ingest:{document_id[:8]}")
         return {
             "id": document_id,
             "filename": pdf.filename,

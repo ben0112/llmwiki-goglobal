@@ -179,4 +179,6 @@ async def regenerate_pages(db, user_id: str, pages: list[dict], deleted_names: l
 def schedule_regeneration(db, user_id: str, pages: list[dict], deleted_names: list[str]) -> None:
     if not pages:
         return
-    asyncio.create_task(regenerate_pages(db, user_id, pages, deleted_names))
+    from infra.tasks import spawn_logged
+    spawn_logged(regenerate_pages(db, user_id, pages, deleted_names),
+                 f"wiki-regen:{len(pages)}页")

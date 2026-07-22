@@ -158,7 +158,8 @@ server {
 ## 6. Verification checklist
 
 ```bash
-curl -fsS https://api.example.com/health            # {"status":"ok"}
+curl -fsS https://api.example.com/health            # {"status":"ok"} — 进程存活
+curl -fsS https://api.example.com/ready             # {"status":"ready"} — 数据库连通(healthcheck 用这个)
 curl -fsS https://mcp.example.com/health            # ok
 curl -fsS https://supabase.example.com/auth/v1/.well-known/jwks.json | head -c 200
 ```

@@ -21,6 +21,7 @@ class CORSMiddleware(_BaseCORSMiddleware):
         await super().__call__(scope, receive, send)
 
 from config import settings
+from infra.tasks import spawn_logged
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +92,19 @@ async def lifespan(app: FastAPI):
         )
         for row in rows:
             logger.info("Recovering stuck document %s", row["id"][:8])
-            asyncio.create_task(ocr_service.process_document(row["id"], row["user_id"]))
+            spawn_logged(ocr_service.process_document(row["id"], row["user_id"]),
+                         f"recover:{row['id'][:8]}")
 
     yield
 
+    # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
     cleanup_task.cancel()
     listener_task.cancel()
+    for task in (cleanup_task, listener_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await pool.close()
 
 
