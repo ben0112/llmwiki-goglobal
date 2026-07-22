@@ -13,7 +13,6 @@ import pytest
 from services.archive_extract import (
     ArchiveError,
     _zip_entry_name,
-    archive_stem,
     clean_relative,
     extract_entries,
     is_supported_archive,
@@ -139,9 +138,7 @@ def test_corrupt_archive_raises():
         extract_entries("bad.zip", b"not a zip at all")
 
 
-def test_supported_and_stem():
+def test_supported_archive_suffixes():
     assert is_supported_archive("语料.zip")
     assert is_supported_archive("x.tar.gz") and is_supported_archive("x.tgz")
     assert not is_supported_archive("x.rar") and not is_supported_archive("x.7z")
-    assert archive_stem("语料包.zip") == "语料包"
-    assert archive_stem("dump.tar.gz") == "dump"

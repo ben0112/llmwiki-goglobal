@@ -38,15 +38,6 @@ def is_supported_archive(filename: str) -> bool:
     return filename.lower().endswith(_ARCHIVE_SUFFIXES)
 
 
-def archive_stem(filename: str) -> str:
-    """去掉压缩扩展名的包名(解压目标文件夹名)。"""
-    lower = filename.lower()
-    for suffix in (".tar.gz", ".tgz", ".tar", ".zip"):
-        if lower.endswith(suffix):
-            return filename[: -len(suffix)]
-    return filename
-
-
 def clean_relative(name: str) -> str | None:
     """规范化包内条目路径;不安全或属于垃圾文件时返回 None。"""
     parts = []

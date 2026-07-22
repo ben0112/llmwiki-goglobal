@@ -872,7 +872,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
           unsupportedNames.push(file.name) // 托管模式暂不支持服务端解压
           return null
         }
-        // 压缩包:上传后服务端解压入库(zip/tar[.gz],以包名建文件夹)
+        // 压缩包:上传后服务端解压入库(zip/tar[.gz],不另建目录,保留包内结构)
         const uploadId = crypto.randomUUID()
         addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: dest })
         const formData = new FormData()

@@ -1,8 +1,8 @@
 """Local file upload routes — simple multipart, no TUS.
 
 Copies uploaded files directly into the workspace and indexes them.
-/v1/upload/archive 额外支持压缩包(zip/tar[.gz]):服务端解压后按包名
-建文件夹逐个入库,复用与普通上传相同的落盘/索引路径。
+/v1/upload/archive 额外支持压缩包(zip/tar[.gz]):服务端解压后不另建
+目录,按包内结构落在所选文件夹下,复用与普通上传相同的落盘/索引路径。
 """
 
 import asyncio
@@ -22,7 +22,7 @@ from deps import get_user_id
 from domain.file_types import EXTRACTION_TYPES, IMAGE_TYPES, SIMPLE_TEXT_TYPES
 from domain.watcher import mark_written
 from services.archive_extract import (
-    ArchiveError, archive_stem, extract_entries, is_supported_archive,
+    ArchiveError, extract_entries, is_supported_archive,
 )
 
 router = APIRouter(tags=["upload"])
@@ -276,8 +276,9 @@ async def upload_archive(
 ):
     """上传压缩包并在服务端解压入库。
 
-    以包名(去扩展名)为目标文件夹,保留包内目录结构;与前端上传去重
-    同口径:同相对路径或同内容哈希的条目自动跳过,仅在响应中计数。
+    与文件夹上传同口径的剥层:不以包名另建目录,保留包内目录结构,
+    直接落在所选文件夹(缺省视图根)下;去重亦与前端上传同口径:
+    同相对路径或同内容哈希的条目自动跳过,仅在响应中计数。
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename")
@@ -293,7 +294,7 @@ async def upload_archive(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     db = request.app.state.sqlite_db
-    base = (path.strip("/") + "/" if path.strip("/") else "") + archive_stem(file.filename)
+    base = path.strip("/") + "/" if path.strip("/") else ""
 
     cursor = await db.execute(
         "SELECT relative_path, content_hash FROM documents WHERE status != 'failed'"
@@ -310,7 +311,7 @@ async def upload_archive(
         if ext not in _ARCHIVE_ALLOWED_TYPES:
             skipped_unsupported += 1
             continue
-        relative = f"{base}/{entry_relative}"
+        relative = f"{base}{entry_relative}"
         digest = hashlib.sha256(content).hexdigest()
         if relative in existing_paths or digest in existing_hashes:
             skipped_duplicate += 1
@@ -321,7 +322,7 @@ async def upload_archive(
 
     return {
         "archive": file.filename,
-        "target": "/" + base + "/",
+        "target": "/" + base,
         "created": len(documents),
         "skipped_duplicate": skipped_duplicate,
         "skipped_unsupported": skipped_unsupported,
