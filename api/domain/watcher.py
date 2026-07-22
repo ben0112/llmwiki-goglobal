@@ -348,10 +348,18 @@ async def sweep_workspace(db: aiosqlite.Connection, workspace: Path) -> tuple[in
 
 
 async def sweep_loop(db: aiosqlite.Connection, workspace: Path) -> None:
-    """启动立即对账一轮(接住停机期间拷入的文件),之后定期兜底。"""
+    """启动立即对账一轮(接住停机期间拷入的文件),之后定期兜底。
+
+    每轮顺带自愈提取队列:pending 且无在飞任务的文档重新入队(spawn 的
+    任务因异常/重启丢失时,文件本身无变化,对账的 mtime 快筛看不见它们)。
+    """
+    from domain.local_processor import kick_pending_backlog
     while True:
         try:
             await sweep_workspace(db, workspace)
+            kicked = await kick_pending_backlog(db, workspace)
+            if kicked:
+                logger.info("Sweep: re-queued %d pending docs with no in-flight task", kicked)
         except Exception:
             logger.exception("Workspace sweep failed")
         await asyncio.sleep(SWEEP_INTERVAL_SECONDS)

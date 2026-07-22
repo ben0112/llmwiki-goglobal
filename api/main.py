@@ -170,13 +170,16 @@ async def _local_lifespan(app: FastAPI):
     watcher_db = await create_sqlite_pool(db_path, init_schema=False)
     sweep_db = await create_sqlite_pool(db_path, init_schema=False)
 
+    # 启动对账挂掉必须留痕:它负责接住停机断点的整个提取积压,静默死亡
+    # 的表现就是"重启后 CPU 闲置、队列不动"
     from domain.local_processor import reconcile_workspace
-    reconcile_task = asyncio.create_task(reconcile_workspace(reconcile_db, workspace))
+    from infra.tasks import spawn_logged
+    reconcile_task = spawn_logged(
+        reconcile_workspace(reconcile_db, workspace), "startup-reconcile")
 
     # 磁盘↔索引定期对账:兜住 inotify 收不到的场景(Docker Desktop 宿主侧
     # 拷入 bind mount、容器停机期间的增删),启动即扫一轮
     from domain.watcher import sweep_loop
-    from infra.tasks import spawn_logged
     sweep_task = spawn_logged(sweep_loop(sweep_db, workspace), "workspace-sweep")
 
     # 语料自动分类轮询(默认关;设置页/环境变量开启后才会真正跑)
@@ -186,7 +189,9 @@ async def _local_lifespan(app: FastAPI):
     watcher_task = None
     try:
         from domain.watcher import watch_workspace
-        watcher_task = asyncio.create_task(watch_workspace(watcher_db, workspace))
+        # 同样走留痕封装:几万文件的工作区可能触发 inotify watch 上限
+        # (ENOSPC)让 watcher 中途挂掉,裸 task 死了毫无声息
+        watcher_task = spawn_logged(watch_workspace(watcher_db, workspace), "file-watcher")
         logger.info("File watcher started")
     except ImportError:
         logger.warning("watchfiles not installed — file watcher disabled")

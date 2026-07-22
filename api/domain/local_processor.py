@@ -23,6 +23,7 @@ from domain.file_types import (
 )
 from domain.watcher import mark_written
 from infra.db.sqlite import SQLiteDocumentRepository, create_pool
+from infra.tasks import spawn_logged
 from services.extracted_assets import build_pdf_image_assets
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,11 @@ _process_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 # N 路提取的 CPU 段(OCR/LibreOffice)照常并行,但大事务写不再互相排队
 # 到超时 —— 批量导入时的 database is locked 风暴正源于此。
 _db_write_gate = asyncio.Lock()
+
+# 排队中或处理中的文档 id:sweep 周期的自愈兜底(kick_pending_backlog)
+# 据此跳过已有任务在飞的文档,避免每轮重复入队。误判无害 —— claim 是
+# 原子的(status='pending' 才领走),重复入队只会空转一次。
+_inflight: set[str] = set()
 
 
 async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Path) -> None:
@@ -126,12 +132,16 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
 async def process_document_isolated(workspace: Path, doc_id: str) -> None:
     """Process a document on its own connection so fire-and-forget tasks can't
     flush another writer's open transaction on a shared connection."""
-    async with _process_semaphore:
-        db = await create_pool(str(workspace / ".llmwiki" / "index.db"), init_schema=False)
-        try:
-            await process_document(db, doc_id, workspace)
-        finally:
-            await db.close()
+    _inflight.add(doc_id)
+    try:
+        async with _process_semaphore:
+            db = await create_pool(str(workspace / ".llmwiki" / "index.db"), init_schema=False)
+            try:
+                await process_document(db, doc_id, workspace)
+            finally:
+                await db.close()
+    finally:
+        _inflight.discard(doc_id)
 
 
 async def chunk_text_document(db: aiosqlite.Connection, doc_id: str, content: str | None) -> None:
@@ -151,74 +161,128 @@ async def chunk_text_document(db: aiosqlite.Connection, doc_id: str, content: st
 
 
 async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
-    """Process documents that were indexed but never extracted or chunked.
+    """启动对账:把停机断点处的所有文档重新排队提取。
 
-    `llmwiki init` lists existing files into the index without extracting PDFs
-    or building search chunks; this backfills both so a folder pointed at on
-    first run is actually readable and searchable.
+    覆盖四类断点(每类扫描独立容错,库忙不拖垮整轮):
+    1. 卡在 processing —— 停机瞬间正在提取的;
+    2. 从未提取过 —— `llmwiki init` 只入索引不提取的;
+    3. 排队中丢失的 pending —— 停机时在信号量后排队的任务随进程消失,
+       这类文档可能带有旧提取结果(如「重新识别」重置的源文档,parser
+       已设、chunks 还在),对"从未提取"的查询不可见,必须整体接住;
+    4. 曾失败 —— 每次启动重试一次,镜像修复后无需手工干预。
+
+    统一去重后经并行通道重跑(受 _process_semaphore 限流,与运行期
+    吞吐一致)—— 逐个串行会让重启后的大积压恢复慢一个数量级。
     """
-    # 锁风暴/崩溃中卡在 processing 的文档:进程重启后不可能仍在处理,
-    # 复位为 pending 并在本轮直接重跑(否则会永远滞留、无人重试)
-    cursor = await db.execute(
-        "SELECT id FROM documents WHERE status = 'processing'")
-    stuck_ids = [r[0] for r in await cursor.fetchall()]
-    if stuck_ids:
-        await db.execute("UPDATE documents SET status = 'pending' WHERE status = 'processing'")
-        await db.commit()
-        logger.info("Reconcile: reset %d docs stuck in 'processing'", len(stuck_ids))
-    for doc_id in stuck_ids:
-        try:
-            await process_document(db, doc_id, workspace)
-        except Exception:
-            logger.exception("Reconcile: retry of stuck doc %s", doc_id[:8])
+    to_process: dict[str, None] = {}   # 有序去重
 
-    extract_ids = await _unchunked_extractable_ids(db)
-    for doc_id in extract_ids:
-        try:
-            await db.execute(
-                "UPDATE documents SET status = 'pending', updated_at = datetime('now') WHERE id = ?",
-                (doc_id,),
+    try:
+        cursor = await db.execute("SELECT id FROM documents WHERE status = 'processing'")
+        stuck_ids = [r[0] for r in await cursor.fetchall()]
+        if stuck_ids:
+            await db.execute("UPDATE documents SET status = 'pending' WHERE status = 'processing'")
+            await db.commit()
+            logger.info("Reconcile: reset %d docs stuck in 'processing'", len(stuck_ids))
+        to_process.update(dict.fromkeys(stuck_ids))
+    except Exception:
+        logger.exception("Reconcile: stuck-processing scan failed")
+
+    extract_ids: list[str] = []
+    try:
+        extract_ids = await _unchunked_extractable_ids(db)
+        if extract_ids:
+            await db.executemany(
+                "UPDATE documents SET status = 'pending', updated_at = datetime('now') "
+                "WHERE id = ?",
+                [(i,) for i in extract_ids],
             )
             await db.commit()
-            await process_document(db, doc_id, workspace)
-        except Exception:
-            logger.exception("Reconcile: failed to process %s", doc_id[:8])
+        to_process.update(dict.fromkeys(extract_ids))
+    except Exception:
+        logger.exception("Reconcile: unchunked scan failed")
 
-    # 曾提取失败的文档每次启动重试一次:镜像修复/依赖补齐后无需手工干预。
-    # 真坏的文件每次启动会再失败一次,代价有界(仅启动时、逐个串行)。
-    placeholders = ",".join("?" for _ in EXTRACTION_TYPES)
-    cursor = await db.execute(
-        f"SELECT id FROM documents WHERE status = 'failed' AND source_kind != 'asset' "
-        f"AND file_type IN ({placeholders})",
-        tuple(EXTRACTION_TYPES),
-    )
-    failed_ids = [r[0] for r in await cursor.fetchall()]
-    for doc_id in failed_ids:
-        try:
-            await db.execute(
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM documents WHERE status = 'pending' AND source_kind != 'asset'")
+        to_process.update(dict.fromkeys(r[0] for r in await cursor.fetchall()))
+    except Exception:
+        logger.exception("Reconcile: pending scan failed")
+
+    try:
+        placeholders = ",".join("?" for _ in EXTRACTION_TYPES)
+        cursor = await db.execute(
+            f"SELECT id FROM documents WHERE status = 'failed' AND source_kind != 'asset' "
+            f"AND file_type IN ({placeholders})",
+            tuple(EXTRACTION_TYPES),
+        )
+        failed_ids = [r[0] for r in await cursor.fetchall()]
+        if failed_ids:
+            await db.executemany(
                 "UPDATE documents SET status = 'pending', error_message = NULL, "
                 "updated_at = datetime('now') WHERE id = ? AND status = 'failed'",
-                (doc_id,),
+                [(i,) for i in failed_ids],
             )
             await db.commit()
-            await process_document(db, doc_id, workspace)
-        except Exception:
-            logger.exception("Reconcile: retry of failed doc %s", doc_id[:8])
-    if failed_ids:
-        logger.info("Reconcile: retried %d previously failed docs", len(failed_ids))
+            logger.info("Reconcile: retrying %d previously failed docs", len(failed_ids))
+        to_process.update(dict.fromkeys(failed_ids))
+    except Exception:
+        logger.exception("Reconcile: failed-docs scan failed")
 
-    text_docs = await _unchunked_text_docs(db)
-    for doc_id, content in text_docs:
-        try:
-            await chunk_text_document(db, doc_id, content)
-        except Exception:
-            logger.exception("Reconcile: failed to chunk %s", doc_id[:8])
+    # 预登记 _inflight:排到后面的文档在真正开跑前也算"有主",sweep 的
+    # 自愈兜底不会重复入队。固定数量搬运工消费队列,避免为几万积压一次
+    # 性创建等量 task 对象。
+    ids = list(to_process)
+    _inflight.update(ids)
+    next_idx = 0
 
-    if extract_ids or text_docs:
+    async def _drain() -> None:
+        nonlocal next_idx
+        while next_idx < len(ids):
+            doc_id = ids[next_idx]
+            next_idx += 1
+            try:
+                await process_document_isolated(workspace, doc_id)
+            except Exception:
+                logger.exception("Reconcile: processing %s failed", doc_id[:8])
+            finally:
+                _inflight.discard(doc_id)
+
+    workers = [spawn_logged(_drain(), f"reconcile-drain-{n}")
+               for n in range(min(PROCESS_CONCURRENCY, len(ids)))]
+
+    text_docs: list[tuple[str, str]] = []
+    try:
+        text_docs = await _unchunked_text_docs(db)
+        for doc_id, content in text_docs:
+            try:
+                await chunk_text_document(db, doc_id, content)
+            except Exception:
+                logger.exception("Reconcile: failed to chunk %s", doc_id[:8])
+    except Exception:
+        logger.exception("Reconcile: text-chunk scan failed")
+
+    if ids or text_docs:
         logger.info(
-            "Reconciled workspace: %d extracted, %d text-chunked",
-            len(extract_ids), len(text_docs),
+            "Reconcile: %d docs queued for extraction (concurrency %d), %d text-chunked",
+            len(ids), PROCESS_CONCURRENCY, len(text_docs),
         )
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+async def kick_pending_backlog(db: aiosqlite.Connection, workspace: Path) -> int:
+    """自愈兜底(sweep 每轮调用):pending 且无在飞任务的文档重新入队。
+
+    正常路径(watcher/上传/重新识别)spawn 的任务若因异常或重启丢失,
+    文档会永远滞留 pending;这里把它们捞回并行通道。每轮限量防止极端
+    情况下重复入队堆积 —— claim 原子性保证重复也只是空转。
+    """
+    cursor = await db.execute(
+        "SELECT id FROM documents WHERE status = 'pending' AND source_kind != 'asset'")
+    ids = [r[0] for r in await cursor.fetchall() if r[0] not in _inflight]
+    for doc_id in ids[:200]:
+        spawn_logged(process_document_isolated(workspace, doc_id), f"kick:{doc_id[:8]}")
+    return len(ids[:200])
 
 
 async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> None:

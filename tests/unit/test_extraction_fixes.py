@@ -360,3 +360,86 @@ def test_ocr_pages_run_in_parallel(monkeypatch):
     assert [p[0] for p in pages] == list(range(1, 9))          # 页序完整
     assert [p[1] for p in pages] == [f"第{i}页内容" for i in range(1, 9)]
     assert peak > 1                                             # 真并行
+
+
+async def test_reconcile_rescues_pending_with_old_chunks(tmp_path, monkeypatch):
+    """「重新识别」重置的源文档带旧提取结果(parser 已设、chunks 还在):
+    停机丢失排队任务后,启动 reconcile 必须仍接住它 —— 曾经的盲区,
+    表现为重启后 OCR 积压不恢复、CPU 闲置。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, parser, tags, version, document_number) "
+            "VALUES (?, ?, 'b.pdf', 'B', '/', 'b.pdf', 'source', 'pdf', 'pending', "
+            "'opendataloader', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.execute(
+            "INSERT INTO document_chunks (id, document_id, chunk_index, content, "
+            "source_content, page, start_char, token_count, header_breadcrumb) "
+            "VALUES (?, ?, 0, '旧内容', '旧内容', 1, 0, 2, '')",
+            (str(uuid.uuid4()), doc_id))
+        await db.commit()
+
+        processed: list[str] = []
+
+        async def fake_process(db_, d, workspace_):
+            processed.append(d)
+
+        monkeypatch.setattr(lp, "process_document", fake_process)
+        await lp.reconcile_workspace(db, ws)
+
+        assert processed == [doc_id]   # 接住且只入队一次
+    finally:
+        await db.close()
+
+
+async def test_kick_pending_backlog_skips_inflight(tmp_path, monkeypatch):
+    """sweep 自愈兜底:无主的 pending 文档重新入队,已在飞的跳过。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        lost_id, inflight_id = str(uuid.uuid4()), str(uuid.uuid4())
+        for n, doc_id in enumerate((lost_id, inflight_id), 1):
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, status, tags, version, document_number) "
+                "VALUES (?, ?, ?, 'D', '/', ?, 'source', 'pdf', 'pending', '[]', 0, ?)",
+                (doc_id, USER_ID, f"d{n}.pdf", f"d{n}.pdf", n))
+        await db.commit()
+
+        processed: list[str] = []
+
+        async def fake_process(db_, d, workspace_):
+            processed.append(d)
+
+        monkeypatch.setattr(lp, "process_document", fake_process)
+        lp._inflight.add(inflight_id)
+        try:
+            kicked = await lp.kick_pending_backlog(db, ws)
+            for _ in range(200):            # spawn 的任务真正跑完(≤4s)
+                if processed:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            lp._inflight.discard(inflight_id)
+
+        assert kicked == 1
+        assert processed == [lost_id]
+    finally:
+        await db.close()
