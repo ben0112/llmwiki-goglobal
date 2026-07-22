@@ -248,6 +248,20 @@ export function FilesGrid({
   const [showFailedOnly, setShowFailedOnly] = React.useState(false)
   React.useEffect(() => { if (failedDocs.length === 0) setShowFailedOnly(false) }, [failedDocs.length])
 
+  // 手动重试提取:清零失败隔离计数并重新排队(失败满 3 次后启动不再自动重试)
+  const [retryingIds, setRetryingIds] = React.useState<Set<string>>(new Set())
+  const retryExtraction = React.useCallback(async (docId: string) => {
+    setRetryingIds((prev) => new Set(prev).add(docId))
+    try {
+      await fetch(`${apiUrl()}/v1/documents/${docId}/retry-extraction`, { method: 'POST' })
+    } catch {
+      // 失败静默:列表下轮轮询会反映真实状态
+    }
+  }, [])
+  const retryAllFailed = React.useCallback(async () => {
+    for (const doc of failedDocs) void retryExtraction(doc.id)
+  }, [failedDocs, retryExtraction])
+
   const isBrowsing = !activeDoc
 
   // Sync note title when activeDoc changes
@@ -677,7 +691,13 @@ export function FilesGrid({
                     >
                       {showFailedOnly ? '返回浏览' : '查看清单'}
                     </button>
-                    <span className="text-muted-foreground/60">重启服务会自动重试;点击条目可查看失败原因</span>
+                    <button
+                      onClick={retryAllFailed}
+                      className="rounded-md border border-border px-2 py-0.5 hover:bg-accent transition-colors cursor-pointer"
+                    >
+                      全部重试
+                    </button>
+                    <span className="text-muted-foreground/60">失败满 3 次后不再自动重试,需手动重试;点击条目可查看失败原因</span>
                   </div>
                 )}
                 {showFailedOnly ? (
@@ -686,11 +706,22 @@ export function FilesGrid({
                       <button
                         key={doc.id}
                         onClick={() => openDoc(doc)}
-                        className="block w-full rounded-md border border-border px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
+                        className="group block w-full rounded-md border border-border px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
                       >
                         <div className="flex items-baseline gap-2 min-w-0">
                           <span className="truncate text-[13px] font-medium">{doc.filename}</span>
                           <span className="shrink-0 text-[11px] text-muted-foreground">{doc.path}</span>
+                          <span
+                            onClick={(e) => { e.stopPropagation(); void retryExtraction(doc.id) }}
+                            className={cn(
+                              'ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 text-[11px] transition-opacity',
+                              retryingIds.has(doc.id)
+                                ? 'opacity-50 pointer-events-none'
+                                : 'opacity-0 group-hover:opacity-100 hover:bg-accent',
+                            )}
+                          >
+                            {retryingIds.has(doc.id) ? '已重新排队' : '重试'}
+                          </span>
                         </div>
                         {doc.error_message && (
                           <div className="mt-0.5 truncate text-[11px] text-destructive/80">{doc.error_message}</div>

@@ -43,6 +43,39 @@ async def get_document(doc_id: UUID, service: Annotated[DocumentService, Depends
     return row
 
 
+@router.post("/v1/documents/{doc_id}/retry-extraction", status_code=202)
+async def retry_extraction(
+    doc_id: UUID, request: Request,
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    """手动重试文档提取:清零失败隔离计数并重新排队(本地模式)。
+
+    失败满 FAILED_RETRY_LIMIT 次的文档不再随启动自动重试,这里是普通
+    源文档(没有语料条目,走不了「重新识别」)唯一的显式解除通道。
+    """
+    state = request.app.state
+    if getattr(state, "mode", "") != "local":
+        raise HTTPException(status_code=400, detail="仅本地模式支持")
+    db = state.sqlite_db
+    cursor = await db.execute(
+        "SELECT status FROM documents WHERE id = ?", (str(doc_id),))
+    if await cursor.fetchone() is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    await db.execute(
+        "UPDATE documents SET status = 'pending', error_message = NULL, "
+        "extraction_attempts = 0, updated_at = datetime('now') WHERE id = ?",
+        (str(doc_id),))
+    await db.commit()
+
+    from pathlib import Path
+
+    from domain.local_processor import process_document_isolated
+    from infra.tasks import spawn_logged
+    spawn_logged(process_document_isolated(Path(state.workspace_path), str(doc_id)),
+                 f"retry:{str(doc_id)[:8]}")
+    return {"status": "queued"}
+
+
 @router.get("/v1/documents/{doc_id}/url")
 async def get_document_url(doc_id: UUID, service: Annotated[DocumentService, Depends(get_document_service)]):
     result = await service.get_url(str(doc_id))

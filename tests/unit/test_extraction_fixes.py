@@ -625,3 +625,202 @@ async def test_extraction_attempts_migration_on_old_db(tmp_path):
         assert (await cur.fetchone())[0] == 0        # 已补列,存量行默认 0
     finally:
         await db.close()
+
+
+async def test_crash_looping_doc_quarantined_at_startup(tmp_path, monkeypatch):
+    """反复把进程压垮的文档(异常没机会抛,靠 except 计数无效):
+    reconcile 复位时计数,达上限转入失败隔离而非再次排队。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        crasher_id, victim_id = str(uuid.uuid4()), str(uuid.uuid4())
+        for n, (doc_id, attempts) in enumerate(((crasher_id, 2), (victim_id, 0)), 1):
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, status, extraction_attempts, tags, version, "
+                "document_number) "
+                "VALUES (?, ?, ?, 'D', '/', ?, 'source', 'pdf', 'processing', ?, '[]', 0, ?)",
+                (doc_id, USER_ID, f"c{n}.pdf", f"c{n}.pdf", attempts, n))
+        await db.commit()
+
+        processed: list[str] = []
+
+        async def fake_process(db_, d, workspace_):
+            processed.append(d)
+
+        monkeypatch.setattr(lp, "process_document", fake_process)
+        await lp.reconcile_workspace(db, ws)
+
+        cursor = await db.execute(
+            "SELECT status, extraction_attempts, error_message FROM documents WHERE id = ?",
+            (crasher_id,))
+        status, attempts, err = await cursor.fetchone()
+        assert status == "failed" and attempts == 3 and "反复中断" in err   # 隔离
+        assert crasher_id not in processed
+        cursor = await db.execute(
+            "SELECT status, extraction_attempts FROM documents WHERE id = ?", (victim_id,))
+        assert (await cursor.fetchone()) == ("pending", 1)   # 无辜停机的:计 1 次并重跑
+        assert victim_id in processed
+    finally:
+        await db.close()
+
+
+async def test_save_local_images_evicts_watcher_squatter_rows(tmp_path):
+    """落盘→入闸门的窗口内 watcher 可能把 .assets 图片抢注成普通文档行:
+    批量插入前按 relative_path 清场,否则撞 UNIQUE 使提取确定性失败。"""
+    import domain.local_processor as lp
+    from services.extracted_assets import build_pdf_image_assets
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '图册.pdf', 'T', '/', '图册.pdf', 'source', 'pdf', 'processing', "
+            "'[]', 0, 1)", (doc_id, USER_ID))
+
+        pages = [(1, "页", [{"id": "img_1_0.png", "bytes": b"PNG", "format": "png"}])]
+        assets, _ = build_pdf_image_assets(doc_id, "图册.pdf", "/", pages)
+        squat_rp = (assets[0].path.rstrip("/") + "/" + assets[0].filename).lstrip("/")
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, ?, 'S', '/', ?, 'source', 'png', 'pending', '[]', 0, 2)",
+            (str(uuid.uuid4()), USER_ID, assets[0].filename, squat_rp))
+        await db.commit()
+
+        await lp._save_local_images(db, doc_id, ws, pages)   # 不得抛 IntegrityError
+
+        cursor = await db.execute(
+            "SELECT source_kind, status FROM documents WHERE relative_path = ?", (squat_rp,))
+        rows = await cursor.fetchall()
+        assert rows == [("asset", "ready")]                  # 抢注行已被资产行取代
+    finally:
+        await db.close()
+
+
+async def test_exception_failure_increments_attempts(tmp_path, monkeypatch):
+    """提取异常(生产最常见失败路径)每次 +1 —— 隔离阈值真实生效。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    (ws / "坏文档.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '坏文档.docx', 'B', '/', '坏文档.docx', 'source', 'docx', "
+            "'pending', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        async def boom(db_, d, path_, ws_):
+            raise RuntimeError("LibreOffice conversion failed: 模拟")
+
+        monkeypatch.setattr(lp, "_process_office", boom)
+
+        await lp.process_document(db, doc_id, ws)
+        cursor = await db.execute(
+            "SELECT status, extraction_attempts FROM documents WHERE id = ?", (doc_id,))
+        assert (await cursor.fetchone()) == ("failed", 1)
+
+        await db.execute("UPDATE documents SET status = 'pending' WHERE id = ?", (doc_id,))
+        await db.commit()
+        await lp.process_document(db, doc_id, ws)
+        cursor = await db.execute(
+            "SELECT extraction_attempts FROM documents WHERE id = ?", (doc_id,))
+        assert (await cursor.fetchone())[0] == 2             # 逐次累计
+    finally:
+        await db.close()
+
+
+async def test_save_local_images_respects_write_gate(tmp_path):
+    """资产入库走 _db_write_gate:闸门被占时 DB 写必须等待(文件可先落盘)。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '图.pdf', 'T', '/', '图.pdf', 'source', 'pdf', 'processing', "
+            "'[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        pages = [(1, "页", [{"id": "img_1_0.png", "bytes": b"PNG", "format": "png"}])]
+        async with lp._db_write_gate:                        # 占住闸门
+            task = asyncio.create_task(lp._save_local_images(db, doc_id, ws, pages))
+            await asyncio.sleep(0.1)
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM documents WHERE source_kind = 'asset'")
+            assert (await cursor.fetchone())[0] == 0         # DB 写被闸门挡住
+        await task                                           # 释放后完成
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM documents WHERE source_kind = 'asset'")
+        assert (await cursor.fetchone())[0] == 1
+    finally:
+        await db.close()
+
+
+async def test_watcher_content_change_clears_quarantine(tmp_path, monkeypatch):
+    """隔离文档被替换为新内容:watcher 重建索引时清零计数、解除隔离。"""
+    import domain.local_processor as lp
+    from domain import watcher
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    f = ws / "修复版.docx"
+    f.write_bytes(b"new fixed content")
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, extraction_attempts, content_hash, tags, "
+            "version, document_number) "
+            "VALUES (?, ?, '修复版.docx', 'F', '/', '修复版.docx', 'source', 'docx', "
+            "'failed', 3, 'old-hash-of-broken-file', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        async def noop(workspace_, d):
+            pass
+
+        monkeypatch.setattr(lp, "process_document_isolated", noop)
+        await watcher._index_file(db, ws, f)
+
+        cursor = await db.execute(
+            "SELECT status, extraction_attempts FROM documents WHERE id = ?", (doc_id,))
+        assert (await cursor.fetchone()) == ("pending", 0)   # 隔离随内容变化解除
+    finally:
+        await db.close()

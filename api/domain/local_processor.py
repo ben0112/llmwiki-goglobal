@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -48,6 +49,21 @@ _db_write_gate = asyncio.Lock()
 # 据此跳过已有任务在飞的文档,避免每轮重复入队。误判无害 —— claim 是
 # 原子的(status='pending' 才领走),重复入队只会空转一次。
 _inflight: set[str] = set()
+
+
+@asynccontextmanager
+async def _gated_write(db: aiosqlite.Connection):
+    """写闸门 + 异常回滚:闸门内半截事务若不回滚,会被同一连接上随后的
+    失败标记 commit 顺带提交(如旧资产已删、新数据未插全)。"""
+    async with _db_write_gate:
+        try:
+            yield
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                logger.warning("Rollback after failed gated write also failed")
+            raise
 
 
 async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Path) -> None:
@@ -105,7 +121,7 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
             await _process_html(db, doc_id, file_path)
         else:
             await db.execute(
-                "UPDATE documents SET status = 'ready', updated_at = datetime('now') WHERE id = ?",
+                "UPDATE documents SET status = 'ready', extraction_attempts = 0, updated_at = datetime('now') WHERE id = ?",
                 (doc_id,),
             )
             await db.commit()
@@ -155,7 +171,7 @@ async def chunk_text_document(db: aiosqlite.Connection, doc_id: str, content: st
     from services.chunker import chunk_text
 
     chunks = chunk_text(content or "")
-    async with _db_write_gate:
+    async with _gated_write(db):
         await _store_chunks(db, doc_id, chunks)
         # `parser` doubles as the chunked-marker so reconcile skips docs that
         # legitimately produce zero chunks (empty/short) instead of retrying them.
@@ -183,12 +199,33 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
     to_process: dict[str, None] = {}   # 有序去重
 
     try:
+        # 卡在 processing = 上次处理中进程中断(停机,或正是该文档拖垮了
+        # 进程)。复位时计一次尝试:靠 except 路径计数对崩溃型文件无效
+        # (进程死了异常没机会抛)。反复中断达上限的转入失败隔离,防止
+        # OOM 型文件每次重启都再拖垮一次进程;正常成功会清零计数,停机
+        # 误伤的无辜文档下次跑通即自愈。
+        cursor = await db.execute(
+            "SELECT id FROM documents WHERE status = 'processing' "
+            "AND extraction_attempts + 1 >= ?", (FAILED_RETRY_LIMIT,))
+        crashed_ids = [r[0] for r in await cursor.fetchall()]
+        if crashed_ids:
+            await db.executemany(
+                "UPDATE documents SET status = 'failed', "
+                "error_message = '提取反复中断(疑似压垮进程),已停止自动重试', "
+                "extraction_attempts = extraction_attempts + 1, "
+                "updated_at = datetime('now') WHERE id = ?",
+                [(i,) for i in crashed_ids])
+            logger.warning("Reconcile: quarantined %d docs that repeatedly died mid-extraction",
+                           len(crashed_ids))
         cursor = await db.execute("SELECT id FROM documents WHERE status = 'processing'")
         stuck_ids = [r[0] for r in await cursor.fetchall()]
         if stuck_ids:
-            await db.execute("UPDATE documents SET status = 'pending' WHERE status = 'processing'")
-            await db.commit()
+            await db.execute(
+                "UPDATE documents SET status = 'pending', "
+                "extraction_attempts = extraction_attempts + 1 WHERE status = 'processing'")
             logger.info("Reconcile: reset %d docs stuck in 'processing'", len(stuck_ids))
+        if crashed_ids or stuck_ids:
+            await db.commit()
         to_process.update(dict.fromkeys(stuck_ids))
     except Exception:
         logger.exception("Reconcile: stuck-processing scan failed")
@@ -333,18 +370,25 @@ async def _save_local_images(
     if not assets:
         return {}
 
-    for asset in assets:
-        relative_asset = (asset.path.rstrip("/") + "/" + asset.filename).lstrip("/")
+    relpaths = [(a.path.rstrip("/") + "/" + a.filename).lstrip("/") for a in assets]
+    for asset, relative_asset in zip(assets, relpaths):
         local_asset = workspace / relative_asset
         local_asset.parent.mkdir(parents=True, exist_ok=True)
         mark_written(str(local_asset))
         local_asset.write_bytes(asset.data)
 
     asset_metadata = [a.metadata() for a in assets]   # 含 sha256,闸门外算完
-    async with _db_write_gate:
+    async with _gated_write(db):
         await db.execute(
             "DELETE FROM documents WHERE source_kind = 'asset' AND metadata LIKE ?",
             (f'%"parent_document_id": "{doc_id}"%',),
+        )
+        # 落盘→入闸门的窗口可远超 mark_written 的 2s 冷却:watcher/sweep 可能
+        # 已把这些图片抢注成普通文档行,批量 INSERT 会撞 UNIQUE(relative_path)
+        # 使提取确定性失败 —— 按 relative_path 清场兜底(同一事务内)
+        await db.executemany(
+            "DELETE FROM documents WHERE relative_path = ?",
+            [(rp,) for rp in relpaths],
         )
         # DELETE 已持写锁,MAX 取号到批量插入之间不会有其他连接插队
         cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) FROM documents")
@@ -354,10 +398,9 @@ async def _save_local_images(
             "source_kind, file_type, file_size, status, content, tags, version, "
             "document_number, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, 'asset', ?, ?, 'ready', NULL, '[]', 0, ?, ?)",
-            [(a.document_id, doc["user_id"], a.filename, a.filename, a.path,
-              (a.path.rstrip("/") + "/" + a.filename).lstrip("/"),
+            [(a.document_id, doc["user_id"], a.filename, a.filename, a.path, rp,
               a.file_type, len(a.data), base_number + i + 1, json.dumps(m))
-             for i, (a, m) in enumerate(zip(assets, asset_metadata))],
+             for i, (a, rp, m) in enumerate(zip(assets, relpaths, asset_metadata))],
         )
         # 父文档 metadata 并入同一事务(等价 set_metadata_field,不单独提交)
         cursor = await db.execute("SELECT metadata FROM documents WHERE id = ?", (doc_id,))
@@ -387,7 +430,7 @@ async def _store_page_contents(
     from services.chunker import chunk_pages
     chunks = chunk_pages(page_contents)   # CPU 段在闸门外
 
-    async with _db_write_gate:
+    async with _gated_write(db):
         await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
         if page_contents:
             await db.executemany(
@@ -399,7 +442,7 @@ async def _store_page_contents(
             )
         await _store_chunks(db, doc_id, chunks)
         await db.execute(
-            "UPDATE documents SET status = 'ready', content = ?, page_count = ?, "
+            "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = ?, "
             "parser = ?, updated_at = datetime('now') WHERE id = ?",
             (full_content, num_pages, parser, doc_id),
         )
@@ -548,7 +591,7 @@ async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path:
     """Extract spreadsheet data (openpyxl / xlrd). Stores pages AND chunks for search."""
     sheets = await asyncio.to_thread(_read_sheet_rows, file_path)
 
-    async with _db_write_gate:
+    async with _gated_write(db):
         await _store_spreadsheet_rows(db, doc_id, sheets, file_path)
 
 
@@ -580,7 +623,7 @@ async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
 
     parser = "xlrd" if file_path.suffix.lower() == ".xls" else "openpyxl"
     await db.execute(
-        "UPDATE documents SET status = 'ready', content = ?, page_count = ?, "
+        "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = ?, "
         "parser = ?, updated_at = datetime('now') WHERE id = ?",
         (full_content, num_sheets, parser, doc_id),
     )
@@ -592,7 +635,7 @@ async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
 async def _process_image(db: aiosqlite.Connection, doc_id: str) -> None:
     """Images are stored as-is — just mark ready."""
     await db.execute(
-        "UPDATE documents SET status = 'ready', page_count = 1, "
+        "UPDATE documents SET status = 'ready', extraction_attempts = 0, page_count = 1, "
         "parser = 'native', updated_at = datetime('now') WHERE id = ?",
         (doc_id,),
     )
@@ -613,10 +656,10 @@ async def _process_html(db: aiosqlite.Connection, doc_id: str, file_path: Path) 
 
     from services.chunker import chunk_text
     chunks = chunk_text(content)
-    async with _db_write_gate:
+    async with _gated_write(db):
         await _store_chunks(db, doc_id, chunks)
         await db.execute(
-            "UPDATE documents SET status = 'ready', content = ?, page_count = 1, "
+            "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = 1, "
             "parser = 'webmd', updated_at = datetime('now') WHERE id = ?",
             (content, doc_id),
         )
