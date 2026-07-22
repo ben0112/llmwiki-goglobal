@@ -22,6 +22,7 @@ import {
   businessPendingCount,
   collectCorpusEntries,
   collectFacetOptions,
+  collectWikiRollups,
   computeKpis,
   entryMatches,
   FACET_LABELS,
@@ -108,7 +109,10 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
   const coverage = React.useMemo(() => buildCoverageGrid(entries), [entries])
   const businessClasses = React.useMemo(() => buildBusinessView(entries), [entries])
   const pendingBusiness = React.useMemo(() => businessPendingCount(entries), [entries])
-  const kpis = React.useMemo(() => computeKpis(entries, citedDocIds), [entries, citedDocIds])
+  const kpis = React.useMemo(
+    () => computeKpis(entries, citedDocIds, undefined, collectWikiRollups(documents)),
+    [entries, citedDocIds, documents],
+  )
 
   const toggleFacet = React.useCallback((key: FacetKey, value: string) => {
     setSelections((prev) => {
@@ -357,6 +361,13 @@ function KpiStrip({ kpis, onShowPending }: { kpis: ReturnType<typeof computeKpis
       label: '引用溯源率',
       value: kpis.cited === null ? '—' : pct(kpis.cited),
       hint: '被至少一个 wiki 页面引用的条目占比',
+    },
+    {
+      label: 'Wiki 覆盖率',
+      value: kpis.wikiCovered === null || kpis.wikiCellsWithEntries === 0
+        ? '—'
+        : `${kpis.wikiCovered}/${kpis.wikiCellsWithEntries}`,
+      hint: '有语料的货架格中已有维基页覆盖的格数(缺口即建页方向,详见 lint)',
     },
     {
       label: '待复核',

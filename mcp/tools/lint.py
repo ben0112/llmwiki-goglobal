@@ -51,6 +51,44 @@ _CORPUS_REQUIRED = ("stage", "domain", "genre", "evidence", "origin", "gov_dept"
                     "timeliness", "lifecycle_state", "review_due")
 _CORPUS_LAYERS = ("G", "C", "O", "Z", "X")
 
+
+def wiki_coverage_summary(entry_metas: list[dict], wiki_rollups: list[dict]) -> dict:
+    """有语料的货架格(阶段×大类层)与业务场景,被维基页 rollup 覆盖的比例。"""
+    cell_counts: dict[tuple[str, str], int] = {}
+    scene_counts: dict[str, int] = {}
+    for meta in entry_metas:
+        stage = meta.get("stage")
+        domain = str(meta.get("domain") or "")
+        if stage and domain[:1] in ("G", "C", "O", "Z"):
+            key = (str(stage), domain[:1])
+            cell_counts[key] = cell_counts.get(key, 0) + 1
+        biz = meta.get("business")
+        code = biz.get("code") if isinstance(biz, dict) else None
+        if code:
+            scene_counts[str(code)] = scene_counts.get(str(code), 0) + 1
+
+    page_cells: set[tuple[str, str]] = set()
+    page_scenes: set[str] = set()
+    for rollup in wiki_rollups:
+        layers = {str(d)[:1] for d in rollup.get("domain") or []}
+        for stage in rollup.get("stage") or []:
+            for layer in layers:
+                page_cells.add((str(stage), layer))
+        for code in rollup.get("business") or []:
+            page_scenes.add(str(code))
+
+    cells = sorted(cell_counts)
+    scenes = sorted(scene_counts)
+    return {
+        "cells_total": len(cells),
+        "cells_covered": sum(1 for c in cells if c in page_cells),
+        "cell_gaps": [f"{s}×{layer}({cell_counts[(s, layer)]}条)"
+                      for s, layer in cells if (s, layer) not in page_cells],
+        "scenes_total": len(scenes),
+        "scenes_covered": sum(1 for c in scenes if c in page_scenes),
+        "scene_gaps": [f"{c}({scene_counts[c]}条)" for c in scenes if c not in page_scenes],
+    }
+
 Scope = Literal["all", "wiki", "sources"]
 
 
@@ -131,6 +169,7 @@ class LintHandler:
                 for r in await self.fs.find_uncited_sources(self.kb_id)
             }
             report += "\n\n" + self._format_coverage_ledger(corpus_entries, uncited_paths)
+            report += "\n\n" + self._format_wiki_coverage(corpus_entries, all_docs)
         return report
 
     # ----- selection -------------------------------------------------------
@@ -389,6 +428,37 @@ class LintHandler:
             ))
 
         return issues
+
+    def _format_wiki_coverage(self, entries: list[tuple[dict, dict]], all_docs: list[dict]) -> str:
+        """Wiki 覆盖率:有语料的货架格/业务场景是否已有维基页覆盖(P2A)。
+
+        缺口清单即建维基页的任务单——先按 guide 的分面检索规则拉语料再建页。"""
+        rollups: list[dict] = []
+        for doc in all_docs:
+            if not self._is_wiki_page(doc):
+                continue
+            meta = doc.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except ValueError:
+                    continue
+            rollup = meta.get("facet_rollup") if isinstance(meta, dict) else None
+            if isinstance(rollup, dict):
+                rollups.append(rollup)
+        summary = wiki_coverage_summary([m for _d, m in entries], rollups)
+
+        lines = [
+            f"**Wiki 覆盖率**:货架 {summary['cells_covered']}/{summary['cells_total']} 格有维基页 · "
+            f"业务场景 {summary['scenes_covered']}/{summary['scenes_total']} 个有维基页",
+        ]
+        if summary["cell_gaps"]:
+            lines.append("货架缺口(建页方向): " + " · ".join(summary["cell_gaps"][:10]))
+        if summary["scene_gaps"]:
+            lines.append("场景缺口: " + " · ".join(summary["scene_gaps"][:10]))
+        if not summary["cell_gaps"] and not summary["scene_gaps"] and summary["cells_total"]:
+            lines.append("有语料的货架与场景均已有对应维基页 ✓")
+        return "\n".join(lines)
 
     def _format_coverage_ledger(self, entries: list[tuple[dict, dict]], uncited_paths: set[str]) -> str:
         """货架覆盖率账本 + 质量 KPI (spec §5.4) over classified corpus entries."""

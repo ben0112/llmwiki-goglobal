@@ -81,3 +81,26 @@ def test_facet_rollup_helper_copies_in_sync():
     api_text = api_copy.read_text(encoding="utf-8")
     # api 侧在共同部分之后追加批量刷新;共同前缀必须逐字一致
     assert api_text.startswith(mcp_text.rstrip() + "\n")
+
+
+def test_wiki_coverage_summary():
+    """P2A:有语料的货架格/业务场景 × 维基页 rollup 的覆盖与缺口。"""
+    from tools.lint import wiki_coverage_summary
+
+    entries = [
+        {"stage": "S2", "domain": "G1", "business": {"code": "B1.2"}},
+        {"stage": "S2", "domain": "G1"},
+        {"stage": "S3", "domain": "C2", "business": {"code": "B2.1"}},
+    ]
+    rollups = [{"stage": ["S2"], "domain": ["G1"], "business": ["B1.2"]}]
+    s = wiki_coverage_summary(entries, rollups)
+    assert s["cells_total"] == 2 and s["cells_covered"] == 1
+    assert s["cell_gaps"] == ["S3×C(1条)"]
+    assert s["scenes_total"] == 2 and s["scenes_covered"] == 1
+    assert s["scene_gaps"] == ["B2.1(1条)"]
+
+    # 无维基页 → 全缺口;无语料 → 全零
+    s2 = wiki_coverage_summary(entries, [])
+    assert s2["cells_covered"] == 0 and len(s2["cell_gaps"]) == 2
+    s3 = wiki_coverage_summary([], rollups)
+    assert s3["cells_total"] == 0 and s3["scene_gaps"] == []

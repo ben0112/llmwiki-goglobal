@@ -342,12 +342,35 @@ export interface CorpusKpis {
   /** 引用溯源率: entries cited by at least one wiki page (null until graph loads). */
   cited: number | null
   pendingReview: number
+  /** Wiki 覆盖率: 有语料的货架格中被维基页 facet_rollup 覆盖的格数(P2A)。 */
+  wikiCovered: number | null
+  wikiCellsWithEntries: number
+}
+
+export interface WikiRollup {
+  stage: string[]
+  domain: string[]
+}
+
+/** 从文档列表提取维基页的 facet_rollup(引用条目自动聚合的八维范围)。 */
+export function collectWikiRollups(documents: DocumentListItem[]): WikiRollup[] {
+  const out: WikiRollup[] = []
+  for (const d of documents) {
+    if (!d.path.startsWith('/wiki/')) continue
+    const meta = d.metadata as Record<string, unknown> | null
+    const r = meta?.facet_rollup as { stage?: string[]; domain?: string[] } | undefined
+    if (r && ((r.stage?.length ?? 0) > 0 || (r.domain?.length ?? 0) > 0)) {
+      out.push({ stage: r.stage ?? [], domain: r.domain ?? [] })
+    }
+  }
+  return out
 }
 
 export function computeKpis(
   entries: CorpusEntry[],
   citedDocIds: Set<string> | null,
   todayIso?: string,
+  wikiRollups?: WikiRollup[] | null,
 ): CorpusKpis {
   const today = todayIso ?? new Date().toISOString().slice(0, 10)
   let completeness = 0
@@ -367,6 +390,23 @@ export function computeKpis(
   const grid = buildCoverageGrid(entries)
   const shelfTotal = STAGES.length * 4 // X 兜底 excluded — it is not a target shelf
   const shelfFilled = shelfTotal - grid.emptyCells.length
+
+  // Wiki 覆盖率:有语料的格子(主阶段×大类层)里,有维基页 rollup 覆盖的格数
+  const entryCells = new Set<string>()
+  for (const { meta } of entries) {
+    const layer = (meta.domain ?? '')[0]
+    if (meta.stage && 'GCOZ'.includes(layer)) entryCells.add(`${meta.stage}|${layer}`)
+  }
+  let wikiCovered: number | null = null
+  if (wikiRollups) {
+    const pageCells = new Set<string>()
+    for (const r of wikiRollups) {
+      const layers = new Set(r.domain.map((d) => d[0]))
+      for (const s of r.stage) for (const layer of layers) pageCells.add(`${s}|${layer}`)
+    }
+    wikiCovered = [...entryCells].filter((c) => pageCells.has(c)).length
+  }
+
   return {
     total: entries.length,
     completeness,
@@ -375,6 +415,8 @@ export function computeKpis(
     onTime,
     cited: citedDocIds ? cited : null,
     pendingReview,
+    wikiCovered,
+    wikiCellsWithEntries: entryCells.size,
   }
 }
 
