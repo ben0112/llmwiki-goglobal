@@ -285,6 +285,8 @@ async def upload_archive(
         raise HTTPException(status_code=400, detail="仅支持 zip / tar / tar.gz / tgz 压缩包")
 
     data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="压缩包超过 1GB 上限")
     try:
         entries = await asyncio.to_thread(extract_entries, file.filename, data)
     except ArchiveError as e:

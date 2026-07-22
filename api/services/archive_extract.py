@@ -17,8 +17,14 @@ import tarfile
 import zipfile
 
 MAX_ENTRIES = 500
-MAX_FILE_BYTES = 100 * 1024 * 1024
-MAX_TOTAL_BYTES = 500 * 1024 * 1024
+# 与 routes/local_upload.MAX_UPLOAD_BYTES 同口径:单文件 1GiB,总量放宽一倍
+MAX_FILE_BYTES = 1_073_741_824
+MAX_TOTAL_BYTES = 2 * 1_073_741_824
+
+
+def _fmt_size(n: int) -> str:
+    gib = 1024 ** 3
+    return f"{n // gib}GB" if n >= gib and n % gib == 0 else f"{n // (1024 ** 2)}MB"
 
 _JUNK_BASENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 _ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz")
@@ -91,10 +97,10 @@ def _check_caps(count: int, size: int, total: int) -> int:
     if count > MAX_ENTRIES:
         raise ArchiveError(f"压缩包内文件过多(上限 {MAX_ENTRIES} 个)")
     if size > MAX_FILE_BYTES:
-        raise ArchiveError(f"包内单个文件超过 {MAX_FILE_BYTES // 1024 // 1024}MB 上限")
+        raise ArchiveError(f"包内单个文件超过 {_fmt_size(MAX_FILE_BYTES)} 上限")
     total += size
     if total > MAX_TOTAL_BYTES:
-        raise ArchiveError(f"解压总量超过 {MAX_TOTAL_BYTES // 1024 // 1024}MB 上限")
+        raise ArchiveError(f"解压总量超过 {_fmt_size(MAX_TOTAL_BYTES)} 上限")
     return total
 
 
