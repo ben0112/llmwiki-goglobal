@@ -745,13 +745,15 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     // 压缩包本身不入库,跳过去重(包内条目由服务端按同口径去重)。
     const namesByPath = new Map<string, Set<string>>()
     for (const d of documents) {
-      if (d.archived) continue
+      if (d.archived || d.status === 'failed') continue   // 失败文件允许同名重传重试
       const set = namesByPath.get(d.path) ?? new Set<string>()
       set.add(d.filename.toLowerCase())
       namesByPath.set(d.path, set)
     }
     const existingHashes = new Set(
-      documents.filter((d) => !d.archived && d.content_hash).map((d) => d.content_hash as string),
+      // failed 文档不参与去重:同内容重传应被允许(比如修复环境后重试)
+      documents.filter((d) => !d.archived && d.status !== 'failed' && d.content_hash)
+        .map((d) => d.content_hash as string),
     )
     const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024      // 1 GiB,与后端一致
     const HASH_MAX_BYTES = 64 * 1024 * 1024          // 超过则跳过浏览器内容哈希(避免整读进内存)

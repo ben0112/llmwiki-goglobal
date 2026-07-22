@@ -240,6 +240,14 @@ export function FilesGrid({
     [activeDocId, sourceDocs],
   )
 
+  // 未成功导入(提取失败)统计:跨全部文件夹;清单点击即打开失败详情
+  const failedDocs = React.useMemo(
+    () => sourceDocs.filter((d) => d.status === 'failed'),
+    [sourceDocs],
+  )
+  const [showFailedOnly, setShowFailedOnly] = React.useState(false)
+  React.useEffect(() => { if (failedDocs.length === 0) setShowFailedOnly(false) }, [failedDocs.length])
+
   const isBrowsing = !activeDoc
 
   // Sync note title when activeDoc changes
@@ -660,7 +668,37 @@ export function FilesGrid({
           <ContextMenu>
             <ContextMenuTrigger asChild>
               <div className="h-full overflow-y-auto p-4">
-                {isEmpty ? (
+                {failedDocs.length > 0 && (
+                  <div className="mb-3 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
+                    <span className="text-destructive">未成功导入 {failedDocs.length} 个文件</span>
+                    <button
+                      onClick={() => setShowFailedOnly((v) => !v)}
+                      className="rounded-md border border-border px-2 py-0.5 hover:bg-accent transition-colors cursor-pointer"
+                    >
+                      {showFailedOnly ? '返回浏览' : '查看清单'}
+                    </button>
+                    <span className="text-muted-foreground/60">重启服务会自动重试;点击条目可查看失败原因</span>
+                  </div>
+                )}
+                {showFailedOnly ? (
+                  <div className="space-y-1.5">
+                    {failedDocs.map((doc) => (
+                      <button
+                        key={doc.id}
+                        onClick={() => openDoc(doc)}
+                        className="block w-full rounded-md border border-border px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
+                      >
+                        <div className="flex items-baseline gap-2 min-w-0">
+                          <span className="truncate text-[13px] font-medium">{doc.filename}</span>
+                          <span className="shrink-0 text-[11px] text-muted-foreground">{doc.path}</span>
+                        </div>
+                        {doc.error_message && (
+                          <div className="mt-0.5 truncate text-[11px] text-destructive/80">{doc.error_message}</div>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                ) : isEmpty ? (
                   <EmptyState isRoot={currentPath === '/'} onUpload={handleUploadHere} onCreateNote={handleCreateNoteHere} />
                 ) : (
                   <div className="min-h-full">

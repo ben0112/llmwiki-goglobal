@@ -208,17 +208,17 @@ class SQLiteDocumentRepository:
         self._db = db
 
     async def list_by_kb(self, kb_id: str, *, path: str | None = None, archived: bool = False) -> list[dict]:
+        # 不过滤 failed:失败文件要在前端可见(统计条/清单/失败详情),
+        # 否则用户既看不到失败原因,也无法删除或重传这批文件
         if path:
             cursor = await self._db.execute(
                 f"SELECT {_DOC_COLUMNS} FROM documents "
-                "WHERE path = ? AND status != 'failed' "
-                "ORDER BY filename",
+                "WHERE path = ? ORDER BY filename",
                 (path,),
             )
         else:
             cursor = await self._db.execute(
-                f"SELECT {_DOC_COLUMNS} FROM documents "
-                "WHERE status != 'failed' ORDER BY filename",
+                f"SELECT {_DOC_COLUMNS} FROM documents ORDER BY filename",
             )
         rows = await cursor.fetchall()
         return rows_to_dicts(cursor, rows)

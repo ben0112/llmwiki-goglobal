@@ -205,9 +205,11 @@ export function KBSidenav({
 
   // 计数只算原始文件:corpus/ 下由分类流水线生成的语料条目不计入,
   // 避免与语料库视图的条目数口径混淆(条目文件在文件网格中仍可浏览)
-  const sourceCount = sourceDocs.filter(
+  const rawDocs = sourceDocs.filter(
     (d) => !(d.relative_path?.startsWith('corpus/') || d.path.startsWith('/corpus/')),
-  ).length
+  )
+  const sourceCount = rawDocs.length
+  const failedCount = rawDocs.filter((d) => d.status === 'failed').length
 
   return (
     <div
@@ -519,6 +521,14 @@ export function KBSidenav({
           >
             <Library className="size-3.5" />
             <span className="flex-1 text-left">原始文件</span>
+            {failedCount > 0 && (
+              <span
+                title={`${failedCount} 个文件未成功导入 — 打开文件视图查看清单与原因`}
+                className="text-[10px] font-medium text-destructive/70"
+              >
+                {failedCount} 失败
+              </span>
+            )}
             {sourceCount > 0 && (
               <span className="text-[10px] text-muted-foreground/30">{sourceCount}</span>
             )}
