@@ -14,6 +14,7 @@ interface PipelineStatus {
   progress: { done: number; total: number } | null
   auto: { enabled: boolean; interval: number }
   counts: { pending: number; imported: number; imported_today: number; excluded: number; failed: number }
+  last_run?: { error?: string; stopped?: boolean } | null
 }
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
@@ -81,6 +82,11 @@ export function PipelineStrip() {
       <span>今日入库 <span className="tabular-nums text-foreground">{counts.imported_today}</span></span>
       {counts.failed > 0 && (
         <span className="text-destructive">失败 <span className="tabular-nums">{counts.failed}</span></span>
+      )}
+      {!status.running && status.last_run?.error && (
+        <span className="text-destructive truncate max-w-64" title={status.last_run.error}>
+          上轮异常:{status.last_run.error}
+        </span>
       )}
       <span className="text-muted-foreground/60">自动分类{status.auto.enabled ? '已开启' : '未开启'}</span>
       <div className="flex-1" />

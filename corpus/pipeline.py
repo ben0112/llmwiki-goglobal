@@ -52,7 +52,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
     # check_same_thread=False: 导入步骤在 to_thread 里落盘+写库,访问是顺序的
     # (同一时刻只有一个使用者),放开 SQLite 的线程绑定检查是安全的。
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA busy_timeout=10000")
+    # 与 API 主连接/MCP 同口径 30s:大工作区里恢复处理、MCP 建维基等
+    # 写事务可能持锁超过 10s,过短会让整轮启动直接 database is locked
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -140,9 +142,13 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
             raise RuntimeError("工作区未初始化(缺 workspace 记录)")
         user_id = user_row[0]
 
-        # 顺手清理孤儿状态行(文档已被删除/重建)
-        conn.execute("DELETE FROM corpus_pipeline WHERE doc_id NOT IN (SELECT id FROM documents)")
-        conn.commit()
+        # 顺手清理孤儿状态行(文档已被删除/重建)。纯家务:拿不到写锁就
+        # 留给下一轮,绝不因此让整轮启动失败(生产曾因并发写持锁在此崩掉)
+        try:
+            conn.execute("DELETE FROM corpus_pipeline WHERE doc_id NOT IN (SELECT id FROM documents)")
+            conn.commit()
+        except sqlite3.OperationalError:
+            conn.rollback()
         candidates = select_candidates(conn, limit)
         result.picked = len(candidates)
 
@@ -188,7 +194,10 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
                     result.review += 1
             except (LLMError, RuntimeError, OSError, sqlite3.Error) as e:
                 msg = f"{type(e).__name__}: {e}"
-                await _set(doc["id"], "failed", error=msg[:500])
+                try:
+                    await _set(doc["id"], "failed", error=msg[:500])
+                except sqlite3.Error:
+                    pass   # 标记失败本身也可能碰锁;宁可下轮重试,不拖垮整轮
                 result.failed += 1
                 result.errors.append((relpath, msg[:200]))
             finally:

@@ -227,6 +227,45 @@ def test_run_batch_llm_calls_are_concurrent(tmp_path, monkeypatch):
     assert peak == 2                              # 串行实现下 peak 只会是 1
 
 
+def test_connect_busy_timeout_30s(tmp_path):
+    """与 API 主连接/MCP 同口径:10s 在生产大工作区不够,曾整轮启动即崩。"""
+    from corpus.pipeline import _connect
+    conn = _connect(str(tmp_path / "t.db"))
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        conn.close()
+
+
+def test_run_batch_survives_locked_cleanup(tmp_path, monkeypatch):
+    """孤儿清理 DELETE 碰上 database is locked 应跳过,而不是让整轮失败。"""
+    import corpus.pipeline as pl
+    from corpus.llm import LLMConfig
+
+    ws = _init_ws(tmp_path)
+    good = _insert_source(ws, "0001_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
+
+    real_connect = pl._connect
+
+    class FlakyConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            if sql.startswith("DELETE FROM corpus_pipeline"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(pl, "_connect", lambda p: FlakyConn(real_connect(p)))
+
+    result = asyncio.run(pl.run_batch(ws, LLMConfig(base_url="mock")))
+    assert result.picked == 1 and result.imported == 1 and result.failed == 0
+    assert _states(ws)[good][0] == "imported"
+
+
 def test_run_batch_reports_progress_and_today_count(tmp_path):
     from corpus.llm import LLMConfig
     from corpus.pipeline import run_batch, status_counts, _connect

@@ -165,10 +165,15 @@ def start_run(state, workspace: Path, limit: int | None = None) -> dict:
             prog = getattr(state, "corpus_pipeline_progress", None) or {}
             state.corpus_pipeline_last_run = {"stopped": True, **prog}
             raise
+        except Exception as e:
+            # 记进 last_run 让状态条可见,再抛给 spawn_logged 落日志
+            state.corpus_pipeline_last_run = {"error": f"{type(e).__name__}: {e}"[:300]}
+            raise
         finally:
             state.corpus_pipeline_progress = None
 
-    state.corpus_pipeline_task = asyncio.create_task(_run())
+    from infra.tasks import spawn_logged
+    state.corpus_pipeline_task = spawn_logged(_run(), "corpus-pipeline")
     return {"started": True, "running": True,
             "concurrency": cfg.effective_concurrency}
 
