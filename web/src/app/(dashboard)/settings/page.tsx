@@ -148,6 +148,7 @@ function CorpusPipelineSection() {
   const [model, setModel] = React.useState('')
   const [apiKey, setApiKey] = React.useState('')
   const [concurrency, setConcurrency] = React.useState('')
+  const [autoInterval, setAutoInterval] = React.useState('30')
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
   const [notice, setNotice] = React.useState<{ ok: boolean; text: string } | null>(null)
@@ -160,6 +161,7 @@ function CorpusPipelineSection() {
         setBaseUrl(c.base_url)
         setModel(c.model)
         setConcurrency(String(c.concurrency || ''))
+        setAutoInterval(String(c.auto.interval))
       })
       .catch(() => {})
   }, [token])
@@ -174,6 +176,7 @@ function CorpusPipelineSection() {
       const body: Record<string, unknown> = {
         base_url: baseUrl.trim(), model: model.trim(),
         concurrency: concurrency === '' ? 0 : Math.max(0, parseInt(concurrency, 10) || 0),
+        auto_interval: Math.max(30, parseInt(autoInterval, 10) || 30),
         ...extra,
       }
       if (apiKey !== '') body.api_key = apiKey
@@ -182,6 +185,7 @@ function CorpusPipelineSection() {
       })
       setCfg(c)
       setApiKey('')
+      setAutoInterval(String(c.auto.interval))
       setNotice({ ok: true, text: '设置已保存' })
     } catch {
       setNotice({ ok: false, text: '保存失败' })
@@ -241,11 +245,22 @@ function CorpusPipelineSection() {
             className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50">
             保存设置
           </button>
-          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input type="checkbox" checked={cfg.auto.enabled}
-              onChange={(e) => save({ auto_enabled: e.target.checked })} />
-            自动分类(每 {cfg.auto.interval}s 检查待分类队列,有积压即自动处理)
-          </label>
+          <div className="flex items-center gap-1.5 text-sm select-none">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={cfg.auto.enabled}
+                onChange={(e) => save({ auto_enabled: e.target.checked })} />
+              自动分类,每
+            </label>
+            <input value={autoInterval} onChange={(e) => setAutoInterval(e.target.value)}
+              onBlur={() => {
+                const v = Math.max(30, parseInt(autoInterval, 10) || 30)
+                setAutoInterval(String(v))
+                if (v !== cfg.auto.interval) save({ auto_interval: v })
+              }}
+              inputMode="numeric"
+              className="w-14 rounded-md border border-border bg-background px-2 py-0.5 text-sm text-center outline-none focus:ring-1 focus:ring-ring" />
+            <span>s 检查待分类队列,有积压即自动处理(最低 30s)</span>
+          </div>
         </div>
         {notice && (
           <p className={`text-xs ${notice.ok ? 'text-emerald-600' : 'text-destructive'}`}>{notice.text}</p>
