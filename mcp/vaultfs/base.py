@@ -109,6 +109,12 @@ class VaultFS(ABC):
     @abstractmethod
     async def propagate_staleness(self, doc_id: str) -> None: ...
 
+    async def mark_cites_stale(self, target_doc_ids: list[str]) -> int:
+        """把通过 cites 引用这些文档的维基页面标记为待复查(stale)。
+
+        语料条目复核变更/复审到期时的联动入口;返回新标记的页面数。"""
+        return 0
+
     @abstractmethod
     async def get_backlinks(self, doc_id: str) -> list[dict]: ...
 

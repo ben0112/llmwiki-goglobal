@@ -287,8 +287,9 @@ class SQLiteDocumentRepository:
     @_serialized
     async def update_content(self, doc_id: str, user_id: str, content: str) -> dict | None:
         cursor = await self._db.execute(
+            # 内容更新即视为已复查:清除待复查标记(与 mcp/vaultfs 同口径)
             "UPDATE documents SET content = ?, version = version + 1, "
-            "updated_at = datetime('now') WHERE id = ? "
+            "updated_at = datetime('now'), stale_since = NULL WHERE id = ? "
             "RETURNING id, content, version",
             (content, doc_id),
         )

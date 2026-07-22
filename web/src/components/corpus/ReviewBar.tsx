@@ -5,6 +5,7 @@
 
 import * as React from 'react'
 import { Check, Pencil, Trash2 } from 'lucide-react'
+import { toast } from 'sonner'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
 import type { CorpusMeta } from '@/lib/corpus'
@@ -36,10 +37,15 @@ export async function reviewEntry(
   token: string, docId: string, action: 'approve' | 'update' | 'exclude',
   labels?: Record<string, unknown>, note?: string,
 ) {
-  return apiFetch(`/v1/corpus/entries/${docId}/review`, token, {
+  const result = await apiFetch<{ stale_pages?: number }>(`/v1/corpus/entries/${docId}/review`, token, {
     method: 'POST',
     body: JSON.stringify({ action, labels, note: note || '' }),
   })
+  // 改标/剔除联动:引用该条目的维基页已标记待复查
+  if (result?.stale_pages) {
+    toast.info(`${result.stale_pages} 个引用该条目的维基页面已标记待复查`)
+  }
+  return result
 }
 
 export function ReviewBadges({ meta }: { meta: CorpusMeta }) {

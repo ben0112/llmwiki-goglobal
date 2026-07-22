@@ -505,6 +505,11 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
   const eyebrow = React.useMemo(() => pathEyebrow(path), [path])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
+  // 待复查标记(语料复核变更/复审到期联动置位;页面被编辑保存后清除)
+  const staleSince = React.useMemo(() => {
+    if (!documentId || !documents) return null
+    return documents.find((d) => d.id === documentId)?.stale_since ?? null
+  }, [documentId, documents])
   const [copied, setCopied] = React.useState(false)
 
   const handleCopy = React.useCallback(() => {
@@ -866,6 +871,11 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
               </div>
               {description && (
                 <p className="text-[15px] text-muted-foreground mt-2.5 leading-relaxed">{description}</p>
+              )}
+              {staleSince && (
+                <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[13px] text-amber-700 dark:text-amber-400">
+                  本页引用的语料或页面自 {staleSince.slice(0, 10)} 起已变更(条目改标/剔除或复审到期),建议复查本页内容;编辑保存后此提示自动消除。
+                </div>
               )}
             </div>
             <div className="wiki-content text-[15px] leading-relaxed" ref={markdownRef}>

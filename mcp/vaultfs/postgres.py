@@ -172,7 +172,9 @@ class PostgresVaultFS(VaultFS):
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         import json as _json
-        sets = ["content = $1", "version = COALESCE(version, 0) + 1", "updated_at = now()"]
+        # 内容更新即视为已复查,清除待复查标记(stale 只在这里被清除)
+        sets = ["content = $1", "version = COALESCE(version, 0) + 1",
+                "updated_at = now()", "stale_since = NULL"]
         args: list = [content, doc_id, self.user_id]
         idx = 4
 
@@ -410,6 +412,22 @@ class PostgresVaultFS(VaultFS):
             ") AND stale_since IS NULL AND user_id = $2",
             doc_id, self.user_id,
         )
+
+    async def mark_cites_stale(self, target_doc_ids: list[str]) -> int:
+        if not target_doc_ids:
+            return 0
+        result = await service_execute(
+            "UPDATE documents SET stale_since = now() "
+            "WHERE id IN ("
+            "  SELECT source_document_id FROM document_references "
+            "  WHERE reference_type = 'cites' AND target_document_id = ANY($1::uuid[])"
+            ") AND source_kind = 'wiki' AND stale_since IS NULL AND user_id = $2",
+            target_doc_ids, self.user_id,
+        )
+        try:
+            return int(str(result).split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
     async def get_backlinks(self, doc_id: str) -> list[dict]:
         return await scoped_query(

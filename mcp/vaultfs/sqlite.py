@@ -325,7 +325,9 @@ class SqliteVaultFS(VaultFS):
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         db = self._db_or_raise()
-        sets = ["content = ?", "version = COALESCE(version, 0) + 1", "updated_at = datetime('now')"]
+        # 内容更新即视为已复查,清除待复查标记(stale 只在这里被清除)
+        sets = ["content = ?", "version = COALESCE(version, 0) + 1",
+                "updated_at = datetime('now')", "stale_since = NULL"]
         args: list = [content]
 
         if title is not None:
@@ -614,6 +616,22 @@ class SqliteVaultFS(VaultFS):
             (doc_id,),
         )
         await db.commit()
+
+    async def mark_cites_stale(self, target_doc_ids: list[str]) -> int:
+        if not target_doc_ids:
+            return 0
+        db = self._db_or_raise()
+        placeholders = ",".join("?" for _ in target_doc_ids)
+        cursor = await db.execute(
+            "UPDATE documents SET stale_since = datetime('now') "
+            "WHERE id IN ("
+            "  SELECT source_document_id FROM document_references "
+            f"  WHERE reference_type = 'cites' AND target_document_id IN ({placeholders})"
+            ") AND source_kind = 'wiki' AND stale_since IS NULL",
+            target_doc_ids,
+        )
+        await db.commit()
+        return cursor.rowcount
 
     async def get_backlinks(self, doc_id: str) -> list[dict]:
         db = self._db_or_raise()

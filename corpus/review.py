@@ -101,6 +101,26 @@ def _rederive_business(rec: EntryRecord, table: CodeTable) -> None:
         rec.business_priority = priority
 
 
+def _citing_wiki_pages(conn: sqlite3.Connection, doc_id: str) -> list[str]:
+    """引用(cites)该条目的维基页面 id。条目删除/换架会级联清边,须先反查。"""
+    return [r[0] for r in conn.execute(
+        "SELECT r.source_document_id FROM document_references r "
+        "JOIN documents d ON d.id = r.source_document_id "
+        "WHERE r.reference_type = 'cites' AND r.target_document_id = ? "
+        "AND d.source_kind = 'wiki'", (doc_id,))]
+
+
+def _mark_pages_stale(conn: sqlite3.Connection, page_ids: list[str]) -> int:
+    """把页面标记为待复查(stale);已标记的不重复计时。返回新标记数。"""
+    if not page_ids:
+        return 0
+    placeholders = ",".join("?" for _ in page_ids)
+    cur = conn.execute(
+        f"UPDATE documents SET stale_since = datetime('now') "
+        f"WHERE id IN ({placeholders}) AND stale_since IS NULL", page_ids)
+    return cur.rowcount
+
+
 def apply_review(workspace: Path, doc_id: str, action: str,
                  labels: dict | None = None, note: str = "",
                  version: str = DEFAULT_VERSION) -> dict:
@@ -111,6 +131,8 @@ def apply_review(workspace: Path, doc_id: str, action: str,
     conn = sqlite3.connect(str(workspace / ".llmwiki" / "index.db"))
     conn.execute("PRAGMA busy_timeout=10000")
     try:
+        # 改标/剔除会改变条目口径:引用它的维基页面需要标记复查
+        citing = _citing_wiki_pages(conn, doc_id) if action in ("update", "exclude") else []
         row = conn.execute(
             "SELECT relative_path, title, metadata, user_id FROM documents WHERE id = ?",
             (doc_id,)).fetchone()
@@ -141,9 +163,11 @@ def apply_review(workspace: Path, doc_id: str, action: str,
                         "error=excluded.error, updated_at=excluded.updated_at",
                         (src_row[0], f"人工不收录: {note[:200]}", meta.get("entry_id", ""),
                          audit["at"]))
+            stale_pages = _mark_pages_stale(conn, citing)
             conn.commit()
             (workspace / old_rel).unlink(missing_ok=True)
-            return {"action": "exclude", "entry_id": meta.get("entry_id", "")}
+            return {"action": "exclude", "entry_id": meta.get("entry_id", ""),
+                    "stale_pages": stale_pages}
 
         rec = record_from_metadata(meta, title or "")
         if action == "update" and labels:
@@ -186,9 +210,11 @@ def apply_review(workspace: Path, doc_id: str, action: str,
         new_meta["review"] = ([*history, audit])[-10:]
         conn.execute("UPDATE documents SET metadata = ? WHERE relative_path = ?",
                      (json.dumps(new_meta, ensure_ascii=False), new_rel))
+        # 仅"改标"联动复查(approve 无口径变化);labels 为空的 update 同 approve
+        stale_pages = _mark_pages_stale(conn, citing) if (action == "update" and labels) else 0
         conn.commit()
         return {"action": action, "entry_id": rec.entry_id, "relative_path": new_rel,
-                "moved": new_rel != old_rel}
+                "moved": new_rel != old_rel, "stale_pages": stale_pages}
     finally:
         conn.close()
 

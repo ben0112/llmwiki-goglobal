@@ -116,3 +116,55 @@ def test_codetable_options_shape():
     assert {o["code"] for o in opts["stages"]} == {"S0", "S1", "S2", "S3", "S4"}
     assert any(o["code"] == "R1" for o in opts["rules"])
     assert len(opts["domains"]) == 20 and len(opts["timeliness"]) == 3
+
+
+def _add_citing_wiki_page(ws: Path, entry_doc_id: str, page_id: str = "wpage1") -> None:
+    """插入一个引用该条目的维基页面(cites 边)。"""
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    conn.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+        "source_kind, file_type, status, tags) "
+        "VALUES (?, 'u1', 'page.md', '页', '/wiki/', ?, 'wiki', 'md', 'ready', '[]')",
+        (page_id, f"wiki/{page_id}.md"))
+    conn.execute(
+        "INSERT INTO document_references (source_document_id, target_document_id, reference_type) "
+        "VALUES (?, ?, 'cites')", (page_id, entry_doc_id))
+    conn.commit()
+    conn.close()
+
+
+def _page_stale(ws: Path, page_id: str = "wpage1"):
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    row = conn.execute("SELECT stale_since FROM documents WHERE id = ?", (page_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def test_relabel_marks_citing_wiki_pages_stale(tmp_path):
+    """改标联动:引用该条目的维基页置 stale_since,approve 不置。"""
+    from corpus.review import apply_review
+
+    ws = _init_ws(tmp_path)
+    _insert_source(ws, "0001_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
+    doc_id, _ = _import_one(ws)
+    _add_citing_wiki_page(ws, doc_id)
+
+    out = apply_review(ws, doc_id, "approve")
+    assert out["stale_pages"] == 0 and _page_stale(ws) is None
+
+    out = apply_review(ws, doc_id, "update", labels={"stage": "S3"})
+    assert out["stale_pages"] == 1
+    assert _page_stale(ws) is not None
+
+
+def test_exclude_marks_citing_wiki_pages_stale(tmp_path):
+    from corpus.review import apply_review
+
+    ws = _init_ws(tmp_path)
+    _insert_source(ws, "0001_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
+    doc_id, _ = _import_one(ws)
+    _add_citing_wiki_page(ws, doc_id, page_id="wpage2")
+
+    out = apply_review(ws, doc_id, "exclude", note="口径不符")
+    assert out["stale_pages"] == 1
+    assert _page_stale(ws, "wpage2") is not None

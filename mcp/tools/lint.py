@@ -99,6 +99,7 @@ class LintHandler:
 
         issues: list[LintIssue] = []
         corpus_entries: list[tuple[dict, dict]] = []
+        overdue_entry_ids: list[str] = []
         for doc in docs:
             if self._is_wiki_page(doc):
                 issues.extend(await self._lint_wiki_page(doc, ctx, include_graph))
@@ -106,7 +107,19 @@ class LintHandler:
                 meta = self._corpus_meta(doc)
                 if meta is not None:
                     corpus_entries.append((doc, meta))
-                    issues.extend(self._lint_corpus_entry(doc, meta))
+                    entry_issues = self._lint_corpus_entry(doc, meta)
+                    issues.extend(entry_issues)
+                    if any(i.code == "corpus-review-overdue" for i in entry_issues):
+                        overdue_entry_ids.append(str(doc["id"]))
+
+        # 复审到期联动:到期条目的引用维基页标记待复查(search query="stale" 可查)
+        if overdue_entry_ids:
+            flagged = await self.fs.mark_cites_stale(overdue_entry_ids)
+            if flagged:
+                issues.append(LintIssue(
+                    "warn", "stale-pages-flagged", f"{len(overdue_entry_ids)} 个到期条目",
+                    f"已把 {flagged} 个引用这些条目的维基页标记为待复查 — search(mode=\"references\", query=\"stale\") 查看",
+                ))
 
         if include_graph:
             issues.extend(await self._lint_kb_wide(path, scope))
