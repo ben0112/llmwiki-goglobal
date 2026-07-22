@@ -702,6 +702,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       const upload = new Upload(file, {
         endpoint: `${apiUrl()}/v1/uploads`,
         retryDelays: [0, 1000, 3000, 5000],
+        // 50MB 分块:1GB 上限下单个 PATCH 不至于撑爆反向代理 body 限制
+        chunkSize: 50 * 1024 * 1024,
         metadata: { filename: file.name, knowledge_base_id: kbId, path: targetPath },
         headers: { Authorization: `Bearer ${t}` },
         onProgress: (sent, total) => setUploadProgress(uploadId, total > 0 ? sent / total : 0),
@@ -725,8 +727,10 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     const destOf = (file: File): string => {
       const rel = relOf(file)
       if (!rel || !rel.includes('/')) return targetPath
-      const dir = rel.split('/').slice(0, -1).join('/')
-      return targetPath.replace(/\/$/, '') + '/' + dir + '/'
+      // 剥离最外层文件夹名:保留内部结构、不额外新建顶层目录——
+      // 内容落在当前所在文件夹(或根)下,避免重复嵌套(如 A/A/…)
+      const dir = rel.split('/').slice(1, -1).join('/')
+      return dir ? targetPath.replace(/\/$/, '') + '/' + dir + '/' : targetPath
     }
     const JUNK = new Set(['.ds_store', 'thumbs.db', 'desktop.ini'])
     const isJunk = (file: File): boolean =>
@@ -749,15 +753,22 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     const existingHashes = new Set(
       documents.filter((d) => !d.archived && d.content_hash).map((d) => d.content_hash as string),
     )
+    const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024      // 1 GiB,与后端一致
+    const HASH_MAX_BYTES = 64 * 1024 * 1024          // 超过则跳过浏览器内容哈希(避免整读进内存)
     const canHash = process.env.NEXT_PUBLIC_MODE === 'local'
       && typeof crypto !== 'undefined' && !!crypto.subtle
     const skippedByName: string[] = []
     const skippedByContent: string[] = []
+    const oversizeNames: string[] = []
     const batchHashes = new Set<string>()
     const batchNames = new Set<string>()
     const toUpload: File[] = []
     for (const file of files) {
       if (isJunk(file)) continue // 系统垃圾文件静默丢弃
+      if (file.size > MAX_UPLOAD_BYTES) {
+        oversizeNames.push(file.name)
+        continue
+      }
       if (isArchive(file.name)) {
         toUpload.push(file)
         continue
@@ -768,7 +779,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         skippedByName.push(file.name)
         continue
       }
-      if (canHash) {
+      if (canHash && file.size <= HASH_MAX_BYTES) {
         try {
           const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
           const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -784,13 +795,67 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     }
     const skippedTotal = skippedByName.length + skippedByContent.length
     if (toUpload.length === 0) {
-      if (skippedTotal > 0) {
-        const names = [...skippedByName, ...skippedByContent]
-        toast.info(`未上传:${skippedTotal} 个文件均为重复文件(重名 ${skippedByName.length} 个,内容相同 ${skippedByContent.length} 个)`, {
+      if (skippedTotal > 0 || oversizeNames.length > 0) {
+        const names = [...skippedByName, ...skippedByContent, ...oversizeNames]
+        const parts = [
+          skippedByName.length > 0 ? `重名 ${skippedByName.length} 个` : '',
+          skippedByContent.length > 0 ? `内容相同 ${skippedByContent.length} 个` : '',
+          oversizeNames.length > 0 ? `超过 1GB 上限 ${oversizeNames.length} 个` : '',
+        ].filter(Boolean).join(',')
+        toast.info(`未上传:${names.length} 个文件被跳过(${parts})`, {
           description: names.slice(0, 5).join('、') + (names.length > 5 ? ` 等 ${names.length} 个` : ''),
         })
       }
       return
+    }
+
+    // 断点续传:大文件分块上传,中断后凭 upload_id 查询进度续传;
+    // upload_id 存 localStorage,刷新页面后重传同一文件也能接着传
+    const RESUMABLE_THRESHOLD = 32 * 1024 * 1024
+    const uploadResumable = async (file: File, dest: string, uploadId: string): Promise<DocumentListItem> => {
+      const storeKey = `lwup:${kbId}:${dest}:${file.name}:${file.size}:${file.lastModified}`
+      let id: string | null = localStorage.getItem(storeKey)
+      let offset = 0
+      if (id) {
+        try {
+          offset = (await apiFetch<{ offset: number }>(`/v1/upload/resumable/${id}`, t)).offset
+        } catch { id = null }
+      }
+      if (!id) {
+        const init = await apiFetch<{ upload_id: string; offset: number }>('/v1/upload/resumable', t, {
+          method: 'POST',
+          body: JSON.stringify({ filename: file.name, path: dest, size: file.size }),
+        })
+        id = init.upload_id
+        offset = init.offset
+        localStorage.setItem(storeKey, id)
+      }
+      const CHUNK = 8 * 1024 * 1024
+      let failures = 0
+      while (offset < file.size) {
+        try {
+          const res = await fetch(`${apiUrl()}/v1/upload/resumable/${id}?offset=${offset}`, {
+            method: 'PATCH',
+            body: file.slice(offset, offset + CHUNK),
+          })
+          if (res.status === 409) { offset = (await res.json()).offset; continue }
+          if (!res.ok) throw new Error(`分块上传失败:${res.status}`)
+          offset = (await res.json()).offset
+          failures = 0
+          setUploadProgress(uploadId, (offset / file.size) * 0.98)
+        } catch (err) {
+          failures += 1
+          if (failures > 5) throw err
+          // 网络抖动:退避后向服务端查询已收 offset,从断点继续
+          await new Promise((resolve) => setTimeout(resolve, 1000 * failures))
+          try {
+            offset = (await apiFetch<{ offset: number }>(`/v1/upload/resumable/${id}`, t)).offset
+          } catch { /* 查询失败则按本地 offset 重试 */ }
+        }
+      }
+      const doc = await apiFetch<DocumentListItem>(`/v1/upload/resumable/${id}/complete`, t, { method: 'POST' })
+      localStorage.removeItem(storeKey)
+      return doc
     }
 
     const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
@@ -871,27 +936,33 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         return null
       }
       if (process.env.NEXT_PUBLIC_MODE === 'local') {
-        // XHR 而非 fetch:浏览器上传进度事件驱动面板进度条
         const uploadId = crypto.randomUUID()
         addUpload({ id: uploadId, filename: file.name, kbId, kbSlug, path: dest })
-        const formData = new FormData()
-        formData.append('file', file)
-        formData.append('path', dest)
         try {
-          const data = await new Promise<DocumentListItem>((resolve, reject) => {
-            const xhr = new XMLHttpRequest()
-            xhr.open('POST', `${apiUrl()}/v1/upload`)
-            xhr.upload.onprogress = (e) => {
-              if (e.lengthComputable) setUploadProgress(uploadId, e.loaded / e.total)
-            }
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) {
-                try { resolve(JSON.parse(xhr.responseText)) } catch { reject(new Error('响应解析失败')) }
-              } else reject(new Error(`上传失败:${xhr.status}`))
-            }
-            xhr.onerror = () => reject(new Error('网络错误'))
-            xhr.send(formData)
-          })
+          let data: DocumentListItem
+          if (file.size > RESUMABLE_THRESHOLD) {
+            // 大文件走断点续传(分块 + 断点恢复)
+            data = await uploadResumable(file, dest, uploadId)
+          } else {
+            // 小文件走单请求 XHR:浏览器上传进度事件驱动面板进度条
+            const formData = new FormData()
+            formData.append('file', file)
+            formData.append('path', dest)
+            data = await new Promise<DocumentListItem>((resolve, reject) => {
+              const xhr = new XMLHttpRequest()
+              xhr.open('POST', `${apiUrl()}/v1/upload`)
+              xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) setUploadProgress(uploadId, e.loaded / e.total)
+              }
+              xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                  try { resolve(JSON.parse(xhr.responseText)) } catch { reject(new Error('响应解析失败')) }
+                } else reject(new Error(`上传失败:${xhr.status}`))
+              }
+              xhr.onerror = () => reject(new Error('网络错误'))
+              xhr.send(formData)
+            })
+          }
           setDocuments((prev) => [data, ...prev])
           markUploadProcessing(uploadId)
           return true
@@ -928,10 +999,11 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       archiveSkipped > 0 ? `压缩包内跳过 ${archiveSkipped} 个` : '',
       skippedByName.length > 0 ? `跳过重名 ${skippedByName.length} 个` : '',
       skippedByContent.length > 0 ? `跳过内容相同 ${skippedByContent.length} 个` : '',
+      oversizeNames.length > 0 ? `超过 1GB ${oversizeNames.length} 个` : '',
       unsupportedNames.length > 0 ? `不支持 ${unsupportedNames.length} 个` : '',
     ].filter(Boolean).join(',')
     const suffix = extras ? `(${extras})` : ''
-    const skippedNames = [...skippedByName, ...skippedByContent, ...unsupportedNames]
+    const skippedNames = [...skippedByName, ...skippedByContent, ...oversizeNames, ...unsupportedNames]
     const skippedDesc = skippedNames.length > 0
       ? `已跳过:${skippedNames.slice(0, 5).join('、')}${skippedNames.length > 5 ? ` 等 ${skippedNames.length} 个` : ''}`
       : undefined

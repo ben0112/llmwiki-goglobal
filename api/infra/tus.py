@@ -119,7 +119,7 @@ def _validate_file_signature(temp_path: Path, ext: str) -> None:
     )
 
 TUS_VERSION = "1.0.0"
-MAX_SIZE = 104_857_600  # 100 MB
+MAX_SIZE = 1_073_741_824  # 1 GiB(前端 tus-js 以 50MB 分块 PATCH,反向代理 body 上限无需同步放大)
 UPLOAD_DIR = Path("/tmp/supavault_tus_uploads")
 STALE_SECONDS = 3600
 

@@ -7,10 +7,15 @@ Copies uploaded files directly into the workspace and indexes them.
 
 import asyncio
 import hashlib
+import json
+import os
+import re
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from config import settings
 from deps import get_user_id
@@ -38,13 +43,31 @@ def _safe_resolve(relative: str) -> Path:
     return resolved
 
 
+MAX_UPLOAD_BYTES = 1_073_741_824  # 1 GiB
+# 内联正文/建索引的文本上限:超大文本文件只登记不内联,避免整读进内存
+_MAX_INLINE_TEXT_BYTES = 50 * 1024 * 1024
+
+
 async def _ingest_bytes(db, relative: str, content_bytes: bytes) -> dict:
-    """把一份文件字节落盘到工作区并建立索引(单文件上传与解压共用)。"""
+    """把一份文件字节落盘到工作区并建立索引(小文件上传与解压共用)。"""
     dest = _safe_resolve(relative)
     dest.parent.mkdir(parents=True, exist_ok=True)
     mark_written(str(dest))
     dest.write_bytes(content_bytes)
+    return await _index_file_on_disk(db, relative, dest,
+                                     hashlib.sha256(content_bytes).hexdigest())
 
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) -> dict:
+    """为已落盘的文件建立索引(哈希由调用方提供,大文件流式计算不进内存)。"""
     filename = relative.rsplit("/", 1)[-1]
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
@@ -52,14 +75,14 @@ async def _ingest_bytes(db, relative: str, content_bytes: bytes) -> dict:
 
     dir_path = "/" + "/".join(relative.split("/")[:-1]) + "/" if "/" in relative else "/"
     source_kind = "wiki" if relative.startswith("wiki/") else "source"
-    content_hash = hashlib.sha256(content_bytes).hexdigest()
+    size = dest.stat().st_size
 
     # HTML is excluded from inline text — it goes through webmd in process_document.
     text_content = None
     needs_processing = ext in EXTRACTION_TYPES
-    if ext in SIMPLE_TEXT_TYPES:
+    if ext in SIMPLE_TEXT_TYPES and size <= _MAX_INLINE_TEXT_BYTES:
         try:
-            text_content = content_bytes.decode("utf-8", errors="replace")
+            text_content = dest.read_text(encoding="utf-8", errors="replace")
         except Exception:
             pass
 
@@ -80,8 +103,9 @@ async def _ingest_bytes(db, relative: str, content_bytes: bytes) -> dict:
                 "content_hash, mtime_ns, last_indexed_at, document_number) "
                 "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, ?, ?, datetime('now'), ?)",
                 (doc_id, filename, title, dir_path, relative, source_kind,
-                 ext or "bin", len(content_bytes),
-                 "ready" if text_content is not None else "pending",
+                 ext or "bin", size,
+                 # 超过内联上限的文本文件直接 ready(不进全文索引,避免整读)
+                 "ready" if (text_content is not None or ext in SIMPLE_TEXT_TYPES) else "pending",
                  text_content, content_hash,
                  int(dest.stat().st_mtime_ns), doc_number),
             )
@@ -118,7 +142,129 @@ async def upload_file(
 
     relative = (path.rstrip("/") + "/" + file.filename).lstrip("/")
     content_bytes = await file.read()
+    if len(content_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="单个文件超过 1GB 上限")
     return await _ingest_bytes(request.app.state.sqlite_db, relative, content_bytes)
+
+
+# ---------------------------------------------------------------------------
+# 断点续传(本地模式):init → [查询 offset →] 分块 PATCH → complete。
+# 分块落在 .llmwiki/tmp/uploads/,完成时原子改名进工作区,哈希流式计算,
+# 大文件全程不整份进内存。中断后凭 upload_id 查询 offset 续传。
+# ---------------------------------------------------------------------------
+
+_STALE_PART_SECONDS = 24 * 3600
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class ResumableInit(BaseModel):
+    filename: str
+    path: str = "/"
+    size: int
+
+
+def _parts_dir() -> Path:
+    d = _workspace_root() / ".llmwiki" / "tmp" / "uploads"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _part_paths(upload_id: str) -> tuple[Path, Path]:
+    if not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail="非法 upload_id")
+    d = _parts_dir()
+    return d / f"{upload_id}.part", d / f"{upload_id}.json"
+
+
+def _purge_stale_parts() -> None:
+    import time
+    now = time.time()
+    for p in _parts_dir().glob("*.part"):
+        try:
+            if now - p.stat().st_mtime > _STALE_PART_SECONDS:
+                p.unlink(missing_ok=True)
+                p.with_suffix(".json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@router.post("/v1/upload/resumable", status_code=201)
+async def resumable_init(body: ResumableInit, user_id: str = Depends(get_user_id)):
+    if not body.filename:
+        raise HTTPException(status_code=400, detail="No filename")
+    if body.size <= 0 or body.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="单个文件超过 1GB 上限")
+    _purge_stale_parts()
+    upload_id = uuid.uuid4().hex
+    part, meta = _part_paths(upload_id)
+    meta.write_text(json.dumps(
+        {"filename": body.filename, "path": body.path, "size": body.size},
+        ensure_ascii=False), encoding="utf-8")
+    part.touch()
+    return {"upload_id": upload_id, "offset": 0}
+
+
+@router.get("/v1/upload/resumable/{upload_id}")
+async def resumable_offset(upload_id: str, user_id: str = Depends(get_user_id)):
+    part, meta = _part_paths(upload_id)
+    if not meta.is_file():
+        raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
+    return {"offset": part.stat().st_size if part.is_file() else 0}
+
+
+@router.patch("/v1/upload/resumable/{upload_id}")
+async def resumable_patch(
+    upload_id: str,
+    request: Request,
+    offset: int,
+    user_id: str = Depends(get_user_id),
+):
+    part, meta_path = _part_paths(upload_id)
+    if not meta_path.is_file():
+        raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    current = part.stat().st_size if part.is_file() else 0
+    if offset != current:
+        # 客户端与服务端进度不一致:排空请求体后回报真实 offset
+        # (不排空则连接被复位,客户端读不到 409 的 JSON)
+        async for _ in request.stream():
+            pass
+        return JSONResponse(status_code=409, content={"offset": current})
+
+    written = current
+    with open(part, "ab") as fh:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > meta["size"] or written > MAX_UPLOAD_BYTES:
+                fh.close()
+                part.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="数据超出声明大小")
+            fh.write(chunk)
+    return {"offset": written}
+
+
+@router.post("/v1/upload/resumable/{upload_id}/complete", status_code=201)
+async def resumable_complete(
+    upload_id: str,
+    user_id: str = Depends(get_user_id),
+    request: Request = None,
+):
+    part, meta_path = _part_paths(upload_id)
+    if not meta_path.is_file() or not part.is_file():
+        raise HTTPException(status_code=404, detail="上传会话不存在或已过期")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if part.stat().st_size != meta["size"]:
+        return JSONResponse(status_code=409, content={"offset": part.stat().st_size})
+
+    relative = (meta["path"].rstrip("/") + "/" + meta["filename"]).lstrip("/")
+    dest = _safe_resolve(relative)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    content_hash = await asyncio.to_thread(_hash_file, part)
+    mark_written(str(dest))
+    os.replace(part, dest)
+    meta_path.unlink(missing_ok=True)
+    return await _index_file_on_disk(request.app.state.sqlite_db, relative, dest, content_hash)
 
 
 @router.post("/v1/upload/archive", status_code=201)
