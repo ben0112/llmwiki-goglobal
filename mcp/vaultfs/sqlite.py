@@ -168,7 +168,7 @@ class SqliteVaultFS(VaultFS):
         _db = await aiosqlite.connect(db_path)
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
-        await _db.execute("PRAGMA busy_timeout=5000")
+        await _db.execute("PRAGMA busy_timeout=30000")
         if _SCHEMA_PATH.exists():
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)

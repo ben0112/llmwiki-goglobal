@@ -154,8 +154,10 @@ def start_run(state, workspace: Path, limit: int | None = None) -> dict:
     async def _run():
         state.corpus_pipeline_progress = {"done": 0, "total": 0}
         try:
+            from domain.watcher import mark_written
             result = await corpus_pipeline.run_batch(
-                workspace, cfg, limit=limit, on_progress=_progress)
+                workspace, cfg, limit=limit, on_progress=_progress,
+                on_file_written=mark_written)
             state.corpus_pipeline_last_run = result.summary()
             return result
         finally:

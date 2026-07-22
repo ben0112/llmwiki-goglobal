@@ -110,8 +110,11 @@ def status_counts(conn: sqlite3.Connection) -> dict:
 
 async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None,
                     version: str = DEFAULT_VERSION,
-                    on_progress=None) -> RunResult:
-    """跑一轮:最多处理 limit(缺省=端点感知默认)条候选。逐条隔离失败。"""
+                    on_progress=None, on_file_written=None) -> RunResult:
+    """跑一轮:最多处理 limit(缺省=端点感知默认)条候选。逐条隔离失败。
+
+    on_file_written(path): 落盘前回调 —— API 进程内传 watcher.mark_written,
+    避免文件监视器与流水线自身的入库写产生 UNIQUE 竞态。"""
     result = RunResult(started_at=_now())
     limit = limit or config.effective_batch_limit
     db_path = str(workspace / ".llmwiki" / "index.db")
@@ -157,6 +160,8 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
                 def _import() -> None:
                     full = workspace / rel_path
                     full.parent.mkdir(parents=True, exist_ok=True)
+                    if on_file_written:
+                        on_file_written(str(full))
                     full.write_text(content, encoding="utf-8")
                     upsert_document(conn, user_id, rec, rel_path, content,
                                     full.stat().st_mtime_ns)
