@@ -219,6 +219,49 @@ def apply_review(workspace: Path, doc_id: str, action: str,
         conn.close()
 
 
+def prepare_reprocess(workspace: Path, doc_id: str) -> dict:
+    """重新识别入库:删除旧条目(引用页标 stale)、清空分类状态、源文档
+    重置为待提取 —— 供「重新识别入库分类」按钮走完整链路。
+
+    调用方随后应触发源文档重新提取(带 OCR 兜底)并起一轮分类。
+    """
+    conn = sqlite3.connect(str(workspace / ".llmwiki" / "index.db"))
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        citing = _citing_wiki_pages(conn, doc_id)
+        row = conn.execute(
+            "SELECT relative_path, metadata FROM documents WHERE id = ?",
+            (doc_id,)).fetchone()
+        if row is None:
+            raise ReviewError("条目不存在")
+        old_rel, meta_json = row
+        try:
+            meta = json.loads(meta_json or "{}")
+        except ValueError:
+            meta = {}
+        if not meta.get("entry_id"):
+            raise ReviewError("该文档不是语料条目")
+        src = meta.get("source_relpath", "")
+        src_row = conn.execute(
+            "SELECT id FROM documents WHERE relative_path = ?", (src,)).fetchone() if src else None
+        if not src_row:
+            raise ReviewError("找不到对应源文件(可能已被删除或移动)")
+        source_id = src_row[0]
+
+        conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        conn.execute("DELETE FROM corpus_pipeline WHERE doc_id = ?", (source_id,))
+        conn.execute(
+            "UPDATE documents SET status = 'pending', error_message = NULL, "
+            "updated_at = datetime('now') WHERE id = ?", (source_id,))
+        stale_pages = _mark_pages_stale(conn, citing)
+        conn.commit()
+        (workspace / old_rel).unlink(missing_ok=True)
+        return {"entry_id": meta.get("entry_id", ""), "source_doc_id": source_id,
+                "stale_pages": stale_pages}
+    finally:
+        conn.close()
+
+
 def codetable_options(version: str = DEFAULT_VERSION) -> dict:
     """复核对话框的下拉取值(码表主值,含中文名)。"""
     table = load(version)

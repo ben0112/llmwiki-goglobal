@@ -168,3 +168,45 @@ def test_exclude_marks_citing_wiki_pages_stale(tmp_path):
     out = apply_review(ws, doc_id, "exclude", note="口径不符")
     assert out["stale_pages"] == 1
     assert _page_stale(ws, "wpage2") is not None
+
+
+def test_prepare_reprocess_full_reset(tmp_path):
+    """重新识别入库:条目删除、引用页标 stale、分类状态清空、源文档回 pending。"""
+    import uuid
+
+    from corpus.review import ReviewError, prepare_reprocess
+
+    ws = _init_ws(tmp_path)
+    src_id = _insert_source(ws, "0001_境外投资备案通知.txt",
+                            "境外投资备案(核准)无纸化通知", POLICY_BODY)
+    entry_id, meta = _import_one(ws)
+    entry_rel = meta and [p for p in (ws / "corpus").rglob("*.md")][0]
+
+    # 造一个引用该条目的维基页面(cites 边)
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    page_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+        "source_kind, file_type, status, tags, version, document_number) "
+        "VALUES (?, 'u1', 'p.md', 'P', '/wiki/', 'wiki/p.md', 'wiki', 'md', 'ready', '[]', 0, 99)",
+        (page_id,))
+    conn.execute(
+        "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type) "
+        "VALUES (?, ?, ?, 'cites')", (str(uuid.uuid4()), page_id, entry_id))
+    conn.commit()
+    conn.close()
+
+    out = prepare_reprocess(ws, entry_id)
+    assert out["source_doc_id"] == src_id and out["stale_pages"] == 1
+
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    assert conn.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (entry_id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM corpus_pipeline WHERE doc_id = ?", (src_id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM documents WHERE id = ?", (src_id,)).fetchone()[0] == "pending"
+    assert conn.execute("SELECT stale_since FROM documents WHERE id = ?", (page_id,)).fetchone()[0] is not None
+    conn.close()
+    assert not entry_rel.exists()                     # 条目文件已删除
+
+    # 非条目文档应报错
+    with pytest.raises(ReviewError, match="不是语料条目"):
+        prepare_reprocess(ws, src_id)

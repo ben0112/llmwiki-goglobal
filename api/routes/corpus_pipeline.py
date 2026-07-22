@@ -275,6 +275,32 @@ async def get_codetable(request: Request):
     return codetable_options()
 
 
+@router.post("/entries/{doc_id}/reprocess", status_code=202)
+async def reprocess_entry(request: Request, doc_id: str):
+    """重新识别入库分类:删除旧条目 → 源文件重新提取(含 OCR 兜底)→
+    自动触发一轮分类重新入库。用于提取质量差(如文本层损坏)的条目。"""
+    workspace = _require_local(request)
+    _corpus()
+    from corpus.review import ReviewError, prepare_reprocess
+
+    try:
+        result = await asyncio.to_thread(prepare_reprocess, workspace, doc_id)
+    except ReviewError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    state = request.app.state
+    source_id = result["source_doc_id"]
+
+    async def _chain():
+        from domain.local_processor import process_document_isolated
+        await process_document_isolated(workspace, source_id)   # 重新提取
+        start_run(state, workspace)                             # 单飞触发分类
+
+    from infra.tasks import spawn_logged
+    spawn_logged(_chain(), f"reprocess:{source_id[:8]}")
+    return {"accepted": True, **result}
+
+
 @router.post("/entries/{doc_id}/review")
 async def review_entry(request: Request, doc_id: str, body: ReviewIn):
     workspace = _require_local(request)

@@ -11,7 +11,8 @@ import {
   isMandatoryReview, reviewEntry,
 } from './ReviewBar'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, LayoutGrid, ListFilter, X } from 'lucide-react'
+import { ArrowLeft, LayoutGrid, ListFilter, RefreshCw, X } from 'lucide-react'
+import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
@@ -131,6 +132,17 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
     },
     [router, kbSlug],
   )
+
+  const reprocessEntry = React.useCallback(async (entry: CorpusEntry) => {
+    if (!token) return
+    try {
+      await apiFetch(`/v1/corpus/entries/${entry.doc.id}/reprocess`, token, { method: 'POST' })
+      toast.success('已开始重新识别:重新提取源文件后将自动重新分类入库')
+      setTimeout(refetchDocuments, 800)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '重新识别失败')
+    }
+  }, [token, refetchDocuments])
 
   const activeSelections = Object.entries(selections).filter(([, v]) => v) as Array<[FacetKey, string]>
 
@@ -272,7 +284,7 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
                 ) : null
               })()}
               <EntryTable entries={filtered} onOpen={openEntry}
-                onReviewed={onReviewed} onEdit={setEditing} />
+                onReviewed={onReviewed} onEdit={setEditing} onReprocess={reprocessEntry} />
             </div>
           </div>
         </div>
@@ -489,11 +501,12 @@ function CoverageMatrix({
 
 // ---------------------------------------------------------------------------
 
-function EntryTable({ entries, onOpen, onReviewed, onEdit }: {
+function EntryTable({ entries, onOpen, onReviewed, onEdit, onReprocess }: {
   entries: CorpusEntry[]
   onOpen: (e: CorpusEntry) => void
   onReviewed: () => void
   onEdit: (e: CorpusEntry) => void
+  onReprocess: (e: CorpusEntry) => void
 }) {
   if (entries.length === 0) {
     return <div className="py-8 text-center text-xs text-muted-foreground">当前筛选无匹配条目。</div>
@@ -502,17 +515,19 @@ function EntryTable({ entries, onOpen, onReviewed, onEdit }: {
     <div className="divide-y divide-border rounded-lg border border-border">
       {entries.map((entry) => (
         <EntryRow key={entry.doc.id} entry={entry} onOpen={() => onOpen(entry)}
-          onReviewed={onReviewed} onEdit={() => onEdit(entry)} />
+          onReviewed={onReviewed} onEdit={() => onEdit(entry)}
+          onReprocess={() => onReprocess(entry)} />
       ))}
     </div>
   )
 }
 
-function EntryRow({ entry, onOpen, onReviewed, onEdit }: {
+function EntryRow({ entry, onOpen, onReviewed, onEdit, onReprocess }: {
   entry: CorpusEntry
   onOpen: () => void
   onReviewed: () => void
   onEdit: () => void
+  onReprocess: () => void
 }) {
   const { meta, doc } = entry
   const status = reviewStatus(meta)
@@ -523,7 +538,7 @@ function EntryRow({ entry, onOpen, onReviewed, onEdit }: {
       tabIndex={0}
       onClick={onOpen}
       onKeyDown={(e) => { if (e.key === 'Enter') onOpen() }}
-      className="block w-full px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
+      className="group block w-full px-3 py-2 text-left hover:bg-accent/50 transition-colors cursor-pointer"
     >
       <div className="flex items-center gap-2">
         <span className="truncate text-[13px] font-medium">{doc.title || doc.filename}</span>
@@ -540,6 +555,15 @@ function EntryRow({ entry, onOpen, onReviewed, onEdit }: {
           <StateBadge tone="alert">{meta.lifecycle_state}</StateBadge>
         )}
         {meta.timeliness === 'M1' && <StateBadge tone="warn">M1 高时效</StateBadge>}
+        {status !== 'pending_review' && <span className="flex-1" />}
+        <button
+          onClick={(e) => { e.stopPropagation(); onReprocess() }}
+          title="重新提取源文件(含 OCR 兜底)并重新分类入库 — 用于提取质量差的条目"
+          className="shrink-0 flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground opacity-0 group-hover:opacity-100 hover:bg-accent hover:text-foreground transition-all cursor-pointer"
+        >
+          <RefreshCw className="size-2.5" />
+          重新识别
+        </button>
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
         <code className="rounded bg-muted px-1 py-px text-[10px]">{meta.entry_id}</code>
