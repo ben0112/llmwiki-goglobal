@@ -1,12 +1,21 @@
-"""PDF extraction via opendataloader-pdf, with a pypdf text-layer fallback.
+"""PDF extraction via opendataloader-pdf, with pypdf and OCR fallbacks.
 
 Shared module used by both the hosted OCR service and the local processor.
 No server-specific dependencies (no asyncpg, S3, httpx).
+
+OCR 兜底(tesseract + poppler,镜像内置):设计类报告常见「文本层编码
+损坏」—— 字体缺失/伪造 ToUnicode 映射时,任何文本引擎都提不出中文,
+只有按页渲染再 OCR 能恢复。文本层产出可疑时抽样对照,OCR 显著更高才
+全文 OCR,避免误伤正常稀疏文档(如图册)。
 """
 
 import base64
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -14,6 +23,14 @@ from pathlib import Path
 import opendataloader_pdf
 
 logger = logging.getLogger(__name__)
+
+OCR_LANGS = os.environ.get("PDF_OCR_LANGS", "chi_sim+eng")
+OCR_MAX_PAGES = int(os.environ.get("PDF_OCR_MAX_PAGES", "300") or 300)
+OCR_DISABLED = os.environ.get("PDF_OCR_DISABLE", "").lower() in ("1", "true", "yes")
+_OCR_PROBE_TRIGGER_AVG = 400   # 文本层平均每页字符低于此值才启动探针
+_OCR_PROBE_PAGES = 3
+_OCR_WIN_RATIO = 2.0           # OCR 采样均值须超过文本层均值的倍数
+_OCR_MIN_PAGE_CHARS = 200      # 且 OCR 采样均值本身要有实质内容
 
 
 def _element_to_markdown(el: dict) -> str:
@@ -101,6 +118,89 @@ def _elements_to_pages(
     return pages
 
 
+def _ocr_available() -> bool:
+    return bool(shutil.which("pdftoppm") and shutil.which("tesseract"))
+
+
+def _pdf_page_count(pdf_path: str) -> int:
+    """poppler pdfinfo 的真实页数;失败返回 0(调用方回退用提取结果页数)。"""
+    if not shutil.which("pdfinfo"):
+        return 0
+    try:
+        out = subprocess.run(["pdfinfo", pdf_path], capture_output=True, timeout=30)
+        m = re.search(rb"^Pages:\s+(\d+)", out.stdout, re.M)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+def _ocr_single_page(pdf_path: str, page_num: int, workdir: Path) -> str:
+    """渲染单页(200dpi 灰度)并 OCR;失败返回空串。"""
+    prefix = workdir / f"p{page_num}"
+    try:
+        subprocess.run(
+            ["pdftoppm", "-f", str(page_num), "-l", str(page_num),
+             "-r", "200", "-gray", "-png", pdf_path, str(prefix)],
+            capture_output=True, timeout=120, check=True)
+        pngs = sorted(workdir.glob(f"p{page_num}-*.png"))
+        if not pngs:
+            return ""
+        out = subprocess.run(
+            ["tesseract", str(pngs[0]), "-", "-l", OCR_LANGS, "--psm", "3"],
+            capture_output=True, timeout=180)
+        for p in pngs:
+            p.unlink(missing_ok=True)
+        return out.stdout.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        logger.warning("OCR page %d failed for %s: %s", page_num, Path(pdf_path).name, e)
+        return ""
+
+
+def _extract_pdf_ocr(pdf_path: str, page_count: int) -> list[tuple[int, str, list[dict]]]:
+    """整份 OCR(页数封顶 OCR_MAX_PAGES),逐页渲染避免一次性占满磁盘。"""
+    n = min(page_count, OCR_MAX_PAGES)
+    pages: list[tuple[int, str, list[dict]]] = []
+    with tempfile.TemporaryDirectory() as td:
+        workdir = Path(td)
+        for i in range(1, n + 1):
+            pages.append((i, _ocr_single_page(pdf_path, i, workdir), []))
+    if page_count > OCR_MAX_PAGES:
+        logger.warning("OCR capped at %d/%d pages for %s",
+                       OCR_MAX_PAGES, page_count, Path(pdf_path).name)
+    return pages
+
+
+def _maybe_ocr(pdf_path: str,
+               pages: list[tuple[int, str, list[dict]]]) -> list[tuple[int, str, list[dict]]]:
+    """文本层产出可疑时抽样对照 OCR,显著更高则整份改用 OCR 结果。"""
+    if OCR_DISABLED or not _ocr_available():
+        return pages
+    text_total = sum(len(md) for _, md, _ in pages)
+    text_avg = text_total / max(len(pages), 1)
+    if text_avg >= _OCR_PROBE_TRIGGER_AVG:
+        return pages
+    page_count = _pdf_page_count(pdf_path) or len(pages)
+    if page_count <= 0:
+        return pages
+
+    # 均匀抽样探针页
+    k = min(_OCR_PROBE_PAGES, page_count)
+    probe_nums = sorted({max(1, round(page_count * (i + 1) / (k + 1))) for i in range(k)})
+    with tempfile.TemporaryDirectory() as td:
+        samples = [_ocr_single_page(pdf_path, n, Path(td)) for n in probe_nums]
+    ocr_avg = sum(len(s) for s in samples) / max(len(samples), 1)
+
+    if ocr_avg < _OCR_MIN_PAGE_CHARS or ocr_avg < _OCR_WIN_RATIO * max(text_avg, 1.0):
+        return pages
+
+    logger.warning(
+        "Text layer looks broken for %s (text %d chars/page vs OCR sample %d) — "
+        "OCR-ing all %d pages", Path(pdf_path).name, int(text_avg), int(ocr_avg), page_count)
+    ocr_pages = _extract_pdf_ocr(pdf_path, page_count)
+    ocr_total = sum(len(md) for _, md, _ in ocr_pages)
+    return ocr_pages if ocr_total > text_total else pages
+
+
 def _extract_pdf_fallback(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
     """pypdf 文本层兜底:无版面结构/图片,但比整份失败强。"""
     from pypdf import PdfReader
@@ -148,7 +248,7 @@ def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
 
         total_pages = data.get("number of pages", 0)
         elements = data.get("kids", [])
-        return _elements_to_pages(elements, total_pages)
+        return _maybe_ocr(pdf_path, _elements_to_pages(elements, total_pages))
     except Exception as e:
         primary = e if isinstance(e, RuntimeError) else RuntimeError(f"PDF extraction failed: {e}")
         try:
@@ -157,4 +257,4 @@ def extract_pdf(pdf_path: str) -> list[tuple[int, str, list[dict]]]:
             raise RuntimeError(f"{primary}(pypdf 兜底亦失败: {fb})") from e
         logger.warning("opendataloader failed for %s, used pypdf fallback: %s",
                        Path(pdf_path).name, primary)
-        return pages
+        return _maybe_ocr(pdf_path, pages)

@@ -207,3 +207,50 @@ async def test_html_disguised_pdf_parsed_as_html(tmp_path):
         assert "境外投资办事指南" in (content or "")
     finally:
         await db.close()
+
+
+# ── OCR 兜底启发式(不依赖 tesseract,CI 可跑)──────────────────
+
+def _mk_pages(n, chars_per_page):
+    return [(i + 1, "字" * chars_per_page, []) for i in range(n)]
+
+
+def test_maybe_ocr_skips_high_yield(monkeypatch):
+    import services.pdf_extract as px
+
+    monkeypatch.setattr(px, "_ocr_available", lambda: True)
+    called = []
+    monkeypatch.setattr(px, "_ocr_single_page", lambda *a: called.append(1) or "x")
+    pages = _mk_pages(10, 800)   # 正常产出:不应触发探针
+    assert px._maybe_ocr("/tmp/x.pdf", pages) is pages
+    assert called == []
+
+
+def test_maybe_ocr_full_ocr_when_probe_wins(monkeypatch):
+    import services.pdf_extract as px
+
+    monkeypatch.setattr(px, "_ocr_available", lambda: True)
+    monkeypatch.setattr(px, "_pdf_page_count", lambda p: 8)
+    monkeypatch.setattr(px, "_ocr_single_page", lambda pdf, n, wd: "汉" * 900)
+    pages = _mk_pages(8, 100)    # 文本层可疑(100/页)
+    out = px._maybe_ocr("/tmp/x.pdf", pages)
+    assert len(out) == 8 and all(md == "汉" * 900 for _, md, _ in out)
+
+
+def test_maybe_ocr_keeps_primary_for_sparse_docs(monkeypatch):
+    import services.pdf_extract as px
+
+    monkeypatch.setattr(px, "_ocr_available", lambda: True)
+    monkeypatch.setattr(px, "_pdf_page_count", lambda p: 8)
+    # 图册类:OCR 采样同样稀疏 → 保留文本层结果
+    monkeypatch.setattr(px, "_ocr_single_page", lambda pdf, n, wd: "图" * 120)
+    pages = _mk_pages(8, 100)
+    assert px._maybe_ocr("/tmp/x.pdf", pages) is pages
+
+
+def test_maybe_ocr_noop_without_tools(monkeypatch):
+    import services.pdf_extract as px
+
+    monkeypatch.setattr(px, "_ocr_available", lambda: False)
+    pages = _mk_pages(3, 10)
+    assert px._maybe_ocr("/tmp/x.pdf", pages) is pages

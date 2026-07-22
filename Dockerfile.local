@@ -32,11 +32,13 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 # Extraction toolchain: JRE for opendataloader-pdf, LibreOffice for
-# Office→PDF conversion, Noto CJK so Chinese documents render correctly.
+# Office→PDF conversion, poppler + tesseract(chi_sim) for the OCR fallback
+# on broken-text-layer PDFs, Noto CJK so Chinese documents render correctly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         default-jre-headless \
         libreoffice-writer libreoffice-impress libreoffice-calc \
         fonts-noto-cjk fonts-liberation \
+        poppler-utils tesseract-ocr tesseract-ocr-chi-sim \
         curl libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
