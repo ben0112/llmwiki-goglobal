@@ -93,6 +93,40 @@ def select_candidates(conn: sqlite3.Connection, limit: int | None = None) -> lis
     ]
 
 
+def list_excluded(conn: sqlite3.Connection, limit: int = 200, offset: int = 0) -> dict:
+    """排除清单:审核拒收的文档及其理由(error 列存 LLM 给的排除原因)。"""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM corpus_pipeline p JOIN documents d ON d.id = p.doc_id "
+        "WHERE p.state = 'excluded'").fetchone()[0]
+    rows = conn.execute(
+        "SELECT d.id, d.title, d.filename, d.relative_path, p.error, p.updated_at "
+        "FROM corpus_pipeline p JOIN documents d ON d.id = p.doc_id "
+        "WHERE p.state = 'excluded' ORDER BY p.updated_at DESC LIMIT ? OFFSET ?",
+        (limit, offset)).fetchall()
+    return {"total": total, "items": [
+        {"doc_id": r[0], "title": r[1] or r[2], "relative_path": r[3],
+         "reason": r[4] or "", "updated_at": r[5]} for r in rows]}
+
+
+def requeue(conn: sqlite3.Connection, doc_ids: list[str] | None = None,
+            all_excluded: bool = False) -> int:
+    """重审:删除分类记录使文档重新成为候选(重新走审核+分类,消耗 token)。
+
+    doc_ids 指定单条/多条;all_excluded=True 时清空全部排除记录。
+    """
+    if all_excluded:
+        cur = conn.execute("DELETE FROM corpus_pipeline WHERE state = 'excluded'")
+    elif doc_ids:
+        placeholders = ",".join("?" for _ in doc_ids)
+        cur = conn.execute(
+            f"DELETE FROM corpus_pipeline WHERE doc_id IN ({placeholders})",
+            tuple(doc_ids))
+    else:
+        return 0
+    conn.commit()
+    return cur.rowcount
+
+
 def reset_failed(conn: sqlite3.Connection) -> int:
     """失败项集体解除隔离:attempts 清零(保持 failed 态与错误信息),
     下一轮(手动或自动分类)重新入选。返回解除条数。"""

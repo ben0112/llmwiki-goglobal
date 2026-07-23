@@ -198,6 +198,41 @@ async def run_pipeline(request: Request, body: RunIn | None = None):
     return start_run(request.app.state, workspace, limit)
 
 
+@router.get("/pipeline/excluded")
+async def list_excluded_pipeline(request: Request, limit: int = 200, offset: int = 0):
+    """排除清单:审核拒收的文档与理由(理由由分类 LLM 给出,存 error 列)。"""
+    workspace = _require_local(request)
+    _, corpus_pipeline = _corpus()
+    conn = _db(workspace)
+    try:
+        return corpus_pipeline.list_excluded(
+            conn, limit=max(1, min(500, limit)), offset=max(0, offset))
+    finally:
+        conn.close()
+
+
+class RequeueIn(BaseModel):
+    doc_ids: list[str] = []
+    all_excluded: bool = False
+
+
+@router.post("/pipeline/requeue")
+async def requeue_pipeline(request: Request, body: RequeueIn):
+    """重审:删除分类记录使文档重回待分类队列(重新消耗 token)。"""
+    workspace = _require_local(request)
+    _, corpus_pipeline = _corpus()
+
+    def _requeue() -> int:
+        conn = _db(workspace, busy_ms=60000)
+        try:
+            return corpus_pipeline.requeue(
+                conn, doc_ids=body.doc_ids or None, all_excluded=body.all_excluded)
+        finally:
+            conn.close()
+
+    return {"requeued": await asyncio.to_thread(_requeue)}
+
+
 @router.post("/pipeline/retry-failed")
 async def retry_failed_pipeline(request: Request):
     """失败满 3 次被隔离的分类项集体解除:attempts 清零后自动回到待分类

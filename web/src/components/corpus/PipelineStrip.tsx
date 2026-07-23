@@ -25,6 +25,7 @@ export function PipelineStrip() {
   const [starting, setStarting] = React.useState(false)
   const [stopping, setStopping] = React.useState(false)
   const [retrying, setRetrying] = React.useState(false)
+  const [showExcluded, setShowExcluded] = React.useState(false)
 
   const refresh = React.useCallback(() => {
     if (!token) return
@@ -108,6 +109,15 @@ export function PipelineStrip() {
           )}
         </span>
       )}
+      {counts.excluded > 0 && (
+        <button
+          onClick={() => setShowExcluded(true)}
+          title="审核判定无语料价值的文档清单(含理由),可重审"
+          className="hover:text-foreground transition-colors cursor-pointer"
+        >
+          排除 <span className="tabular-nums">{counts.excluded}</span> · 清单
+        </button>
+      )}
       {!status.running && status.last_run?.error && (
         <span className="text-destructive truncate max-w-64" title={status.last_run.error}>
           上轮异常:{status.last_run.error}
@@ -135,6 +145,162 @@ export function PipelineStrip() {
           {stopping ? '停止中…' : '停止分类'}
         </button>
       )}
+      {showExcluded && token && (
+        <ExcludedDialog token={token} onClose={() => setShowExcluded(false)} onChanged={refresh} />
+      )}
+    </div>
+  )
+}
+
+interface ExcludedItem {
+  doc_id: string
+  title: string
+  relative_path: string
+  reason: string
+  updated_at: string
+}
+
+// 排除清单:审核拒收的文档与 LLM 给出的理由;单条/全部重审(删除分类
+// 记录重新入队,会重新消耗 token —— 文案里写明,全部重审需二次确认)。
+function ExcludedDialog({ token, onClose, onChanged }: {
+  token: string
+  onClose: () => void
+  onChanged: () => void
+}) {
+  const [total, setTotal] = React.useState(0)
+  const [items, setItems] = React.useState<ExcludedItem[]>([])
+  const [loading, setLoading] = React.useState(false)
+  const [filter, setFilter] = React.useState('')
+  const [busyId, setBusyId] = React.useState<string | null>(null)
+  const [confirmAll, setConfirmAll] = React.useState(false)
+
+  const load = React.useCallback(async (offset: number) => {
+    setLoading(true)
+    try {
+      const r = await apiFetch<{ total: number; items: ExcludedItem[] }>(
+        `/v1/corpus/pipeline/excluded?limit=200&offset=${offset}`, token)
+      setTotal(r.total)
+      setItems((prev) => (offset === 0 ? r.items : [...prev, ...r.items]))
+    } catch { /* 保持已加载内容 */ } finally {
+      setLoading(false)
+    }
+  }, [token])
+
+  React.useEffect(() => { load(0) }, [load])
+
+  const requeue = async (docIds: string[] | null) => {
+    setBusyId(docIds ? docIds[0] : 'all')
+    try {
+      await apiFetch('/v1/corpus/pipeline/requeue', token, {
+        method: 'POST',
+        body: JSON.stringify(docIds ? { doc_ids: docIds } : { all_excluded: true }),
+      })
+      if (docIds) {
+        setItems((prev) => prev.filter((i) => !docIds.includes(i.doc_id)))
+        setTotal((t) => Math.max(0, t - docIds.length))
+      } else {
+        setItems([])
+        setTotal(0)
+      }
+      onChanged()
+    } catch { /* 下轮刷新纠正 */ } finally {
+      setBusyId(null)
+      setConfirmAll(false)
+    }
+  }
+
+  const shown = filter
+    ? items.filter((i) =>
+        (i.title + i.relative_path + i.reason).toLowerCase().includes(filter.toLowerCase()))
+    : items
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+      <div
+        className="flex max-h-[80vh] w-[760px] max-w-[92vw] flex-col rounded-lg border border-border bg-background shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-3 border-b border-border px-4 py-2.5">
+          <span className="text-sm font-medium">排除清单</span>
+          <span className="text-xs text-muted-foreground">
+            审核判定无语料价值,共 <span className="tabular-nums">{total}</span> 条 · 重审会重新消耗 token
+          </span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="text-xs text-muted-foreground hover:text-foreground cursor-pointer">关闭</button>
+        </div>
+        <div className="border-b border-border px-4 py-2">
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="按文件名 / 路径 / 理由过滤已加载条目"
+            className="w-full rounded-md border border-border bg-background px-2.5 py-1 text-xs outline-none focus:ring-1 focus:ring-ring"
+          />
+        </div>
+        <div className="flex-1 overflow-y-auto px-2 py-1.5">
+          {shown.map((item) => (
+            <div key={item.doc_id} className="group flex items-start gap-2 rounded-md px-2 py-1.5 hover:bg-accent/50">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2 min-w-0">
+                  <span className="truncate text-[13px]">{item.title}</span>
+                  <span className="shrink-0 truncate max-w-48 text-[11px] text-muted-foreground">{item.relative_path}</span>
+                </div>
+                {item.reason && (
+                  <div className="mt-0.5 truncate text-[11px] text-muted-foreground" title={item.reason}>
+                    {item.reason}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => requeue([item.doc_id])}
+                disabled={busyId !== null}
+                className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-accent hover:text-foreground cursor-pointer disabled:opacity-50"
+              >
+                {busyId === item.doc_id ? '已入队' : '重审'}
+              </button>
+            </div>
+          ))}
+          {shown.length === 0 && !loading && (
+            <div className="px-3 py-8 text-center text-xs text-muted-foreground">
+              {items.length === 0 ? '没有排除记录' : '无匹配条目'}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-3 border-t border-border px-4 py-2 text-xs">
+          <span className="text-muted-foreground tabular-nums">已加载 {items.length}/{total}</span>
+          {items.length < total && (
+            <button
+              onClick={() => load(items.length)}
+              disabled={loading}
+              className="rounded-md border border-border px-2 py-0.5 hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
+            >
+              {loading ? '加载中…' : '加载更多'}
+            </button>
+          )}
+          <div className="flex-1" />
+          {total > 0 && (
+            confirmAll ? (
+              <span className="flex items-center gap-2">
+                <span className="text-destructive">重审全部 {total} 条会重新消耗相应 token,确认?</span>
+                <button
+                  onClick={() => requeue(null)}
+                  disabled={busyId !== null}
+                  className="rounded-md border border-destructive/40 px-2 py-0.5 text-destructive hover:bg-destructive/10 cursor-pointer disabled:opacity-50"
+                >
+                  确认重审
+                </button>
+                <button onClick={() => setConfirmAll(false)} className="text-muted-foreground hover:text-foreground cursor-pointer">取消</button>
+              </span>
+            ) : (
+              <button
+                onClick={() => setConfirmAll(true)}
+                className="rounded-md border border-border px-2 py-0.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer"
+              >
+                全部重审({total})
+              </button>
+            )
+          )}
+        </div>
+      </div>
     </div>
   )
 }

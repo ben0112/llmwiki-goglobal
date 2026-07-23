@@ -502,3 +502,38 @@ def test_reset_failed_requeues_quarantined(tmp_path, monkeypatch):
     result = asyncio.run(pl.run_batch(ws, cfg))
     assert result.picked == 1 and result.imported == 1
     assert _states(ws)[bad][0] == "imported"
+
+
+def test_excluded_list_and_requeue(tmp_path):
+    """排除清单带理由;重审(单条/全部)删除记录使文档重新入选并可入库。"""
+    import corpus.pipeline as pl
+    from corpus.llm import LLMConfig
+
+    ws = _init_ws(tmp_path)
+    short = _insert_source(ws, "0001_口号.txt", "欢迎关注", "关注我们,共创辉煌。")
+    good = _insert_source(ws, "0002_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
+
+    cfg = LLMConfig(base_url="mock")
+    asyncio.run(pl.run_batch(ws, cfg))
+    assert _states(ws)[short][0] == "excluded"
+
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    listing = pl.list_excluded(conn)
+    assert listing["total"] == 1
+    assert listing["items"][0]["title"] == "欢迎关注"
+    assert listing["items"][0]["reason"]                     # LLM 理由已存
+
+    # 单条重审:记录删除,重新成为候选(mock 审核仍会排除,attempts 从头计)
+    assert pl.requeue(conn, doc_ids=[short]) == 1
+    assert pl.status_counts(conn)["pending"] == 1
+    conn.close()
+    result = asyncio.run(pl.run_batch(ws, cfg))
+    assert result.picked == 1 and result.excluded == 1
+
+    # 全部重审
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    assert pl.requeue(conn, all_excluded=True) == 1
+    assert pl.list_excluded(conn)["total"] == 0
+    assert pl.requeue(conn) == 0                             # 空参防误删
+    conn.close()
+    assert _states(ws)[good][0] == "imported"                # 已入库的不受影响
