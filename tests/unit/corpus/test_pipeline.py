@@ -343,3 +343,44 @@ def test_llm_requests_share_keepalive_connection():
         assert len(connections) == 1, f"期望 1 条连接,实际 {len(connections)}"
     finally:
         srv.shutdown()
+
+
+def test_resolve_config_thinking_precedence():
+    """思考模式:设置页显式值(含显式关闭)优先于环境变量,默认关。"""
+    from corpus.pipeline import resolve_config
+
+    class EnvOn:
+        CORPUS_LLM_THINKING = True
+
+    class EnvEmpty:
+        pass
+
+    assert resolve_config({}, EnvEmpty()).enable_thinking is False          # 默认关
+    assert resolve_config({}, EnvOn()).enable_thinking is True              # 环境变量开
+    assert resolve_config({"enable_thinking": False}, EnvOn()).enable_thinking is False  # 显式关优先
+    assert resolve_config({"enable_thinking": True}, EnvEmpty()).enable_thinking is True
+
+
+async def test_complete_raw_payload_carries_thinking_flag(monkeypatch):
+    """开关真实进入请求 payload 的 chat_template_kwargs。"""
+    import corpus.llm as cl
+
+    captured: list[dict] = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeClient:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            captured.append(json)
+            return FakeResp()
+
+    monkeypatch.setattr(cl, "_get_client", lambda: FakeClient())
+    for flag in (True, False):
+        cfg = cl.LLMConfig(base_url="http://x/v1", enable_thinking=flag)
+        await cl._complete_raw(cfg, "sys", "user", max_tokens=8, temperature=0.0)
+    assert captured[0]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert captured[1]["chat_template_kwargs"] == {"enable_thinking": False}

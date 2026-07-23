@@ -135,6 +135,7 @@ interface PipelineConfig {
   api_key_masked: string
   concurrency: number
   effective_concurrency: number
+  enable_thinking: boolean
   is_local_endpoint: boolean
   auto: { enabled: boolean; interval: number }
 }
@@ -240,6 +241,15 @@ function CorpusPipelineSection() {
             placeholder={`LLM 并发数(默认 ${cfg.effective_concurrency})`}
             className="w-44 rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring" />
         </div>
+        <label className="flex items-center gap-2 text-sm select-none cursor-pointer">
+          <input type="checkbox" checked={cfg.enable_thinking}
+            onChange={(e) => save({ enable_thinking: e.target.checked })} />
+          <span>思考模式</span>
+          <span className="text-xs text-muted-foreground">
+            模型先推理再作答:标注更审慎,但更慢、更耗 token;仅对支持
+            enable_thinking 的推理栈(vLLM/MLX 等)生效,其他端点忽略
+          </span>
+        </label>
         <div className="flex items-center gap-3">
           <button onClick={() => save()} disabled={saving}
             className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors cursor-pointer disabled:opacity-50">

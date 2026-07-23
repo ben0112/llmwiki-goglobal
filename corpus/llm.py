@@ -48,6 +48,7 @@ class LLMConfig:
     api_key: str = ""
     timeout: float = DEFAULT_TIMEOUT
     concurrency: int = 0  # 同时向端点发起的请求数;0 = 端点感知默认
+    enable_thinking: bool = False  # 思考模式:更审慎但更慢、更耗 token
 
     @property
     def effective_concurrency(self) -> int:
@@ -109,8 +110,10 @@ async def _complete_raw(config: LLMConfig, system_prompt: str, user_prompt: str,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
-        # 本地推理栈(MLX/vLLM 等)支持时关闭思考模式,省时省 token
-        "chat_template_kwargs": {"enable_thinking": False},
+        # 思考模式开关(设置页可配,默认关):经 chat_template_kwargs 对
+        # 本地推理栈(MLX/vLLM 等)生效,不支持的端点会忽略该字段。开启
+        # 后分类更审慎但更慢、更耗 token;输出中的 <think> 段由解析层剥除。
+        "chat_template_kwargs": {"enable_thinking": config.enable_thinking},
     }
     headers = {"Content-Type": "application/json"}
     if config.api_key:

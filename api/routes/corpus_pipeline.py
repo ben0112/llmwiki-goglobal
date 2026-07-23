@@ -54,6 +54,7 @@ class LLMConfigIn(BaseModel):
     concurrency: int | None = Field(default=None, ge=0)  # 0 = 恢复端点感知默认
     auto_enabled: bool | None = None
     auto_interval: int | None = Field(default=None, ge=30)
+    enable_thinking: bool | None = None  # 思考模式:更审慎但更慢、更耗 token
 
 
 def _masked(key: str) -> str:
@@ -73,6 +74,7 @@ def _config_out(stored: dict, request: Request) -> dict:
         "timeout": cfg.timeout,
         "concurrency": cfg.concurrency,
         "effective_concurrency": cfg.effective_concurrency,
+        "enable_thinking": cfg.enable_thinking,
         "is_local_endpoint": corpus_llm.is_local_endpoint(cfg.base_url),
         "auto": corpus_pipeline.resolve_auto(stored, env),
         "source": "settings" if stored.get("base_url") else ("env" if getattr(env, "CORPUS_LLM_BASE_URL", "") else "default"),
@@ -115,6 +117,8 @@ async def put_llm_config(request: Request, body: LLMConfigIn):
                 stored["auto_enabled"] = body.auto_enabled
             if body.auto_interval is not None:
                 stored["auto_interval"] = body.auto_interval
+            if body.enable_thinking is not None:
+                stored["enable_thinking"] = body.enable_thinking
             corpus_pipeline.save_llm_settings(conn, stored)
             return stored
         finally:

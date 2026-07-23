@@ -260,6 +260,11 @@ def save_llm_settings(conn: sqlite3.Connection, data: dict) -> None:
 def resolve_config(stored: dict, env) -> LLMConfig:
     """优先级:设置存储(前端) > 环境变量 > 内置默认。"""
     from .llm import DEFAULT_BASE_URL
+    # 布尔开关:设置页显式值(含显式关闭)优先于环境变量,与 auto 同语义
+    if "enable_thinking" in stored:
+        thinking = bool(stored["enable_thinking"])
+    else:
+        thinking = bool(getattr(env, "CORPUS_LLM_THINKING", False))
     return LLMConfig(
         base_url=stored.get("base_url") or getattr(env, "CORPUS_LLM_BASE_URL", "") or DEFAULT_BASE_URL,
         model=stored.get("model") or getattr(env, "CORPUS_LLM_MODEL", ""),
@@ -267,6 +272,7 @@ def resolve_config(stored: dict, env) -> LLMConfig:
         timeout=float(stored.get("timeout") or getattr(env, "CORPUS_LLM_TIMEOUT", 120) or 120),
         concurrency=int(stored.get("concurrency")
                         or getattr(env, "CORPUS_LLM_CONCURRENCY", 0) or 0),
+        enable_thinking=thinking,
     )
 
 
