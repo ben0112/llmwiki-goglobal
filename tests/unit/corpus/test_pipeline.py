@@ -468,3 +468,37 @@ def test_retry_delay_shape():
         for _ in range(20):
             d = _retry_delay(attempt, None)
             assert base * 0.5 <= d <= base * 1.5
+
+
+def test_reset_failed_requeues_quarantined(tmp_path, monkeypatch):
+    """失败满 3 次被隔离的文档:reset_failed 清零后重新入选,修好即入库。"""
+    import corpus.pipeline as pl
+    from corpus.llm import LLMConfig, LLMError
+
+    ws = _init_ws(tmp_path)
+    bad = _insert_source(ws, "0001_坏文档.txt", "会失败的文档", POLICY_BODY)
+
+    real_classify = pl.classify
+    broken = True
+
+    async def flaky_classify(config, title, body, relpath):
+        if broken:
+            raise LLMError("模拟端点故障")
+        return await real_classify(config, title, body, relpath)
+
+    monkeypatch.setattr(pl, "classify", flaky_classify)
+    cfg = LLMConfig(base_url="mock")
+    for _ in range(3):
+        asyncio.run(pl.run_batch(ws, cfg))
+    assert _states(ws)[bad] == ("failed", 3)
+    assert asyncio.run(pl.run_batch(ws, cfg)).picked == 0     # 已隔离
+
+    conn = sqlite3.connect(str(ws / ".llmwiki" / "index.db"))
+    assert pl.reset_failed(conn) == 1                          # 解除 1 条
+    assert pl.status_counts(conn)["pending"] == 1              # 回到待分类
+    conn.close()
+
+    broken = False                                             # "端点修好了"
+    result = asyncio.run(pl.run_batch(ws, cfg))
+    assert result.picked == 1 and result.imported == 1
+    assert _states(ws)[bad][0] == "imported"

@@ -906,3 +906,44 @@ async def test_doc_binary_has_no_fallback(tmp_path, monkeypatch):
     (tmp_path / 'old.doc').write_bytes(b'\xd0\xcf\x11\xe0 fake ole')
     with pytest.raises(RuntimeError, match='LibreOffice conversion failed'):
         await lp._process_office(None, 'doc-1', tmp_path / 'old.doc', tmp_path)
+
+
+async def test_watcher_content_change_clears_pipeline_state(tmp_path, monkeypatch):
+    """修好文件放回去:watcher 重建索引时作废旧分类记录(含满 3 次的
+    隔离),让文档重新进入待分类队列。"""
+    import domain.local_processor as lp
+    from domain import watcher
+
+    ws = tmp_path / "ws"
+    (ws / ".llmwiki").mkdir(parents=True)
+    f = ws / "修复版.txt"
+    f.write_text("修复后的新内容,足够长的一段正文。", encoding="utf-8")
+    db = await aiosqlite.connect(str(ws / ".llmwiki" / "index.db"))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, content_hash, tags, version, document_number) "
+            "VALUES (?, ?, '修复版.txt', 'F', '/', '修复版.txt', 'source', 'txt', "
+            "'ready', 'old-hash', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.execute(
+            "INSERT INTO corpus_pipeline (doc_id, state, attempts, error, updated_at) "
+            "VALUES (?, 'failed', 3, '旧内容分类失败', datetime('now'))", (doc_id,))
+        await db.commit()
+
+        monkeypatch.setattr(lp, "process_document_isolated", lambda w, d: _noop())
+        await watcher._index_file(db, ws, f)
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM corpus_pipeline WHERE doc_id = ?", (doc_id,))
+        assert (await cursor.fetchone())[0] == 0   # 分类记录已作废
+    finally:
+        await db.close()
+
+
+async def _noop():
+    pass

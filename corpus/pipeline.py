@@ -93,6 +93,16 @@ def select_candidates(conn: sqlite3.Connection, limit: int | None = None) -> lis
     ]
 
 
+def reset_failed(conn: sqlite3.Connection) -> int:
+    """失败项集体解除隔离:attempts 清零(保持 failed 态与错误信息),
+    下一轮(手动或自动分类)重新入选。返回解除条数。"""
+    cur = conn.execute(
+        "UPDATE corpus_pipeline SET attempts = 0, updated_at = datetime('now') "
+        "WHERE state = 'failed'")
+    conn.commit()
+    return cur.rowcount
+
+
 def status_counts(conn: sqlite3.Connection) -> dict:
     # 联 documents:全量 reindex 会更换文档 id,孤儿状态行不计入
     counts = dict(conn.execute(

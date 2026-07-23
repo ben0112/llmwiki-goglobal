@@ -24,6 +24,7 @@ export function PipelineStrip() {
   const [status, setStatus] = React.useState<PipelineStatus | null>(null)
   const [starting, setStarting] = React.useState(false)
   const [stopping, setStopping] = React.useState(false)
+  const [retrying, setRetrying] = React.useState(false)
 
   const refresh = React.useCallback(() => {
     if (!token) return
@@ -65,6 +66,18 @@ export function PipelineStrip() {
     }
   }
 
+  const retryFailed = async () => {
+    if (!token || retrying) return
+    setRetrying(true)
+    try {
+      await apiFetch('/v1/corpus/pipeline/retry-failed', token, { method: 'POST' })
+      refresh()
+    } catch { /* 状态条下轮刷新即可 */ } finally {
+      /* 保持"已重新排队"直到下轮刷新把失败数更新,避免连点 */
+      setTimeout(() => setRetrying(false), 3000)
+    }
+  }
+
   return (
     <div className="shrink-0 border-b border-border bg-muted/30 px-4 py-1.5 flex items-center gap-4 text-xs text-muted-foreground">
       <span className="font-medium text-foreground">分类流水线</span>
@@ -81,7 +94,19 @@ export function PipelineStrip() {
       )}
       <span>今日入库 <span className="tabular-nums text-foreground">{counts.imported_today}</span></span>
       {counts.failed > 0 && (
-        <span className="text-destructive">失败 <span className="tabular-nums">{counts.failed}</span></span>
+        <span className="flex items-center gap-1.5 text-destructive">
+          失败 <span className="tabular-nums">{counts.failed}</span>
+          {!status.running && (
+            <button
+              onClick={retryFailed}
+              disabled={retrying}
+              title="清零失败计数,全部重新排队分类(下一轮自动重跑)"
+              className="rounded-md border border-border px-1.5 py-0 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer disabled:opacity-50"
+            >
+              {retrying ? '已重新排队' : '重试失败项'}
+            </button>
+          )}
+        </span>
       )}
       {!status.running && status.last_run?.error && (
         <span className="text-destructive truncate max-w-64" title={status.last_run.error}>

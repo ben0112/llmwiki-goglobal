@@ -198,6 +198,24 @@ async def run_pipeline(request: Request, body: RunIn | None = None):
     return start_run(request.app.state, workspace, limit)
 
 
+@router.post("/pipeline/retry-failed")
+async def retry_failed_pipeline(request: Request):
+    """失败满 3 次被隔离的分类项集体解除:attempts 清零后自动回到待分类
+    队列(数量上会从「失败」同时计入「待分类」),下一轮自动重跑。"""
+    workspace = _require_local(request)
+    _, corpus_pipeline = _corpus()
+
+    def _reset() -> int:
+        conn = _db(workspace, busy_ms=60000)
+        try:
+            return corpus_pipeline.reset_failed(conn)
+        finally:
+            conn.close()
+
+    reset = await asyncio.to_thread(_reset)
+    return {"reset": reset}
+
+
 @router.post("/pipeline/stop")
 async def stop_pipeline(request: Request):
     """停止分类队列:取消在飞轮次,并关闭自动分类(否则 30s 内会自动重启)。

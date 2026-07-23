@@ -175,6 +175,9 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
             "WHERE id = ?",
             (content, stat.st_size, content_hash, int(stat.st_mtime_ns), doc_id),
         )
+        # 内容已变:分类状态一并作废(含失败满 3 次的隔离记录),让修复后
+        # 的文件重新进入待分类队列 —— 否则"修好文件放回去"永远不会再分类
+        await db.execute("DELETE FROM corpus_pipeline WHERE doc_id = ?", (doc_id,))
         await db.commit()
         logger.info("Re-indexed (modified): %s", relative)
         if ext not in SIMPLE_TEXT_TYPES and ext:
