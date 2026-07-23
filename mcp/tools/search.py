@@ -111,6 +111,8 @@ class SearchHandler:
             tag_set = {t.lower() for t in tags}
             matches = [m for m in matches if tag_set.issubset({t.lower() for t in (m.get("tags") or [])})]
 
+        matches = await self._fold_corpus(matches)
+
         if not matches:
             scope_msg = ""
             if scope != "all":
@@ -286,6 +288,55 @@ class SearchHandler:
             date_part = f", {date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else date_val}"
         return f"  {doc['path']}{doc['filename']}{date_part}"
 
+    @staticmethod
+    def _match_relpath(match: dict) -> str:
+        return f"{match.get('path', '/')}{match['filename']}".lstrip("/")
+
+    async def _fold_corpus(self, matches: list[dict]) -> list[dict]:
+        """语料折叠与可信度标记(仅在库里真有分类流水线时生效)。
+
+        - 已入库源文件的命中:条目本身也命中时直接丢弃(条目说话);
+          条目未命中时保留但改标为条目(引用应指向带八维元数据的条目,
+          原文路径与页码保留用于核对);
+        - 未入库/被排除/分类失败的源文件命中:加标记,AI 取材时自行掂量。
+        普通工作区(无流水线)与托管模式零改变。
+        """
+        rps = [self._match_relpath(m) for m in matches]
+        source_rps = [rp for rp in rps if not rp.startswith(("corpus/", "wiki/"))]
+        if not source_rps:
+            return matches
+        try:
+            ctx = await self.fs.corpus_search_context(self.kb_id, source_rps)
+        except Exception:
+            return matches
+        if not ctx.get("has_pipeline"):
+            return matches
+
+        entries, states = ctx["entries"], ctx["states"]
+        entry_native = {rp for rp in rps if rp.startswith("corpus/")}
+        out: list[dict] = []
+        for m, rp in zip(matches, rps):
+            if rp.startswith(("corpus/", "wiki/")):
+                out.append(m)
+                continue
+            entry_rp = entries.get(rp)
+            if entry_rp:
+                if entry_rp in entry_native:
+                    continue          # 条目已有命中,原文重复丢弃
+                out.append({**m, "corpus_entry": entry_rp, "corpus_origin": rp})
+                continue
+            st = states.get(rp)
+            if st is None:
+                m = {**m, "corpus_mark": "[未入库]"}
+            elif st["state"] == "excluded":
+                reason = (st.get("reason") or "").strip()
+                m = {**m, "corpus_mark": f"[已排除{(':' + reason[:40]) if reason else ''}]"}
+            elif st["state"] == "failed":
+                m = {**m, "corpus_mark": "[分类失败]"}
+            # imported 但条目查不到(极端:条目被删)按未标记处理
+            out.append(m)
+        return out
+
     def _format_search_result(self, match: dict, query: str) -> str:
         """Format a single search result with snippet.
 
@@ -315,6 +366,16 @@ class SearchHandler:
             marker = " [annotated]"
 
         snippet = _extract_snippet(match.get("content", ""), query)
+
+        # 语料折叠:已入库源文件的命中以条目身份呈现(引用应指向条目),
+        # 原文路径与页码保留供核对;未入库/排除/失败的源文件带可信度标记
+        if match.get("corpus_entry"):
+            origin = f"/{match['corpus_origin']}"
+            return (f"**/{match['corpus_entry']}** [语料条目]{score_str} — [view]({link})"
+                    f"\n  原文: {origin}{page_str}{breadcrumb}\n```\n{snippet}\n```\n")
+        if match.get("corpus_mark"):
+            marker = f" {match['corpus_mark']}{marker}"
+
         return f"**{filepath}**{page_str}{score_str}{marker} — [view]({link}){breadcrumb}\n```\n{snippet}\n```\n"
 
 

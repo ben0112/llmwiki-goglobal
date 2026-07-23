@@ -56,7 +56,7 @@ jobs:
 
       - name: Run MCP VaultFS + tool handler tests
         working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py -v
+        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py -v
 
   postgres-integration:
     name: Integration tests (Postgres)

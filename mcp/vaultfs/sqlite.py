@@ -509,6 +509,38 @@ class SqliteVaultFS(VaultFS):
         return labeled
 
 
+    async def corpus_search_context(self, kb_id: str, relpaths: list[str]) -> dict:
+        """已入库源文件 → 条目映射 + 流水线状态(未入库/排除/失败标记用)。
+
+        旧库可能没有 corpus_pipeline 表,整体容错回落为"无流水线"。
+        """
+        empty = {"has_pipeline": False, "entries": {}, "states": {}}
+        db = self._db_or_raise()
+        try:
+            cursor = await db.execute("SELECT EXISTS(SELECT 1 FROM corpus_pipeline)")
+            if not (await cursor.fetchone())[0]:
+                return empty
+            out = {"has_pipeline": True, "entries": {}, "states": {}}
+            if not relpaths:
+                return out
+            ph = ",".join("?" for _ in relpaths)
+            cursor = await db.execute(
+                "SELECT json_extract(metadata, '$.source_relpath'), relative_path "
+                "FROM documents WHERE relative_path LIKE 'corpus/%' "
+                f"AND json_extract(metadata, '$.source_relpath') IN ({ph})",
+                relpaths)
+            for src, entry_rp in await cursor.fetchall():
+                out["entries"][src] = entry_rp
+            cursor = await db.execute(
+                "SELECT d.relative_path, p.state, COALESCE(p.error, '') "
+                "FROM corpus_pipeline p JOIN documents d ON d.id = p.doc_id "
+                f"WHERE d.relative_path IN ({ph})", relpaths)
+            for rp, state, err in await cursor.fetchall():
+                out["states"][rp] = {"state": state, "reason": err}
+            return out
+        except Exception:
+            return empty
+
     async def load_source_bytes(self, doc: dict) -> bytes | None:
         relative = doc.get("relative_path") or (doc["path"].rstrip("/") + "/" + doc["filename"]).lstrip("/")
         return self._load_local_bytes(relative)

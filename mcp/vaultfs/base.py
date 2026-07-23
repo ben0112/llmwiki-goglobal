@@ -76,6 +76,15 @@ class VaultFS(ABC):
         facets: dict | None = None,
     ) -> list[dict]: ...
 
+    async def corpus_search_context(self, kb_id: str, relpaths: list[str]) -> dict:
+        """搜索结果的语料折叠/可信度标记上下文(默认无流水线,普通库零开销)。
+
+        返回 {"has_pipeline": bool,
+              "entries": {源文件相对路径: 语料条目相对路径},
+              "states":  {源文件相对路径: {"state": ..., "reason": ...}}}
+        """
+        return {"has_pipeline": False, "entries": {}, "states": {}}
+
     @abstractmethod
     async def load_source_bytes(self, doc: dict) -> bytes | None: ...
 
