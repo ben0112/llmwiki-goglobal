@@ -481,6 +481,28 @@ async def _process_pdf(db: aiosqlite.Connection, doc_id: str, file_path: Path, w
 
 # ── Office processing ─────────────────────────────────────────────────────
 
+def _extract_docx_paragraphs(file_path: Path) -> list[str]:
+    """docx zip 直读兜底:LibreOffice 对损坏/非标准 docx 可能直接崩溃
+    (SIGABRT,重试无用),而 docx 本质是 zip 包 —— 解包 word/document.xml
+    即可拿到全部段落文本。丢版面,但比整份失败强(与 PDF 的 pypdf 兜底
+    同一哲学)。表格单元格内的段落同样被 w:p 遍历覆盖。"""
+    import zipfile
+    from xml.etree import ElementTree
+
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(file_path) as z:
+        xml = z.read("word/document.xml")
+    root = ElementTree.fromstring(xml)
+    paras: list[str] = []
+    for p in root.iter(f"{W}p"):
+        text = "".join(t.text or "" for t in p.iter(f"{W}t")).strip()
+        if text:
+            paras.append(text)
+    if not paras:
+        raise RuntimeError("docx 兜底未提取到文本")
+    return paras
+
+
 async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path, workspace: Path) -> None:
     """Convert Office docs to PDF via local LibreOffice, then extract text."""
     lo = shutil.which("libreoffice") or shutil.which("soffice")
@@ -495,43 +517,56 @@ async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 短名软链再转换:让输出名可预期,规避超长/特殊字符文件名的边界问题
-        ext = file_path.suffix.lstrip(".") or "doc"
-        src = Path(tmpdir) / f"source.{ext}"
-        os.symlink(file_path.resolve(), src)
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [lo, "--headless", "--norestore",
-             # 每次调用独立用户配置目录:并发转换共用 ~/.config/libreoffice
-             # 会互踩配置锁,后来者直接失败(批量导入时成片报错的根因)
-             f"-env:UserInstallation=file://{tmpdir}/lo-profile",
-             "--convert-to", "pdf", "--outdir", tmpdir, str(src)],
-            capture_output=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"LibreOffice conversion failed: {result.stderr.decode()[:300]}")
+        try:
+            # 短名软链再转换:让输出名可预期,规避超长/特殊字符文件名的边界问题
+            ext = file_path.suffix.lstrip(".") or "doc"
+            src = Path(tmpdir) / f"source.{ext}"
+            os.symlink(file_path.resolve(), src)
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [lo, "--headless", "--norestore",
+                 # 每次调用独立用户配置目录:并发转换共用 ~/.config/libreoffice
+                 # 会互踩配置锁,后来者直接失败(批量导入时成片报错的根因)
+                 f"-env:UserInstallation=file://{tmpdir}/lo-profile",
+                 "--convert-to", "pdf", "--outdir", tmpdir, str(src)],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"LibreOffice conversion failed: {result.stderr.decode()[:300]}")
 
-        pdf_files = list(Path(tmpdir).glob("*.pdf"))
-        if not pdf_files:
-            # 载入失败(如加密/受保护文档)时 soffice 退出码为 0、原因只打在
-            # stdout —— 带出来让失败原因可诊断
-            detail = (result.stdout.decode(errors="replace")[:200]
-                      or result.stderr.decode(errors="replace")[:200]).strip()
-            raise RuntimeError(
-                f"LibreOffice produced no PDF output{(': ' + detail) if detail else ''}")
+            pdf_files = list(Path(tmpdir).glob("*.pdf"))
+            if not pdf_files:
+                # 载入失败(如加密/受保护文档)时 soffice 退出码为 0、原因只打在
+                # stdout —— 带出来让失败原因可诊断
+                detail = (result.stdout.decode(errors="replace")[:200]
+                          or result.stderr.decode(errors="replace")[:200]).strip()
+                raise RuntimeError(
+                    f"LibreOffice produced no PDF output{(': ' + detail) if detail else ''}")
 
-        converted_pdf = pdf_files[0]
+            converted_pdf = pdf_files[0]
 
-        # Store converted PDF in cache for the viewer
-        cache_dir = workspace / ".llmwiki" / "cache" / "local" / doc_id
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(converted_pdf, cache_dir / "converted.pdf")
+            # Store converted PDF in cache for the viewer
+            cache_dir = workspace / ".llmwiki" / "cache" / "local" / doc_id
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(converted_pdf, cache_dir / "converted.pdf")
 
-        from services.pdf_extract import extract_pdf
-        pages_with_images = await asyncio.to_thread(extract_pdf, str(converted_pdf))
-        page_elements = await _save_local_images(db, doc_id, workspace, pages_with_images)
-        page_contents = [(num, md) for num, md, _ in pages_with_images]
-        await _store_page_contents(db, doc_id, page_contents, "libreoffice+opendataloader", page_elements)
+            from services.pdf_extract import extract_pdf
+            pages_with_images = await asyncio.to_thread(extract_pdf, str(converted_pdf))
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            if file_path.suffix.lower() != ".docx":
+                raise    # .doc 等二进制格式没有廉价兜底,照常失败
+            try:
+                paras = await asyncio.to_thread(_extract_docx_paragraphs, file_path)
+            except Exception as fb:
+                raise RuntimeError(f"{e}(docx 兜底亦失败: {fb})") from e
+            logger.warning("LibreOffice failed for %s, used docx-xml fallback: %s",
+                           file_path.name, str(e)[:200])
+            await _store_page_contents(db, doc_id, [(1, "\n\n".join(paras))], "docx-xml")
+            return
+
+    page_elements = await _save_local_images(db, doc_id, workspace, pages_with_images)
+    page_contents = [(num, md) for num, md, _ in pages_with_images]
+    await _store_page_contents(db, doc_id, page_contents, "libreoffice+opendataloader", page_elements)
 
 
 # ── Mistral OCR ───────────────────────────────────────────────────────────

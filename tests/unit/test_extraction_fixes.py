@@ -824,3 +824,85 @@ async def test_watcher_content_change_clears_quarantine(tmp_path, monkeypatch):
         assert (await cursor.fetchone()) == ("pending", 0)   # 隔离随内容变化解除
     finally:
         await db.close()
+
+
+def _mini_docx(path: Path) -> None:
+    """手工拼最小合法 docx(zip + word/document.xml,含表格段落)。"""
+    import zipfile
+    xml = (
+        '<?xml version="1.0"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body>'
+        '<w:p><w:r><w:t>境外投资备案指南</w:t></w:r></w:p>'
+        '<w:p><w:r><w:t>第一章 总则</w:t></w:r><w:r><w:t>(续)</w:t></w:r></w:p>'
+        '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>表格内容甲</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+        '</w:body></w:document>'
+    )
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('word/document.xml', xml)
+
+
+def test_docx_zip_fallback_extracts_paragraphs(tmp_path):
+    from domain.local_processor import _extract_docx_paragraphs
+
+    f = tmp_path / '样例.docx'
+    _mini_docx(f)
+    paras = _extract_docx_paragraphs(f)
+    assert paras == ['境外投资备案指南', '第一章 总则(续)', '表格内容甲']   # 表格段落也覆盖
+
+
+async def test_process_office_falls_back_to_docx_xml(tmp_path, monkeypatch):
+    """LibreOffice 崩溃(损坏/非标准 docx 常见)时走 zip 直读兜底入库。"""
+    import domain.local_processor as lp
+
+    ws = tmp_path / 'ws'
+    (ws / '.llmwiki').mkdir(parents=True)
+    _mini_docx(ws / '崩溃文档.docx')
+    db = await aiosqlite.connect(str(ws / '.llmwiki' / 'index.db'))
+    try:
+        await db.executescript(SCHEMA_PATH.read_text(encoding='utf-8'))
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, user_id) VALUES (?, 'w', '', ?)",
+            (str(uuid.uuid4()), USER_ID))
+        doc_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, status, tags, version, document_number) "
+            "VALUES (?, ?, '崩溃文档.docx', 'C', '/', '崩溃文档.docx', 'source', 'docx', "
+            "'pending', '[]', 0, 1)", (doc_id, USER_ID))
+        await db.commit()
+
+        class Crashed:
+            returncode = 134
+            stderr = b'Fatal exception: Signal 6'
+            stdout = b''
+
+        monkeypatch.setattr(lp.shutil, 'which', lambda name: '/usr/bin/libreoffice')
+        monkeypatch.setattr(lp.subprocess, 'run', lambda *a, **kw: Crashed())
+
+        await lp.process_document(db, doc_id, ws)
+
+        cursor = await db.execute(
+            "SELECT status, parser, content, extraction_attempts FROM documents WHERE id = ?",
+            (doc_id,))
+        status, parser, content, attempts = await cursor.fetchone()
+        assert status == 'ready' and parser == 'docx-xml' and attempts == 0
+        assert '境外投资备案指南' in content and '表格内容甲' in content
+    finally:
+        await db.close()
+
+
+async def test_doc_binary_has_no_fallback(tmp_path, monkeypatch):
+    """.doc(OLE 二进制)没有廉价兜底:LibreOffice 失败即失败。"""
+    import domain.local_processor as lp
+
+    class Crashed:
+        returncode = 134
+        stderr = b'Fatal exception: Signal 6'
+        stdout = b''
+
+    monkeypatch.setattr(lp.shutil, 'which', lambda name: '/usr/bin/libreoffice')
+    monkeypatch.setattr(lp.subprocess, 'run', lambda *a, **kw: Crashed())
+    (tmp_path / 'old.doc').write_bytes(b'\xd0\xcf\x11\xe0 fake ole')
+    with pytest.raises(RuntimeError, match='LibreOffice conversion failed'):
+        await lp._process_office(None, 'doc-1', tmp_path / 'old.doc', tmp_path)
