@@ -274,6 +274,27 @@ def codetable_options(version: str = DEFAULT_VERSION) -> dict:
             name = val.get("name") if isinstance(val, dict) else val
             out.append({"code": code, "name": str(name)})
         return out
+    def _scene_sort_key(code: str):
+        # 数字段按数值、其余按字面,元组保证跨类型可比("B7.10" 排在 "B7.9" 后)
+        return [(0, int(p)) if p.isdigit() else (1, p)
+                for p in code.lstrip("B").split(".")]
+
+    # 业务全目录(7 类 → 场景):业务视图据此显示 0 条的缺口场景,
+    # 仅凭条目派生看不到"哪些场景还没有语料"
+    scenes = raw.get("business_scenes", {})
+    business = []
+    for code, val in raw.get("business_classes", {}).items():
+        business.append({
+            "code": code,
+            "name": val.get("name", "") if isinstance(val, dict) else str(val),
+            "priority": val.get("priority", "") if isinstance(val, dict) else "",
+            "scenes": [
+                {"code": sc, "name": str(sn)}
+                for sc, sn in sorted(scenes.items(), key=lambda kv: _scene_sort_key(kv[0]))
+                if sc.split(".")[0] == code
+            ],
+        })
+
     return {
         "version": table.version,
         "stages": pairs("stages"),
@@ -283,4 +304,5 @@ def codetable_options(version: str = DEFAULT_VERSION) -> dict:
         "evidence": pairs("evidence"),
         "origins": [{"code": v, "name": v} for v in raw.get("origins", {}).values()],
         "timeliness": pairs("timeliness"),
+        "business": business,
     }

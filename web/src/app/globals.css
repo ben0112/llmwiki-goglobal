@@ -36,6 +36,7 @@
 
   /* Accent blue */
   --color-accent-blue: hsl(var(--accent-blue));
+  --color-corpus-bar: hsl(var(--corpus-bar));
 
   /* Sidebar tokens */
   --color-sidebar: hsl(var(--sidebar));
@@ -86,6 +87,7 @@
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
   --accent-blue: 220 40% 50%;
+  --corpus-bar: 220 45% 48%;   /* 语料业务视图条形;validate_palette 双模通过 */
   --sidebar: 30 3% 96%;
   --sidebar-foreground: 20 14% 4%;
   --sidebar-primary: 24 10% 10%;
@@ -122,6 +124,7 @@
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
   --accent-blue: 220 35% 55%;
+  --corpus-bar: 220 55% 62%;
   --sidebar: 20 14% 3%;
   --sidebar-foreground: 40 10% 90%;
   --sidebar-primary: 40 10% 90%;

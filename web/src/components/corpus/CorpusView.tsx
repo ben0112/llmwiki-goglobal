@@ -209,6 +209,7 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
           classes={businessClasses}
           pending={pendingBusiness}
           selections={selections}
+          catalog={codetable?.business}
           onSelectScene={(code) => {
             setSelections((prev) => (prev.business === code ? {} : { business: code }))
             setView('knowledge')
@@ -603,18 +604,63 @@ function StateBadge({ tone, children }: { tone: 'warn' | 'alert'; children: Reac
 
 // ---------------------------------------------------------------------------
 
+interface MergedScene { code: string; name: string; count: number }
+interface MergedClass {
+  code: string; name: string; priority: string; count: number; scenes: MergedScene[]
+}
+
+/** 码表全目录 × 条目计数合并:目录给全集(0 条的缺口场景可见),条目给计数。 */
+function mergeBusinessCatalog(
+  classes: ReturnType<typeof buildBusinessView>,
+  catalog: CodetableOptions['business'],
+): MergedClass[] {
+  if (!catalog?.length) {
+    return classes.map((cls) => ({
+      code: cls.code, name: cls.name, priority: cls.priority, count: cls.count,
+      scenes: cls.scenes.map((s) => ({ code: s.code, name: s.scene, count: s.count })),
+    }))
+  }
+  const sceneCounts = new Map<string, number>()
+  const classCounts = new Map<string, number>()
+  for (const cls of classes) {
+    classCounts.set(cls.code, cls.count)
+    for (const s of cls.scenes) sceneCounts.set(s.code, s.count)
+  }
+  const merged = catalog.map((c) => ({
+    code: c.code, name: c.name, priority: c.priority,
+    count: classCounts.get(c.code) ?? 0,
+    scenes: c.scenes.map((s) => ({ code: s.code, name: s.name, count: sceneCounts.get(s.code) ?? 0 })),
+  }))
+  merged.sort((a, b) => a.priority.localeCompare(b.priority) || a.code.localeCompare(b.code))
+  return merged
+}
+
+function StatTile({ label, value, sub }: { label: string; value: React.ReactNode; sub?: string }) {
+  return (
+    <div className="rounded-lg border border-border px-3 py-2">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate text-lg font-semibold leading-tight">{value}</div>
+      {sub && <div className="text-[11px] text-muted-foreground">{sub}</div>}
+    </div>
+  )
+}
+
 function BusinessPane({
   classes,
   pending,
   selections,
+  catalog,
   onSelectScene,
 }: {
   classes: ReturnType<typeof buildBusinessView>
   pending: number
   selections: FacetSelections
+  catalog: CodetableOptions['business']
   onSelectScene: (code: string) => void
 }) {
-  if (classes.length === 0) {
+  const merged = React.useMemo(() => mergeBusinessCatalog(classes, catalog), [classes, catalog])
+
+  if (classes.length === 0 && merged.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
         <p className="text-sm font-medium">暂无业务视图数据</p>
@@ -625,16 +671,81 @@ function BusinessPane({
       </div>
     )
   }
+
+  const total = merged.reduce((n, c) => n + c.count, 0)
+  const allScenes = merged.flatMap((c) => c.scenes)
+  const covered = allScenes.filter((s) => s.count > 0).length
+  const maxClass = Math.max(1, ...merged.map((c) => c.count))
+  const maxScene = Math.max(1, ...allScenes.map((s) => s.count))
+  const top = allScenes.reduce<MergedScene | null>(
+    (best, s) => (s.count > (best?.count ?? 0) ? s : best), null)
+
   return (
     <div className="flex-1 overflow-y-auto px-4 py-4">
       <div className="mb-3 flex items-baseline gap-2">
-        <span className="text-xs font-medium">7 类企业需求 → 27 业务场景</span>
+        <span className="text-xs font-medium">{merged.length} 类企业需求 → {allScenes.length} 业务场景</span>
         <span className="text-[11px] text-muted-foreground">按需求频度 P1→P7 排序 · 业务标签由八维自动派生</span>
-        {pending > 0 && <span className="text-[11px] text-muted-foreground">业务待定 {pending} 条</span>}
       </div>
+
+      {/* KPI 行 */}
+      <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatTile label="已归类语料" value={total.toLocaleString()} sub="条" />
+        <StatTile label="场景覆盖" value={`${covered} / ${allScenes.length}`}
+          sub={covered < allScenes.length ? `${allScenes.length - covered} 个场景待补语料` : '全部场景已有语料'} />
+        <StatTile label="业务待定" value={pending.toLocaleString()} sub="条 · 八维不足以派生业务码" />
+        <StatTile label="最大场景" value={top ? top.name : '—'} sub={top ? `${top.code} · ${top.count} 条` : undefined} />
+      </div>
+
+      {/* 需求类分布:单序列水平条形,值标在条端,悬停浮层给占比 */}
+      <div className="mb-4 rounded-lg border border-border px-3 py-2.5">
+        <div className="mb-1.5 flex items-baseline gap-2">
+          <span className="text-xs font-medium">需求类分布</span>
+          <span className="text-[11px] text-muted-foreground">悬停看占比 · 点击定位到场景卡片</span>
+        </div>
+        <div>
+          {merged.map((cls) => {
+            const pct = Math.round((cls.count / maxClass) * 100)
+            const share = total > 0 ? Math.round((cls.count / total) * 1000) / 10 : 0
+            const sceneCovered = cls.scenes.filter((s) => s.count > 0).length
+            return (
+              <button
+                key={cls.code}
+                onClick={() => document.getElementById(`biz-${cls.code}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
+                className="group relative flex w-full items-center gap-2 rounded-md px-1.5 py-[3px] transition-colors cursor-pointer hover:bg-accent/50"
+              >
+                <span className="w-52 shrink-0 truncate text-left text-[12px] text-muted-foreground group-hover:text-foreground">
+                  <span className="text-muted-foreground/60">{cls.code}</span> {cls.name}
+                </span>
+                <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">{cls.priority}</span>
+                <div className="h-4 flex-1 min-w-0">
+                  {/* 内层预留端值宽度:最长条(100%)的值标签也永远在容器内,不贴边不裁切 */}
+                  <div className="relative h-full mr-10">
+                    <div
+                      className="absolute inset-y-0 left-0 rounded-r-[4px] bg-corpus-bar"
+                      style={{ width: `${pct}%` }}
+                    />
+                    <span
+                      className="absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1.5 text-[11px] tabular-nums text-muted-foreground"
+                      style={{ left: `${pct}%` }}
+                    >
+                      {cls.count}
+                    </span>
+                  </div>
+                </div>
+                {/* 悬停浮层 */}
+                <div className="pointer-events-none absolute left-56 top-full z-10 mt-0.5 hidden whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 text-[11px] text-popover-foreground shadow-sm group-hover:block">
+                  {cls.count} 条 · 占 {share}% · {sceneCovered}/{cls.scenes.length} 个场景有语料
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* 场景卡片:比例条 + 缺口场景 */}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {classes.map((cls) => (
-          <div key={cls.code} className="rounded-lg border border-border p-3">
+        {merged.map((cls) => (
+          <div key={cls.code} id={`biz-${cls.code}`} className="rounded-lg border border-border p-3">
             <div className="flex items-baseline gap-2">
               <span className="text-xs font-medium">
                 {cls.code} {cls.name}
@@ -643,22 +754,38 @@ function BusinessPane({
               <span className="ml-auto text-[11px] text-muted-foreground tabular-nums">{cls.count} 条</span>
             </div>
             <div className="mt-2 space-y-0.5">
-              {cls.scenes.map((scene) => (
-                <button
-                  key={scene.code}
-                  onClick={() => onSelectScene(scene.code)}
-                  className={cn(
-                    'flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] transition-colors cursor-pointer',
-                    selections.business === scene.code
-                      ? 'bg-accent text-foreground'
-                      : 'text-muted-foreground hover:text-foreground hover:bg-accent/60',
-                  )}
-                >
-                  <span className="text-[10px] text-muted-foreground/60 tabular-nums">{scene.code}</span>
-                  <span className="flex-1 truncate">{scene.scene}</span>
-                  <span className="text-[11px] text-muted-foreground tabular-nums">{scene.count}</span>
-                </button>
-              ))}
+              {cls.scenes.map((scene) =>
+                scene.count === 0 ? (
+                  <div
+                    key={scene.code}
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] text-muted-foreground/50"
+                  >
+                    <span className="text-[10px] tabular-nums">{scene.code}</span>
+                    <span className="flex-1 truncate">{scene.name}</span>
+                    <span className="rounded border border-dashed border-border px-1 text-[10px]">缺口</span>
+                  </div>
+                ) : (
+                  <button
+                    key={scene.code}
+                    onClick={() => onSelectScene(scene.code)}
+                    className={cn(
+                      'relative flex w-full items-center gap-2 overflow-hidden rounded-md px-2 py-1 text-left text-[12px] transition-colors cursor-pointer',
+                      selections.business === scene.code
+                        ? 'bg-accent text-foreground'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent/60',
+                    )}
+                  >
+                    {/* 比例条:同色系约 15% 不透明度的面积水铺在行内,量级一眼可读 */}
+                    <div
+                      className="absolute inset-y-[3px] left-0 rounded-r-[4px] bg-corpus-bar/15"
+                      style={{ width: `${Math.round((scene.count / maxScene) * 100)}%` }}
+                    />
+                    <span className="relative text-[10px] text-muted-foreground/60 tabular-nums">{scene.code}</span>
+                    <span className="relative flex-1 truncate">{scene.name}</span>
+                    <span className="relative text-[11px] tabular-nums">{scene.count}</span>
+                  </button>
+                ),
+              )}
             </div>
           </div>
         ))}

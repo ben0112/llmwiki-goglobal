@@ -31,6 +31,8 @@ export interface CodetableOptions {
   evidence: { code: string; name: string }[]
   origins: { code: string; name: string }[]
   timeliness: { code: string; name: string }[]
+  /** 业务全目录(7 类 → 场景),业务视图据此显示缺口场景 */
+  business?: { code: string; name: string; priority: string; scenes: { code: string; name: string }[] }[]
 }
 
 export async function reviewEntry(
