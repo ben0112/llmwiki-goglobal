@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import random
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -33,7 +35,11 @@ def is_local_endpoint(base_url: str) -> bool:
     return host in _LOCAL_HOSTS or host.endswith(".local") or host.endswith(".internal")
 
 
-MAX_CONCURRENCY = 32
+# 并发上限:默认 256,可经 CORPUS_LLM_MAX_CONCURRENCY 放宽(封顶 1024)
+# 供大配额端点实验。再往上通常先撞端点限流(429)或 vLLM 排队,拿不到
+# 收益;并发只压缩耗时,token 花费不变。
+MAX_CONCURRENCY = max(32, min(1024, int(
+    os.environ.get("CORPUS_LLM_MAX_CONCURRENCY", "") or 256)))
 
 
 def default_concurrency(base_url: str) -> int:
@@ -64,6 +70,23 @@ class LLMError(Exception):
     pass
 
 
+# 大并发下的瞬时故障自愈:429(限流)/5xx(过载)与连接类瞬断在请求层
+# 指数退避重试,不上抛为语料失败 —— 否则并发风暴会把好语料成片打进
+# 失败态(满 3 次即不再入选队列)。
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRY_MAX = 5   # 全抖动 1/2/4/8/16s 级,最长累计约 45s
+
+
+def _retry_delay(attempt: int, retry_after: str | None) -> float:
+    """服务端给了 Retry-After 就照办(封顶 60s),否则指数退避 + 全抖动。"""
+    if retry_after:
+        try:
+            return min(60.0, max(0.5, float(retry_after)))
+        except ValueError:
+            pass
+    return min(30.0, float(2 ** attempt)) * (0.5 + random.random())
+
+
 # 进程级共享 HTTP 客户端:数万次分类请求逐次新建/关闭 AsyncClient 会把
 # TCP+TLS 握手做上数万遍。按事件循环缓存(CLI/测试可能多次 asyncio.run,
 # 旧 loop 的客户端不可复用),timeout 逐请求传入。持 loop 对象比较身份
@@ -77,8 +100,11 @@ def _get_client() -> httpx.AsyncClient:
     global _client, _client_loop
     loop = asyncio.get_running_loop()
     if _client is None or _client.is_closed or _client_loop is not loop:
+        # 连接池随并发上限走:64 硬顶会让高并发在客户端内部排队,
+        # 空跑不出配置的并发数
         _client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+            limits=httpx.Limits(max_connections=MAX_CONCURRENCY + 32,
+                                max_keepalive_connections=min(64, MAX_CONCURRENCY)),
         )
         _client_loop = loop
     return _client
@@ -118,15 +144,38 @@ async def _complete_raw(config: LLMConfig, system_prompt: str, user_prompt: str,
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
-    try:
-        resp = await _get_client().post(
-            config.base_url.rstrip("/") + "/chat/completions",
-            json=payload, headers=headers, timeout=config.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except httpx.HTTPError as e:
-        raise LLMError(f"端点请求失败: {e}") from e
+    url = config.base_url.rstrip("/") + "/chat/completions"
+    client = _get_client()
+
+    data = None
+    for attempt in range(_RETRY_MAX + 1):
+        try:
+            resp = await client.post(url, json=payload, headers=headers,
+                                     timeout=config.timeout)
+        except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            # 连接类瞬断(端点重启/负载均衡切换):退避重跑
+            if attempt >= _RETRY_MAX:
+                raise LLMError(f"端点请求失败(重试 {_RETRY_MAX} 次后放弃): {e}") from e
+            await asyncio.sleep(_retry_delay(attempt, None))
+            continue
+        except httpx.HTTPError as e:
+            # 读超时等不重试:深队列下重试只会火上浇油
+            raise LLMError(f"端点请求失败: {e}") from e
+        if resp.status_code in _RETRY_STATUS:
+            if attempt >= _RETRY_MAX:
+                raise LLMError(
+                    f"端点过载/限流(HTTP {resp.status_code},重试 {_RETRY_MAX} 次后放弃)")
+            await asyncio.sleep(_retry_delay(attempt, resp.headers.get("retry-after")))
+            continue
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as e:
+            raise LLMError(f"端点请求失败: {e}") from e
+        except ValueError as e:
+            raise LLMError(f"响应非 JSON: {e}") from e
+        break
+
     try:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:

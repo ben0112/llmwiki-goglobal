@@ -217,8 +217,9 @@ function CorpusPipelineSection() {
       <h2 className="text-base font-medium">语料分类流水线</h2>
       <p className="mt-2 text-sm text-muted-foreground">
         新语料的审核与八维标注所用的 LLM 端点(OpenAI 兼容)。并发数为同时向端点
-        发起的请求数,留空或填 0 时按端点自动取默认:本地端点 2,云端 8。每轮处理
-        全部待分类语料。
+        发起的请求数,留空或填 0 时按端点自动取默认:本地端点 2,云端 8;上限 256
+        (可经环境变量 CORPUS_LLM_MAX_CONCURRENCY 放宽至 1024)。大并发需端点配额
+        支撑——遇 429/5xx 会自动指数退避重试,不计入语料失败。每轮处理全部待分类语料。
       </p>
 
       <div className="mt-4 space-y-3">

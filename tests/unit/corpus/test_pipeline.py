@@ -60,8 +60,10 @@ def test_endpoint_aware_concurrency_default():
     assert default_concurrency("http://127.0.0.1:1234/v1") == 2
     assert default_concurrency("https://api.deepseek.com/v1") == 8
     assert LLMConfig(base_url="https://api.deepseek.com/v1", concurrency=7).effective_concurrency == 7
-    # 上下限保护:离谱的配置钳制到 [1, 32]
-    assert LLMConfig(base_url="mock", concurrency=1000).effective_concurrency == 32
+    # 上下限保护:离谱的配置钳制到 [1, MAX_CONCURRENCY](默认 256,env 可放宽)
+    from corpus.llm import MAX_CONCURRENCY
+    assert MAX_CONCURRENCY == 256
+    assert LLMConfig(base_url="mock", concurrency=2000).effective_concurrency == MAX_CONCURRENCY
     assert LLMConfig(base_url="mock", concurrency=-3).effective_concurrency == 1
 
 
@@ -368,6 +370,8 @@ async def test_complete_raw_payload_carries_thinking_flag(monkeypatch):
     captured: list[dict] = []
 
     class FakeResp:
+        status_code = 200
+        headers: dict = {}
         def raise_for_status(self):
             pass
         def json(self):
@@ -384,3 +388,83 @@ async def test_complete_raw_payload_carries_thinking_flag(monkeypatch):
         await cl._complete_raw(cfg, "sys", "user", max_tokens=8, temperature=0.0)
     assert captured[0]["chat_template_kwargs"] == {"enable_thinking": True}
     assert captured[1]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+async def test_llm_retries_429_with_retry_after_then_succeeds(monkeypatch):
+    """限流在请求层退避自愈:429→429→200 成功返回,Retry-After 生效,
+    全程不上抛 LLMError(不计入语料失败)。"""
+    import corpus.llm as cl
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(cl.asyncio, "sleep", fake_sleep)
+
+    calls = 0
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.headers = {"retry-after": "2"} if code == 429 else {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "答案"}}]}
+
+    class FakeClient:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            nonlocal calls
+            calls += 1
+            return Resp(429 if calls <= 2 else 200)
+
+    monkeypatch.setattr(cl, "_get_client", lambda: FakeClient())
+    out = await cl._complete_raw(
+        cl.LLMConfig(base_url="http://x/v1"), "s", "u", max_tokens=8, temperature=0.0)
+    assert out == "答案" and calls == 3
+    assert sleeps == [2.0, 2.0]                    # Retry-After 照办
+
+
+async def test_llm_gives_up_after_retry_budget(monkeypatch):
+    """持续 503:重试预算耗尽后才上抛 LLMError,总请求数 = 1 + _RETRY_MAX。"""
+    import corpus.llm as cl
+    from corpus.llm import LLMError
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(cl.asyncio, "sleep", fake_sleep)
+
+    calls = 0
+
+    class Resp:
+        status_code = 503
+        headers = {}
+
+    class FakeClient:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            nonlocal calls
+            calls += 1
+            return Resp()
+
+    monkeypatch.setattr(cl, "_get_client", lambda: FakeClient())
+    with pytest.raises(LLMError, match="过载/限流"):
+        await cl._complete_raw(
+            cl.LLMConfig(base_url="http://x/v1"), "s", "u", max_tokens=8, temperature=0.0)
+    assert calls == cl._RETRY_MAX + 1
+
+
+def test_retry_delay_shape():
+    """退避形状:Retry-After 优先且封顶;否则指数级 + 全抖动落在 [0.5x, 1.5x]。"""
+    from corpus.llm import _retry_delay
+
+    assert _retry_delay(0, "3") == 3.0
+    assert _retry_delay(0, "999") == 60.0          # Retry-After 封顶
+    assert _retry_delay(0, "not-a-number") >= 0.5  # 解析失败回落指数退避
+    for attempt, base in ((0, 1), (2, 4), (4, 16)):
+        for _ in range(20):
+            d = _retry_delay(attempt, None)
+            assert base * 0.5 <= d <= base * 1.5
