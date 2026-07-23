@@ -129,7 +129,7 @@ def apply_review(workspace: Path, doc_id: str, action: str,
     table = load(version)
     today = date.today()
     conn = sqlite3.connect(str(workspace / ".llmwiki" / "index.db"))
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=60000")
     try:
         # 改标/剔除会改变条目口径:引用它的维基页面需要标记复查
         citing = _citing_wiki_pages(conn, doc_id) if action in ("update", "exclude") else []
@@ -226,7 +226,7 @@ def prepare_reprocess(workspace: Path, doc_id: str) -> dict:
     调用方随后应触发源文档重新提取(带 OCR 兜底)并起一轮分类。
     """
     conn = sqlite3.connect(str(workspace / ".llmwiki" / "index.db"))
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=60000")
     try:
         citing = _citing_wiki_pages(conn, doc_id)
         row = conn.execute(

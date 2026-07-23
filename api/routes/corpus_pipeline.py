@@ -37,9 +37,12 @@ def _require_local(request: Request) -> Path:
     return Path(request.app.state.workspace_path)
 
 
-def _db(workspace: Path) -> sqlite3.Connection:
+def _db(workspace: Path, busy_ms: int = 10000) -> sqlite3.Connection:
+    """读路径保持短超时(WAL 下读不受写锁影响,等待本就异常);写路径
+    传 60s —— 批量提取/分类的连续大事务会长时间占住写锁,10s 实测会
+    饿死交互式小写(保存设置/停止按钮 500)。写调用务必放线程里跑。"""
     conn = sqlite3.connect(str(workspace / ".llmwiki" / "index.db"))
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
     return conn
 
 
@@ -92,26 +95,32 @@ async def get_llm_config(request: Request):
 async def put_llm_config(request: Request, body: LLMConfigIn):
     workspace = _require_local(request)
     _, corpus_pipeline = _corpus()
-    conn = _db(workspace)
-    try:
-        stored = corpus_pipeline.load_llm_settings(conn)
-        if body.base_url:
-            stored["base_url"] = body.base_url.strip()
-        if body.model:
-            stored["model"] = body.model.strip()
-        if body.api_key is not None:          # 缺省沿用;显式空串清除
-            stored["api_key"] = body.api_key.strip()
-        if body.timeout is not None:
-            stored["timeout"] = body.timeout
-        if body.concurrency is not None:      # 0 = 恢复端点感知默认
-            stored["concurrency"] = body.concurrency
-        if body.auto_enabled is not None:
-            stored["auto_enabled"] = body.auto_enabled
-        if body.auto_interval is not None:
-            stored["auto_interval"] = body.auto_interval
-        corpus_pipeline.save_llm_settings(conn, stored)
-    finally:
-        conn.close()
+
+    def _update() -> dict:
+        # 同步等锁最长 60s:放线程执行,不冻结事件循环
+        conn = _db(workspace, busy_ms=60000)
+        try:
+            stored = corpus_pipeline.load_llm_settings(conn)
+            if body.base_url:
+                stored["base_url"] = body.base_url.strip()
+            if body.model:
+                stored["model"] = body.model.strip()
+            if body.api_key is not None:          # 缺省沿用;显式空串清除
+                stored["api_key"] = body.api_key.strip()
+            if body.timeout is not None:
+                stored["timeout"] = body.timeout
+            if body.concurrency is not None:      # 0 = 恢复端点感知默认
+                stored["concurrency"] = body.concurrency
+            if body.auto_enabled is not None:
+                stored["auto_enabled"] = body.auto_enabled
+            if body.auto_interval is not None:
+                stored["auto_interval"] = body.auto_interval
+            corpus_pipeline.save_llm_settings(conn, stored)
+            return stored
+        finally:
+            conn.close()
+
+    stored = await asyncio.to_thread(_update)
     return _config_out(stored, request)
 
 
@@ -200,13 +209,16 @@ async def stop_pipeline(request: Request):
     if was_running:
         task.cancel()
 
-    conn = _db(workspace)
-    try:
-        stored = corpus_pipeline.load_llm_settings(conn)
-        stored["auto_enabled"] = False
-        corpus_pipeline.save_llm_settings(conn, stored)
-    finally:
-        conn.close()
+    def _disable_auto() -> None:
+        conn = _db(workspace, busy_ms=60000)
+        try:
+            stored = corpus_pipeline.load_llm_settings(conn)
+            stored["auto_enabled"] = False
+            corpus_pipeline.save_llm_settings(conn, stored)
+        finally:
+            conn.close()
+
+    await asyncio.to_thread(_disable_auto)
     return {"stopped": was_running, "auto_disabled": True}
 
 

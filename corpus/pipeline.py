@@ -54,7 +54,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     # 与 API 主连接/MCP 同口径 30s:大工作区里恢复处理、MCP 建维基等
     # 写事务可能持锁超过 10s,过短会让整轮启动直接 database is locked
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 

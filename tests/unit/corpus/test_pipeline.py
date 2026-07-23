@@ -227,12 +227,13 @@ def test_run_batch_llm_calls_are_concurrent(tmp_path, monkeypatch):
     assert peak == 2                              # 串行实现下 peak 只会是 1
 
 
-def test_connect_busy_timeout_30s(tmp_path):
-    """与 API 主连接/MCP 同口径:10s 在生产大工作区不够,曾整轮启动即崩。"""
+def test_connect_busy_timeout_60s(tmp_path):
+    """与 API 主连接同口径 60s:批量提取的连续大事务会长时间占住写锁,
+    30s 在生产 4 万文件工作区仍会饿死交互式小写(实测保存设置 500)。"""
     from corpus.pipeline import _connect
     conn = _connect(str(tmp_path / "t.db"))
     try:
-        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
     finally:
         conn.close()
 
