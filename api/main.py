@@ -56,6 +56,75 @@ async def _repair_hosted_derived_drift(pool) -> list[dict]:
     return rows
 
 
+async def _recover_durable_extraction_jobs(pool, job_service) -> list:
+    """Idempotently backfill extraction jobs in one startup transaction."""
+    from uuid import UUID
+
+    from jobs.models import JobCreate, JobType
+
+    recovered = []
+    async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(
+            "SELECT id, user_id, knowledge_base_id FROM documents "
+            "WHERE status IN ('pending', 'processing') AND NOT archived "
+            "AND source_kind = 'source' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM background_jobs "
+            "WHERE background_jobs.user_id = documents.user_id "
+            "AND background_jobs.job_type = 'document.extract' "
+            "AND background_jobs.idempotency_key = 'document.extract:' || documents.id::text"
+            ") ORDER BY id FOR UPDATE"
+        )
+        for row in rows:
+            document_id = row["id"]
+            user_id = row["user_id"]
+            recovered.append(
+                await job_service.create_in_transaction(
+                    conn,
+                    JobCreate(
+                        job_type=JobType.DOCUMENT_EXTRACT,
+                        user_id=UUID(str(user_id)),
+                        knowledge_base_id=UUID(str(row["knowledge_base_id"])),
+                        document_id=UUID(str(document_id)),
+                        payload={"document_id": str(document_id)},
+                        idempotency_key=f"document.extract:{document_id}",
+                    ),
+                    authenticated_user_id=UUID(str(user_id)),
+                )
+            )
+    return recovered
+
+
+async def _recover_hosted_extractions(
+    pool,
+    *,
+    durable_jobs_enabled: bool,
+    job_service,
+    ocr_service,
+    spawn=spawn_logged,
+) -> list:
+    """Select exactly one Hosted recovery strategy for the rollout flag."""
+    if durable_jobs_enabled:
+        recovered = await _recover_durable_extraction_jobs(pool, job_service)
+        if recovered:
+            logger.info("Recovered %d durable document extraction job(s)", len(recovered))
+        return recovered
+    if ocr_service is None:
+        return []
+
+    rows = await pool.fetch(
+        "SELECT id::text, user_id::text FROM documents "
+        "WHERE status IN ('pending', 'processing') AND NOT archived"
+    )
+    for row in rows:
+        logger.info("Recovering stuck document %s", row["id"][:8])
+        spawn(
+            ocr_service.process_document(row["id"], row["user_id"]),
+            f"recover:{row['id'][:8]}",
+        )
+    return rows
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.MODE == "local":
@@ -99,22 +168,19 @@ async def lifespan(app: FastAPI):
     from services.hosted import HostedServiceFactory
     app.state.factory = HostedServiceFactory(pool, s3_service, ocr_service)
 
+    await _recover_hosted_extractions(
+        pool,
+        durable_jobs_enabled=settings.DURABLE_JOBS_ENABLED,
+        job_service=app.state.job_service,
+        ocr_service=ocr_service,
+    )
+
     # Real-time document change notifications via WebSocket
     from routes.ws import setup_listener
     listener_task = await setup_listener(settings.listen_database_url)
 
     from infra.tus import cleanup_stale_uploads
     cleanup_task = asyncio.create_task(cleanup_stale_uploads())
-
-    if ocr_service:
-        rows = await pool.fetch(
-            "SELECT id::text, user_id::text FROM documents "
-            "WHERE status IN ('pending', 'processing') AND NOT archived"
-        )
-        for row in rows:
-            logger.info("Recovering stuck document %s", row["id"][:8])
-            spawn_logged(ocr_service.process_document(row["id"], row["user_id"]),
-                         f"recover:{row['id'][:8]}")
 
     yield
 
@@ -289,6 +355,7 @@ app.add_middleware(
         "Location", "Upload-Offset", "Upload-Length",
         "Tus-Resumable", "Tus-Version", "Tus-Max-Size", "Tus-Extension",
         "X-Document-Id",
+        "X-Job-Id",
     ],
 )
 

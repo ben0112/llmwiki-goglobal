@@ -21,11 +21,27 @@ class JobService:
         self._pool = pool
 
     async def create(self, command: JobCreate, *, authenticated_user_id: UUID) -> JobRecord:
+        async with self._pool.acquire() as conn, conn.transaction():
+            return await self.create_in_transaction(
+                conn,
+                command,
+                authenticated_user_id=authenticated_user_id,
+            )
+
+    async def create_in_transaction(
+        self,
+        conn: asyncpg.Connection,
+        command: JobCreate,
+        *,
+        authenticated_user_id: UUID,
+    ) -> JobRecord:
+        """Create a job inside a caller-owned business transaction."""
+        if not conn.is_in_transaction():
+            raise RuntimeError("job creation connection must be in an explicit transaction")
         if command.user_id != authenticated_user_id:
             raise ValueError("command user does not match the authenticated user")
-        async with self._pool.acquire() as conn, conn.transaction():
-            await self._validate_resources(conn, command, authenticated_user_id)
-            return await repository.create(conn, command)
+        await self._validate_resources(conn, command, authenticated_user_id)
+        return await repository.create(conn, command)
 
     async def get(self, job_id: UUID, *, authenticated_user_id: UUID) -> JobRecord | None:
         async with self._pool.acquire() as conn, conn.transaction():

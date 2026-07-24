@@ -3,14 +3,17 @@ SSRF/size/magic-byte guards on the download path. No live network — getaddrinf
 and the httpx transport are mocked, matching test_webclip_ssrf.py."""
 
 import socket
+from types import SimpleNamespace
 
 import httpx
-import pytest
-from fastapi import HTTPException
-
 import infra.safe_fetch as sf
+import pytest
 import services.url_ingest as ui
+from fastapi import HTTPException
+from routes import documents as document_routes
 from services.url_ingest import UrlIngestService, _derive_filename, _normalize_pdf_url, _sanitize_filename
+from starlette.requests import Request
+from starlette.responses import Response
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -26,6 +29,7 @@ def _fake_getaddrinfo(mapping: dict[str, list[str]]):
         if host in mapping:
             return _gai_return(*mapping[host])
         raise socket.gaierror(f"unknown host {host}")
+
     return _gai
 
 
@@ -33,15 +37,23 @@ def _client_with_transport(handler):
     def factory(*args, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
         return _REAL_ASYNC_CLIENT(*args, **kwargs)
+
     return factory
 
 
 def _service() -> UrlIngestService:
-    return UrlIngestService(pool=None, s3_service=None, ocr_service=None)
+    return UrlIngestService(pool=None, s3_service=None, job_service=None)
+
+
+def test_url_ingest_accepts_durable_job_service_instead_of_ocr_service():
+    job_service = object()
+
+    service = UrlIngestService(pool=None, s3_service=None, job_service=job_service)
+
+    assert service.jobs is job_service
 
 
 class TestNormalizePdfUrl:
-
     def test_arxiv_abs_rewritten_to_pdf(self):
         assert _normalize_pdf_url("https://arxiv.org/abs/2506.06266") == "https://arxiv.org/pdf/2506.06266"
         assert _normalize_pdf_url("https://www.arxiv.org/abs/2506.06266v3") == "https://www.arxiv.org/pdf/2506.06266v3"
@@ -53,8 +65,83 @@ class TestNormalizePdfUrl:
         assert _normalize_pdf_url("https://arxiv.org/pdf/2506.06266") == "https://arxiv.org/pdf/2506.06266"
 
 
-class TestDeriveFilename:
+async def test_create_from_url_uses_durable_job_service_and_sets_response_header(monkeypatch):
+    job_service = object()
+    state = SimpleNamespace(
+        s3_service=object(),
+        job_service=job_service,
+        pool=object(),
+    )
+    app = SimpleNamespace(state=state)
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
+    response = Response()
+    captured = {}
 
+    async def current_user(_request):
+        return "00000000-0000-0000-0000-000000000001"
+
+    class FakeUrlIngestService:
+        def __init__(self, pool, s3_service, jobs):
+            captured["args"] = (pool, s3_service, jobs)
+
+        async def ingest_pdf(self, user_id, kb_id, url, path):
+            captured["call"] = (user_id, kb_id, url, path)
+            return {
+                "id": "00000000-0000-0000-0000-000000000010",
+                "filename": "paper.pdf",
+                "status": "pending",
+                "already_exists": False,
+                "job_id": "00000000-0000-0000-0000-000000000020",
+            }
+
+    monkeypatch.setattr(document_routes, "get_current_user", current_user)
+    monkeypatch.setattr(document_routes, "UrlIngestService", FakeUrlIngestService)
+    body = document_routes.CreateFromUrl(
+        knowledge_base_id="00000000-0000-0000-0000-000000000002",
+        url="https://example.test/paper.pdf",
+    )
+
+    result = await document_routes.create_document_from_url.__wrapped__(request, body, response)
+
+    assert captured["args"] == (state.pool, state.s3_service, job_service)
+    assert response.headers["X-Job-Id"] == result["job_id"]
+
+
+def test_cors_exposes_durable_job_header():
+    from main import app
+
+    cors = next(middleware for middleware in app.user_middleware if middleware.cls.__name__ == "CORSMiddleware")
+    assert "X-Job-Id" in cors.kwargs["expose_headers"]
+
+
+async def test_from_url_is_unavailable_when_durable_jobs_are_disabled(monkeypatch):
+    state = SimpleNamespace(
+        s3_service=object(),
+        ocr_service=object(),
+        job_service=None,
+        pool=object(),
+    )
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/", "headers": [], "app": SimpleNamespace(state=state)}
+    )
+    response = Response()
+
+    async def current_user(_request):
+        return "00000000-0000-0000-0000-000000000001"
+
+    monkeypatch.setattr(document_routes, "get_current_user", current_user)
+    body = document_routes.CreateFromUrl(
+        knowledge_base_id="00000000-0000-0000-0000-000000000002",
+        url="https://example.test/paper.pdf",
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        await document_routes.create_document_from_url.__wrapped__(request, body, response)
+
+    assert raised.value.status_code == 501
+
+
+class TestDeriveFilename:
     def test_content_disposition_wins(self):
         resp = httpx.Response(200, headers={"content-disposition": 'inline; filename="2506.06266v3.pdf"'})
         assert _derive_filename(resp, "https://arxiv.org/pdf/2506.06266") == "2506.06266v3.pdf"
@@ -75,7 +162,6 @@ class TestDeriveFilename:
 
 
 class TestDownloadGuards:
-
     async def test_downloads_pdf_with_pinned_ip(self, monkeypatch):
         captured: dict = {}
 
@@ -111,11 +197,14 @@ class TestDownloadGuards:
         assert exc.value.status_code == 400
         assert sent["count"] == 0
 
-    @pytest.mark.parametrize("url", [
-        "https://example.com:444/doc.pdf",
-        "https://user:pass@example.com/doc.pdf",
-        "https://api.railway.internal/doc.pdf",
-    ])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com:444/doc.pdf",
+            "https://user:pass@example.com/doc.pdf",
+            "https://api.railway.internal/doc.pdf",
+        ],
+    )
     async def test_unsafe_url_shape_rejected_without_sending(self, monkeypatch, url):
         sent = {"count": 0}
 
@@ -136,11 +225,14 @@ class TestDownloadGuards:
             return httpx.Response(302, headers={"location": "http://meta.test/latest"})
 
         monkeypatch.setattr(
-            sf.socket, "getaddrinfo",
-            _fake_getaddrinfo({
-                "cdn.test": ["93.184.216.34"],
-                "meta.test": ["169.254.169.254"],
-            }),
+            sf.socket,
+            "getaddrinfo",
+            _fake_getaddrinfo(
+                {
+                    "cdn.test": ["93.184.216.34"],
+                    "meta.test": ["169.254.169.254"],
+                }
+            ),
         )
         monkeypatch.setattr(ui.httpx, "AsyncClient", _client_with_transport(handler))
 
