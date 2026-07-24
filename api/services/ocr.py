@@ -255,20 +255,50 @@ class OCRService:
     ) -> int:
         """Process Office files. Routes through converter or falls back to local LibreOffice."""
         if settings.PDF_BACKEND == "mistral":
-            pdf_key = await self._convert_to_pdf_s3(document_id, user_id, s3_source_key, ext)
-            if not settings.MISTRAL_API_KEY:
-                raise TerminalExtractionError("extraction_configuration", "Document extraction is unavailable.")
-            await self._check_user_page_limit(user_id, 1)
-            presigned_url = await self._s3.generate_presigned_get(pdf_key)
-            ocr_result = await self._call_mistral_ocr(presigned_url, "document_url")
-            return await self._store_ocr_result(
-                document_id,
-                user_id,
-                kb_id,
-                ocr_result,
-                **({"before_write": before_write} if before_write is not None else {}),
-                **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
+            attempt_pdf_key = (
+                f"{user_id}/{document_id}/derived/{artifact_namespace}/converted.pdf"
+                if artifact_namespace is not None
+                else f"{user_id}/{document_id}/converted.pdf"
             )
+            try:
+                pdf_key = await self._convert_to_pdf_s3(
+                    document_id,
+                    user_id,
+                    s3_source_key,
+                    ext,
+                    artifact_namespace=artifact_namespace,
+                )
+            except BaseException:  # noqa: BLE001 - converter may PUT before returning an error or cancellation.
+                if artifact_namespace is not None:
+                    await self._delete_artifact_keys([attempt_pdf_key])
+                raise
+            converted_metadata = {"converted_s3_key": pdf_key if artifact_namespace is not None else None}
+            try:
+                if not settings.MISTRAL_API_KEY:
+                    raise TerminalExtractionError("extraction_configuration", "Document extraction is unavailable.")
+                await self._check_user_page_limit(user_id, 1)
+                presigned_url = await self._s3.generate_presigned_get(pdf_key)
+                ocr_result = await self._call_mistral_ocr(presigned_url, "document_url")
+                return await self._store_ocr_result(
+                    document_id,
+                    user_id,
+                    kb_id,
+                    ocr_result,
+                    **({"before_write": before_write} if before_write is not None else {}),
+                    **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
+                    metadata_patch_extra=converted_metadata,
+                )
+            except BaseException:  # noqa: BLE001 - compensate cancellation and uncertain final publication.
+                if artifact_namespace is not None:
+                    published = await self._artifacts_were_published(
+                        document_id,
+                        user_id,
+                        converted_metadata,
+                        [],
+                    )
+                    if published is False:
+                        await self._delete_artifact_keys([pdf_key])
+                raise
         if settings.CONVERTER_URL:
             presigned_url = await self._s3.generate_presigned_get(s3_source_key)
             pages = await self._call_converter_extract(presigned_url, ext)
@@ -371,9 +401,19 @@ class OCRService:
 
     # ── Office local fallback (no converter) ──────────────────────────────
 
-    async def _convert_to_pdf_s3(self, document_id: str, user_id: str, s3_source_key: str, ext: str) -> str:
+    async def _convert_to_pdf_s3(
+        self,
+        document_id: str,
+        user_id: str,
+        s3_source_key: str,
+        ext: str,
+        *,
+        artifact_namespace: str | None = None,
+    ) -> str:
         """Convert Office file to PDF and upload to S3. Returns S3 key of the PDF."""
         pdf_key = f"{user_id}/{document_id}/converted.pdf"
+        if artifact_namespace is not None:
+            pdf_key = f"{user_id}/{document_id}/derived/{artifact_namespace}/converted.pdf"
 
         if settings.CONVERTER_URL:
             # Legacy path — only used for Mistral backend with converter
@@ -885,18 +925,19 @@ class OCRService:
         *,
         before_write: BeforeWrite | None = None,
         artifact_namespace: str | None = None,
+        metadata_patch_extra: dict | None = None,
     ) -> int:
         ocr_json_bytes = json.dumps(ocr_result).encode()
         ocr_key = f"{user_id}/{document_id}/ocr.json"
         artifact_objects = None
-        metadata_patch_extra = None
+        metadata_patch = dict(metadata_patch_extra or {})
         if artifact_namespace is None:
             await self._s3.upload_bytes(ocr_key, ocr_json_bytes, "application/json")
-            metadata_patch_extra = {"ocr_s3_key": None}
+            metadata_patch["ocr_s3_key"] = None
         else:
             ocr_key = f"{user_id}/{document_id}/derived/{artifact_namespace}/ocr.json"
             artifact_objects = [(ocr_key, ocr_json_bytes, "application/json")]
-            metadata_patch_extra = {"ocr_s3_key": ocr_key}
+            metadata_patch["ocr_s3_key"] = ocr_key
 
         pages = ocr_result.get("pages", [])
 
@@ -950,7 +991,7 @@ class OCRService:
             before_write=before_write,
             artifact_namespace=artifact_namespace,
             artifact_objects=artifact_objects,
-            metadata_patch_extra=metadata_patch_extra,
+            metadata_patch_extra=metadata_patch,
         )
 
         if artifact_namespace is None:

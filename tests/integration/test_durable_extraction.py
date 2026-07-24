@@ -911,6 +911,208 @@ async def test_legacy_html_publish_clears_durable_pointer_before_deleting_old_ar
 
 
 @pytest.mark.asyncio
+async def test_durable_office_cancel_after_conversion_preserves_current_pointer_and_cleans_attempt(
+    pool,
+    monkeypatch,
+):
+    job, user_id, _kb_id, doc_id = await _seed_document_job(
+        pool,
+        filename="paper.docx",
+        status="ready",
+        version=3,
+    )
+    old_key = f"{user_id}/{doc_id}/derived/old-job/attempt-1/converted.pdf"
+    new_key = f"{user_id}/{doc_id}/derived/{job.id}/attempt-{job.attempt_count}/converted.pdf"
+    await pool.execute(
+        "UPDATE documents SET metadata = $2::jsonb WHERE id = $1",
+        doc_id,
+        json.dumps({"converted_s3_key": old_key}),
+    )
+    s3 = RecordingS3()
+    s3.objects[old_key] = b"current-pdf"
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def converted(self, document_id, user_id, source_key, ext, *, artifact_namespace=None):
+        del self, document_id, user_id, source_key, ext
+        assert artifact_namespace == f"{job.id}/attempt-{job.attempt_count}"
+        s3.objects[new_key] = b"attempt-pdf"
+        return new_key
+
+    async def cancel_after_conversion(self, url, url_type="document_url"):
+        del self, url, url_type
+        raise JobCancelled("cancelled after conversion")
+
+    monkeypatch.setattr(OCRService, "_convert_to_pdf_s3", converted)
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", cancel_after_conversion)
+
+    with pytest.raises(JobCancelled):
+        await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+
+    metadata = await pool.fetchval("SELECT metadata FROM documents WHERE id = $1", doc_id)
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert metadata["converted_s3_key"] == old_key
+    assert s3.objects[old_key] == b"current-pdf"
+    assert new_key not in s3.objects
+
+
+@pytest.mark.asyncio
+async def test_durable_office_success_switches_converted_pointer_and_cleans_previous(pool, monkeypatch):
+    job, user_id, kb_id, doc_id = await _seed_document_job(
+        pool,
+        filename="paper.docx",
+        status="ready",
+        version=2,
+    )
+    old_key = f"{user_id}/{doc_id}/derived/old-job/attempt-1/converted.pdf"
+    new_key = f"{user_id}/{doc_id}/derived/{job.id}/attempt-{job.attempt_count}/converted.pdf"
+    await pool.execute(
+        "UPDATE documents SET metadata = $2::jsonb WHERE id = $1",
+        doc_id,
+        json.dumps({"converted_s3_key": old_key}),
+    )
+    s3 = RecordingS3()
+    s3.objects[old_key] = b"old-pdf"
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def converted(self, document_id, user_id, source_key, ext, *, artifact_namespace=None):
+        del self, document_id, user_id, source_key, ext
+        assert artifact_namespace == f"{job.id}/attempt-{job.attempt_count}"
+        s3.objects[new_key] = b"new-pdf"
+        return new_key
+
+    async def mistral_result(self, url, url_type="document_url"):
+        del self, url, url_type
+        return {"pages": [{"index": 0, "markdown": "converted office"}]}
+
+    monkeypatch.setattr(OCRService, "_convert_to_pdf_s3", converted)
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", mistral_result)
+
+    result = await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+
+    metadata = await pool.fetchval("SELECT metadata FROM documents WHERE id = $1", doc_id)
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert result["derived_version"] == 3
+    assert metadata["converted_s3_key"] == new_key
+    assert old_key not in s3.objects
+    assert s3.objects[new_key] == b"new-pdf"
+
+    from services.hosted import HostedDocumentService, HostedPublicWikiService
+
+    await HostedDocumentService(pool, str(user_id), s3).get_url(str(doc_id))
+    assert s3.presigned_gets[-1] == new_key
+    await pool.execute(
+        "UPDATE knowledge_bases SET visibility = 'public', public_slug = 'converted-office' WHERE id = $1",
+        kb_id,
+    )
+    await pool.execute(
+        "UPDATE documents SET path = '/wiki/', document_number = 42 WHERE id = $1",
+        doc_id,
+    )
+    assert await HostedPublicWikiService(pool).get_asset_key("converted-office", 42) == new_key
+
+
+@pytest.mark.asyncio
+async def test_legacy_office_publish_clears_durable_converted_pointer_and_uses_fixed_key(pool, monkeypatch):
+    _job, user_id, _kb_id, doc_id = await _seed_document_job(
+        pool,
+        filename="paper.docx",
+        status="ready",
+        version=1,
+    )
+    old_key = f"{user_id}/{doc_id}/derived/old-job/attempt-1/converted.pdf"
+    fixed_key = f"{user_id}/{doc_id}/converted.pdf"
+    await pool.execute(
+        "UPDATE documents SET metadata = $2::jsonb WHERE id = $1",
+        doc_id,
+        json.dumps({"converted_s3_key": old_key}),
+    )
+    s3 = RecordingS3()
+    s3.objects[old_key] = b"durable-pdf"
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def converted(self, document_id, user_id, source_key, ext, *, artifact_namespace=None):
+        del self, document_id, user_id, source_key, ext
+        assert artifact_namespace is None
+        s3.objects[fixed_key] = b"legacy-pdf"
+        return fixed_key
+
+    async def mistral_result(self, url, url_type="document_url"):
+        del self, url, url_type
+        return {"pages": [{"index": 0, "markdown": "legacy office"}]}
+
+    monkeypatch.setattr(OCRService, "_convert_to_pdf_s3", converted)
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", mistral_result)
+
+    assert await OCRService(s3, pool)._do_process(str(doc_id), str(user_id)) == 2
+
+    metadata = await pool.fetchval("SELECT metadata FROM documents WHERE id = $1", doc_id)
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert metadata["converted_s3_key"] is None
+    assert old_key not in s3.objects
+    assert s3.objects[fixed_key] == b"legacy-pdf"
+
+    from services.hosted import HostedDocumentService
+
+    await HostedDocumentService(pool, str(user_id), s3).get_url(str(doc_id))
+    assert s3.presigned_gets[-1] == fixed_key
+
+
+@pytest.mark.asyncio
+async def test_durable_converter_failure_after_put_cleans_versioned_converted_object(monkeypatch):
+    namespace = "job-id/attempt-1"
+    expected_key = f"user-id/doc-id/derived/{namespace}/converted.pdf"
+
+    class PutThenFailS3(RecordingS3):
+        async def generate_presigned_put(self, key: str, content_type: str = "application/pdf") -> str:
+            del content_type
+            self.objects[key] = b"converter-put"
+            return "https://storage.invalid/signed-put"
+
+    class FailedResponse:
+        headers = {"content-type": "application/json"}
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "https://converter.invalid/convert")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("converter failed", request=request, response=response)
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        async def post(self, url, json, headers):
+            del url, json, headers
+            return FailedResponse()
+
+    s3 = PutThenFailS3()
+    monkeypatch.setattr(settings, "CONVERTER_URL", "https://converter.invalid")
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+    monkeypatch.setattr("services.ocr.httpx.AsyncClient", lambda *args, **kwargs: FakeClient())
+
+    with pytest.raises(httpx.HTTPStatusError, match="converter failed"):
+        await OCRService(s3, pool=None)._process_office(
+            "doc-id",
+            "user-id",
+            "kb-id",
+            "user-id/doc-id/source.docx",
+            "docx",
+            artifact_namespace=namespace,
+        )
+
+    assert expected_key not in s3.objects
+
+
+@pytest.mark.asyncio
 async def test_archived_immediately_before_final_write_cannot_publish_derived_rows(pool, monkeypatch):
     job, _user_id, _kb_id, doc_id = await _seed_document_job(pool)
     s3 = RecordingS3()

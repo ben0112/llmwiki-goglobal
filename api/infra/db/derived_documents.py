@@ -167,7 +167,7 @@ async def replace_derived_content(
                 previous_metadata = json.loads(previous_metadata)
             replaced_artifact_keys = [
                 previous_metadata[key]
-                for key in ("tagged_s3_key", "ocr_s3_key")
+                for key in ("tagged_s3_key", "ocr_s3_key", "converted_s3_key")
                 if previous_metadata.get(key)
             ]
             await conn.execute("DELETE FROM document_pages WHERE document_id = $1", document_id)

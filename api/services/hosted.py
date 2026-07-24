@@ -366,7 +366,8 @@ class HostedDocumentService(DocumentService):
 
         ext = row["filename"].rsplit(".", 1)[-1].lower() if "." in row["filename"] else row["file_type"]
         if ext in {"pptx", "ppt", "docx", "doc"}:
-            s3_key = f"{row['user_id']}/{row['id']}/converted.pdf"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            s3_key = metadata.get("converted_s3_key") or f"{row['user_id']}/{row['id']}/converted.pdf"
         elif ext in {"html", "htm"}:
             metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
             s3_key = metadata.get("tagged_s3_key") or f"{row['user_id']}/{row['id']}/tagged.html"
@@ -1030,7 +1031,8 @@ class HostedPublicWikiService(PublicWikiService):
             else row["file_type"]
         )
         if ext in {"pptx", "ppt", "docx", "doc"}:
-            return f"{row['user_id']}/{row['doc_id']}/converted.pdf"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            return metadata.get("converted_s3_key") or f"{row['user_id']}/{row['doc_id']}/converted.pdf"
         if ext in {"html", "htm"}:
             metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
             return metadata.get("tagged_s3_key") or f"{row['user_id']}/{row['doc_id']}/tagged.html"
