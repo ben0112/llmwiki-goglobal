@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import sys
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,7 +16,14 @@ from botocore.exceptions import EndpointConnectionError
 from config import settings
 from fastapi import HTTPException
 from jobs import repository
-from jobs.handlers import RetryableJobError, TerminalJobError, WorkerContext, handle_document_extract
+from jobs.handlers import (
+    RetryableJobError,
+    TerminalJobError,
+    WorkerContext,
+    _prepare_document_extraction,
+    _set_extraction_failure_status,
+    handle_document_extract,
+)
 from jobs.lease import JobLease
 from jobs.models import JobCancelled, JobCreate, JobRecord, JobType, LeaseLost
 from jobs.service import JobService
@@ -166,6 +174,31 @@ class ScriptedLease:
             if self.failure is not None and self.connection_calls == self.fail_on_connection_call:
                 raise self.failure
         return
+
+
+class GatedDatabaseLease:
+    def __init__(self, job: JobRecord) -> None:
+        self.job = job
+        self.job_locked = asyncio.Event()
+        self.release_job = asyncio.Event()
+        self.backend_pid: int | None = None
+
+    async def checkpoint(self, conn=None):
+        assert conn is not None and conn.is_in_transaction()
+        await conn.execute("SET LOCAL lock_timeout = '2s'")
+        await repository.assert_active(conn, self.job.id, "worker-extraction")
+        self.backend_pid = await conn.fetchval("SELECT pg_backend_pid()")
+        self.job_locked.set()
+        await self.release_job.wait()
+
+
+async def _wait_for_blocked_backend(observer, backend_pid: int) -> None:
+    async with asyncio.timeout(1):
+        while not await observer.fetchval(
+            "SELECT COALESCE(cardinality(pg_blocking_pids($1)) > 0, false)",
+            backend_pid,
+        ):
+            pass
 
 
 @pytest.mark.asyncio
@@ -998,7 +1031,7 @@ async def test_versioned_artifact_staging_does_not_hold_final_job_or_document_lo
     heartbeat = asyncio.create_task(heartbeat_once())
     heartbeat_completed_during_upload = True
     try:
-        await asyncio.wait_for(asyncio.shield(heartbeat), timeout=0.15)
+        await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
     except TimeoutError:
         heartbeat_completed_during_upload = False
     finally:
@@ -1426,6 +1459,187 @@ async def test_archived_immediately_before_final_write_cannot_publish_derived_ro
     assert dict(row) == {"archived": False, "version": 0}
     assert await pool.fetchval("SELECT count(*) FROM document_pages WHERE document_id = $1", doc_id) == 0
     assert await pool.fetchval("SELECT count(*) FROM document_chunks WHERE document_id = $1", doc_id) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_phase", ["prepare", "failure"])
+async def test_ensure_and_worker_document_transition_share_job_then_document_lock_order(pool, worker_phase):
+    job, user_id, kb_id, doc_id = await _seed_document_job(pool)
+    lease = GatedDatabaseLease(job)
+    if worker_phase == "prepare":
+        worker = asyncio.create_task(_prepare_document_extraction(job, lease, _context(pool, None), {"pdf"}))
+    else:
+        worker = asyncio.create_task(_set_extraction_failure_status(job, lease, _context(pool, None), retryable=True))
+
+    ensure_conn = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = ensure_conn.transaction()
+    ensure = None
+    committed = False
+    try:
+        await asyncio.wait_for(lease.job_locked.wait(), timeout=1)
+        await transaction.start()
+        await ensure_conn.execute("SET LOCAL lock_timeout = '2s'")
+        ensure_pid = await ensure_conn.fetchval("SELECT pg_backend_pid()")
+        ensure = asyncio.create_task(
+            JobService(pool).ensure_document_extraction_in_transaction(
+                ensure_conn,
+                document_id=doc_id,
+                user_id=user_id,
+                knowledge_base_id=kb_id,
+                restart_terminal=True,
+            )
+        )
+        await _wait_for_blocked_backend(observer, ensure_pid)
+        lease.release_job.set()
+        async with asyncio.timeout(3):
+            worker_result, (ensured, created) = await asyncio.gather(worker, ensure)
+        assert worker_result is None
+        assert ensured.id == job.id
+        assert not created
+        assert await ensure_conn.fetchval("SELECT 1") == 1
+        await transaction.commit()
+        committed = True
+    finally:
+        lease.release_job.set()
+        for task in (worker, ensure):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (worker, ensure) if task is not None), return_exceptions=True)
+        if not committed:
+            with suppress(Exception):
+                await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(ensure_conn)
+
+    assert await pool.fetchval("SELECT status::text FROM documents WHERE id = $1", doc_id) == "processing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish_kind", ["derived", "image"])
+async def test_url_and_publish_share_advisory_job_document_lock_order(pool, publish_kind):
+    filename = "image.png" if publish_kind == "image" else "paper.pdf"
+    job, user_id, kb_id, doc_id = await _seed_document_job(pool, filename=filename)
+    url_conn = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = url_conn.transaction()
+    publish = None
+    committed = False
+
+    async def final_checkpoint(conn):
+        await conn.execute("SET LOCAL lock_timeout = '2s'")
+        await repository.assert_active(conn, job.id, "worker-extraction")
+
+    try:
+        await transaction.start()
+        await url_conn.execute("SET LOCAL lock_timeout = '2s'")
+        url_pid = await url_conn.fetchval("SELECT pg_backend_pid()")
+        await url_conn.execute("SELECT pg_advisory_xact_lock(hashtext($1::text))", str(user_id))
+        service = OCRService(RecordingS3(), pool)
+        if publish_kind == "image":
+            operation = service._process_image(
+                str(doc_id),
+                str(user_id),
+                str(kb_id),
+                f"{user_id}/{doc_id}/source.png",
+                "png",
+                before_write=final_checkpoint,
+            )
+        else:
+            operation = service._commit_derived_content(
+                str(doc_id),
+                str(user_id),
+                str(kb_id),
+                pages=[(1, "published")],
+                chunks=[],
+                parser="lock-order-test",
+                before_write=final_checkpoint,
+            )
+        publish = asyncio.create_task(operation)
+        async with asyncio.timeout(1):
+            while True:
+                blocked_pids = await observer.fetchval(
+                    "SELECT COALESCE(array_agg(pid), '{}') FROM pg_stat_activity "
+                    "WHERE pid <> $1 AND wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+                    url_pid,
+                )
+                if blocked_pids:
+                    break
+
+        ensured, created = await JobService(pool).ensure_document_extraction_in_transaction(
+            url_conn,
+            document_id=doc_id,
+            user_id=user_id,
+            knowledge_base_id=kb_id,
+            restart_terminal=True,
+        )
+        assert ensured.id == job.id
+        assert not created
+        assert await url_conn.fetchval("SELECT 1") == 1
+        await transaction.commit()
+        committed = True
+        async with asyncio.timeout(3):
+            assert await publish == 1
+    finally:
+        if publish is not None and not publish.done():
+            publish.cancel()
+        if publish is not None:
+            await asyncio.gather(publish, return_exceptions=True)
+        if not committed:
+            with suppress(Exception):
+                await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(url_conn)
+
+    row = await pool.fetchrow("SELECT status::text, version, page_count FROM documents WHERE id = $1", doc_id)
+    assert dict(row) == {"status": "ready", "version": 1, "page_count": 1}
+
+
+@pytest.mark.asyncio
+async def test_two_startup_replicas_do_not_prelock_document_before_authoritative_job(pool):
+    from main import _recover_durable_extraction_jobs
+
+    job, _user_id, _kb_id, doc_id = await _seed_document_job(pool)
+    lease = GatedDatabaseLease(job)
+    worker = asyncio.create_task(_prepare_document_extraction(job, lease, _context(pool, None), {"pdf"}))
+    entered = [asyncio.Event(), asyncio.Event()]
+    pids: list[int] = []
+
+    class ObservedJobService(JobService):
+        def __init__(self, pool, index):
+            super().__init__(pool)
+            self.index = index
+
+        async def ensure_document_extraction_in_transaction(self, conn, **kwargs):
+            await conn.execute("SET LOCAL lock_timeout = '2s'")
+            pids.append(await conn.fetchval("SELECT pg_backend_pid()"))
+            entered[self.index].set()
+            return await super().ensure_document_extraction_in_transaction(conn, **kwargs)
+
+    recoveries = []
+    observer = await pool.acquire()
+    try:
+        await asyncio.wait_for(lease.job_locked.wait(), timeout=1)
+        recoveries = [
+            asyncio.create_task(_recover_durable_extraction_jobs(pool, ObservedJobService(pool, index)))
+            for index in range(2)
+        ]
+        async with asyncio.timeout(1):
+            await asyncio.gather(*(event.wait() for event in entered))
+        for pid in pids:
+            await _wait_for_blocked_backend(observer, pid)
+        lease.release_job.set()
+        async with asyncio.timeout(3):
+            worker_result, first, second = await asyncio.gather(worker, *recoveries)
+        assert worker_result is None
+        assert [record for record in (*first, *second) if record.document_id == doc_id] == []
+    finally:
+        lease.release_job.set()
+        for task in (worker, *recoveries):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(worker, *recoveries, return_exceptions=True)
+        await pool.release(observer)
 
 
 @pytest.mark.asyncio

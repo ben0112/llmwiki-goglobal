@@ -127,9 +127,18 @@ class OCRService:
                 "Document extraction quota was exceeded.",
             )
 
-    async def _check_user_page_limit(self, user_id: str, new_pages: int, conn=None):
+    async def _check_user_page_limit(
+        self,
+        user_id: str,
+        new_pages: int,
+        conn: asyncpg.Connection | None = None,
+        *,
+        after_lock: BeforeWrite | None = None,
+    ):
         """Quota check — uses an advisory lock when given a transaction connection so concurrent jobs serialize."""
         executor = conn or self._pool
+        if after_lock is not None and conn is None:
+            raise ValueError("after_lock requires a transaction connection")
         if conn is not None:
             # pg_advisory_xact_lock serializes concurrent OCR jobs for the same
             # user inside this transaction; releases on commit/rollback.
@@ -137,6 +146,8 @@ class OCRService:
                 "SELECT pg_advisory_xact_lock(hashtext($1::text))",
                 user_id,
             )
+        if after_lock is not None:
+            await after_lock(conn)
         row = await executor.fetchrow(
             "SELECT u.page_limit, "
             "COALESCE((SELECT SUM(page_count) FROM documents WHERE user_id = $1 AND NOT archived), 0)::bigint AS used "
@@ -611,9 +622,12 @@ class OCRService:
         uploaded_keys: list[str] = []
 
         async def check_page_limit(conn):
-            if before_write is not None:
-                await before_write(conn)
-            await self._check_user_page_limit(user_id, len(pages), conn=conn)
+            await self._check_user_page_limit(
+                user_id,
+                len(pages),
+                conn=conn,
+                after_lock=before_write,
+            )
 
         metadata_patch = dict(metadata_patch_extra or {})
         if assets is not None:
@@ -765,9 +779,7 @@ class OCRService:
         conn = await self._pool.acquire()
         try:
             async with conn.transaction():
-                if before_write is not None:
-                    await before_write(conn)
-                await self._check_user_page_limit(user_id, 1, conn=conn)
+                await self._check_user_page_limit(user_id, 1, conn=conn, after_lock=before_write)
                 version = await conn.fetchval(
                     "UPDATE documents SET status = 'ready', page_count = 1, parser = 'native', "
                     "version = version + 1, error_message = NULL, updated_at = now() "

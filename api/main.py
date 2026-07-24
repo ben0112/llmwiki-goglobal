@@ -74,7 +74,7 @@ async def _recover_durable_extraction_jobs(pool, job_service) -> list:
         rows = await conn.fetch(
             "SELECT id, user_id, knowledge_base_id FROM documents "
             "WHERE status IN ('pending', 'processing') AND NOT archived "
-            "AND source_kind = 'source' ORDER BY id FOR UPDATE"
+            "AND source_kind = 'source' ORDER BY id"
         )
         for row in rows:
             job, created = await job_service.ensure_document_extraction_in_transaction(

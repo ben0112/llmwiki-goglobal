@@ -55,6 +55,13 @@ class JobService:
         """Return the authoritative extraction job or append one immutable successor."""
         if not conn.is_in_transaction():
             raise RuntimeError("extraction job ensure requires an explicit transaction")
+        latest = await conn.fetchrow(
+            "SELECT id, state::text FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
+            user_id,
+            document_id,
+        )
         document = await conn.fetchrow(
             "SELECT status::text, version FROM documents "
             "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
@@ -66,13 +73,17 @@ class JobService:
         if document is None:
             raise JobResourceNotFound("referenced extraction document was not found")
 
-        latest = await conn.fetchrow(
-            "SELECT id, state::text FROM background_jobs "
-            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
-            "ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
-            user_id,
-            document_id,
-        )
+        if latest is None:
+            # A concurrent creator may have committed while this transaction waited
+            # for the document.  Re-read without taking a job lock while holding the
+            # document lock, so the global job -> document order remains acyclic.
+            latest = await conn.fetchrow(
+                "SELECT id, state::text FROM background_jobs "
+                "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                user_id,
+                document_id,
+            )
         if latest is not None:
             state = JobState(latest["state"])
             if not state.is_terminal or (state is JobState.SUCCEEDED and document["status"] == "ready"):
@@ -126,9 +137,8 @@ class JobService:
             and cancelled.job_type.value == "document.extract"
             and cancelled.document_id is not None
         ):
-            # Deliberately use a second transaction: final publication locks the
-            # document before the job row, while cancellation locks the job first.
-            # Releasing the job lock here prevents a job/document lock inversion.
+            # Deliberately use a second transaction so cancellation never holds
+            # the job and document locks across the status propagation boundary.
             async with self._pool.acquire() as conn, conn.transaction():
                 await conn.execute(
                     "UPDATE documents SET "

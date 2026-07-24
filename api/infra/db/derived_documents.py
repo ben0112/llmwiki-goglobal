@@ -137,6 +137,9 @@ async def replace_derived_content(
     conn = await pool.acquire()
     try:
         async with conn.transaction():
+            if before_write is not None:
+                await before_write(conn)
+
             document = await conn.fetchrow(
                 "SELECT version, metadata FROM documents "
                 "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
@@ -147,9 +150,6 @@ async def replace_derived_content(
             )
             if document is None:
                 raise LookupError(f"document {document_id} not found for derived-content write")
-
-            if before_write is not None:
-                await before_write(conn)
 
             still_active = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM documents "
