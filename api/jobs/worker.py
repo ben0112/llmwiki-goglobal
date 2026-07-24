@@ -172,23 +172,41 @@ def _outcome(status: str, job_id: UUID | None = None) -> dict[str, str]:
     return outcome
 
 
-def _prepare_job_result(raw_result: object) -> dict[str, JSONValue]:
-    """Validate a handler result against the durable JSONB persistence boundary."""
+def _invalid_result() -> TerminalJobError:
+    return TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE)
+
+
+def _prepare_job_result(raw_result: object) -> tuple[dict[str, JSONValue], str]:
+    """Validate strict JSON types and produce safe PostgreSQL JSON input text."""
     try:
         result = to_json_value(raw_result)
         if not isinstance(result, dict):
             raise TypeError("job handler result must be a JSON object")
-        encoded = json.dumps(
+        serialized = json.dumps(
             result,
             ensure_ascii=False,
             allow_nan=False,
             separators=(", ", ": "),
-        ).encode("utf-8")
+        )
     except (OverflowError, RecursionError, TypeError, ValueError):
-        raise TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE) from None
-    if len(encoded) > RESULT_MAX_BYTES:
-        raise TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE)
-    return result
+        raise _invalid_result() from None
+    return result, serialized
+
+
+async def _validate_result_in_postgres(
+    conn: asyncpg.Connection,
+    serialized_json: str,
+) -> None:
+    """Use PostgreSQL's canonical jsonb text as the authoritative size boundary."""
+    try:
+        canonical_bytes = await conn.fetchval(
+            "SELECT octet_length($1::jsonb::text)",
+            serialized_json,
+        )
+    except asyncpg.PostgresError:
+        raise _invalid_result() from None
+    if not isinstance(canonical_bytes, int) or canonical_bytes > RESULT_MAX_BYTES:
+        raise _invalid_result()
 
 
 async def _run_claimed_job(
@@ -213,8 +231,9 @@ async def _run_claimed_job(
             if handler is None:
                 raise UnsupportedJobHandler
             raw_result = await handler(job, lease, worker_context)
-            result = _prepare_job_result(raw_result)
+            result, serialized_result = _prepare_job_result(raw_result)
             async with pool.acquire() as conn, conn.transaction():
+                await _validate_result_in_postgres(conn, serialized_result)
                 await repository.succeed(conn, job.id, worker_id, result)
             return _outcome("succeeded", job.id)
         except asyncio.CancelledError:

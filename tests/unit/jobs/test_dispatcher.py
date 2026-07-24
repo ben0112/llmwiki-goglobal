@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -420,6 +419,10 @@ class FakeWorkerPool:
         self.close_calls = 0
         self.active_connections = 0
         self.active_transactions = 0
+        self.postgres_result_bytes = None
+        self.postgres_validation_error = None
+        self.result_validation_calls = []
+        self.events = []
 
     @asynccontextmanager
     async def acquire(self):
@@ -441,6 +444,15 @@ class FakeWorkerPool:
 
     async def close(self):
         self.close_calls += 1
+
+    async def fetchval(self, query, serialized_json):
+        self.result_validation_calls.append((query, serialized_json))
+        self.events.append("postgres-validate")
+        if self.postgres_validation_error is not None:
+            raise self.postgres_validation_error
+        if self.postgres_result_bytes is not None:
+            return self.postgres_result_bytes
+        return len(serialized_json.encode("utf-8"))
 
 
 class PoolWithConnectionTransaction(FakeWorkerPool):
@@ -512,7 +524,7 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
 
     pool = PoolWithConnectionTransaction()
     job = _job()
-    calls = []
+    calls = pool.events
 
     async def claim(*_args):
         return job
@@ -536,54 +548,24 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
     outcome = await worker.run_job(ctx, str(job.id))
 
     assert outcome == {"status": "succeeded", "job_id": str(job.id)}
-    assert calls == ["handler", (pool.connection, job.id, "worker-test", {"ok": True, "nested": [1, None]})]
+    assert calls == [
+        "handler",
+        "postgres-validate",
+        (pool.connection, job.id, "worker-test", {"ok": True, "nested": [1, None]}),
+    ]
     assert FakeLease.instances[-1].args == (pool, job.id, "worker-test", 60, 15)
     assert pool.acquires == 2
     assert pool.transactions == 2
 
 
-@pytest.mark.parametrize(
-    "result",
-    [
-        {"x": "a" * 16_375},
-        {"x": "你" * 5_458 + "a"},
-    ],
-)
-def test_prepare_job_result_accepts_exact_utf8_database_boundary(result):
+def test_prepare_job_result_returns_strict_mapping_and_safe_json_input():
     from jobs.worker import _prepare_job_result
 
-    encoded = json.dumps(
-        result,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(", ", ": "),
-    ).encode("utf-8")
-    assert len(encoded) == 16_384
-    assert _prepare_job_result(result) == result
+    result, serialized = _prepare_job_result({"x": "你", "nested": [1, None]})
 
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        {"x": "a" * 16_376},
-        {"x": "你" * 5_458 + "aa"},
-    ],
-)
-def test_prepare_job_result_rejects_one_byte_over_database_boundary(result):
-    from jobs.handlers import TerminalJobError
-    from jobs.worker import _prepare_job_result
-
-    encoded = json.dumps(
-        result,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(", ", ": "),
-    ).encode("utf-8")
-    assert len(encoded) == 16_385
-    with pytest.raises(TerminalJobError) as raised:
-        _prepare_job_result(result)
-    assert raised.value.error_code == "invalid_job_result"
-    assert raised.value.error_message == "The job produced an invalid result."
+    assert result == {"x": "你", "nested": [1, None]}
+    assert serialized == '{"x": "你", "nested": [1, null]}'
+    assert "\\u4f60" not in serialized
 
 
 @pytest.mark.parametrize(
@@ -603,6 +585,89 @@ def test_prepare_job_result_rejects_nonmapping_and_nested_non_json_values(result
         _prepare_job_result(result)
     assert raised.value.error_code == "invalid_job_result"
     assert raised.value.error_message == "The job produced an invalid result."
+
+
+@pytest.mark.asyncio
+async def test_postgres_result_validation_uses_parameterized_canonical_byte_count():
+    from jobs.worker import _validate_result_in_postgres
+
+    pool = PoolWithConnectionTransaction()
+    pool.postgres_result_bytes = 16_384
+
+    assert await _validate_result_in_postgres(pool.connection, '{"x": "value"}') is None
+    assert len(pool.result_validation_calls) == 1
+    query, serialized = pool.result_validation_calls[0]
+    assert " ".join(query.split()).lower() == "select octet_length($1::jsonb::text)"
+    assert serialized == '{"x": "value"}'
+
+
+@pytest.mark.asyncio
+async def test_postgres_result_validation_rejects_canonical_byte_count_over_limit():
+    from jobs.handlers import TerminalJobError
+    from jobs.worker import _validate_result_in_postgres
+
+    pool = PoolWithConnectionTransaction()
+    pool.postgres_result_bytes = 16_385
+
+    with pytest.raises(TerminalJobError) as raised:
+        await _validate_result_in_postgres(pool.connection, '{"x": "value"}')
+    assert raised.value.error_code == "invalid_job_result"
+    assert raised.value.error_message == "The job produced an invalid result."
+
+
+@pytest.mark.asyncio
+async def test_postgres_result_parse_failure_is_terminal_after_transaction_release(
+    monkeypatch,
+    caplog,
+):
+    import asyncpg
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+    pool.postgres_validation_error = asyncpg.PostgresError("TOP_SECRET_DB_ERROR RAW_RESULT_TOKEN")
+    job = _job()
+    succeed_calls = []
+    recorded = []
+
+    async def claim(*_args):
+        return job
+
+    async def handler(*_args):
+        return {"result": "RAW_RESULT_TOKEN"}
+
+    async def succeed(*args):
+        succeed_calls.append(args)
+
+    async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
+        assert pool.active_connections == 1
+        assert pool.active_transactions == 1
+        pool.events.append("fail")
+        recorded.append(kwargs)
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker.repository, "succeed", succeed)
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+    caplog.set_level(logging.ERROR, logger="jobs.worker")
+
+    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    assert outcome == {"status": "failed", "job_id": str(job.id)}
+    assert succeed_calls == []
+    assert recorded == [
+        {
+            "error_code": "invalid_job_result",
+            "error_message": "The job produced an invalid result.",
+            "retryable": False,
+        }
+    ]
+    assert pool.events == ["postgres-validate", "fail"]
+    assert pool.transactions == 3
+    assert pool.active_connections == 0
+    assert pool.active_transactions == 0
+    assert "TOP_SECRET_DB_ERROR" not in caplog.text
+    assert "RAW_RESULT_TOKEN" not in caplog.text
+    assert "RAW_RESULT_TOKEN" not in repr(recorded)
 
 
 @pytest.mark.asyncio

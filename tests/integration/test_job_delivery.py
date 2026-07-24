@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -275,3 +277,126 @@ async def test_worker_claims_once_uses_persisted_type_and_records_success_with_r
     assert row["result"] == '{"completed": true}'
     assert row["lease_owner"] is None
     assert row["lease_expires_at"] is None
+
+
+async def _run_result_job(pool, monkeypatch, result):
+    from jobs import worker
+
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(pool, user_id, run_after=OLD)
+    succeed_calls = []
+    real_succeed = worker.repository.succeed
+
+    async def handler(*_args):
+        return result
+
+    async def succeed(conn, job_id, owner, persisted_result):
+        succeed_calls.append((conn, job_id, owner, persisted_result))
+        return await real_succeed(conn, job_id, owner, persisted_result)
+
+    monkeypatch.setattr(worker.repository, "succeed", succeed)
+    context = WorkerContext(pool=pool, s3=None, converter_url="", converter_secret="")
+    ctx = {
+        "pool": pool,
+        "worker_id": "result-validation-worker",
+        "lease_seconds": 30,
+        "heartbeat_seconds": 10,
+        "worker_context": context,
+        "handlers": {JobType.DOCUMENT_EXTRACT: handler},
+    }
+    outcome = await worker.run_job(ctx, str(job["id"]))
+    row = await pool.fetchrow(
+        "SELECT state, error_code, error_message, result, attempt_count FROM background_jobs WHERE id = $1",
+        job["id"],
+    )
+    return job, outcome, row, succeed_calls
+
+
+@pytest.mark.asyncio
+async def test_postgres_canonical_exponent_expansion_is_terminal_before_succeed(
+    pool,
+    monkeypatch,
+):
+    result = {"x": [1e300] * 55}
+    serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
+    assert len(serialized.encode("utf-8")) < 16_384
+    assert await pool.fetchval("SELECT octet_length($1::jsonb::text)", serialized) > 16_384
+
+    job, outcome, row, succeed_calls = await _run_result_job(pool, monkeypatch, result)
+
+    assert outcome == {"status": "failed", "job_id": str(job["id"])}
+    assert succeed_calls == []
+    assert dict(row) == {
+        "state": "failed",
+        "error_code": "invalid_job_result",
+        "error_message": "The job produced an invalid result.",
+        "result": None,
+        "attempt_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_rejects_nul_result_without_leaking_or_calling_succeed(
+    pool,
+    monkeypatch,
+    caplog,
+):
+    result = {"x": "TOP_SECRET_TOKEN\x00RAW_RESULT_TOKEN"}
+    caplog.set_level(logging.ERROR, logger="jobs.worker")
+
+    job, outcome, row, succeed_calls = await _run_result_job(pool, monkeypatch, result)
+
+    assert outcome == {"status": "failed", "job_id": str(job["id"])}
+    assert succeed_calls == []
+    assert dict(row) == {
+        "state": "failed",
+        "error_code": "invalid_job_result",
+        "error_message": "The job produced an invalid result.",
+        "result": None,
+        "attempt_count": 1,
+    }
+    assert "TOP_SECRET_TOKEN" not in caplog.text
+    assert "RAW_RESULT_TOKEN" not in caplog.text
+    assert "TOP_SECRET_TOKEN" not in repr(dict(row))
+    assert "RAW_RESULT_TOKEN" not in repr(dict(row))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result,expected_bytes,expected_state,expected_succeed_calls",
+    [
+        ({"x": "a" * 16_375}, 16_384, "succeeded", 1),
+        ({"x": "a" * 16_376}, 16_385, "failed", 0),
+        ({"x": "你" * 5_458 + "a"}, 16_384, "succeeded", 1),
+        ({"x": "你" * 5_458 + "aa"}, 16_385, "failed", 0),
+    ],
+)
+async def test_postgres_canonical_result_boundary_controls_succeed(
+    pool,
+    monkeypatch,
+    result,
+    expected_bytes,
+    expected_state,
+    expected_succeed_calls,
+):
+    serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
+    canonical_bytes = await pool.fetchval(
+        "SELECT octet_length($1::jsonb::text)",
+        serialized,
+    )
+    assert canonical_bytes == expected_bytes
+
+    job, outcome, row, succeed_calls = await _run_result_job(pool, monkeypatch, result)
+
+    assert row["state"] == expected_state
+    assert len(succeed_calls) == expected_succeed_calls
+    if expected_state == "succeeded":
+        assert outcome == {"status": "succeeded", "job_id": str(job["id"])}
+        assert row["error_code"] is None
+        assert row["result"] is not None
+    else:
+        assert outcome == {"status": "failed", "job_id": str(job["id"])}
+        assert row["error_code"] == "invalid_job_result"
+        assert row["error_message"] == "The job produced an invalid result."
+        assert row["result"] is None
