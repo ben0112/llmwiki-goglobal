@@ -128,14 +128,14 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
             )
 
             for edge in edges:
-                if edge["type"] == "cites":
+                if edge.reference_type == "cites":
                     await conn.execute(
                         "INSERT INTO document_references "
                         "(source_document_id, target_document_id, knowledge_base_id, reference_type, page) "
                         "VALUES ($1, $2, $3, 'cites', $4) "
                         "ON CONFLICT (source_document_id, target_document_id, reference_type) "
                         "DO UPDATE SET page = EXCLUDED.page, created_at = now()",
-                        page["id"], edge["target_id"], kb_id, edge["page"],
+                        page["id"], edge.target_id, kb_id, edge.page,
                     )
                     total_cites += 1
                 else:
@@ -144,7 +144,7 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
                         "(source_document_id, target_document_id, knowledge_base_id, reference_type) "
                         "VALUES ($1, $2, $3, 'links_to') "
                         "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
-                        page["id"], edge["target_id"], kb_id,
+                        page["id"], edge.target_id, kb_id,
                     )
                     total_links += 1
 
@@ -223,13 +223,13 @@ async def rebuild_local(db, user_id: str) -> dict:
                 )
 
                 for edge in edges:
-                    if edge["type"] == "cites":
+                    if edge.reference_type == "cites":
                         await db.execute(
                             "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type, page) "
                             "VALUES (?, ?, ?, 'cites', ?) "
                             "ON CONFLICT (source_document_id, target_document_id, reference_type) "
                             "DO UPDATE SET page = excluded.page",
-                            (str(uuid.uuid4()), page["id"], edge["target_id"], edge["page"]),
+                            (str(uuid.uuid4()), page["id"], edge.target_id, edge.page),
                         )
                         total_cites += 1
                     else:
@@ -237,7 +237,7 @@ async def rebuild_local(db, user_id: str) -> dict:
                             "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type) "
                             "VALUES (?, ?, ?, 'links_to') "
                             "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
-                            (str(uuid.uuid4()), page["id"], edge["target_id"]),
+                            (str(uuid.uuid4()), page["id"], edge.target_id),
                         )
                         total_links += 1
 

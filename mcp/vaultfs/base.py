@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+from llmwiki_core.wiki import WikiWriteBundle
+
 # Content-derived edge types, rebuilt from wiki page text on every write.
 CITATION_TYPES = ("cites", "links_to")
 
@@ -51,6 +53,11 @@ class VaultFS(ABC):
 
     @abstractmethod
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None: ...
+
+    @abstractmethod
+    async def write_wiki_bundle(self, kb_id: str, bundle: WikiWriteBundle) -> dict:
+        """Atomically commit a wiki revision and all of its derived state."""
+        raise NotImplementedError
 
     @abstractmethod
     async def archive_documents(self, doc_ids: list[str]) -> int: ...

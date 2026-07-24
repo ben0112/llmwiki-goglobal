@@ -3,6 +3,7 @@
 import logging
 import re
 from datetime import date
+import json
 
 import aioboto3
 import asyncpg
@@ -10,6 +11,7 @@ import asyncpg
 from config import settings
 from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute, get_pool
 from services.chunker import chunk_text, store_chunks_pg
+from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 from .base import VaultFS, DuplicateDocumentError
 from .facets import postgres_facet_conditions, validate_facets
 
@@ -167,7 +169,7 @@ class PostgresVaultFS(VaultFS):
                     raise PermissionError(f"knowledge base {kb_id} not owned by user")
                 if file_type in ("md", "txt"):
                     chunks = chunk_text(content or "")
-                    await store_chunks_pg(conn, str(row["id"]), self.user_id, kb_id, chunks)
+                    await store_chunks_pg(conn, str(row["id"]), self.user_id, kb_id, 1, chunks)
         return dict(row)
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
@@ -198,7 +200,7 @@ class PostgresVaultFS(VaultFS):
         sql = (
             f"UPDATE documents SET {', '.join(sets)} "
             f"WHERE id = $2 AND user_id = $3 "
-            f"RETURNING id, filename, path, knowledge_base_id, file_type"
+            f"RETURNING id, filename, path, knowledge_base_id, file_type, version"
         )
 
         pool = await get_pool()
@@ -209,9 +211,156 @@ class PostgresVaultFS(VaultFS):
                     chunks = chunk_text(content or "")
                     await store_chunks_pg(
                         conn, str(row["id"]), self.user_id,
-                        str(row["knowledge_base_id"]), chunks,
+                        str(row["knowledge_base_id"]), row["version"], chunks,
                     )
         return {"id": row["id"], "filename": row["filename"], "path": row["path"]} if row else None
+
+    async def write_wiki_bundle(self, kb_id: str, bundle: WikiWriteBundle) -> dict:
+        """Commit a wiki revision and every derived row in one Postgres transaction."""
+        from datetime import date as _date
+
+        from .facet_rollup import apply_rollup, rollup_from_metas
+
+        pool = await get_pool()
+        version = 1 if bundle.expected_version is None else bundle.expected_version + 1
+        metadata = dict(bundle.metadata)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    if bundle.expected_version is None:
+                        # The historical schema has no active-path unique index.
+                        # Serialize this logical key so concurrent creates cannot
+                        # both pass the ownership/path check.
+                        logical_path = f"{kb_id}:{bundle.path}:{bundle.filename}"
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                            logical_path,
+                        )
+                        duplicate = await conn.fetchval(
+                            "SELECT 1 FROM documents WHERE knowledge_base_id = $1::uuid "
+                            "AND path = $2 AND filename = $3 AND NOT archived",
+                            kb_id,
+                            bundle.path,
+                            bundle.filename,
+                        )
+                        if duplicate:
+                            raise DuplicateDocumentError(bundle.path, bundle.filename)
+                        row = await conn.fetchrow(
+                            "INSERT INTO documents "
+                            "(id, knowledge_base_id, user_id, filename, title, path, source_kind, "
+                            "file_type, status, content, tags, date, metadata, version) "
+                            "SELECT $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 'wiki', "
+                            "$7, 'ready', $8, $9, $10, $11::jsonb, 1 "
+                            "WHERE EXISTS (SELECT 1 FROM knowledge_bases "
+                            "WHERE id = $2::uuid AND user_id = $3::uuid) "
+                            "RETURNING id",
+                            bundle.document_id,
+                            kb_id,
+                            self.user_id,
+                            bundle.filename,
+                            bundle.title,
+                            bundle.path,
+                            bundle.file_type,
+                            bundle.content,
+                            list(bundle.tags),
+                            bundle.date,
+                            json.dumps(metadata),
+                        )
+                        if row is None:
+                            raise PermissionError(f"knowledge base {kb_id} not owned by user")
+                    else:
+                        row = await conn.fetchrow(
+                            "UPDATE documents SET content = $1, title = $2, tags = $3, "
+                            "date = $4, metadata = $5::jsonb, version = $6, stale_since = NULL, "
+                            "updated_at = now() WHERE id = $7::uuid AND knowledge_base_id = $8::uuid "
+                            "AND user_id = $9::uuid AND version = $10 RETURNING id",
+                            bundle.content,
+                            bundle.title,
+                            list(bundle.tags),
+                            bundle.date,
+                            json.dumps(metadata),
+                            version,
+                            bundle.document_id,
+                            kb_id,
+                            self.user_id,
+                            bundle.expected_version,
+                        )
+                        if row is None:
+                            raise VersionConflict(
+                                f"document {bundle.document_id} is not at version "
+                                f"{bundle.expected_version}"
+                            )
+                except asyncpg.UniqueViolationError as exc:
+                    if exc.constraint_name == "idx_documents_unique_active":
+                        raise DuplicateDocumentError(bundle.path, bundle.filename) from exc
+                    raise
+
+                await store_chunks_pg(
+                    conn,
+                    bundle.document_id,
+                    self.user_id,
+                    kb_id,
+                    version,
+                    chunk_text(bundle.content),
+                )
+                await conn.execute(
+                    "DELETE FROM document_references WHERE source_document_id = $1::uuid "
+                    "AND reference_type = ANY($2::text[])",
+                    bundle.document_id,
+                    ["cites", "links_to"],
+                )
+                for edge in bundle.edges:
+                    await conn.execute(
+                        "INSERT INTO document_references "
+                        "(source_document_id, target_document_id, knowledge_base_id, "
+                        "reference_type, page) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)",
+                        bundle.document_id,
+                        edge.target_id,
+                        kb_id,
+                        edge.reference_type,
+                        edge.page,
+                    )
+
+                await conn.execute(
+                    "UPDATE documents SET stale_since = now() WHERE id IN ("
+                    "SELECT source_document_id FROM document_references "
+                    "WHERE target_document_id = $1::uuid AND reference_type = 'links_to') "
+                    "AND stale_since IS NULL AND user_id = $2::uuid",
+                    bundle.document_id,
+                    self.user_id,
+                )
+
+                rows = await conn.fetch(
+                    "SELECT d.metadata FROM document_references r "
+                    "JOIN documents d ON d.id = r.target_document_id "
+                    "WHERE r.source_document_id = $1::uuid AND r.reference_type = 'cites' "
+                    "AND d.path LIKE '/corpus/%'",
+                    bundle.document_id,
+                )
+                metas = []
+                for item in rows:
+                    raw = item["metadata"]
+                    try:
+                        parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, dict):
+                        metas.append(parsed)
+                rollup = rollup_from_metas(metas, _date.today().isoformat())
+                if apply_rollup(metadata, rollup):
+                    await conn.execute(
+                        "UPDATE documents SET metadata = $1::jsonb "
+                        "WHERE id = $2::uuid AND user_id = $3::uuid",
+                        json.dumps(metadata, ensure_ascii=False),
+                        bundle.document_id,
+                        self.user_id,
+                    )
+        return {
+            "id": bundle.document_id,
+            "filename": bundle.filename,
+            "path": bundle.path,
+            "version": version,
+        }
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         result = await service_execute(

@@ -1,10 +1,20 @@
 """Pure citation and wiki-link parsing shared by API and MCP."""
 
 import re
+from dataclasses import dataclass
 
 _CITATION_RE = re.compile(r"\[\^\d+\]:\s*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
 _EXTENSION_RE = re.compile(r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$")
+
+
+@dataclass(frozen=True)
+class ReferenceEdge:
+    """A content-derived edge from the current document to a target."""
+
+    target_id: str
+    reference_type: str
+    page: int | None = None
 
 
 def parse_citation_filename(raw: str) -> tuple[str, int | None]:
@@ -88,9 +98,9 @@ def extract_references(
     filename_to_doc: dict[str, dict],
     base_to_doc: dict[str, dict],
     wiki_path_to_doc: dict[str, dict],
-) -> list[dict]:
+) -> list[ReferenceEdge]:
     """Return deduplicated content-derived citation and wiki-link edges."""
-    edges: list[dict] = []
+    edges: list[ReferenceEdge] = []
     seen: set[tuple[str, str]] = set()
     source_id = str(doc_id)
 
@@ -112,7 +122,7 @@ def extract_references(
 
 
 def _append_edge(
-    edges: list[dict],
+    edges: list[ReferenceEdge],
     seen: set[tuple[str, str]],
     source_id: str,
     target: dict,
@@ -123,4 +133,4 @@ def _append_edge(
     key = (target_id, reference_type)
     if target_id != source_id and key not in seen:
         seen.add(key)
-        edges.append({"target_id": target_id, "type": reference_type, "page": page})
+        edges.append(ReferenceEdge(target_id, reference_type, page))

@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+from llmwiki_core.references import ReferenceEdge
+
 
 def _references_module():
     spec = importlib.util.spec_from_file_location(
@@ -53,7 +55,7 @@ def test_extract_references_matches_hyphenated_version_source():
         {"deepseek-r1.md": page},
     )
 
-    assert edges == [{"target_id": "source-1", "type": "cites", "page": 5}]
+    assert edges == [ReferenceEdge("source-1", "cites", 5)]
 
 
 def test_parse_citation_chinese_article_suffix_strips_but_keeps_no_page():

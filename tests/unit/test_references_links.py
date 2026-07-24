@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 
+from llmwiki_core.references import ReferenceEdge
+
 
 def _references_module():
     spec = importlib.util.spec_from_file_location(
@@ -53,9 +55,7 @@ def test_links_resolve_against_wiki_path_map():
 
     for label, content, expected_target in cases:
         edges = extract_references(content, source_id, wiki_dir, {}, {}, wiki_map)
-        assert edges == [
-            {"target_id": expected_target, "type": "links_to", "page": None}
-        ], label
+        assert edges == [ReferenceEdge(expected_target, "links_to")], label
 
 
 def test_duplicate_link_targets_dedup_to_one_edge():
@@ -65,7 +65,7 @@ def test_duplicate_link_targets_dedup_to_one_edge():
     content = "See [first](/wiki/abs.md) and again [second](/wiki/abs.md)."
     edges = extract_references(content, "writer-1", "notes/", {}, {}, wiki_map)
 
-    assert edges == [{"target_id": "abs-1", "type": "links_to", "page": None}]
+    assert edges == [ReferenceEdge("abs-1", "links_to")]
 
 
 def test_self_reference_is_excluded():

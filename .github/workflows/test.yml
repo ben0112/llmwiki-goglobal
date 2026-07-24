@@ -65,7 +65,7 @@ jobs:
 
       - name: Run MCP VaultFS + tool handler tests
         working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py -v
+        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_atomic_wiki_write ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_startup_reconciles_disk_after_database_rollback -v
 
   postgres-integration:
     name: Integration tests (Postgres)
@@ -113,4 +113,4 @@ jobs:
 
       - name: Run MCP Postgres isolation tests
         working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_mcp_isolation.py -v
+        run: pytest ../tests/integration/mcp/test_mcp_isolation.py ../tests/integration/mcp/test_wiki_write_invariants.py::test_postgres_atomic_wiki_write -v

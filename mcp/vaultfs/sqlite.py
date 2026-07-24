@@ -1,8 +1,10 @@
 """SQLite + local filesystem implementation of VaultFS."""
 
+import asyncio
 import json
 import logging
 import os
+import tempfile
 import uuid
 from datetime import date
 from pathlib import Path
@@ -10,6 +12,8 @@ from pathlib import Path
 import aiosqlite
 
 from services.chunker import chunk_text, store_chunks_sqlite
+from llmwiki_core.references import build_lookup_maps, extract_references
+from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 from .base import VaultFS, DuplicateDocumentError
 from .facets import sqlite_facet_conditions, validate_facets
 
@@ -19,6 +23,7 @@ _SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_schema.s
 
 _db: aiosqlite.Connection | None = None
 _workspace_root: Path | None = None
+_write_lock = asyncio.Lock()
 
 _OVERVIEW_TEMPLATE = """\
 ---
@@ -338,7 +343,7 @@ class SqliteVaultFS(VaultFS):
                  json.dumps(metadata) if metadata else None, doc_number),
             )
             if file_type in ("md", "txt"):
-                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+                await store_chunks_sqlite(db, doc_id, 1, chunk_text(content or ""))
             await db.commit()
         except aiosqlite.IntegrityError:
             await db.rollback()
@@ -376,17 +381,149 @@ class SqliteVaultFS(VaultFS):
             )
 
             cursor = await db.execute(
-                "SELECT filename, path, file_type FROM documents WHERE id = ?", (doc_id,),
+                "SELECT filename, path, file_type, version FROM documents WHERE id = ?", (doc_id,),
             )
             row = await cursor.fetchone()
             if row and row[2] in ("md", "txt"):
-                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+                await store_chunks_sqlite(db, doc_id, row[3], chunk_text(content or ""))
 
             await db.commit()
         except Exception:
             await db.rollback()
             raise
         return {"id": doc_id, "filename": row[0], "path": row[1]} if row else None
+
+    async def write_wiki_bundle(self, kb_id: str, bundle: WikiWriteBundle) -> dict:
+        """Commit a wiki revision and every derived row in one SQLite transaction."""
+        from datetime import date as _date
+
+        from .facet_rollup import apply_rollup, rollup_from_metas
+
+        db = self._db_or_raise()
+        version = 1 if bundle.expected_version is None else bundle.expected_version + 1
+        relative_path = (bundle.path.rstrip("/") + "/" + bundle.filename).lstrip("/")
+        metadata = dict(bundle.metadata)
+
+        async with _write_lock:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                if bundle.expected_version is None:
+                    cursor = await db.execute(
+                        "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents"
+                    )
+                    document_number = (await cursor.fetchone())[0]
+                    await db.execute(
+                        "INSERT INTO documents "
+                        "(id, user_id, filename, title, path, relative_path, source_kind, "
+                        "file_type, status, content, tags, date, metadata, version, document_number) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'wiki', ?, 'ready', ?, ?, ?, ?, 1, ?)",
+                        (
+                            bundle.document_id,
+                            self.user_id,
+                            bundle.filename,
+                            bundle.title,
+                            bundle.path,
+                            relative_path,
+                            bundle.file_type,
+                            bundle.content,
+                            json.dumps(bundle.tags),
+                            bundle.date,
+                            json.dumps(metadata),
+                            document_number,
+                        ),
+                    )
+                else:
+                    cursor = await db.execute(
+                        "UPDATE documents SET content = ?, title = ?, tags = ?, date = ?, "
+                        "metadata = ?, version = ?, stale_since = NULL, updated_at = datetime('now') "
+                        "WHERE id = ? AND user_id = ? AND version = ?",
+                        (
+                            bundle.content,
+                            bundle.title,
+                            json.dumps(bundle.tags),
+                            bundle.date,
+                            json.dumps(metadata),
+                            version,
+                            bundle.document_id,
+                            self.user_id,
+                            bundle.expected_version,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise VersionConflict(
+                            f"document {bundle.document_id} is not at version "
+                            f"{bundle.expected_version}"
+                        )
+
+                await store_chunks_sqlite(
+                    db,
+                    bundle.document_id,
+                    version,
+                    chunk_text(bundle.content),
+                )
+                await db.execute(
+                    "DELETE FROM document_references WHERE source_document_id = ? "
+                    "AND reference_type IN ('cites', 'links_to')",
+                    (bundle.document_id,),
+                )
+                for edge in bundle.edges:
+                    await db.execute(
+                        "INSERT INTO document_references "
+                        "(id, source_document_id, target_document_id, reference_type, page) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(uuid.uuid4()),
+                            bundle.document_id,
+                            edge.target_id,
+                            edge.reference_type,
+                            edge.page,
+                        ),
+                    )
+
+                await db.execute(
+                    "UPDATE documents SET stale_since = datetime('now') "
+                    "WHERE id IN (SELECT source_document_id FROM document_references "
+                    "WHERE target_document_id = ? AND reference_type = 'links_to') "
+                    "AND stale_since IS NULL",
+                    (bundle.document_id,),
+                )
+
+                cursor = await db.execute(
+                    "SELECT d.metadata FROM document_references r "
+                    "JOIN documents d ON d.id = r.target_document_id "
+                    "WHERE r.source_document_id = ? AND r.reference_type = 'cites' "
+                    "AND d.relative_path LIKE 'corpus/%'",
+                    (bundle.document_id,),
+                )
+                metas = []
+                for (raw,) in await cursor.fetchall():
+                    try:
+                        parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    except ValueError:
+                        continue
+                    if isinstance(parsed, dict):
+                        metas.append(parsed)
+                rollup = rollup_from_metas(metas, _date.today().isoformat())
+                if apply_rollup(metadata, rollup):
+                    await db.execute(
+                        "UPDATE documents SET metadata = ? WHERE id = ?",
+                        (json.dumps(metadata, ensure_ascii=False), bundle.document_id),
+                    )
+                await db.commit()
+            except aiosqlite.IntegrityError as exc:
+                await db.rollback()
+                if "relative_path" in str(exc):
+                    raise DuplicateDocumentError(bundle.path, bundle.filename) from exc
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+        return {
+            "id": bundle.document_id,
+            "filename": bundle.filename,
+            "path": bundle.path,
+            "version": version,
+        }
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         db = self._db_or_raise()
@@ -601,8 +738,25 @@ class SqliteVaultFS(VaultFS):
         if not file_path:
             return False
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
-        return True
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=file_path.parent,
+                prefix=f".{file_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = handle.name
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, file_path)
+            return True
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def delete_from_disk(self, docs: list[dict]) -> None:
         for d in docs:
@@ -786,6 +940,7 @@ class SqliteVaultFS(VaultFS):
         cursor = await db.execute("SELECT id FROM workspace LIMIT 1")
         row = await cursor.fetchone()
         if row:
+            await self._reconcile_wiki_files(row[0])
             return row[0]
         ws_id = str(uuid.uuid4())
         await db.execute(
@@ -793,7 +948,64 @@ class SqliteVaultFS(VaultFS):
             (ws_id, workspace_name, self.user_id),
         )
         await db.commit()
+        await self._reconcile_wiki_files(ws_id)
         return ws_id
+
+    async def _reconcile_wiki_files(self, kb_id: str) -> int:
+        """Repair an indexed wiki revision when disk replacement won a prior crash."""
+        if _workspace_root is None:
+            return 0
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, filename, title, path, file_type, content, tags, date, metadata, version "
+            "FROM documents WHERE source_kind = 'wiki' AND file_type = 'md' "
+            "AND status != 'failed'"
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        if not rows:
+            return 0
+        # Include source documents so citations can be rebuilt with the page.
+        cursor = await db.execute("SELECT id, filename, title, path FROM documents")
+        lookup_docs = _rows_to_dicts(cursor, await cursor.fetchall())
+        filename_to_doc, base_to_doc, wiki_path_to_doc = build_lookup_maps(lookup_docs)
+
+        repaired = 0
+        for row in rows:
+            file_path = self._resolve_path(row["path"].lstrip("/") + row["filename"])
+            if file_path is None or not file_path.is_file():
+                continue
+            disk_content = file_path.read_text(encoding="utf-8")
+            if disk_content == (row["content"] or ""):
+                continue
+            wiki_dir = row["path"].replace("/wiki/", "", 1)
+            edges = extract_references(
+                disk_content,
+                str(row["id"]),
+                wiki_dir,
+                filename_to_doc,
+                base_to_doc,
+                wiki_path_to_doc,
+            )
+            await self.write_wiki_bundle(
+                kb_id,
+                WikiWriteBundle.build(
+                    document_id=str(row["id"]),
+                    expected_version=int(row["version"]),
+                    filename=row["filename"],
+                    path=row["path"],
+                    file_type=row["file_type"],
+                    content=disk_content,
+                    title=row["title"],
+                    tags=row.get("tags") or [],
+                    date=row.get("date"),
+                    metadata=row.get("metadata") or {},
+                    edges=edges,
+                ),
+            )
+            repaired += 1
+        if repaired:
+            logger.warning("Reconciled %d wiki file(s) from disk", repaired)
+        return repaired
 
     async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
         today = date.today().isoformat()

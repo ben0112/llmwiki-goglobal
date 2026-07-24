@@ -1,4 +1,5 @@
 from llmwiki_core.references import (
+    ReferenceEdge,
     build_lookup_maps,
     extract_references,
     parse_citation_filename,
@@ -19,7 +20,7 @@ def test_reference_extraction_deduplicates_edges():
         bases,
         paths,
     )
-    assert edges == [{"target_id": "src", "type": "cites", "page": 3}]
+    assert edges == [ReferenceEdge("src", "cites", 3)]
 
 
 def test_chinese_page_suffix_with_fullwidth_comma_is_parsed():

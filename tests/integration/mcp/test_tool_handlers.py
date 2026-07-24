@@ -5,7 +5,6 @@ Uses SqliteVaultFS with a temp workspace — no Postgres needed.
 """
 
 import pytest
-from tests.integration.mcp.conftest import TEST_USER_ID
 
 
 def _make_kb(kb_id: str) -> dict:
@@ -37,6 +36,36 @@ class TestWriteReadFlow:
         writer = WriteHandler(instance, _make_kb(kb_id))
         result = await writer.create("/wiki/", "Concepts", "# Concepts", ["overview"], "", False)
         assert "cite sources" in result.lower() or "footnotes" in result.lower()
+
+    async def test_wiki_writes_commit_reference_graph_with_revision(self, fs):
+        instance, kb_id = fs
+        from tools.write import WriteHandler
+
+        source = await instance.create_document(
+            kb_id, "source.pdf", "Source", "/", "pdf", "", ["source"]
+        )
+        writer = WriteHandler(instance, _make_kb(kb_id))
+        await writer.create(
+            "/wiki/",
+            "Atomic References",
+            "Claim.[^1]\n\n[^1]: source.pdf, p.7",
+            ["wiki"],
+            "",
+            False,
+        )
+
+        page = await instance.get_document(kb_id, "atomic-references.md", "/wiki/")
+        refs = await instance.get_forward_references(str(page["id"]))
+        assert [(str(row["id"]), row["reference_type"], row["page"]) for row in refs] == [
+            (str(source["id"]), "cites", 7)
+        ]
+
+        await writer.edit(
+            "wiki/atomic-references.md",
+            "Claim.[^1]\n\n[^1]: source.pdf, p.7",
+            "Claim without a citation.",
+        )
+        assert await instance.get_forward_references(str(page["id"])) == []
 
     async def test_create_wiki_page_adds_frontmatter_from_args(self, fs):
         instance, kb_id = fs
@@ -633,11 +662,9 @@ class TestReadModes:
 
     async def test_read_backlinks_shown(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
 
         kb = _make_kb(kb_id)
-        writer = WriteHandler(instance, kb)
         reader = ReadHandler(instance, kb)
 
         target = await instance.create_document(kb_id, "target.md", "Target", "/wiki/", "md", "target content", ["tag"])

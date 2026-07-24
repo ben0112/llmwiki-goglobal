@@ -43,17 +43,17 @@ async def update_references(
     for edge in edges:
         await fs.upsert_reference(
             document_id,
-            edge["target_id"],
+            edge.target_id,
             kb_id,
-            edge["type"],
-            edge["page"],
+            edge.reference_type,
+            edge.page,
         )
 
     logger.info(
         "Updated references for doc=%s: %d citations, %d links",
         document_id[:8],
-        sum(1 for edge in edges if edge["type"] == "cites"),
-        sum(1 for edge in edges if edge["type"] == "links_to"),
+        sum(1 for edge in edges if edge.reference_type == "cites"),
+        sum(1 for edge in edges if edge.reference_type == "links_to"),
     )
 
 
