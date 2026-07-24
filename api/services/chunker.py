@@ -88,7 +88,7 @@ async def _store_chunks_on_conn(
             for chunk in chunks
         ],
     )
-    logger.info("Stored %d chunks for doc %s", len(chunks), document_id[:8])
+    logger.info("Stored %d chunks for doc %s", len(chunks), str(document_id)[:8])
 
 
 __all__ = [
