@@ -58,10 +58,6 @@ async def _repair_hosted_derived_drift(pool) -> list[dict]:
 
 async def _recover_durable_extraction_jobs(pool, job_service) -> list:
     """Idempotently backfill extraction jobs in one startup transaction."""
-    from uuid import UUID
-
-    from jobs.models import JobCreate, JobType
-
     recovered = []
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -78,31 +74,18 @@ async def _recover_durable_extraction_jobs(pool, job_service) -> list:
         rows = await conn.fetch(
             "SELECT id, user_id, knowledge_base_id FROM documents "
             "WHERE status IN ('pending', 'processing') AND NOT archived "
-            "AND source_kind = 'source' "
-            "AND NOT EXISTS ("
-            "SELECT 1 FROM background_jobs "
-            "WHERE background_jobs.user_id = documents.user_id "
-            "AND background_jobs.job_type = 'document.extract' "
-            "AND background_jobs.idempotency_key = 'document.extract:' || documents.id::text"
-            ") ORDER BY id FOR UPDATE"
+            "AND source_kind = 'source' ORDER BY id FOR UPDATE"
         )
         for row in rows:
-            document_id = row["id"]
-            user_id = row["user_id"]
-            recovered.append(
-                await job_service.create_in_transaction(
-                    conn,
-                    JobCreate(
-                        job_type=JobType.DOCUMENT_EXTRACT,
-                        user_id=UUID(str(user_id)),
-                        knowledge_base_id=UUID(str(row["knowledge_base_id"])),
-                        document_id=UUID(str(document_id)),
-                        payload={"document_id": str(document_id)},
-                        idempotency_key=f"document.extract:{document_id}",
-                    ),
-                    authenticated_user_id=UUID(str(user_id)),
-                )
+            job, created = await job_service.ensure_document_extraction_in_transaction(
+                conn,
+                document_id=row["id"],
+                user_id=row["user_id"],
+                knowledge_base_id=row["knowledge_base_id"],
+                restart_terminal=False,
             )
+            if created:
+                recovered.append(job)
     return recovered
 
 

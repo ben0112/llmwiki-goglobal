@@ -7,7 +7,7 @@ from uuid import UUID
 import asyncpg
 
 from jobs import repository
-from jobs.models import JobCreate, JobRecord
+from jobs.models import JobCreate, JobRecord, JobState, JobType
 
 
 class JobResourceNotFound(LookupError):
@@ -42,6 +42,76 @@ class JobService:
             raise ValueError("command user does not match the authenticated user")
         await self._validate_resources(conn, command, authenticated_user_id)
         return await repository.create(conn, command)
+
+    async def ensure_document_extraction_in_transaction(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        document_id: UUID,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        restart_terminal: bool,
+    ) -> tuple[JobRecord, bool]:
+        """Return the authoritative extraction job or append one immutable successor."""
+        if not conn.is_in_transaction():
+            raise RuntimeError("extraction job ensure requires an explicit transaction")
+        document = await conn.fetchrow(
+            "SELECT status::text, version FROM documents "
+            "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+            "AND NOT archived AND source_kind = 'source' FOR UPDATE",
+            document_id,
+            user_id,
+            knowledge_base_id,
+        )
+        if document is None:
+            raise JobResourceNotFound("referenced extraction document was not found")
+
+        latest = await conn.fetchrow(
+            "SELECT id, state::text FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
+            user_id,
+            document_id,
+        )
+        if latest is not None:
+            state = JobState(latest["state"])
+            if not state.is_terminal or (state is JobState.SUCCEEDED and document["status"] == "ready"):
+                record = await repository.get_for_user(conn, latest["id"], user_id)
+                if record is None:
+                    raise RuntimeError("authoritative extraction job disappeared")
+                return record, False
+            if document["status"] == "failed" and not restart_terminal:
+                record = await repository.get_for_user(conn, latest["id"], user_id)
+                if record is None:
+                    raise RuntimeError("authoritative extraction job disappeared")
+                return record, False
+
+        idempotency_key = f"document.extract:{document_id}"
+        if latest is not None:
+            idempotency_key = f"{idempotency_key}:after:{latest['id']}"
+            if restart_terminal:
+                await conn.execute(
+                    "UPDATE documents SET "
+                    "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE 'pending' END, "
+                    "error_message = NULL, updated_at = now() "
+                    "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3",
+                    document_id,
+                    user_id,
+                    knowledge_base_id,
+                )
+        record = await self.create_in_transaction(
+            conn,
+            JobCreate(
+                job_type=JobType.DOCUMENT_EXTRACT,
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                payload={"document_id": str(document_id)},
+                idempotency_key=idempotency_key,
+            ),
+            authenticated_user_id=user_id,
+        )
+        return record, True
 
     async def get(self, job_id: UUID, *, authenticated_user_id: UUID) -> JobRecord | None:
         async with self._pool.acquire() as conn, conn.transaction():

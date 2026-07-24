@@ -105,11 +105,15 @@ async def handle_document_extract(
     async def final_checkpoint(conn: asyncpg.Connection) -> None:
         await lease.checkpoint(conn)
 
+    async def artifact_checkpoint() -> None:
+        await lease.checkpoint()
+
     try:
         version = await OCRService(context.s3, context.pool).extract_document(
             str(job.document_id),
             str(job.user_id),
             before_write=final_checkpoint,
+            before_artifact_write=artifact_checkpoint,
             artifact_namespace=f"{job.id}/attempt-{job.attempt_count}",
         )
     except TerminalExtractionError as exc:

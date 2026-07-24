@@ -244,13 +244,15 @@ def test_handler_registry_is_complete_read_only_and_transport_neutral():
 
 
 @pytest.mark.asyncio
-async def test_all_initial_handlers_explicitly_reject_unsupported_business_work():
+async def test_placeholder_handlers_explicitly_reject_unsupported_business_work():
     from jobs.handlers import HANDLERS, UnsupportedJobHandler, WorkerContext
-    from jobs.models import JobRecord
+    from jobs.models import JobRecord, JobType
 
     context = WorkerContext(pool=object(), s3=None, converter_url="", converter_secret="")
     lease = object()
-    for job_type, handler in HANDLERS.items():
+    unsupported_types = (JobType.GRAPH_REBUILD, JobType.UPLOAD_CLEANUP)
+    for job_type in unsupported_types:
+        handler = HANDLERS[job_type]
         record = JobRecord(id=uuid4(), job_type=job_type, user_id=uuid4())
         with pytest.raises(UnsupportedJobHandler) as raised:
             await handler(record, lease, context)

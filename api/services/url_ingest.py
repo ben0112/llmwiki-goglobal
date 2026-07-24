@@ -132,6 +132,8 @@ class UrlIngestService:
         commit_attempted = False
         failure: Exception | asyncio.CancelledError | None = None
         failure_traceback = None
+        release_failure: Exception | asyncio.CancelledError | None = None
+        release_failure_traceback = None
         conn = None
         transaction = None
         try:
@@ -175,21 +177,31 @@ class UrlIngestService:
                     await asyncio.shield(transaction.rollback())
         finally:
             if conn is not None:
-                await asyncio.shield(self.pool.release(conn))
+                try:
+                    await asyncio.shield(self.pool.release(conn))
+                except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - resolve persistence first.
+                    release_failure = exc
+                    release_failure_traceback = exc.__traceback__
 
         if failure is not None:
-            committed: bool | None = False
-            if commit_attempted and duplicate is None and job is not None:
-                committed = await asyncio.shield(
-                    self._confirm_document_job_committed(user_id, kb_id, document_id, job.id)
-                )
-            if duplicate is not None or committed is False:
-                await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
-            raise failure.with_traceback(failure_traceback)
+            await self._raise_persistence_failure(
+                failure,
+                failure_traceback,
+                commit_attempted=commit_attempted,
+                duplicate=duplicate,
+                job=job,
+                user_id=user_id,
+                kb_id=kb_id,
+                document_id=document_id,
+            )
 
         if duplicate is not None:
             await self._delete_uploaded_document_prefix(user_id, document_id)
+            if release_failure is not None:
+                raise release_failure.with_traceback(release_failure_traceback)
             return {**duplicate, "already_exists": True, "job_id": str(job.id)}
+        if release_failure is not None:
+            raise release_failure.with_traceback(release_failure_traceback)
 
         return {
             "id": document_id,
@@ -198,6 +210,25 @@ class UrlIngestService:
             "already_exists": False,
             "job_id": str(job.id),
         }
+
+    async def _raise_persistence_failure(
+        self,
+        failure: Exception | asyncio.CancelledError,
+        failure_traceback,
+        *,
+        commit_attempted: bool,
+        duplicate: dict | None,
+        job,
+        user_id: str,
+        kb_id: str,
+        document_id: str,
+    ) -> None:
+        committed: bool | None = False
+        if commit_attempted and duplicate is None and job is not None:
+            committed = await asyncio.shield(self._confirm_document_job_committed(user_id, kb_id, document_id, job.id))
+        if duplicate is not None or committed is False:
+            await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
+        raise failure.with_traceback(failure_traceback)
 
     async def _commit_transaction(self, transaction) -> None:
         await transaction.commit()
@@ -319,45 +350,15 @@ class UrlIngestService:
         user_id: str,
         kb_id: str,
     ):
-        from jobs import repository
-        from jobs.models import JobCreate, JobType
-
         document_id = UUID(existing["id"])
-        latest = await conn.fetchrow(
-            "SELECT id, state, idempotency_key FROM background_jobs "
-            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
-            "ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
-            UUID(user_id),
-            document_id,
-        )
-        if latest is not None and latest["state"] in {"queued", "running", "retry_wait", "succeeded"}:
-            return await repository.get_for_user(conn, latest["id"], UUID(user_id))
-
-        idempotency_key = f"document.extract:{document_id}"
-        if latest is not None:
-            idempotency_key = f"{idempotency_key}:after:{latest['id']}"
-            await conn.execute(
-                "UPDATE documents SET "
-                "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE 'pending' END, "
-                "error_message = NULL, "
-                "updated_at = now() WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
-                "AND NOT archived AND source_kind = 'source'",
-                document_id,
-                UUID(user_id),
-                UUID(kb_id),
-            )
-        return await self.jobs.create_in_transaction(
+        job, _ = await self.jobs.ensure_document_extraction_in_transaction(
             conn,
-            JobCreate(
-                job_type=JobType.DOCUMENT_EXTRACT,
-                user_id=UUID(user_id),
-                knowledge_base_id=UUID(kb_id),
-                document_id=document_id,
-                payload={"document_id": str(document_id)},
-                idempotency_key=idempotency_key,
-            ),
-            authenticated_user_id=UUID(user_id),
+            document_id=document_id,
+            user_id=UUID(user_id),
+            knowledge_base_id=UUID(kb_id),
+            restart_terminal=True,
         )
+        return job
 
     async def _delete_uploaded_document_prefix(self, user_id: str, document_id: str) -> None:
         try:

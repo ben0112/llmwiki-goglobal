@@ -24,6 +24,7 @@ class DerivedAsset(Protocol):
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
 AfterCommit = Callable[[list[str]], Awaitable[None]]
+_ARTIFACT_POINTER_KEYS = ("converted_s3_key", "ocr_s3_key", "tagged_s3_key")
 
 
 async def find_inconsistent_ready_documents(
@@ -165,10 +166,13 @@ async def replace_derived_content(
             previous_metadata = document["metadata"] or {}
             if isinstance(previous_metadata, str):
                 previous_metadata = json.loads(previous_metadata)
+            next_metadata = metadata_patch or {}
             replaced_artifact_keys = [
                 previous_metadata[key]
-                for key in ("tagged_s3_key", "ocr_s3_key", "converted_s3_key")
-                if previous_metadata.get(key)
+                for key in _ARTIFACT_POINTER_KEYS
+                if key in next_metadata
+                and previous_metadata.get(key)
+                and previous_metadata[key] != next_metadata[key]
             ]
             await conn.execute("DELETE FROM document_pages WHERE document_id = $1", document_id)
             if pages:

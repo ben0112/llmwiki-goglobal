@@ -58,6 +58,24 @@ class RecordingS3:
         self.objects.pop(key, None)
 
 
+class ReleaseFailingPool:
+    def __init__(self, pool, *, cancelled: bool = False) -> None:
+        self._pool = pool
+        self._cancelled = cancelled
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+    async def acquire(self):
+        return await self._pool.acquire()
+
+    async def release(self, conn) -> None:
+        await self._pool.release(conn)
+        if self._cancelled:
+            raise asyncio.CancelledError
+        raise RuntimeError("pool release failed")
+
+
 async def _seed_tenant(pool, *, storage_limit_bytes: int = 1_000_000):
     user_id = uuid4()
     kb_id = uuid4()
@@ -359,6 +377,134 @@ async def test_url_ingest_unknown_commit_outcome_preserves_artifact(pool, monkey
 
     assert len(s3.objects) == 1
     assert s3.deleted_prefixes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_cancelled", [False, True])
+async def test_url_ingest_precommit_failure_with_release_failure_preserves_original_and_cleans_source(
+    pool,
+    monkeypatch,
+    release_cancelled,
+):
+    user_id, kb_id = await _seed_tenant(pool)
+    s3 = RecordingS3()
+
+    class BodyFailingJobs(JobService):
+        async def create_in_transaction(self, conn, command, *, authenticated_user_id):
+            del conn, command, authenticated_user_id
+            raise RuntimeError("body insert failed")
+
+    service = UrlIngestService(
+        ReleaseFailingPool(pool, cancelled=release_cancelled),
+        s3,
+        BodyFailingJobs(pool),
+    )
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    with pytest.raises(RuntimeError, match="body insert failed"):
+        await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/release-body.pdf", "/")
+
+    assert s3.objects == {}
+    assert s3.deleted_prefixes == [s3.uploads[0].rsplit("source.pdf", 1)[0]]
+    assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_outcome", ["committed", "rolled_back", "unknown"])
+async def test_url_ingest_commit_failure_with_release_failure_still_resolves_original_outcome(
+    pool,
+    monkeypatch,
+    commit_outcome,
+):
+    user_id, kb_id = await _seed_tenant(pool)
+    s3 = RecordingS3()
+    service = UrlIngestService(ReleaseFailingPool(pool), s3, JobService(pool))
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    async def fail_commit(transaction):
+        if commit_outcome == "committed":
+            await transaction.commit()
+        raise RuntimeError("commit result lost")
+
+    monkeypatch.setattr(service, "_commit_transaction", fail_commit)
+    if commit_outcome == "unknown":
+
+        async def unknown_result(*_args):
+            return None
+
+        monkeypatch.setattr(service, "_confirm_document_job_committed", unknown_result)
+
+    with pytest.raises(RuntimeError, match="commit result lost"):
+        await service.ingest_pdf(
+            str(user_id),
+            str(kb_id),
+            f"https://example.test/release-{commit_outcome}.pdf",
+            "/",
+        )
+
+    if commit_outcome == "rolled_back":
+        assert s3.objects == {}
+        assert len(s3.deleted_prefixes) == 1
+    else:
+        assert len(s3.objects) == 1
+        assert s3.deleted_prefixes == []
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_duplicate_commit_with_release_failure_deletes_only_temporary_source(pool, monkeypatch):
+    _job, user_id, kb_id, existing_doc_id = await _seed_document_job(pool)
+    source_url = "https://example.test/release-duplicate.pdf"
+    await pool.execute(
+        "UPDATE documents SET metadata = $2::jsonb WHERE id = $1",
+        existing_doc_id,
+        json.dumps({"source_url": source_url}),
+    )
+    existing = {
+        "id": str(existing_doc_id),
+        "knowledge_base_id": str(kb_id),
+        "title": None,
+        "path": "/",
+        "filename": "paper.pdf",
+        "status": "pending",
+    }
+    s3 = RecordingS3()
+    existing_key = f"{user_id}/{existing_doc_id}/source.pdf"
+    s3.objects[existing_key] = b"existing-source"
+    service = UrlIngestService(ReleaseFailingPool(pool), s3, JobService(pool))
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ntemporary", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    async def race_duplicate(_user_id, _kb_id, _url, *, conn=None):
+        return existing if conn is not None else None
+
+    monkeypatch.setattr(service, "_find_by_source_url", race_duplicate)
+
+    with pytest.raises(RuntimeError, match="pool release failed"):
+        await service.ingest_pdf(str(user_id), str(kb_id), source_url, "/")
+
+    temporary_prefix = s3.uploads[0].rsplit("source.pdf", 1)[0]
+    assert s3.deleted_prefixes == [temporary_prefix]
+    assert s3.objects == {existing_key: b"existing-source"}
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE document_id = $1", existing_doc_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_new_document_commit_with_release_failure_preserves_committed_source(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    s3 = RecordingS3()
+    service = UrlIngestService(ReleaseFailingPool(pool), s3, JobService(pool))
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncommitted", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    with pytest.raises(RuntimeError, match="pool release failed"):
+        await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/release-new.pdf", "/")
+
+    assert len(s3.objects) == 1
+    assert s3.deleted_prefixes == []
+    assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 1
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 1
 
 
 @pytest.mark.asyncio
@@ -818,6 +964,54 @@ async def test_mistral_asset_upload_failure_cannot_publish_ready_or_leave_attemp
 
 
 @pytest.mark.asyncio
+async def test_versioned_artifact_staging_does_not_hold_final_job_or_document_locks(pool, monkeypatch):
+    job, _user_id, _kb_id, doc_id = await _seed_document_job(pool)
+
+    class GatedArtifactS3(RecordingS3):
+        def __init__(self):
+            super().__init__()
+            self.upload_started = asyncio.Event()
+            self.release_upload = asyncio.Event()
+
+        async def upload_bytes(self, key: str, data: bytes, content_type: str) -> None:
+            if "/derived/" in key and key.endswith("/ocr.json"):
+                self.upload_started.set()
+                await self.release_upload.wait()
+            await super().upload_bytes(key, data, content_type)
+
+    s3 = GatedArtifactS3()
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def mistral_result(self, url, url_type="document_url"):
+        del self, url, url_type
+        return {"pages": [{"index": 0, "markdown": "slow staged artifact"}]}
+
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", mistral_result)
+    extraction = asyncio.create_task(handle_document_extract(job, _lease(pool, job), _context(pool, s3)))
+    await asyncio.wait_for(s3.upload_started.wait(), timeout=1)
+
+    async def heartbeat_once():
+        async with pool.acquire() as conn, conn.transaction():
+            return await repository.heartbeat(conn, job.id, "worker-extraction", 120)
+
+    heartbeat = asyncio.create_task(heartbeat_once())
+    heartbeat_completed_during_upload = True
+    try:
+        await asyncio.wait_for(asyncio.shield(heartbeat), timeout=0.15)
+    except TimeoutError:
+        heartbeat_completed_during_upload = False
+    finally:
+        s3.release_upload.set()
+
+    await extraction
+    await heartbeat
+
+    assert heartbeat_completed_during_upload
+    assert await pool.fetchval("SELECT status::text FROM documents WHERE id = $1", doc_id) == "ready"
+
+
+@pytest.mark.asyncio
 async def test_successful_reextraction_cleans_previous_published_asset_after_commit(pool, monkeypatch):
     job, user_id, kb_id, doc_id = await _seed_document_job(pool, status="ready", version=1)
     old_asset_id = uuid4()
@@ -1013,6 +1207,54 @@ async def test_durable_office_success_switches_converted_pointer_and_cleans_prev
         doc_id,
     )
     assert await HostedPublicWikiService(pool).get_asset_key("converted-office", 42) == new_key
+
+
+@pytest.mark.asyncio
+async def test_office_backend_switch_preserves_unreplaced_mistral_artifact_pointers(pool, monkeypatch):
+    job, user_id, _kb_id, doc_id = await _seed_document_job(pool, filename="paper.docx")
+    converted_key = f"{user_id}/{doc_id}/derived/{job.id}/attempt-{job.attempt_count}/converted.pdf"
+    s3 = RecordingS3()
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def converted(self, document_id, user_id, source_key, ext, *, artifact_namespace=None):
+        del self, document_id, user_id, source_key, ext
+        assert artifact_namespace == f"{job.id}/attempt-{job.attempt_count}"
+        s3.objects[converted_key] = b"mistral-converted"
+        return converted_key
+
+    async def mistral_result(self, url, url_type="document_url"):
+        del self, url, url_type
+        return {"pages": [{"index": 0, "markdown": "mistral office"}]}
+
+    monkeypatch.setattr(OCRService, "_convert_to_pdf_s3", converted)
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", mistral_result)
+    await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+
+    first_metadata = await pool.fetchval("SELECT metadata FROM documents WHERE id = $1", doc_id)
+    if isinstance(first_metadata, str):
+        first_metadata = json.loads(first_metadata)
+    ocr_key = first_metadata["ocr_s3_key"]
+    assert s3.objects[converted_key] == b"mistral-converted"
+    assert ocr_key in s3.objects
+
+    monkeypatch.setattr(settings, "PDF_BACKEND", "opendataloader")
+    monkeypatch.setattr(settings, "CONVERTER_URL", "https://converter.invalid")
+
+    async def extracted_pages(self, source_url, ext):
+        del self, source_url, ext
+        return [(1, "opendataloader office")]
+
+    monkeypatch.setattr(OCRService, "_call_converter_extract", extracted_pages)
+    await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+
+    second_metadata = await pool.fetchval("SELECT metadata FROM documents WHERE id = $1", doc_id)
+    if isinstance(second_metadata, str):
+        second_metadata = json.loads(second_metadata)
+    assert second_metadata["converted_s3_key"] == converted_key
+    assert second_metadata["ocr_s3_key"] == ocr_key
+    assert s3.objects[converted_key] == b"mistral-converted"
+    assert ocr_key in s3.objects
 
 
 @pytest.mark.asyncio
@@ -1219,7 +1461,7 @@ async def test_startup_recovery_creates_only_missing_source_extraction_jobs_idem
     recovered_second = await _recover_durable_extraction_jobs(pool, JobService(pool))
 
     expected_ids = {documents[0][0], documents[1][0]}
-    assert {record.document_id for record in recovered_first} == expected_ids
+    assert {record.document_id for record in recovered_first if record.user_id == user_id} == expected_ids
     assert recovered_second == []
     rows = await pool.fetch(
         "SELECT document_id, user_id, knowledge_base_id, payload, idempotency_key "
@@ -1233,6 +1475,38 @@ async def test_startup_recovery_creates_only_missing_source_extraction_jobs_idem
         assert row["knowledge_base_id"] == kb_id
         assert json.loads(row["payload"]) == {"document_id": str(row["document_id"])}
         assert row["idempotency_key"] == f"document.extract:{row['document_id']}"
+
+
+@pytest.mark.asyncio
+async def test_drifted_ready_document_with_succeeded_job_gets_one_successor_across_replicas(pool):
+    from main import _recover_durable_extraction_jobs, _repair_hosted_derived_drift
+
+    job, _user_id, _kb_id, doc_id = await _seed_document_job(pool, status="ready", version=2)
+    await pool.execute(
+        "UPDATE background_jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
+        job.id,
+    )
+    await pool.execute(
+        "INSERT INTO document_pages (document_id, page, content, document_version) VALUES ($1, 1, 'stale', 1)",
+        doc_id,
+    )
+
+    repaired = await _repair_hosted_derived_drift(pool)
+    recovered = await asyncio.gather(
+        _recover_durable_extraction_jobs(pool, JobService(pool)),
+        _recover_durable_extraction_jobs(pool, JobService(pool)),
+    )
+
+    assert [row["id"] for row in repaired] == [doc_id]
+    assert sum(len(records) for records in recovered) == 1
+    jobs = await pool.fetch(
+        "SELECT id, state::text, idempotency_key FROM background_jobs WHERE document_id = $1 ORDER BY created_at, id",
+        doc_id,
+    )
+    assert len(jobs) == 2
+    assert jobs[0]["state"] == "succeeded"
+    assert jobs[1]["state"] == "queued"
+    assert jobs[1]["idempotency_key"] == f"document.extract:{doc_id}:after:{job.id}"
 
 
 @pytest.mark.asyncio
@@ -1384,6 +1658,48 @@ async def test_cancelled_first_extraction_can_be_explicitly_recreated_by_url_pro
     assert successor["state"] == "queued"
     assert successor["idempotency_key"] == f"document.extract:{doc_id}:after:{original.id}"
     assert await pool.fetchval("SELECT status::text FROM documents WHERE id = $1", doc_id) == "pending"
+
+
+@pytest.mark.asyncio
+async def test_url_producer_creates_successor_for_pending_document_with_succeeded_latest_job(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    doc_id = uuid4()
+    source_url = "https://example.test/drifted.pdf"
+    await pool.execute(
+        "INSERT INTO documents "
+        "(id,knowledge_base_id,user_id,filename,path,file_type,status,metadata,version) "
+        "VALUES ($1,$2,$3,'drifted.pdf','/','pdf','pending',$4::jsonb,1)",
+        doc_id,
+        kb_id,
+        user_id,
+        json.dumps({"source_url": source_url}),
+    )
+    jobs = JobService(pool)
+    original = await jobs.create(
+        JobCreate(
+            job_type=JobType.DOCUMENT_EXTRACT,
+            user_id=user_id,
+            knowledge_base_id=kb_id,
+            document_id=doc_id,
+            payload={"document_id": str(doc_id)},
+            idempotency_key=f"document.extract:{doc_id}",
+        ),
+        authenticated_user_id=user_id,
+    )
+    await pool.execute("UPDATE background_jobs SET state = 'succeeded' WHERE id = $1", original.id)
+    producer = UrlIngestService(pool, RecordingS3(), jobs)
+    monkeypatch.setattr(producer, "_download", lambda _url: pytest.fail("existing source must not redownload"))
+
+    recreated = await producer.ingest_pdf(str(user_id), str(kb_id), source_url, "/")
+
+    assert recreated["job_id"] != str(original.id)
+    successor = await pool.fetchrow(
+        "SELECT state::text, idempotency_key FROM background_jobs WHERE id = $1::uuid", recreated["job_id"]
+    )
+    assert dict(successor) == {
+        "state": "queued",
+        "idempotency_key": f"document.extract:{doc_id}:after:{original.id}",
+    }
 
 
 async def _async_value(value):

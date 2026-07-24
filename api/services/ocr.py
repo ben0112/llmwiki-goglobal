@@ -28,6 +28,7 @@ IMAGE_TYPES = {"png", "jpg", "jpeg", "webp", "gif"}
 OCR_TYPES = {"pdf"} | OFFICE_TYPES | IMAGE_TYPES
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
+BeforeArtifactWrite = Callable[[], Awaitable[None]]
 ArtifactObject = tuple[str, bytes, str]
 _ARTIFACT_POINTER_KEYS = frozenset({"converted_s3_key", "ocr_s3_key", "tagged_s3_key"})
 
@@ -85,6 +86,7 @@ class OCRService:
         user_id: str,
         *,
         before_write: BeforeWrite,
+        before_artifact_write: BeforeArtifactWrite,
         artifact_namespace: str | None = None,
     ) -> int:
         """Run extraction transparently for a durable worker-owned lease."""
@@ -94,6 +96,7 @@ class OCRService:
                     document_id,
                     user_id,
                     before_write=before_write,
+                    before_artifact_write=before_artifact_write,
                     artifact_namespace=artifact_namespace,
                     set_processing=False,
                 )
@@ -156,6 +159,7 @@ class OCRService:
         user_id: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
         set_processing: bool = True,
     ) -> int:
@@ -178,6 +182,8 @@ class OCRService:
 
         write_kwargs = {"before_write": before_write} if before_write is not None else {}
         durable_kwargs = dict(write_kwargs)
+        if before_artifact_write is not None:
+            durable_kwargs["before_artifact_write"] = before_artifact_write
         if artifact_namespace is not None:
             durable_kwargs["artifact_namespace"] = artifact_namespace
         if ext in OFFICE_TYPES:
@@ -205,6 +211,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         if settings.PDF_BACKEND == "mistral":
@@ -220,6 +227,7 @@ class OCRService:
                 kb_id,
                 ocr_result,
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
                 **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         if settings.CONVERTER_URL:
@@ -232,6 +240,7 @@ class OCRService:
                 pages,
                 "opendataloader",
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
                 **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         return await self._process_opendataloader(
@@ -240,6 +249,7 @@ class OCRService:
             kb_id,
             s3_source_key,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
             **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
 
@@ -252,6 +262,7 @@ class OCRService:
         ext: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         """Process Office files. Routes through converter or falls back to local LibreOffice."""
@@ -262,6 +273,8 @@ class OCRService:
                 else f"{user_id}/{document_id}/converted.pdf"
             )
             try:
+                if before_artifact_write is not None:
+                    await before_artifact_write()
                 pdf_key = await self._convert_to_pdf_s3(
                     document_id,
                     user_id,
@@ -269,6 +282,8 @@ class OCRService:
                     ext,
                     artifact_namespace=artifact_namespace,
                 )
+                if before_artifact_write is not None:
+                    await before_artifact_write()
             except BaseException:  # noqa: BLE001 - converter may PUT before returning an error or cancellation.
                 if artifact_namespace is not None:
                     await self._delete_artifact_keys([attempt_pdf_key])
@@ -286,6 +301,7 @@ class OCRService:
                     kb_id,
                     ocr_result,
                     **({"before_write": before_write} if before_write is not None else {}),
+                    **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
                     **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
                     metadata_patch_extra=converted_metadata,
                 )
@@ -310,6 +326,7 @@ class OCRService:
                 pages,
                 "opendataloader",
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
                 **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         return await self._process_office_local(
@@ -319,6 +336,7 @@ class OCRService:
             s3_source_key,
             ext,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
             **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
 
@@ -374,6 +392,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         """Extract PDF via opendataloader-pdf (local mode or hosted fallback)."""
@@ -394,6 +413,7 @@ class OCRService:
             page_elements=page_elements,
             assets=assets,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
             **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
         if artifact_namespace is None:
@@ -480,6 +500,7 @@ class OCRService:
         ext: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         """Convert Office file to PDF locally, then extract with opendataloader."""
@@ -524,6 +545,7 @@ class OCRService:
             page_elements=page_elements,
             assets=assets,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"before_artifact_write": before_artifact_write} if before_artifact_write is not None else {}),
             **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
         if artifact_namespace is None:
@@ -571,6 +593,7 @@ class OCRService:
         page_elements: dict[int, dict] | None = None,
         assets: list[ExtractedAsset] | None = None,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
         artifact_objects: list[ArtifactObject] | None = None,
         metadata_patch_extra: dict | None = None,
@@ -590,11 +613,6 @@ class OCRService:
         async def check_page_limit(conn):
             if before_write is not None:
                 await before_write(conn)
-            for key, data, content_type in pending_artifacts:
-                uploaded_keys.append(key)
-                await self._s3.upload_bytes(key, data, content_type)
-                if before_write is not None:
-                    await before_write(conn)
             await self._check_user_page_limit(user_id, len(pages), conn=conn)
 
         metadata_patch = dict(metadata_patch_extra or {})
@@ -602,6 +620,14 @@ class OCRService:
             metadata_patch["assets"] = [asset.metadata() for asset in assets]
 
         try:
+            for key, data, content_type in pending_artifacts:
+                if before_artifact_write is not None:
+                    await before_artifact_write()
+                uploaded_keys.append(key)
+                await self._s3.upload_bytes(key, data, content_type)
+                if before_artifact_write is not None:
+                    await before_artifact_write()
+
             current_artifact_keys = {key for key, _, _ in pending_artifacts}
             current_artifact_keys.update(
                 value
@@ -691,6 +717,7 @@ class OCRService:
         page_elements: dict[int, dict] | None = None,
         assets: list[ExtractedAsset] | None = None,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         """Store pages/chunks and update document status."""
@@ -716,6 +743,7 @@ class OCRService:
             page_elements=page_elements,
             assets=assets or [],
             before_write=before_write,
+            before_artifact_write=before_artifact_write,
             artifact_namespace=artifact_namespace,
         )
         logger.info("Extracted (%s): doc=%s pages=%d chunks=%d", parser, document_id[:8], num_pages, len(chunks))
@@ -766,6 +794,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
     ) -> int:
         """Parse HTML with webmd parser, store markdown + tagged HTML."""
@@ -804,6 +833,7 @@ class OCRService:
             parser="webmd",
             content=markdown_content,
             before_write=before_write,
+            before_artifact_write=before_artifact_write,
             artifact_namespace=artifact_namespace,
             artifact_objects=artifact_objects,
             metadata_patch_extra=metadata_patch_extra,
@@ -930,6 +960,7 @@ class OCRService:
         ocr_result: dict,
         *,
         before_write: BeforeWrite | None = None,
+        before_artifact_write: BeforeArtifactWrite | None = None,
         artifact_namespace: str | None = None,
         metadata_patch_extra: dict | None = None,
     ) -> int:
@@ -995,6 +1026,7 @@ class OCRService:
             page_elements=stored_elements,
             assets=assets,
             before_write=before_write,
+            before_artifact_write=before_artifact_write,
             artifact_namespace=artifact_namespace,
             artifact_objects=artifact_objects,
             metadata_patch_extra=metadata_patch,
