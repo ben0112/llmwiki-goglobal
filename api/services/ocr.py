@@ -29,6 +29,7 @@ OCR_TYPES = {"pdf"} | OFFICE_TYPES | IMAGE_TYPES
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
 ArtifactObject = tuple[str, bytes, str]
+_ARTIFACT_POINTER_KEYS = frozenset({"converted_s3_key", "ocr_s3_key", "tagged_s3_key"})
 
 
 class ExtractionError(RuntimeError):
@@ -602,6 +603,11 @@ class OCRService:
 
         try:
             current_artifact_keys = {key for key, _, _ in pending_artifacts}
+            current_artifact_keys.update(
+                value
+                for key, value in (metadata_patch_extra or {}).items()
+                if key in _ARTIFACT_POINTER_KEYS and isinstance(value, str) and value
+            )
 
             async def cleanup_replaced_artifacts(keys: list[str]) -> None:
                 await self._delete_artifact_keys([key for key in keys if key not in current_artifact_keys])

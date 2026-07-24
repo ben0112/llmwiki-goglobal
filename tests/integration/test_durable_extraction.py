@@ -1016,6 +1016,53 @@ async def test_durable_office_success_switches_converted_pointer_and_cleans_prev
 
 
 @pytest.mark.asyncio
+async def test_same_office_job_attempt_reexecution_preserves_current_converted_artifact(pool, monkeypatch):
+    job, user_id, kb_id, doc_id = await _seed_document_job(pool, filename="paper.docx")
+    current_key = f"{user_id}/{doc_id}/derived/{job.id}/attempt-{job.attempt_count}/converted.pdf"
+    s3 = RecordingS3()
+    conversions = 0
+    monkeypatch.setattr(settings, "PDF_BACKEND", "mistral")
+    monkeypatch.setattr(settings, "MISTRAL_API_KEY", "secret")
+
+    async def converted(self, document_id, user_id, source_key, ext, *, artifact_namespace=None):
+        nonlocal conversions
+        del self, document_id, user_id, source_key, ext
+        assert artifact_namespace == f"{job.id}/attempt-{job.attempt_count}"
+        conversions += 1
+        s3.objects[current_key] = f"converted-{conversions}".encode()
+        return current_key
+
+    async def mistral_result(self, url, url_type="document_url"):
+        del self, url, url_type
+        return {"pages": [{"index": 0, "markdown": "idempotent office"}]}
+
+    monkeypatch.setattr(OCRService, "_convert_to_pdf_s3", converted)
+    monkeypatch.setattr(OCRService, "_call_mistral_ocr", mistral_result)
+
+    first = await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+    second = await handle_document_extract(job, _lease(pool, job), _context(pool, s3))
+
+    assert first["derived_version"] == 1
+    assert second["derived_version"] == 2
+    assert conversions == 2
+    assert s3.objects[current_key] == b"converted-2"
+
+    from services.hosted import HostedDocumentService, HostedPublicWikiService
+
+    await HostedDocumentService(pool, str(user_id), s3).get_url(str(doc_id))
+    assert s3.presigned_gets[-1] == current_key
+    await pool.execute(
+        "UPDATE knowledge_bases SET visibility = 'public', public_slug = 'repeated-office' WHERE id = $1",
+        kb_id,
+    )
+    await pool.execute(
+        "UPDATE documents SET path = '/wiki/', document_number = 43 WHERE id = $1",
+        doc_id,
+    )
+    assert await HostedPublicWikiService(pool).get_asset_key("repeated-office", 43) == current_key
+
+
+@pytest.mark.asyncio
 async def test_legacy_office_publish_clears_durable_converted_pointer_and_uses_fixed_key(pool, monkeypatch):
     _job, user_id, _kb_id, doc_id = await _seed_document_job(
         pool,
