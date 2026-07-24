@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -25,14 +25,6 @@ from jobs.models import (
 )
 
 _ATTEMPTS_EXHAUSTED_MESSAGE = "The job could not be completed after retrying."
-
-
-def _utc_now(value: datetime | None) -> datetime:
-    if value is None:
-        return datetime.now(UTC)
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
 
 
 def _validate_owner(owner: str) -> None:
@@ -226,18 +218,25 @@ async def request_cancel(conn: asyncpg.Connection, job_id: UUID, user_id: UUID) 
 
 
 _CLAIM = """
-UPDATE background_jobs
+WITH target AS MATERIALIZED (
+    SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM target
+)
+UPDATE background_jobs AS job
 SET
     state = 'running',
     lease_owner = $2,
-    heartbeat_at = $3,
-    lease_expires_at = $3 + $4 * interval '1 second',
-    attempt_count = attempt_count + 1
-WHERE id = $1
-  AND (state = 'queued' OR (state = 'retry_wait' AND run_after <= $3))
-  AND cancel_requested_at IS NULL
-  AND attempt_count < max_attempts
-RETURNING *
+    heartbeat_at = lease_clock.checked_at,
+    lease_expires_at = lease_clock.checked_at + make_interval(secs => $3::double precision),
+    attempt_count = job.attempt_count + 1
+FROM target, lease_clock
+WHERE job.id = target.id
+  AND job.state IN ('queued', 'retry_wait')
+  AND job.run_after <= lease_clock.checked_at
+  AND job.cancel_requested_at IS NULL
+  AND job.attempt_count < job.max_attempts
+RETURNING job.*
 """
 
 
@@ -246,26 +245,30 @@ async def claim(
     job_id: UUID,
     owner: str,
     lease_seconds: int,
-    *,
-    now: datetime | None = None,
 ) -> JobRecord | None:
     """Atomically acquire one due job for a worker."""
     _validate_owner(owner)
     _validate_positive(lease_seconds, "lease_seconds")
-    row = await conn.fetchrow(_CLAIM, job_id, owner, _utc_now(now), lease_seconds)
+    row = await conn.fetchrow(_CLAIM, job_id, owner, lease_seconds)
     return None if row is None else _row_to_record(row)
 
 
 _HEARTBEAT = """
-UPDATE background_jobs
+WITH target AS MATERIALIZED (
+    SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM target
+)
+UPDATE background_jobs AS job
 SET
-    heartbeat_at = $3,
-    lease_expires_at = $3 + $4 * interval '1 second'
-WHERE id = $1
-  AND state = 'running'
-  AND lease_owner = $2
-  AND lease_expires_at > $3
-RETURNING *
+    heartbeat_at = lease_clock.checked_at,
+    lease_expires_at = lease_clock.checked_at + make_interval(secs => $3::double precision)
+FROM target, lease_clock
+WHERE job.id = target.id
+  AND job.state = 'running'
+  AND job.lease_owner = $2
+  AND job.lease_expires_at > lease_clock.checked_at
+RETURNING job.*
 """
 
 
@@ -274,38 +277,41 @@ async def heartbeat(
     job_id: UUID,
     owner: str,
     lease_seconds: int,
-    *,
-    now: datetime | None = None,
 ) -> JobRecord:
     """Extend a live owned lease, or report that ownership was lost."""
     _validate_owner(owner)
     _validate_positive(lease_seconds, "lease_seconds")
-    row = await conn.fetchrow(_HEARTBEAT, job_id, owner, _utc_now(now), lease_seconds)
+    row = await conn.fetchrow(_HEARTBEAT, job_id, owner, lease_seconds)
     if row is None:
         raise LeaseLost("background job lease is no longer active")
     return _row_to_record(row)
 
 
-async def assert_active(
-    conn: asyncpg.Connection,
-    job_id: UUID,
-    owner: str,
-    *,
-    now: datetime | None = None,
-) -> JobRecord:
+_ASSERT_ACTIVE = """
+WITH target AS MATERIALIZED (
+    SELECT job.*
+    FROM background_jobs AS job
+    WHERE job.id = $1
+      AND job.lease_owner = $2
+    FOR UPDATE
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM target
+)
+SELECT target.*, lease_clock.checked_at AS lease_checked_at
+FROM target
+CROSS JOIN lease_clock
+"""
+
+
+async def assert_active(conn: asyncpg.Connection, job_id: UUID, owner: str) -> JobRecord:
     """Check ownership, expiry, and cooperative cancellation at a worker checkpoint."""
     _validate_owner(owner)
-    checked_at = _utc_now(now)
-    row = await conn.fetchrow(
-        "SELECT * FROM background_jobs WHERE id = $1 AND lease_owner = $2",
-        job_id,
-        owner,
-    )
+    row = await conn.fetchrow(_ASSERT_ACTIVE, job_id, owner)
     if (
         row is None
         or row["state"] != JobState.RUNNING.value
         or row["lease_expires_at"] is None
-        or row["lease_expires_at"] <= checked_at
+        or row["lease_expires_at"] <= row["lease_checked_at"]
     ):
         raise LeaseLost("background job lease is no longer active")
     if row["cancel_requested_at"] is not None:
@@ -314,22 +320,28 @@ async def assert_active(
 
 
 _SUCCEED = """
-UPDATE background_jobs
+WITH target AS MATERIALIZED (
+    SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM target
+)
+UPDATE background_jobs AS job
 SET
     state = 'succeeded',
-    result = $4::jsonb,
+    result = $3::jsonb,
     progress = NULL,
     error_code = NULL,
     error_message = NULL,
     lease_owner = NULL,
     lease_expires_at = NULL,
     heartbeat_at = NULL
-WHERE id = $1
-  AND state = 'running'
-  AND lease_owner = $2
-  AND lease_expires_at > $3
-  AND cancel_requested_at IS NULL
-RETURNING *
+FROM target, lease_clock
+WHERE job.id = target.id
+  AND job.state = 'running'
+  AND job.lease_owner = $2
+  AND job.lease_expires_at > lease_clock.checked_at
+  AND job.cancel_requested_at IS NULL
+RETURNING job.*
 """
 
 
@@ -338,23 +350,21 @@ async def succeed(
     job_id: UUID,
     owner: str,
     result: Mapping[str, JSONValue],
-    *,
-    now: datetime | None = None,
 ) -> JobRecord:
     """Persist successful output only while the worker still owns a live lease."""
     _validate_owner(owner)
-    checked_at = _utc_now(now)
     serialized_result = json.dumps(to_json_value(result))
-    row = await conn.fetchrow(_SUCCEED, job_id, owner, checked_at, serialized_result)
+    row = await conn.fetchrow(_SUCCEED, job_id, owner, serialized_result)
     if row is not None:
         return _row_to_record(row)
     cancelled = await conn.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM background_jobs "
+        "WITH lease_clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at) "
+        "SELECT EXISTS(SELECT 1 FROM background_jobs, lease_clock "
         "WHERE id = $1 AND state = 'running' AND lease_owner = $2 "
-        "AND lease_expires_at > $3 AND cancel_requested_at IS NOT NULL)",
+        "AND lease_expires_at > lease_clock.checked_at "
+        "AND cancel_requested_at IS NOT NULL)",
         job_id,
         owner,
-        checked_at,
     )
     if cancelled:
         raise JobCancelled("background job cancellation was requested")
@@ -362,40 +372,46 @@ async def succeed(
 
 
 _FAIL_OR_RETRY = """
+WITH target AS MATERIALIZED (
+    SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM target
+)
 UPDATE background_jobs AS job
 SET
     state = CASE
         WHEN job.cancel_requested_at IS NOT NULL THEN 'cancelled'
-        WHEN $4 AND job.attempt_count < job.max_attempts THEN 'retry_wait'
+        WHEN $3 AND job.attempt_count < job.max_attempts THEN 'retry_wait'
         ELSE 'failed'
     END,
     run_after = CASE
         WHEN job.cancel_requested_at IS NULL
-         AND $4
+         AND $3
          AND job.attempt_count < job.max_attempts
-        THEN $7::timestamptz
-             + ($8::double precision[])[job.attempt_count] * interval '1 second'
+        THEN lease_clock.checked_at
+             + make_interval(secs => ($6::double precision[])[job.attempt_count])
         ELSE job.run_after
     END,
     error_code = CASE
         WHEN job.cancel_requested_at IS NOT NULL THEN NULL
-        WHEN $4 AND job.attempt_count >= job.max_attempts THEN 'attempts_exhausted'
-        ELSE $5
+        WHEN $3 AND job.attempt_count >= job.max_attempts THEN 'attempts_exhausted'
+        ELSE $4
     END,
     error_message = CASE
         WHEN job.cancel_requested_at IS NOT NULL THEN NULL
-        WHEN $4 AND job.attempt_count >= job.max_attempts THEN $9
-        ELSE $6
+        WHEN $3 AND job.attempt_count >= job.max_attempts THEN $7
+        ELSE $5
     END,
     result = NULL,
     progress = NULL,
     lease_owner = NULL,
     lease_expires_at = NULL,
     heartbeat_at = NULL
-WHERE job.id = $1
+FROM target, lease_clock
+WHERE job.id = target.id
   AND job.state = 'running'
   AND job.lease_owner = $2
-  AND job.lease_expires_at > $3
+  AND job.lease_expires_at > lease_clock.checked_at
 RETURNING job.*
 """
 
@@ -408,22 +424,18 @@ async def fail_or_retry(
     error_code: str,
     error_message: str,
     retryable: bool,
-    now: datetime | None = None,
 ) -> JobRecord:
     """Record cancellation, deterministic retry, or terminal worker failure."""
     _validate_owner(owner)
     _validate_error(error_code, error_message)
-    checked_at = _utc_now(now)
     retry_delays = [retry_delay_seconds(attempt, jitter=0) for attempt in range(1, 21)]
     row = await conn.fetchrow(
         _FAIL_OR_RETRY,
         job_id,
         owner,
-        checked_at,
         retryable,
         error_code,
         error_message,
-        checked_at,
         retry_delays,
         _ATTEMPTS_EXHAUSTED_MESSAGE,
     )
@@ -433,14 +445,17 @@ async def fail_or_retry(
 
 
 _REAP_EXPIRED = """
-WITH expired AS (
-    SELECT id
-    FROM background_jobs
-    WHERE state = 'running'
-      AND lease_expires_at <= $1
-    ORDER BY lease_expires_at, id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $2
+WITH lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at
+), expired AS (
+    SELECT job.id
+    FROM background_jobs AS job
+    CROSS JOIN lease_clock
+    WHERE job.state = 'running'
+      AND job.lease_expires_at <= lease_clock.checked_at
+    ORDER BY job.lease_expires_at, job.id
+    FOR UPDATE OF job SKIP LOCKED
+    LIMIT $1
 )
 UPDATE background_jobs AS job
 SET
@@ -450,7 +465,8 @@ SET
         ELSE 'failed'
     END,
     run_after = CASE
-        WHEN job.cancel_requested_at IS NULL AND job.attempt_count < job.max_attempts THEN $1
+        WHEN job.cancel_requested_at IS NULL AND job.attempt_count < job.max_attempts
+        THEN lease_clock.checked_at
         ELSE job.run_after
     END,
     error_code = CASE
@@ -461,14 +477,14 @@ SET
     error_message = CASE
         WHEN job.cancel_requested_at IS NOT NULL THEN NULL
         WHEN job.attempt_count < job.max_attempts THEN 'Worker lease expired.'
-        ELSE 'Worker lease expired after all attempts were used.'
+        ELSE $2
     END,
     result = NULL,
     progress = NULL,
     lease_owner = NULL,
     lease_expires_at = NULL,
     heartbeat_at = NULL
-FROM expired
+FROM expired, lease_clock
 WHERE job.id = expired.id
 RETURNING job.id
 """
@@ -477,10 +493,9 @@ RETURNING job.id
 async def reap_expired(
     conn: asyncpg.Connection,
     *,
-    now: datetime | None = None,
     limit: int = 100,
 ) -> list[UUID]:
     """Recover a bounded batch of expired leases without colliding with other reapers."""
     _validate_positive(limit, "limit")
-    rows = await conn.fetch(_REAP_EXPIRED, _utc_now(now), limit)
+    rows = await conn.fetch(_REAP_EXPIRED, limit, _ATTEMPTS_EXHAUSTED_MESSAGE)
     return [_uuid(row["id"], "id") for row in rows]

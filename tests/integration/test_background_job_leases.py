@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -15,8 +16,11 @@ from jobs.models import (
     LeaseLost,
 )
 
-NOW = datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)
 OLD_UPDATED_AT = datetime(2020, 1, 1, tzinfo=UTC)
+
+
+async def _db_now(pool):
+    return await pool.fetchval("SELECT clock_timestamp()")
 
 
 async def _seed_user(pool):
@@ -82,39 +86,51 @@ async def _wait_for_lock_wait(observer_conn, backend_pid, timeout_seconds=1) -> 
 
 
 @pytest.mark.asyncio
-async def test_claims_queued_and_due_retry_but_not_future_retry(pool):
+async def test_claims_only_database_due_queued_and_retry_jobs(pool):
     user_id = await _seed_user(pool)
-    queued = await _insert_job(pool, user_id, run_after=NOW + timedelta(days=1))
-    due_retry = await _insert_job(pool, user_id, state="retry_wait", run_after=NOW, attempt_count=1, max_attempts=3)
-    future_retry = await _insert_job(
+    database_now = await _db_now(pool)
+    due = database_now - timedelta(minutes=1)
+    future = database_now + timedelta(hours=1)
+    queued = await _insert_job(pool, user_id, run_after=due)
+    queued_future = await _insert_job(pool, user_id, run_after=future)
+    due_retry = await _insert_job(
         pool,
         user_id,
         state="retry_wait",
-        run_after=NOW + timedelta(microseconds=1),
+        run_after=due,
+        attempt_count=1,
+        max_attempts=3,
     )
+    future_retry = await _insert_job(pool, user_id, state="retry_wait", run_after=future)
 
+    before = await _db_now(pool)
     async with pool.acquire() as conn:
-        claimed_queued = await repository.claim(conn, queued["id"], "worker-a", 30, now=NOW)
-        claimed_retry = await repository.claim(conn, due_retry["id"], "worker-a", 30, now=NOW)
-        not_due = await repository.claim(conn, future_retry["id"], "worker-a", 30, now=NOW)
+        claimed_queued = await repository.claim(conn, queued["id"], "worker-a", 30)
+        claimed_retry = await repository.claim(conn, due_retry["id"], "worker-a", 30)
+        queued_not_due = await repository.claim(conn, queued_future["id"], "worker-a", 30)
+        retry_not_due = await repository.claim(conn, future_retry["id"], "worker-a", 30)
+    after = await _db_now(pool)
 
-    assert claimed_queued.state is JobState.RUNNING
-    assert claimed_queued.attempt_count == 1
-    assert claimed_queued.heartbeat_at == NOW
-    assert claimed_queued.lease_expires_at == NOW + timedelta(seconds=30)
-    assert claimed_queued.updated_at > OLD_UPDATED_AT
-    assert claimed_retry.state is JobState.RUNNING
-    assert claimed_retry.attempt_count == 2
-    assert not_due is None
-    unchanged = await pool.fetchrow("SELECT * FROM background_jobs WHERE id = $1", future_retry["id"])
-    assert unchanged["attempt_count"] == 0
-    assert unchanged["updated_at"] == OLD_UPDATED_AT
+    for claimed, attempts in ((claimed_queued, 1), (claimed_retry, 2)):
+        assert claimed.state is JobState.RUNNING
+        assert claimed.attempt_count == attempts
+        assert before <= claimed.heartbeat_at <= after
+        assert claimed.lease_expires_at - claimed.heartbeat_at == timedelta(seconds=30)
+        assert claimed.updated_at > OLD_UPDATED_AT
+    assert queued_not_due is None
+    assert retry_not_due is None
+    unchanged = await pool.fetch(
+        "SELECT id, attempt_count, updated_at FROM background_jobs WHERE id = ANY($1::uuid[])",
+        [queued_future["id"], future_retry["id"]],
+    )
+    assert {row["attempt_count"] for row in unchanged} == {0}
+    assert {row["updated_at"] for row in unchanged} == {OLD_UPDATED_AT}
 
 
 @pytest.mark.asyncio
 async def test_two_claimers_have_one_winner_and_one_attempt_increment(pool):
     user_id = await _seed_user(pool)
-    job = await _insert_job(pool, user_id)
+    job = await _insert_job(pool, user_id, run_after=OLD_UPDATED_AT)
     conn_a = await pool.acquire()
     conn_b = await pool.acquire()
     observer = await pool.acquire()
@@ -123,13 +139,14 @@ async def test_two_claimers_have_one_winner_and_one_attempt_increment(pool):
     committed = False
     try:
         await transaction_a.start()
-        first = await repository.claim(conn_a, job["id"], "worker-a", 30, now=NOW)
+        first = await repository.claim(conn_a, job["id"], "worker-a", 30)
         backend_b = await conn_b.fetchval("SELECT pg_backend_pid()")
-        pending = asyncio.create_task(repository.claim(conn_b, job["id"], "worker-b", 30, now=NOW))
+        pending = asyncio.create_task(repository.claim(conn_b, job["id"], "worker-b", 30))
         await _wait_for_lock_wait(observer, backend_b)
         await transaction_a.commit()
         committed = True
-        second = await pending
+        async with asyncio.timeout(1):
+            second = await pending
     finally:
         if not committed:
             await transaction_a.rollback()
@@ -147,141 +164,134 @@ async def test_two_claimers_have_one_winner_and_one_attempt_increment(pool):
 
 
 @pytest.mark.asyncio
-async def test_claim_rejects_cancelled_terminal_running_exhausted_missing_and_bad_inputs(pool):
+async def test_claim_rejects_ineligible_rows_and_non_integral_lease_durations(pool):
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
     rows = [
-        await _insert_job(pool, user_id, cancel_requested_at=NOW),
+        await _insert_job(pool, user_id, run_after=OLD_UPDATED_AT, cancel_requested_at=database_now),
         await _insert_job(pool, user_id, state="succeeded"),
         await _insert_job(pool, user_id, state="running"),
-        await _insert_job(pool, user_id, attempt_count=3, max_attempts=3),
+        await _insert_job(pool, user_id, run_after=OLD_UPDATED_AT, attempt_count=3, max_attempts=3),
     ]
     async with pool.acquire() as conn:
         for row in rows:
-            assert await repository.claim(conn, row["id"], "worker", 10, now=NOW) is None
-        assert await repository.claim(conn, uuid4(), "worker", 10, now=NOW) is None
+            assert await repository.claim(conn, row["id"], "worker", 10) is None
+        assert await repository.claim(conn, uuid4(), "worker", 10) is None
         with pytest.raises(ValueError, match="owner"):
-            await repository.claim(conn, rows[0]["id"], " ", 10, now=NOW)
-        with pytest.raises(ValueError, match="lease_seconds"):
-            await repository.claim(conn, rows[0]["id"], "worker", 0, now=NOW)
-        for invalid_lease_seconds in (True, 1.5):
+            await repository.claim(conn, rows[0]["id"], " ", 10)
+        for invalid_lease_seconds in (0, True, 1.5):
             with pytest.raises(ValueError, match="lease_seconds"):
-                await repository.claim(
-                    conn,
-                    rows[0]["id"],
-                    "worker",
-                    invalid_lease_seconds,
-                    now=NOW,
-                )
+                await repository.claim(conn, rows[0]["id"], "worker", invalid_lease_seconds)
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_extends_only_a_live_owner_lease(pool):
+async def test_heartbeat_extends_only_a_live_owner_lease_using_database_time(pool):
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    live_expiry = database_now + timedelta(minutes=1)
+    expired_at = database_now - timedelta(minutes=1)
     live = await _insert_job(
         pool,
         user_id,
         state="running",
         lease_owner="worker-a",
-        lease_expires_at=NOW + timedelta(seconds=1),
-        heartbeat_at=NOW - timedelta(seconds=2),
+        lease_expires_at=live_expiry,
+        heartbeat_at=database_now,
     )
     expired = await _insert_job(
         pool,
         user_id,
         state="running",
         lease_owner="worker-a",
-        lease_expires_at=NOW,
-        heartbeat_at=NOW - timedelta(seconds=2),
+        lease_expires_at=expired_at,
+        heartbeat_at=expired_at,
     )
     cancelled = await _insert_job(
         pool,
         user_id,
         state="running",
         lease_owner="worker-a",
-        lease_expires_at=NOW + timedelta(seconds=1),
-        cancel_requested_at=NOW,
+        lease_expires_at=live_expiry,
+        cancel_requested_at=database_now,
     )
+    before = await _db_now(pool)
     async with pool.acquire() as conn:
-        beat = await repository.heartbeat(conn, live["id"], "worker-a", 30, now=NOW)
-        cancelled_beat = await repository.heartbeat(conn, cancelled["id"], "worker-a", 30, now=NOW)
+        beat = await repository.heartbeat(conn, live["id"], "worker-a", 30)
+        cancelled_beat = await repository.heartbeat(conn, cancelled["id"], "worker-a", 30)
         with pytest.raises(LeaseLost):
-            await repository.heartbeat(conn, live["id"], "worker-b", 30, now=NOW)
+            await repository.heartbeat(conn, live["id"], "worker-b", 30)
         with pytest.raises(LeaseLost):
-            await repository.heartbeat(conn, expired["id"], "worker-a", 30, now=NOW)
+            await repository.heartbeat(conn, expired["id"], "worker-a", 30)
         for invalid_lease_seconds in (True, 1.5):
             with pytest.raises(ValueError, match="lease_seconds"):
-                await repository.heartbeat(
-                    conn,
-                    live["id"],
-                    "worker-a",
-                    invalid_lease_seconds,
-                    now=NOW,
-                )
+                await repository.heartbeat(conn, live["id"], "worker-a", invalid_lease_seconds)
+    after = await _db_now(pool)
 
-    assert beat.heartbeat_at == NOW
-    assert beat.lease_expires_at == NOW + timedelta(seconds=30)
+    assert before <= beat.heartbeat_at <= after
+    assert beat.lease_expires_at - beat.heartbeat_at == timedelta(seconds=30)
     assert beat.updated_at > OLD_UPDATED_AT
-    assert cancelled_beat.cancel_requested_at == NOW
-    assert cancelled_beat.lease_expires_at == NOW + timedelta(seconds=30)
+    assert cancelled_beat.cancel_requested_at == database_now
+    assert cancelled_beat.lease_expires_at - cancelled_beat.heartbeat_at == timedelta(seconds=30)
 
 
 @pytest.mark.asyncio
-async def test_assert_active_distinguishes_cancellation_from_lost_lease(pool):
+async def test_assert_active_locks_and_distinguishes_live_cancellation_from_expiry(pool):
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    live_expiry = database_now + timedelta(minutes=1)
+    expired_at = database_now - timedelta(minutes=1)
     live = await _insert_job(
         pool,
         user_id,
         state="running",
         lease_owner="worker-a",
-        lease_expires_at=NOW + timedelta(seconds=1),
+        lease_expires_at=live_expiry,
     )
     cancelled = await _insert_job(
         pool,
         user_id,
         state="running",
         lease_owner="worker-a",
-        lease_expires_at=NOW + timedelta(seconds=1),
-        cancel_requested_at=NOW,
+        lease_expires_at=live_expiry,
+        cancel_requested_at=database_now,
     )
-    expired_equal = await _insert_job(
-        pool,
-        user_id,
-        state="running",
-        lease_owner="worker-a",
-        lease_expires_at=NOW,
-    )
-    expired_earlier = await _insert_job(
-        pool,
-        user_id,
-        state="running",
-        lease_owner="worker-a",
-        lease_expires_at=NOW - timedelta(microseconds=1),
-        cancel_requested_at=NOW,
-    )
+    expired_equal_or_earlier = [
+        await _insert_job(
+            pool,
+            user_id,
+            state="running",
+            lease_owner="worker-a",
+            lease_expires_at=expired_at,
+            cancel_requested_at=database_now if index else None,
+        )
+        for index in range(2)
+    ]
     async with pool.acquire() as conn:
-        assert (await repository.assert_active(conn, live["id"], "worker-a", now=NOW)).id == live["id"]
+        async with conn.transaction():
+            assert (await repository.assert_active(conn, live["id"], "worker-a")).id == live["id"]
         with pytest.raises(JobCancelled):
-            await repository.assert_active(conn, cancelled["id"], "worker-a", now=NOW)
-        for expired in (expired_equal, expired_earlier):
+            await repository.assert_active(conn, cancelled["id"], "worker-a")
+        for expired in expired_equal_or_earlier:
             with pytest.raises(LeaseLost):
-                await repository.assert_active(conn, expired["id"], "worker-a", now=NOW)
+                await repository.assert_active(conn, expired["id"], "worker-a")
         for job_id, owner in ((live["id"], "worker-b"), (uuid4(), "worker-a")):
             with pytest.raises(LeaseLost):
-                await repository.assert_active(conn, job_id, owner, now=NOW)
+                await repository.assert_active(conn, job_id, owner)
         await conn.execute("UPDATE background_jobs SET state = 'failed' WHERE id = $1", live["id"])
         with pytest.raises(LeaseLost):
-            await repository.assert_active(conn, live["id"], "worker-a", now=NOW)
+            await repository.assert_active(conn, live["id"], "worker-a")
 
 
 @pytest.mark.asyncio
 async def test_succeed_persists_strict_json_and_rejects_stale_or_cancelled_workers(pool):
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
 
     async def running(**changes):
         values = {
             "lease_owner": "worker-a",
-            "lease_expires_at": NOW + timedelta(seconds=1),
-            "heartbeat_at": NOW,
+            "lease_expires_at": database_now + timedelta(minutes=1),
+            "heartbeat_at": database_now,
             "progress": '{"percent": 50}',
             "error_code": "old",
             "error_message": "old",
@@ -290,10 +300,10 @@ async def test_succeed_persists_strict_json_and_rejects_stale_or_cancelled_worke
         return await _insert_job(pool, user_id, state="running", **values)
 
     live = await running()
-    expired = await running(lease_expires_at=NOW)
-    cancelled = await running(cancel_requested_at=NOW)
+    expired = await running(lease_expires_at=database_now - timedelta(minutes=1))
+    cancelled = await running(cancel_requested_at=database_now)
     async with pool.acquire() as conn:
-        succeeded = await repository.succeed(conn, live["id"], "worker-a", {"nested": [{"ok": True}]}, now=NOW)
+        succeeded = await repository.succeed(conn, live["id"], "worker-a", {"nested": [{"ok": True}]})
         for job_id, owner, error in (
             (live["id"], "worker-a", LeaseLost),
             (expired["id"], "worker-a", LeaseLost),
@@ -301,9 +311,9 @@ async def test_succeed_persists_strict_json_and_rejects_stale_or_cancelled_worke
             (cancelled["id"], "worker-b", LeaseLost),
         ):
             with pytest.raises(error):
-                await repository.succeed(conn, job_id, owner, {"ok": True}, now=NOW)
+                await repository.succeed(conn, job_id, owner, {"ok": True})
         with pytest.raises(TypeError):
-            await repository.succeed(conn, uuid4(), "worker-a", {"bad": object()}, now=NOW)
+            await repository.succeed(conn, uuid4(), "worker-a", {"bad": object()})
 
     assert succeeded.state is JobState.SUCCEEDED
     assert succeeded.result == {"nested": ({"ok": True},)}
@@ -316,22 +326,60 @@ async def test_succeed_persists_strict_json_and_rejects_stale_or_cancelled_worke
 
 
 @pytest.mark.asyncio
-async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
+async def test_application_clock_cannot_bypass_database_expiry(pool):
+    for operation in (
+        repository.claim,
+        repository.heartbeat,
+        repository.assert_active,
+        repository.succeed,
+        repository.fail_or_retry,
+        repository.reap_expired,
+    ):
+        assert "now" not in inspect.signature(operation).parameters
+
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    expired = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        lease_owner="worker-a",
+        lease_expires_at=database_now - timedelta(minutes=1),
+    )
+    application_old_time = database_now - timedelta(days=365)
+    async with pool.acquire() as conn:
+        with pytest.raises(LeaseLost):
+            await repository.heartbeat(conn, expired["id"], "worker-a", 30)
+        with pytest.raises(LeaseLost):
+            await repository.succeed(conn, expired["id"], "worker-a", {"ok": True})
+        with pytest.raises(TypeError, match="now"):
+            await repository.heartbeat(
+                conn,
+                expired["id"],
+                "worker-a",
+                30,
+                now=application_old_time,
+            )
+
+
+@pytest.mark.asyncio
+async def test_fail_or_retry_uses_database_time_and_persisted_attempt_count(pool):
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
 
     async def running(*, attempt_count=1, max_attempts=3, **changes):
         values = {
             "attempt_count": attempt_count,
             "max_attempts": max_attempts,
             "lease_owner": "worker-a",
-            "lease_expires_at": NOW + timedelta(seconds=1),
-            "heartbeat_at": NOW,
+            "lease_expires_at": database_now + timedelta(minutes=1),
+            "heartbeat_at": database_now,
             "progress": '{"percent": 50}',
         }
         values.update(changes)
         return await _insert_job(pool, user_id, state="running", **values)
 
-    cancelled = await running(cancel_requested_at=NOW)
+    cancelled = await running(cancel_requested_at=database_now)
     retry = await running(attempt_count=2)
     nonretry = await running()
     exhausted = await running(attempt_count=3, max_attempts=3)
@@ -343,8 +391,8 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
             error_code="internal",
             error_message="hidden",
             retryable=True,
-            now=NOW,
         )
+        before_retry = await conn.fetchval("SELECT clock_timestamp()")
         retry_result = await repository.fail_or_retry(
             conn,
             retry["id"],
@@ -352,8 +400,8 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
             error_code="temporary",
             error_message="try again",
             retryable=True,
-            now=NOW,
         )
+        after_retry = await conn.fetchval("SELECT clock_timestamp()")
         failed_result = await repository.fail_or_retry(
             conn,
             nonretry["id"],
@@ -361,7 +409,6 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
             error_code="invalid",
             error_message="cannot retry",
             retryable=False,
-            now=NOW,
         )
         exhausted_result = await repository.fail_or_retry(
             conn,
@@ -370,7 +417,6 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
             error_code="temporary",
             error_message="still failing",
             retryable=True,
-            now=NOW,
         )
         with pytest.raises(LeaseLost):
             await repository.fail_or_retry(
@@ -380,7 +426,6 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
                 error_code="temporary",
                 error_message="again",
                 retryable=True,
-                now=NOW,
             )
         for field, value in (
             ("error_code", "x" * (ERROR_CODE_MAX_CHARS + 1)),
@@ -393,16 +438,15 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
                     uuid4(),
                     "worker-a",
                     retryable=False,
-                    now=NOW,
                     **arguments,
                 )
 
     assert cancelled_result.state is JobState.CANCELLED
-    assert cancelled_result.cancel_requested_at == NOW
+    assert cancelled_result.cancel_requested_at == database_now
     assert cancelled_result.error_code is None
     assert cancelled_result.error_message is None
     assert retry_result.state is JobState.RETRY_WAIT
-    assert retry_result.run_after == NOW + timedelta(seconds=4)
+    assert before_retry <= retry_result.run_after - timedelta(seconds=4) <= after_retry
     assert retry_result.error_code == "temporary"
     assert retry_result.error_message == "try again"
     assert failed_result.state is JobState.FAILED
@@ -419,32 +463,36 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
 
 
 @pytest.mark.asyncio
-async def test_reaper_handles_all_branches_limit_repeat_and_renewed_lease(pool):
+async def test_reaper_uses_database_time_for_all_branches_limit_and_repeat(pool):
     await pool.execute("DELETE FROM background_jobs")
     user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    expired_at = database_now - timedelta(minutes=1)
 
     async def expired(**changes):
         values = {
             "attempt_count": 1,
             "max_attempts": 3,
             "lease_owner": "dead-worker",
-            "lease_expires_at": NOW,
-            "heartbeat_at": NOW - timedelta(seconds=30),
+            "lease_expires_at": expired_at,
+            "heartbeat_at": expired_at,
         }
         values.update(changes)
         return await _insert_job(pool, user_id, state="running", **values)
 
     retry = await expired()
-    cancelled = await expired(cancel_requested_at=NOW)
+    cancelled = await expired(cancel_requested_at=database_now)
     exhausted = await expired(attempt_count=3, max_attempts=3)
-    renewed = await expired(lease_expires_at=NOW + timedelta(microseconds=1))
+    live = await expired(lease_expires_at=database_now + timedelta(hours=1))
+    before = await _db_now(pool)
     async with pool.acquire() as conn:
-        first = await repository.reap_expired(conn, now=NOW, limit=2)
-        second = await repository.reap_expired(conn, now=NOW, limit=2)
-        repeated = await repository.reap_expired(conn, now=NOW, limit=2)
+        first = await repository.reap_expired(conn, limit=2)
+        second = await repository.reap_expired(conn, limit=2)
+        repeated = await repository.reap_expired(conn, limit=2)
         for invalid_limit in (0, True, 1.5):
             with pytest.raises(ValueError, match="limit"):
-                await repository.reap_expired(conn, now=NOW, limit=invalid_limit)
+                await repository.reap_expired(conn, limit=invalid_limit)
+    after = await _db_now(pool)
 
     assert len(first) == 2
     assert len(second) == 1
@@ -455,17 +503,18 @@ async def test_reaper_handles_all_branches_limit_repeat_and_renewed_lease(pool):
         for row in await pool.fetch(
             "SELECT id, state, run_after, lease_owner, lease_expires_at, heartbeat_at, "
             "error_code, error_message FROM background_jobs WHERE id = ANY($1::uuid[])",
-            [retry["id"], cancelled["id"], exhausted["id"], renewed["id"]],
+            [retry["id"], cancelled["id"], exhausted["id"], live["id"]],
         )
     }
     assert rows[retry["id"]]["state"] == "retry_wait"
-    assert rows[retry["id"]]["run_after"] == NOW
+    assert before <= rows[retry["id"]]["run_after"] <= after
     assert rows[retry["id"]]["error_code"] == "lease_expired"
     assert rows[cancelled["id"]]["state"] == "cancelled"
     assert rows[cancelled["id"]]["error_code"] is None
     assert rows[exhausted["id"]]["state"] == "failed"
     assert rows[exhausted["id"]]["error_code"] == "attempts_exhausted"
-    assert rows[renewed["id"]]["state"] == "running"
+    assert rows[exhausted["id"]]["error_message"] == "The job could not be completed after retrying."
+    assert rows[live["id"]]["state"] == "running"
     for job_id in (retry["id"], cancelled["id"], exhausted["id"]):
         assert rows[job_id]["lease_owner"] is None
         assert rows[job_id]["lease_expires_at"] is None
@@ -476,6 +525,7 @@ async def test_reaper_handles_all_branches_limit_repeat_and_renewed_lease(pool):
 async def test_concurrent_reapers_return_disjoint_ids_with_skip_locked(pool):
     await pool.execute("DELETE FROM background_jobs")
     user_id = await _seed_user(pool)
+    expired_at = (await _db_now(pool)) - timedelta(minutes=1)
     jobs = [
         await _insert_job(
             pool,
@@ -484,7 +534,7 @@ async def test_concurrent_reapers_return_disjoint_ids_with_skip_locked(pool):
             attempt_count=1,
             max_attempts=3,
             lease_owner="dead-worker",
-            lease_expires_at=NOW,
+            lease_expires_at=expired_at,
         )
         for _ in range(2)
     ]
@@ -494,8 +544,9 @@ async def test_concurrent_reapers_return_disjoint_ids_with_skip_locked(pool):
     committed = False
     try:
         await transaction_a.start()
-        first = await repository.reap_expired(conn_a, now=NOW, limit=1)
-        second = await repository.reap_expired(conn_b, now=NOW, limit=1)
+        async with asyncio.timeout(1):
+            first = await repository.reap_expired(conn_a, limit=1)
+            second = await repository.reap_expired(conn_b, limit=1)
         await transaction_a.commit()
         committed = True
     finally:
@@ -507,3 +558,162 @@ async def test_concurrent_reapers_return_disjoint_ids_with_skip_locked(pool):
     assert len(first) == len(second) == 1
     assert set(first).isdisjoint(second)
     assert set(first + second) == {job["id"] for job in jobs}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_transaction_fences_concurrent_reaper(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="worker-a",
+        lease_expires_at=database_now + timedelta(minutes=1),
+    )
+    conn_heartbeat = await pool.acquire()
+    conn_reaper = await pool.acquire()
+    conn_probe = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = conn_heartbeat.transaction()
+    probe = None
+    committed = False
+    try:
+        await transaction.start()
+        renewed = await repository.heartbeat(conn_heartbeat, job["id"], "worker-a", 300)
+        probe_pid = await conn_probe.fetchval("SELECT pg_backend_pid()")
+        probe = asyncio.create_task(
+            conn_probe.fetchval("SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE", job["id"])
+        )
+        await _wait_for_lock_wait(observer, probe_pid)
+        async with asyncio.timeout(1):
+            assert await repository.reap_expired(conn_reaper) == []
+        probe.cancel()
+        with suppress(asyncio.CancelledError):
+            await probe
+        await transaction.commit()
+        committed = True
+        assert await repository.reap_expired(conn_reaper) == []
+    finally:
+        if probe is not None and not probe.done():
+            probe.cancel()
+            with suppress(asyncio.CancelledError):
+                await probe
+        if not committed:
+            await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(conn_probe)
+        await pool.release(conn_reaper)
+        await pool.release(conn_heartbeat)
+
+    assert renewed.lease_expires_at - renewed.heartbeat_at == timedelta(seconds=300)
+    assert await pool.fetchval("SELECT state FROM background_jobs WHERE id = $1", job["id"]) == "running"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_samples_database_time_after_waiting_for_row_lock(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        lease_owner="worker-a",
+        lease_expires_at=database_now + timedelta(milliseconds=200),
+    )
+    conn_lock = await pool.acquire()
+    conn_heartbeat = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = conn_lock.transaction()
+    pending_heartbeat = None
+    committed = False
+    try:
+        await transaction.start()
+        await conn_lock.fetchval("SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE", job["id"])
+        heartbeat_pid = await conn_heartbeat.fetchval("SELECT pg_backend_pid()")
+        pending_heartbeat = asyncio.create_task(repository.heartbeat(conn_heartbeat, job["id"], "worker-a", 30))
+        await _wait_for_lock_wait(observer, heartbeat_pid)
+        async with asyncio.timeout(1):
+            while not await observer.fetchval(
+                "SELECT clock_timestamp() >= lease_expires_at FROM background_jobs WHERE id = $1",
+                job["id"],
+            ):
+                await asyncio.sleep(0)
+        await transaction.commit()
+        committed = True
+        with pytest.raises(LeaseLost):
+            async with asyncio.timeout(1):
+                await pending_heartbeat
+    finally:
+        if pending_heartbeat is not None and not pending_heartbeat.done():
+            pending_heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_heartbeat
+        if not committed:
+            await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(conn_heartbeat)
+        await pool.release(conn_lock)
+
+
+@pytest.mark.asyncio
+async def test_final_transaction_checkpoint_fences_cancel_and_recovery(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="worker-a",
+        lease_expires_at=database_now + timedelta(minutes=1),
+    )
+    conn_worker = await pool.acquire()
+    conn_cancel = await pool.acquire()
+    conn_reaper = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = conn_worker.transaction()
+    pending_cancel = None
+    committed = False
+    try:
+        await transaction.start()
+        await repository.assert_active(conn_worker, job["id"], "worker-a")
+        cancel_pid = await conn_cancel.fetchval("SELECT pg_backend_pid()")
+        pending_cancel = asyncio.create_task(repository.request_cancel(conn_cancel, job["id"], user_id))
+        await _wait_for_lock_wait(observer, cancel_pid)
+        await conn_worker.execute(
+            "UPDATE background_jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+            job["id"],
+        )
+        await conn_worker.execute("UPDATE users SET display_name = 'fenced-write' WHERE id = $1", user_id)
+        async with asyncio.timeout(1):
+            assert await repository.reap_expired(conn_reaper) == []
+        assert await observer.fetchval("SELECT display_name FROM users WHERE id = $1", user_id) is None
+        await transaction.commit()
+        committed = True
+        async with asyncio.timeout(1):
+            cancellation = await pending_cancel
+        recovered = await repository.reap_expired(conn_reaper)
+    finally:
+        if pending_cancel is not None and not pending_cancel.done():
+            pending_cancel.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_cancel
+        if not committed:
+            await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(conn_reaper)
+        await pool.release(conn_cancel)
+        await pool.release(conn_worker)
+
+    assert cancellation.cancel_requested_at is not None
+    assert recovered == [job["id"]]
+    row = await pool.fetchrow("SELECT state FROM background_jobs WHERE id = $1", job["id"])
+    assert row["state"] == "cancelled"
+    assert await pool.fetchval("SELECT display_name FROM users WHERE id = $1", user_id) == "fenced-write"

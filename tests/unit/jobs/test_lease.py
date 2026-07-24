@@ -129,12 +129,14 @@ async def test_heartbeat_repeats_using_short_acquired_transactions():
     async with lease:
         await waiter.waiting.wait()
         await waiter.pulse()
-        while len(calls) < 1:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(1):
+            while len(calls) < 1:
+                await asyncio.sleep(0)
         await waiter.waiting.wait()
         await waiter.pulse()
-        while len(calls) < 2:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(1):
+            while len(calls) < 2:
+                await asyncio.sleep(0)
 
     assert [call[1:] for call in calls] == [
         (lease.job_id, "worker-a", 30),
@@ -186,6 +188,23 @@ async def test_checkpoint_returns_active_record():
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_reuses_caller_transaction_connection_without_pool_acquire():
+    pool = FakePool()
+    calls = []
+
+    async def assert_active(conn, job_id, owner):
+        calls.append((conn, job_id, owner))
+        return object()
+
+    lease = make_lease(pool=pool, assert_active_fn=assert_active)
+    result = await lease.checkpoint(pool.connection)
+
+    assert result is not None
+    assert calls == [(pool.connection, lease.job_id, "worker-a")]
+    assert pool.calls == []
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_raises_stored_heartbeat_failure_before_database_access():
     waiter = ControlledWaiter()
     failure = LeaseLost("heartbeat lease lost")
@@ -197,8 +216,9 @@ async def test_checkpoint_raises_stored_heartbeat_failure_before_database_access
     async with lease:
         await waiter.waiting.wait()
         await waiter.pulse()
-        while lease.heartbeat_failure is None:
-            await asyncio.sleep(0)
+        async with asyncio.timeout(1):
+            while lease.heartbeat_failure is None:
+                await asyncio.sleep(0)
         lease.pool.calls.clear()
         with pytest.raises(LeaseLost, match="heartbeat lease lost") as raised:
             await lease.checkpoint()

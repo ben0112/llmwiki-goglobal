@@ -108,9 +108,11 @@ class JobLease:
             self._heartbeat_task = None
         return False
 
-    async def checkpoint(self) -> JobRecord:
+    async def checkpoint(self, conn: asyncpg.Connection | None = None) -> JobRecord:
         if self._heartbeat_failure is not None:
             raise self._heartbeat_failure
+        if conn is not None:
+            return await self._assert_active_fn(conn, self.job_id, self.owner)
         async with self.pool.acquire() as conn, conn.transaction():
             return await self._assert_active_fn(conn, self.job_id, self.owner)
 
