@@ -278,9 +278,13 @@ async def handle_graph_rebuild(
         raise RetryableJobError("graph_transient", "Graph rebuild will be retried.") from None
 
     expected_keys = {"citations", "links", "facet_rollups"}
-    if set(raw_result) != expected_keys or any(
-        isinstance(raw_result[key], bool) or not isinstance(raw_result[key], int) or raw_result[key] < 0
-        for key in expected_keys
+    if (
+        not isinstance(raw_result, Mapping)
+        or set(raw_result) != expected_keys
+        or any(
+            isinstance(raw_result[key], bool) or not isinstance(raw_result[key], int) or raw_result[key] < 0
+            for key in expected_keys
+        )
     ):
         raise TerminalJobError("invalid_job_result", "The job produced an invalid result.")
     return {key: raw_result[key] for key in ("citations", "links", "facet_rollups")}

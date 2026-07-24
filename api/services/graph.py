@@ -90,11 +90,12 @@ async def rebuild_hosted(
     user_id: str,
     before_write: BeforeWrite | None = None,
 ) -> dict:
-    """Parse wiki pages and rebuild reference edges atomically.
+    """Compute on a worker connection, then publish one tenant graph atomically.
 
-    Runs through RLS (authenticated role) — the database enforces that
-    the user can only read/write their own documents and references.
-    Uses a savepoint for atomicity within the ScopedDB transaction.
+    Every read and write carries explicit user and knowledge-base predicates;
+    worker correctness does not depend on request-scoped RLS. Computation runs
+    outside the final transaction. That transaction starts with ``before_write``
+    and commits derived edges and facet rollups together.
     """
     all_docs = [
         dict(r)

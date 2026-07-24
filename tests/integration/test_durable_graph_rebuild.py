@@ -239,6 +239,71 @@ async def test_repeated_request_never_rewrites_active_graph_job_contract(pool, g
 
 
 @pytest.mark.asyncio
+async def test_service_retries_when_conflicting_active_job_turns_terminal(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    service = JobService(pool)
+    winner = await service.ensure_graph_rebuild(
+        knowledge_base_id=kb_id,
+        authenticated_user_id=user_id,
+    )
+    before = await pool.fetchrow(
+        "SELECT user_id, knowledge_base_id, document_id, payload, idempotency_key, "
+        "attempt_count, max_attempts FROM background_jobs WHERE id = $1",
+        winner.id,
+    )
+    real_create = repository.create_active_graph
+    create_calls = 0
+
+    async def conflict_then_finish(conn, command):
+        nonlocal create_calls
+        create_calls += 1
+        created = await real_create(conn, command)
+        if create_calls == 1:
+            assert created is None
+            await conn.execute(
+                "UPDATE background_jobs SET state = 'succeeded' WHERE id = $1",
+                winner.id,
+            )
+        return created
+
+    monkeypatch.setattr(repository, "create_active_graph", conflict_then_finish)
+
+    successor = await service.ensure_graph_rebuild(
+        knowledge_base_id=kb_id,
+        authenticated_user_id=user_id,
+    )
+
+    assert create_calls == 2
+    assert successor.id != winner.id
+    assert successor.state.value == "queued"
+    old = await pool.fetchrow(
+        "SELECT state, user_id, knowledge_base_id, document_id, payload, idempotency_key, "
+        "attempt_count, max_attempts FROM background_jobs WHERE id = $1",
+        winner.id,
+    )
+    assert old["state"] == "succeeded"
+    for field in (
+        "user_id",
+        "knowledge_base_id",
+        "document_id",
+        "payload",
+        "idempotency_key",
+        "attempt_count",
+        "max_attempts",
+    ):
+        assert old[field] == before[field]
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM background_jobs WHERE user_id = $1 AND knowledge_base_id = $2 "
+            "AND job_type = 'graph.rebuild' AND state IN ('queued', 'running', 'retry_wait')",
+            user_id,
+            kb_id,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_rebuild_authentication_precedes_service_availability(pool, graph_api_clients):
     user_id, kb_id = await _seed_tenant(pool)
     app, client = graph_api_clients[0]
@@ -612,3 +677,27 @@ async def test_graph_handler_retries_operational_postgres_errors_without_leaking
     assert raised.value.error_code == "graph_transient"
     assert "private" not in raised.value.error_message
     assert "secret" not in raised.value.error_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_result", [None, ["citations", "links", "facet_rollups"]])
+async def test_graph_handler_rejects_non_mapping_results_with_stable_error(
+    pool,
+    monkeypatch,
+    invalid_result,
+):
+    import services.graph as graph_service
+
+    user_id, kb_id = await _seed_tenant(pool)
+    job = await _seed_graph_job(pool, user_id, kb_id)
+
+    async def return_invalid_result(*args, **kwargs):
+        return invalid_result
+
+    monkeypatch.setattr(graph_service, "rebuild_hosted", return_invalid_result)
+
+    with pytest.raises(TerminalJobError) as raised:
+        await handle_graph_rebuild(job, RecordingLease(), _worker_context(pool))
+
+    assert raised.value.error_code == "invalid_job_result"
+    assert raised.value.error_message == "The job produced an invalid result."
