@@ -28,13 +28,28 @@ async def store_chunks(
     user_id: str,
     knowledge_base_id: str,
     chunks: list[Chunk],
+    document_version: int = 0,
 ):
     if isinstance(pool_or_conn, asyncpg.Connection):
-        await _store_chunks_on_conn(pool_or_conn, document_id, user_id, knowledge_base_id, chunks)
+        await _store_chunks_on_conn(
+            pool_or_conn,
+            document_id,
+            user_id,
+            knowledge_base_id,
+            chunks,
+            document_version,
+        )
     else:
         conn = await pool_or_conn.acquire()
         try:
-            await _store_chunks_on_conn(conn, document_id, user_id, knowledge_base_id, chunks)
+            await _store_chunks_on_conn(
+                conn,
+                document_id,
+                user_id,
+                knowledge_base_id,
+                chunks,
+                document_version,
+            )
         finally:
             await pool_or_conn.release(conn)
 
@@ -45,6 +60,7 @@ async def _store_chunks_on_conn(
     user_id: str,
     knowledge_base_id: str,
     chunks: list[Chunk],
+    document_version: int = 0,
 ):
     await conn.execute("DELETE FROM document_chunks WHERE document_id = $1", document_id)
 
@@ -53,8 +69,9 @@ async def _store_chunks_on_conn(
 
     await conn.executemany(
         "INSERT INTO document_chunks "
-        "(document_id, user_id, knowledge_base_id, chunk_index, content, source_content, page, start_char, token_count, header_breadcrumb) "
-        "VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9)",
+        "(document_id, user_id, knowledge_base_id, chunk_index, content, source_content, "
+        "page, start_char, token_count, header_breadcrumb, document_version) "
+        "VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10)",
         [
             (
                 document_id,
@@ -66,6 +83,7 @@ async def _store_chunks_on_conn(
                 chunk.start_char,
                 chunk.token_count,
                 chunk.header_breadcrumb,
+                document_version,
             )
             for chunk in chunks
         ],

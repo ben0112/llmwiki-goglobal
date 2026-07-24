@@ -1,4 +1,3 @@
-import json
 import time
 import asyncio
 import logging
@@ -236,8 +235,8 @@ async def _finalize(upload: TusUpload, app_state) -> str:
     try:
         await pool.execute(
             "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-            "file_type, file_size, status) "
-            "VALUES ($1::uuid, $2::uuid, $3, $4, $8, $5, $6, $7, 'pending')",
+            "source_kind, file_type, file_size, status) "
+            "VALUES ($1::uuid, $2::uuid, $3, $4, $8, $5, 'source', $6, $7, 'pending')",
             document_id,
             upload.knowledge_base_id,
             user_id,
