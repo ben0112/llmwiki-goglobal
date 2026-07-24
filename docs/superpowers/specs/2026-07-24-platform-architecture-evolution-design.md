@@ -88,7 +88,9 @@ database constraints:
 - Status transitions are limited to:
   `pending -> processing -> ready`,
   `pending|processing -> failed`,
-  and `failed -> pending`. Hosted archival remains the orthogonal
+  `failed -> pending`, and the explicit system-repair invalidation
+  `ready -> pending`. The repair transition is not available to ordinary
+  business flows. Hosted archival remains the orthogonal
   `archived=true` lifecycle flag used by the existing schema. Local deletion
   remains a physical delete because the filesystem is its source of truth.
 - `ready` means the current document version has complete derived data. Pages,

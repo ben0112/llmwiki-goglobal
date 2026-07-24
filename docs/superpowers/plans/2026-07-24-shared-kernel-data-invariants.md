@@ -205,6 +205,16 @@ def test_ready_cannot_skip_processing():
         assert_status_transition(DocumentStatus.PENDING, DocumentStatus.READY)
 
 
+def test_ready_can_only_return_to_pending_for_system_repair():
+    with pytest.raises(InvalidStatusTransition):
+        assert_status_transition(DocumentStatus.READY, DocumentStatus.PENDING)
+    assert_status_transition(
+        DocumentStatus.READY,
+        DocumentStatus.PENDING,
+        for_repair=True,
+    )
+
+
 def test_document_kinds_are_stable_wire_values():
     assert [kind.value for kind in DocumentKind] == ["source", "wiki", "asset"]
 
@@ -267,7 +277,14 @@ _ALLOWED = {
 }
 
 
-def assert_status_transition(old: DocumentStatus, new: DocumentStatus) -> None:
+def assert_status_transition(
+    old: DocumentStatus,
+    new: DocumentStatus,
+    *,
+    for_repair: bool = False,
+) -> None:
+    if for_repair and old is DocumentStatus.READY and new is DocumentStatus.PENDING:
+        return
     if new not in _ALLOWED[old]:
         raise InvalidStatusTransition(f"{old.value} -> {new.value}")
 
