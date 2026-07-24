@@ -30,10 +30,16 @@ async def job_client(pool, monkeypatch):
     from config import settings
     from main import app
 
-    previous_service = getattr(app.state, "job_service", None)
-    had_service = hasattr(app.state, "job_service")
-    previous_error = getattr(app.state, "job_service_error", None)
-    had_error = hasattr(app.state, "job_service_error")
+    sentinel = object()
+    previous_state = {
+        name: getattr(app.state, name, sentinel)
+        for name in (
+            "pool",
+            "auth_provider",
+            "job_service",
+            "job_service_error",
+        )
+    }
 
     app.state.pool = pool
     app.state.auth_provider = None
@@ -46,14 +52,12 @@ async def job_client(pool, monkeypatch):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             yield client
     finally:
-        if had_service:
-            app.state.job_service = previous_service
-        else:
-            del app.state.job_service
-        if had_error:
-            app.state.job_service_error = previous_error
-        elif hasattr(app.state, "job_service_error"):
-            del app.state.job_service_error
+        for name, previous_value in previous_state.items():
+            if previous_value is sentinel:
+                if hasattr(app.state, name):
+                    delattr(app.state, name)
+            else:
+                setattr(app.state, name, previous_value)
 
 
 async def _insert_job(pool, user_id: str, *, state: str = "queued", **values) -> UUID:
@@ -183,11 +187,25 @@ async def test_job_routes_require_authentication(path, job_client):
 
 @pytest.mark.asyncio
 async def test_non_uuid_authenticated_subject_is_rejected_before_service_call(job_client, pool):
-    job_id = await _insert_job(pool, USER_A_ID)
+    import deps
+    from main import app
 
-    response = await job_client.get(f"/v1/jobs/{job_id}", headers=auth_headers("not-a-uuid"))
+    job_id = await _insert_job(pool, USER_A_ID)
+    service_dependency_calls = 0
+
+    async def fail_if_service_dependency_runs():
+        nonlocal service_dependency_calls
+        service_dependency_calls += 1
+        raise AssertionError("job service dependency ran before UUID authentication")
+
+    app.dependency_overrides[deps.get_job_service] = fail_if_service_dependency_runs
+    try:
+        response = await job_client.get(f"/v1/jobs/{job_id}", headers=auth_headers("not-a-uuid"))
+    finally:
+        app.dependency_overrides.pop(deps.get_job_service, None)
 
     assert response.status_code == 401
+    assert service_dependency_calls == 0
     assert "UUID" not in response.text
     assert "not-a-uuid" not in response.text
 
@@ -260,6 +278,89 @@ async def test_unavailable_service_does_not_preempt_authentication(job_client):
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_openapi_declares_typed_public_job_response(job_client):
+    response = await job_client.get("/openapi.json")
+
+    assert response.status_code == 200
+    document = response.json()
+    for operation in (
+        document["paths"]["/v1/jobs/{job_id}"]["get"],
+        document["paths"]["/v1/jobs/{job_id}/cancel"]["post"],
+    ):
+        response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+        assert response_schema == {"$ref": "#/components/schemas/PublicJobResponse"}
+
+    schemas = document["components"]["schemas"]
+    public_job = schemas["PublicJobResponse"]
+    assert set(public_job["properties"]) == {
+        "id",
+        "type",
+        "state",
+        "progress",
+        "result",
+        "attempt_count",
+        "max_attempts",
+        "cancel_requested",
+        "error",
+        "created_at",
+        "updated_at",
+    }
+    assert set(public_job["required"]) == set(public_job["properties"])
+    assert public_job["properties"]["id"]["format"] == "uuid"
+    assert public_job["properties"]["type"] == {"$ref": "#/components/schemas/JobType"}
+    assert public_job["properties"]["state"] == {"$ref": "#/components/schemas/JobState"}
+    for field in ("progress", "result"):
+        json_object, null_value = public_job["properties"][field]["anyOf"]
+        assert json_object == {
+            "additionalProperties": {"$ref": "#/components/schemas/JsonValue"},
+            "type": "object",
+        }
+        assert null_value == {"type": "null"}
+    assert public_job["properties"]["created_at"]["format"] == "date-time"
+    assert public_job["properties"]["updated_at"]["format"] == "date-time"
+    assert "PublicJobError" in schemas
+    assert set(schemas["PublicJobError"]["properties"]) == {"code", "message"}
+
+
+@pytest.mark.asyncio
+async def test_response_model_filters_serializer_private_fields(job_client, pool, monkeypatch):
+    import routes.jobs as jobs_route
+
+    job_id = await _insert_job(pool, USER_A_ID)
+    real_serializer = jobs_route.serialize_public_job
+
+    def serializer_with_private_fields(record):
+        return {
+            **real_serializer(record),
+            "payload": {"secret": "must-not-cross-http-boundary"},
+            "lease_owner": "private-worker",
+            "internal_stack": "private stack trace",
+        }
+
+    monkeypatch.setattr(jobs_route, "serialize_public_job", serializer_with_private_fields)
+
+    response = await job_client.get(f"/v1/jobs/{job_id}", headers=auth_headers(USER_A_ID))
+
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "id",
+        "type",
+        "state",
+        "progress",
+        "result",
+        "attempt_count",
+        "max_attempts",
+        "cancel_requested",
+        "error",
+        "created_at",
+        "updated_at",
+    }
+    assert "must-not-cross-http-boundary" not in response.text
+    assert "private-worker" not in response.text
+    assert "private stack trace" not in response.text
+
+
 def test_local_configuration_does_not_register_or_import_job_router():
     root = Path(__file__).resolve().parents[3]
     env = os.environ.copy()
@@ -276,7 +377,10 @@ def test_local_configuration_does_not_register_or_import_job_router():
         "import sys; import main; "
         "paths={r.path for r in main.app.routes}; "
         "assert '/v1/jobs/{job_id}' not in paths; "
-        "assert 'routes.jobs' not in sys.modules"
+        "assert 'routes.jobs' not in sys.modules; "
+        "blocked=('jobs', 'redis', 'arq'); "
+        "assert not [name for name in sys.modules "
+        "if any(name == prefix or name.startswith(prefix + '.') for prefix in blocked)]"
     )
 
     result = subprocess.run(
