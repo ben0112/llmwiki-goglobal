@@ -1,13 +1,34 @@
 import json
-from typing import Annotated, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Annotated
 
-from fastapi import Depends, Request
-
+from fastapi import Depends, HTTPException, Request, status
 from scoped_db import ScopedDB
 
 
 async def get_pool(request: Request):
     return request.app.state.pool
+
+
+async def get_job_service(request: Request):
+    """Return the Hosted durable job service, failing closed when unavailable."""
+    from config import settings
+
+    service = getattr(request.app.state, "job_service", None)
+    if not settings.DURABLE_JOBS_ENABLED or service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable job service unavailable",
+        )
+
+    from jobs.service import JobService
+
+    if not isinstance(service, JobService):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable job service unavailable",
+        )
+    return service
 
 
 async def get_user_id(request: Request) -> str:
@@ -21,6 +42,7 @@ async def get_user_id(request: Request) -> str:
     if auth_provider:
         return await auth_provider.get_current_user(request)
     from auth import get_current_user
+
     return await get_current_user(request)
 
 
@@ -58,6 +80,7 @@ async def get_scoped_db(
         return
 
     from auth import get_current_user
+
     user_id = await get_current_user(request)
     conn = await pool.acquire()
     tr = conn.transaction()

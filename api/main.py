@@ -75,6 +75,12 @@ async def lifespan(app: FastAPI):
     app.state.pool = pool
     app.state.mode = "hosted"
 
+    app.state.job_service = None
+    if settings.DURABLE_JOBS_ENABLED:
+        from jobs.service import JobService
+
+        app.state.job_service = JobService(pool)
+
     await _repair_hosted_derived_drift(pool)
 
     s3_service = None
@@ -161,6 +167,7 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.s3_service = None
     app.state.storage_service = storage
     app.state.ocr_service = None
+    app.state.job_service = None
     app.state.auth_provider = auth_provider
     app.state.workspace_path = str(workspace)
 
@@ -302,13 +309,16 @@ if settings.MODE == "local":
     app.include_router(local_graph_router)
     set_workspace_root(settings.WORKSPACE_PATH)
 else:
+    from infra.tus import router as tus_router
     from routes.api_keys import router as api_keys_router
     from routes.graph import router as graph_router
-    from routes.ws import router as ws_router
+    from routes.jobs import router as jobs_router
     from routes.public import router as public_router
-    from infra.tus import router as tus_router
+    from routes.ws import router as ws_router
+
     app.include_router(api_keys_router)
     app.include_router(tus_router)
     app.include_router(graph_router)
     app.include_router(ws_router)
     app.include_router(public_router)
+    app.include_router(jobs_router)
