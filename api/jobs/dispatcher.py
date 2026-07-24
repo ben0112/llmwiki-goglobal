@@ -30,6 +30,7 @@ WHERE job.state IN ('queued', 'retry_wait')
   AND job.attempt_count < job.max_attempts
   AND (
       job.last_dispatched_at IS NULL
+      OR job.last_dispatched_at < job.run_after
       OR job.last_dispatched_at
          < dispatch_clock.checked_at - make_interval(secs => $1::double precision)
   )

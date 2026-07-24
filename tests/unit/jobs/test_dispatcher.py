@@ -4,10 +4,12 @@ import asyncio
 import inspect
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 
@@ -17,6 +19,15 @@ def _runtime_settings(**changes):
         "DURABLE_JOBS_ENABLED": True,
         "REDIS_URL": "redis://redis.internal:6380/4",
         "DATABASE_URL": "postgresql://database.internal/jobs",
+        "S3_BUCKET": None,
+        "AWS_ACCESS_KEY_ID": None,
+        "AWS_SECRET_ACCESS_KEY": None,
+        "CONVERTER_URL": "https://converter.invalid",
+        "CONVERTER_SECRET": "converter-secret",
+        "JOB_LEASE_SECONDS": 60,
+        "JOB_HEARTBEAT_SECONDS": 15,
+        "JOB_DISPATCH_BATCH_SIZE": 100,
+        "JOB_REDELIVER_SECONDS": 30,
     }
     values.update(changes)
     return SimpleNamespace(**values)
@@ -110,6 +121,7 @@ async def test_select_due_job_ids_uses_parameterized_ordered_skip_locked_query()
     assert args == (30, 2)
     assert "clock_timestamp()" in normalized
     assert "job.last_dispatched_at < dispatch_clock.checked_at" in normalized
+    assert "job.last_dispatched_at < job.run_after" in normalized
     assert "order by job.run_after, job.created_at, job.id" in normalized
     assert "for update of job skip locked" in normalized
     assert "limit $2" in normalized
@@ -236,13 +248,25 @@ async def test_all_initial_handlers_explicitly_reject_unsupported_business_work(
         assert "not supported" in raised.value.error_message.lower()
 
 
-def test_handler_errors_validate_stable_codes_and_sanitize_messages():
+def test_handler_errors_persist_only_vetted_utf8_postgres_safe_messages():
     from jobs.handlers import RetryableJobError, TerminalJobError
 
-    error = RetryableJobError("converter_timeout", "  converter\n timed\tout  ")
+    error = RetryableJobError(
+        "converter_timeout",
+        "TOP_SECRET_TOKEN from raw converter exception",
+    )
     assert error.error_code == "converter_timeout"
-    assert error.error_message == "converter timed out"
-    assert str(error) == "converter timed out"
+    assert error.error_message == "Converter timed out."
+    assert str(error) == "Converter timed out."
+
+    for unsafe in ("TOP_SECRET_TOKEN\x00db unsafe", "TOP_SECRET_TOKEN\ud800"):
+        unsafe_error = TerminalJobError("invalid_document", unsafe)
+        assert unsafe_error.error_message == "Document is invalid."
+        unsafe_error.error_message.encode("utf-8")
+        assert "\x00" not in unsafe_error.error_message
+
+    with pytest.raises(TypeError, match="message"):
+        TerminalJobError("stable", b"not utf-8")
 
     with pytest.raises(ValueError, match="error_code"):
         TerminalJobError("Not Stable!", "message")
@@ -261,32 +285,87 @@ def test_arq_imports_are_confined_to_adapter_modules():
 
 
 def test_worker_settings_disable_arq_retry_and_results_with_unique_safe_crons():
-    from jobs.worker import WorkerSettings, dispatch_cron, reap_cron, run_job
+    from jobs import worker
 
-    assert WorkerSettings.functions == [run_job]
-    assert WorkerSettings.max_tries == 1
-    assert WorkerSettings.retry_jobs is False
-    assert WorkerSettings.keep_result == 0
-    assert WorkerSettings.job_timeout == 3600
-    assert WorkerSettings.on_startup.__name__ == "startup"
-    assert WorkerSettings.on_shutdown.__name__ == "shutdown"
-    assert len(WorkerSettings.cron_jobs) == 2
+    built = worker.build_worker_settings(_runtime_settings())
+    assert built["functions"] == [worker.run_job]
+    assert built["max_tries"] == 1
+    assert built["retry_jobs"] is False
+    assert built["keep_result"] == 0
+    assert built["job_timeout"] == 3600
+    assert built["on_startup"] is worker.startup
+    assert built["on_shutdown"] is worker.shutdown
+    assert len(built["cron_jobs"]) == 2
 
-    dispatch, reap = WorkerSettings.cron_jobs
-    assert dispatch.coroutine is dispatch_cron
+    dispatch, reap = built["cron_jobs"]
+    assert dispatch.coroutine is worker.dispatch_cron
     assert dispatch.second == {0, 10, 20, 30, 40, 50}
-    assert reap.coroutine is reap_cron
+    assert reap.coroutine is worker.reap_cron
     assert reap.second == {5, 35}
     assert {dispatch.name, reap.name} == {"durable_job_dispatch", "durable_job_reaper"}
-    assert {dispatch.job_id, reap.job_id} == {
-        "durable-job-dispatch-cron",
-        "durable-job-reaper-cron",
-    }
-    for job in WorkerSettings.cron_jobs:
+    assert dispatch.job_id is None
+    assert reap.job_id is None
+    for job in built["cron_jobs"]:
         assert job.run_at_startup is True
         assert job.unique is True
         assert job.max_tries == 1
         assert job.keep_result_s == 0
+
+
+class CronRecordingRedis:
+    def __init__(self, seen):
+        self.seen = seen
+        self.attempts = []
+        self.enqueued = []
+
+    async def enqueue_job(self, function, *args, **kwargs):
+        del args
+        job_id = kwargs["_job_id"]
+        self.attempts.append((function, job_id))
+        if job_id in self.seen:
+            return None
+        self.seen.add(job_id)
+        self.enqueued.append((function, job_id))
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_real_arq_cron_ids_change_by_schedule_and_dedupe_across_replicas():
+    from jobs import worker
+
+    seen = set()
+    first = worker.create_durable_worker(_runtime_settings(), handle_signals=False)
+    second = worker.create_durable_worker(_runtime_settings(), handle_signals=False)
+    first_redis = CronRecordingRedis(seen)
+    second_redis = CronRecordingRedis(seen)
+    first._pool = first_redis
+    second._pool = second_redis
+    scheduled = datetime(2026, 1, 1, tzinfo=UTC)
+
+    await asyncio.gather(
+        first.run_cron(scheduled, delay=0.1),
+        second.run_cron(scheduled, delay=0.1),
+    )
+
+    assert sorted(first_redis.attempts) == sorted(second_redis.attempts)
+    assert len(first_redis.attempts) == 2
+    assert len(first_redis.enqueued) + len(second_redis.enqueued) == 2
+
+    first_dispatch_id = next(job_id for function, job_id in first_redis.attempts if function == "durable_job_dispatch")
+    await first.run_cron(scheduled + timedelta(seconds=10), delay=0.1)
+    dispatch_ids = [job_id for function, job_id in first_redis.attempts if function == "durable_job_dispatch"]
+    assert len(dispatch_ids) == 2
+    assert dispatch_ids[0] == first_dispatch_id
+    assert dispatch_ids[1] != first_dispatch_id
+
+
+def test_worker_module_does_not_expose_arq_cli_worker_settings():
+    from arq.utils import import_string
+    from jobs import worker
+
+    assert not hasattr(worker, "WorkerSettings")
+    with pytest.raises(ImportError, match="does not define"):
+        import_string("jobs.worker.WorkerSettings")
 
 
 @pytest.mark.parametrize(
@@ -328,16 +407,18 @@ def test_worker_factories_validate_before_arq_construction(
 def test_build_worker_settings_preserves_safety_and_parses_validated_redis_url():
     from jobs import worker
 
-    built = worker.build_worker_settings(_runtime_settings())
+    runtime_settings = _runtime_settings()
+    built = worker.build_worker_settings(runtime_settings)
 
     assert built["functions"] == [worker.run_job]
-    assert built["cron_jobs"] == worker.WorkerSettings.cron_jobs
+    assert len(built["cron_jobs"]) == 2
     assert built["max_tries"] == 1
     assert built["retry_jobs"] is False
     assert built["keep_result"] == 0
     assert built["job_timeout"] == 3600
     assert built["on_startup"] is worker.startup
     assert built["on_shutdown"] is worker.shutdown
+    assert built["ctx"]["runtime_settings"] is runtime_settings
     redis_settings = built["redis_settings"]
     assert redis_settings.host == "redis.internal"
     assert redis_settings.port == 6380
@@ -347,9 +428,11 @@ def test_build_worker_settings_preserves_safety_and_parses_validated_redis_url()
 def test_create_durable_worker_constructs_configured_unconnected_arq_worker():
     from jobs import worker
 
+    runtime_settings = _runtime_settings()
     arq_worker = worker.create_durable_worker(
-        _runtime_settings(),
+        runtime_settings,
         handle_signals=False,
+        ctx={"trace_id": "opaque"},
     )
 
     assert arq_worker.redis_settings.host == "redis.internal"
@@ -357,6 +440,15 @@ def test_create_durable_worker_constructs_configured_unconnected_arq_worker():
     assert arq_worker.redis_settings.database == 4
     assert arq_worker.redis_settings.host != "localhost"
     assert arq_worker._pool is None
+    assert arq_worker.ctx["runtime_settings"] is runtime_settings
+    assert arq_worker.ctx["trace_id"] == "opaque"
+
+    none_ctx_worker = worker.create_durable_worker(
+        runtime_settings,
+        handle_signals=False,
+        ctx=None,
+    )
+    assert none_ctx_worker.ctx["runtime_settings"] is runtime_settings
 
 
 def test_run_durable_worker_passes_validated_dynamic_settings_to_arq(monkeypatch):
@@ -587,6 +679,22 @@ def test_prepare_job_result_rejects_nonmapping_and_nested_non_json_values(result
     assert raised.value.error_message == "The job produced an invalid result."
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"x": "a" * 16_385},
+        {"a" * 16_385: "x"},
+    ],
+)
+def test_prepare_job_result_rejects_obviously_oversized_single_strings(result):
+    from jobs.handlers import TerminalJobError
+    from jobs.worker import _prepare_job_result
+
+    with pytest.raises(TerminalJobError) as raised:
+        _prepare_job_result(result)
+    assert raised.value.error_code == "invalid_job_result"
+
+
 @pytest.mark.asyncio
 async def test_postgres_result_validation_uses_parameterized_canonical_byte_count():
     from jobs.worker import _validate_result_in_postgres
@@ -616,15 +724,37 @@ async def test_postgres_result_validation_rejects_canonical_byte_count_over_limi
 
 
 @pytest.mark.asyncio
-async def test_postgres_result_parse_failure_is_terminal_after_transaction_release(
+@pytest.mark.parametrize(
+    "validation_error,expected_failure",
+    [
+        (
+            asyncpg.DataError("TOP_SECRET_DB_ERROR RAW_RESULT_TOKEN"),
+            {
+                "error_code": "invalid_job_result",
+                "error_message": "The job produced an invalid result.",
+                "retryable": False,
+            },
+        ),
+        (
+            asyncpg.ConnectionDoesNotExistError("TOP_SECRET_DB_ERROR RAW_RESULT_TOKEN"),
+            {
+                "error_code": "unhandled_worker_error",
+                "error_message": "The job encountered an unexpected error.",
+                "retryable": True,
+            },
+        ),
+    ],
+)
+async def test_postgres_result_validation_classifies_data_and_operational_errors(
     monkeypatch,
     caplog,
+    validation_error,
+    expected_failure,
 ):
-    import asyncpg
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
-    pool.postgres_validation_error = asyncpg.PostgresError("TOP_SECRET_DB_ERROR RAW_RESULT_TOKEN")
+    pool.postgres_validation_error = validation_error
     job = _job()
     succeed_calls = []
     recorded = []
@@ -654,13 +784,7 @@ async def test_postgres_result_parse_failure_is_terminal_after_transaction_relea
 
     assert outcome == {"status": "failed", "job_id": str(job.id)}
     assert succeed_calls == []
-    assert recorded == [
-        {
-            "error_code": "invalid_job_result",
-            "error_message": "The job produced an invalid result.",
-            "retryable": False,
-        }
-    ]
+    assert recorded == [expected_failure]
     assert pool.events == ["postgres-validate", "fail"]
     assert pool.transactions == 3
     assert pool.active_connections == 0
@@ -1035,17 +1159,18 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     monkeypatch.setattr(worker, "_create_pool", create_pool)
     monkeypatch.setattr(worker, "_create_s3_service", lambda: s3)
     monkeypatch.setattr(worker, "_make_worker_id", lambda: "host:42:opaque")
-    monkeypatch.setattr(worker.settings, "MODE", "hosted")
-    monkeypatch.setattr(worker.settings, "DURABLE_JOBS_ENABLED", True)
-    monkeypatch.setattr(worker.settings, "REDIS_URL", "redis://worker.test/0")
-    monkeypatch.setattr(worker.settings, "DATABASE_URL", "postgresql://worker.test/jobs")
-    monkeypatch.setattr(worker.settings, "AWS_ACCESS_KEY_ID", "access")
-    monkeypatch.setattr(worker.settings, "AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.setattr(worker.settings, "S3_BUCKET", "bucket")
-    monkeypatch.setattr(worker.settings, "CONVERTER_URL", "https://converter.test")
-    monkeypatch.setattr(worker.settings, "CONVERTER_SECRET", "converter-secret")
+    runtime_settings = _runtime_settings(
+        REDIS_URL="redis://worker.test/0",
+        DATABASE_URL="postgresql://worker.test/jobs",
+        AWS_ACCESS_KEY_ID="access",
+        AWS_SECRET_ACCESS_KEY="secret",
+        S3_BUCKET="bucket",
+        CONVERTER_URL="https://converter.test",
+        CONVERTER_SECRET="converter-secret",
+    )
+    monkeypatch.setattr(worker.settings, "MODE", "local")
 
-    ctx = {"redis": redis}
+    ctx = {"redis": redis, "runtime_settings": runtime_settings}
     await worker.startup(ctx)
 
     assert ctx["pool"] is pool
@@ -1055,6 +1180,7 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     assert ctx["worker_context"].pool is pool
     assert ctx["worker_context"].converter_secret == "converter-secret"
     assert ctx["handlers"] is worker.HANDLERS
+    assert ctx["runtime_settings"] is runtime_settings
     assert "websocket" not in " ".join(ctx).lower()
 
     await worker.shutdown(ctx)
@@ -1092,11 +1218,15 @@ async def test_startup_rejects_non_durable_context_before_creating_pool(
         return PoolWithConnectionTransaction()
 
     monkeypatch.setattr(worker, "_create_pool", create_pool)
-    monkeypatch.setattr(worker.settings, "MODE", mode)
-    monkeypatch.setattr(worker.settings, "DURABLE_JOBS_ENABLED", durable)
-    monkeypatch.setattr(worker.settings, "REDIS_URL", redis_url)
-    monkeypatch.setattr(worker.settings, "DATABASE_URL", "postgresql://configured")
-    ctx = {"redis": object()} if has_ctx_redis else {}
+    runtime_settings = _runtime_settings(
+        MODE=mode,
+        DURABLE_JOBS_ENABLED=durable,
+        REDIS_URL=redis_url,
+        DATABASE_URL="postgresql://configured",
+    )
+    ctx = {"runtime_settings": runtime_settings}
+    if has_ctx_redis:
+        ctx["redis"] = object()
 
     with pytest.raises(RuntimeError, match=match):
         await worker.startup(ctx)
@@ -1117,14 +1247,57 @@ async def test_startup_closes_pool_when_later_resource_creation_fails(monkeypatc
 
     monkeypatch.setattr(worker, "_create_pool", create_pool)
     monkeypatch.setattr(worker, "_create_s3_service", fail_s3)
-    monkeypatch.setattr(worker.settings, "MODE", "hosted")
-    monkeypatch.setattr(worker.settings, "DURABLE_JOBS_ENABLED", True)
-    monkeypatch.setattr(worker.settings, "REDIS_URL", "redis://configured")
-    monkeypatch.setattr(worker.settings, "DATABASE_URL", "postgresql://configured")
-    monkeypatch.setattr(worker.settings, "AWS_ACCESS_KEY_ID", "access")
-    monkeypatch.setattr(worker.settings, "AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.setattr(worker.settings, "S3_BUCKET", "bucket")
-
     with pytest.raises(RuntimeError, match="s3 construction failed"):
-        await worker.startup({"redis": object()})
+        await worker.startup(
+            {
+                "redis": object(),
+                "runtime_settings": _runtime_settings(
+                    AWS_ACCESS_KEY_ID="access",
+                    AWS_SECRET_ACCESS_KEY="secret",
+                    S3_BUCKET="bucket",
+                ),
+            }
+        )
     assert pool.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_closes_tracked_s3_and_pool_when_context_construction_fails(monkeypatch):
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+
+    class CloseableS3:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+    s3 = CloseableS3()
+
+    async def create_pool(_url):
+        return pool
+
+    def fail_worker_context(**_kwargs):
+        raise RuntimeError("worker context construction failed")
+
+    monkeypatch.setattr(worker, "_create_pool", create_pool)
+    monkeypatch.setattr(worker, "_create_s3_service", lambda: s3)
+    monkeypatch.setattr(worker, "WorkerContext", fail_worker_context)
+    ctx = {
+        "redis": object(),
+        "runtime_settings": _runtime_settings(
+            AWS_ACCESS_KEY_ID="access",
+            AWS_SECRET_ACCESS_KEY="secret",
+            S3_BUCKET="bucket",
+        ),
+    }
+
+    with pytest.raises(RuntimeError, match="worker context construction failed"):
+        await worker.startup(ctx)
+
+    assert s3.close_calls == 1
+    assert pool.close_calls == 1
+    assert "s3" not in ctx
+    assert "pool" not in ctx

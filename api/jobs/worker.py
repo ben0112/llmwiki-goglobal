@@ -62,8 +62,12 @@ def _make_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
 
 
-def _s3_is_configured() -> bool:
-    return bool(settings.S3_BUCKET and settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY)
+def _s3_is_configured(runtime_settings: object) -> bool:
+    return bool(
+        getattr(runtime_settings, "S3_BUCKET", None)
+        and getattr(runtime_settings, "AWS_ACCESS_KEY_ID", None)
+        and getattr(runtime_settings, "AWS_SECRET_ACCESS_KEY", None)
+    )
 
 
 def validate_worker_runtime(runtime_settings: object) -> None:
@@ -83,42 +87,43 @@ def validate_worker_runtime(runtime_settings: object) -> None:
 
 async def startup(ctx: dict) -> None:
     """Construct only the resources needed by a hosted durable worker."""
-    validate_worker_runtime(settings)
+    runtime_settings = ctx.get("runtime_settings")
+    if runtime_settings is None:
+        raise RuntimeError("ARQ durable worker requires runtime_settings in ctx")
+    validate_worker_runtime(runtime_settings)
     if ctx.get("redis") is None:
         raise RuntimeError("ARQ durable worker requires ctx['redis'] from ARQ")
 
-    pool: asyncpg.Pool | None = None
     try:
-        pool = await _create_pool(settings.DATABASE_URL)
-        s3 = _create_s3_service() if _s3_is_configured() else None
+        pool = await _create_pool(runtime_settings.DATABASE_URL)
+        ctx["pool"] = pool
+        s3 = _create_s3_service() if _s3_is_configured(runtime_settings) else None
+        ctx["s3"] = s3
         worker_context = WorkerContext(
             pool=pool,
             s3=s3,
-            converter_url=settings.CONVERTER_URL,
-            converter_secret=settings.CONVERTER_SECRET,
+            converter_url=runtime_settings.CONVERTER_URL,
+            converter_secret=runtime_settings.CONVERTER_SECRET,
         )
         ctx.update(
             {
-                "pool": pool,
-                "s3": s3,
                 "worker_context": worker_context,
                 "handlers": HANDLERS,
                 "worker_id": _make_worker_id(),
-                "lease_seconds": settings.JOB_LEASE_SECONDS,
-                "heartbeat_seconds": settings.JOB_HEARTBEAT_SECONDS,
-                "dispatch_batch_size": settings.JOB_DISPATCH_BATCH_SIZE,
-                "reap_batch_size": settings.JOB_DISPATCH_BATCH_SIZE,
-                "redeliver_seconds": settings.JOB_REDELIVER_SECONDS,
+                "lease_seconds": runtime_settings.JOB_LEASE_SECONDS,
+                "heartbeat_seconds": runtime_settings.JOB_HEARTBEAT_SECONDS,
+                "dispatch_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
+                "reap_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
+                "redeliver_seconds": runtime_settings.JOB_REDELIVER_SECONDS,
             }
         )
     except BaseException:
-        if pool is not None:
-            await pool.close()
+        await _close_worker_resources(ctx)
         raise
 
 
-async def shutdown(ctx: dict) -> None:
-    """Release worker-owned resources while leaving ARQ's Redis client alone."""
+async def _close_worker_resources(ctx: dict) -> None:
+    """Close each tracked worker-owned resource at most once."""
     pool = ctx.pop("pool", None)
     s3 = ctx.pop("s3", None)
     ctx.pop("worker_context", None)
@@ -139,6 +144,11 @@ async def shutdown(ctx: dict) -> None:
     finally:
         if pool is not None:
             await pool.close()
+
+
+async def shutdown(ctx: dict) -> None:
+    """Release worker-owned resources while leaving ARQ's Redis client alone."""
+    await _close_worker_resources(ctx)
 
 
 async def _record_failure(
@@ -176,19 +186,36 @@ def _invalid_result() -> TerminalJobError:
     return TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE)
 
 
+def _reject_obviously_oversized_strings(value: JSONValue) -> None:
+    """Reject only strings that alone cannot fit PostgreSQL's result budget."""
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > RESULT_MAX_BYTES:
+            raise _invalid_result()
+        return
+    if isinstance(value, list):
+        for item in value:
+            _reject_obviously_oversized_strings(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_obviously_oversized_strings(key)
+            _reject_obviously_oversized_strings(item)
+
+
 def _prepare_job_result(raw_result: object) -> tuple[dict[str, JSONValue], str]:
     """Validate strict JSON types and produce safe PostgreSQL JSON input text."""
     try:
         result = to_json_value(raw_result)
         if not isinstance(result, dict):
             raise TypeError("job handler result must be a JSON object")
+        _reject_obviously_oversized_strings(result)
         serialized = json.dumps(
             result,
             ensure_ascii=False,
             allow_nan=False,
             separators=(", ", ": "),
         )
-    except (OverflowError, RecursionError, TypeError, ValueError):
+    except (OverflowError, RecursionError, TypeError, UnicodeError, ValueError):
         raise _invalid_result() from None
     return result, serialized
 
@@ -203,8 +230,11 @@ async def _validate_result_in_postgres(
             "SELECT octet_length($1::jsonb::text)",
             serialized_json,
         )
-    except asyncpg.PostgresError:
-        raise _invalid_result() from None
+    except asyncpg.PostgresError as exc:
+        sqlstate = getattr(exc, "sqlstate", None)
+        if isinstance(exc, asyncpg.DataError) or (isinstance(sqlstate, str) and sqlstate.startswith("22")):
+            raise _invalid_result() from None
+        raise
     if not isinstance(canonical_bytes, int) or canonical_bytes > RESULT_MAX_BYTES:
         raise _invalid_result()
 
@@ -323,13 +353,12 @@ async def reap_cron(ctx: dict) -> None:
     logger.info("reaped expired durable jobs count=%d", len(reaped))
 
 
-class WorkerSettings:
-    functions = [run_job]
-    cron_jobs = [
+def _build_cron_jobs() -> list:
+    """Build fresh CronJob instances because ARQ mutates their next_run state."""
+    return [
         cron(
             dispatch_cron,
             name="durable_job_dispatch",
-            job_id="durable-job-dispatch-cron",
             second={0, 10, 20, 30, 40, 50},
             run_at_startup=True,
             unique=True,
@@ -339,7 +368,6 @@ class WorkerSettings:
         cron(
             reap_cron,
             name="durable_job_reaper",
-            job_id="durable-job-reaper-cron",
             second={5, 35},
             run_at_startup=True,
             unique=True,
@@ -347,12 +375,6 @@ class WorkerSettings:
             keep_result=0,
         ),
     ]
-    max_tries = 1
-    retry_jobs = False
-    keep_result = 0
-    job_timeout = 3600
-    on_startup = startup
-    on_shutdown = shutdown
 
 
 def build_worker_settings(runtime_settings: object) -> dict[str, object]:
@@ -360,27 +382,45 @@ def build_worker_settings(runtime_settings: object) -> dict[str, object]:
     validate_worker_runtime(runtime_settings)
     redis_url = runtime_settings.REDIS_URL.strip()
     return {
-        "functions": WorkerSettings.functions,
-        "cron_jobs": WorkerSettings.cron_jobs,
-        "max_tries": WorkerSettings.max_tries,
-        "retry_jobs": WorkerSettings.retry_jobs,
-        "keep_result": WorkerSettings.keep_result,
-        "job_timeout": WorkerSettings.job_timeout,
-        "on_startup": WorkerSettings.on_startup,
-        "on_shutdown": WorkerSettings.on_shutdown,
+        "functions": [run_job],
+        "cron_jobs": _build_cron_jobs(),
+        "max_tries": 1,
+        "retry_jobs": False,
+        "keep_result": 0,
+        "job_timeout": 3600,
+        "on_startup": startup,
+        "on_shutdown": shutdown,
         "redis_settings": RedisSettings.from_dsn(redis_url),
+        "ctx": {"runtime_settings": runtime_settings},
     }
+
+
+def _merge_worker_context(
+    runtime_settings: object,
+    kwargs: dict[str, object],
+) -> None:
+    if "ctx" not in kwargs:
+        return
+    supplied_ctx = kwargs["ctx"]
+    if supplied_ctx is None:
+        kwargs["ctx"] = {"runtime_settings": runtime_settings}
+        return
+    if not isinstance(supplied_ctx, Mapping):
+        raise TypeError("ctx must be a mapping")
+    kwargs["ctx"] = {**supplied_ctx, "runtime_settings": runtime_settings}
 
 
 def create_durable_worker(runtime_settings: object = settings, **kwargs: object) -> object:
     """Construct an unconnected ARQ Worker after mandatory durable preflight."""
     worker_settings = build_worker_settings(runtime_settings)
+    _merge_worker_context(runtime_settings, kwargs)
     return arq_create_worker(worker_settings, **kwargs)
 
 
 def run_durable_worker(runtime_settings: object = settings, **kwargs: object) -> object:
     """Run the supported durable worker launcher after mandatory preflight."""
     worker_settings = build_worker_settings(runtime_settings)
+    _merge_worker_context(runtime_settings, kwargs)
     return arq_run_worker(worker_settings, **kwargs)
 
 

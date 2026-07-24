@@ -13,6 +13,15 @@ from jobs.lease import JobLease
 from jobs.models import ERROR_MESSAGE_MAX_CHARS, JobRecord, JobType, JSONValue
 
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_GENERIC_ERROR_MESSAGE = "The job could not be completed."
+_VETTED_ERROR_MESSAGES = MappingProxyType(
+    {
+        "converter_timeout": "Converter timed out.",
+        "invalid_document": "Document is invalid.",
+        "invalid_job_result": "The job produced an invalid result.",
+        "unsupported_job_type": "This job type is not supported.",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +44,7 @@ def _sanitize_message(message: str) -> str:
     sanitized = " ".join(message.split())[:ERROR_MESSAGE_MAX_CHARS]
     if not sanitized:
         raise ValueError("error message must not be empty")
-    return sanitized
+    return _GENERIC_ERROR_MESSAGE
 
 
 class JobHandlerError(RuntimeError):
@@ -45,7 +54,8 @@ class JobHandlerError(RuntimeError):
         if not isinstance(error_code, str) or not _ERROR_CODE_PATTERN.fullmatch(error_code):
             raise ValueError("error_code must be a stable lowercase identifier")
         self.error_code = error_code
-        self.error_message = _sanitize_message(error_message)
+        fallback_message = _sanitize_message(error_message)
+        self.error_message = _VETTED_ERROR_MESSAGES.get(error_code, fallback_message)
         super().__init__(self.error_message)
 
 

@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from jobs.dispatcher import dispatch_due_jobs, mark_dispatched, select_due_job_ids
-from jobs.handlers import WorkerContext
+from jobs.handlers import TerminalJobError, WorkerContext
 from jobs.models import JobState, JobType
 
 OLD = datetime(2020, 1, 1, tzinfo=UTC)
@@ -94,6 +94,34 @@ async def test_due_selection_filters_orders_batches_and_redelivers_by_database_t
         recent["id"],
     )
     assert recent["id"] in await _select(pool, redeliver_seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_new_retry_generation_dispatches_when_due_without_waiting_for_redelivery(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    now = await pool.fetchval("SELECT clock_timestamp()")
+    new_generation = await _insert_job(
+        pool,
+        user_id,
+        state="retry_wait",
+        attempt_count=1,
+        run_after=now - timedelta(seconds=1),
+        last_dispatched_at=now - timedelta(seconds=5),
+    )
+    same_generation = await _insert_job(
+        pool,
+        user_id,
+        state="retry_wait",
+        attempt_count=1,
+        run_after=now - timedelta(seconds=5),
+        last_dispatched_at=now - timedelta(seconds=1),
+    )
+
+    selected = await _select(pool, redeliver_seconds=30)
+
+    assert new_generation["id"] in selected
+    assert same_generation["id"] not in selected
 
 
 @pytest.mark.asyncio
@@ -360,6 +388,55 @@ async def test_postgres_rejects_nul_result_without_leaking_or_calling_succeed(
     assert "RAW_RESULT_TOKEN" not in caplog.text
     assert "TOP_SECRET_TOKEN" not in repr(dict(row))
     assert "RAW_RESULT_TOKEN" not in repr(dict(row))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_message",
+    [
+        "TOP_SECRET_HANDLER_TOKEN\x00postgres unsafe",
+        "TOP_SECRET_HANDLER_TOKEN\ud800",
+    ],
+)
+async def test_handler_failure_messages_are_postgres_safe_and_do_not_leak(
+    pool,
+    caplog,
+    unsafe_message,
+):
+    from jobs import worker
+
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(pool, user_id, run_after=OLD)
+
+    async def handler(*_args):
+        raise TerminalJobError("unsafe_handler_failure", unsafe_message)
+
+    context = WorkerContext(pool=pool, s3=None, converter_url="", converter_secret="")
+    ctx = {
+        "pool": pool,
+        "worker_id": "safe-message-worker",
+        "lease_seconds": 30,
+        "heartbeat_seconds": 10,
+        "worker_context": context,
+        "handlers": {JobType.DOCUMENT_EXTRACT: handler},
+    }
+    caplog.set_level(logging.ERROR, logger="jobs.worker")
+
+    outcome = await worker.run_job(ctx, str(job["id"]))
+
+    row = await pool.fetchrow(
+        "SELECT state, error_code, error_message FROM background_jobs WHERE id = $1",
+        job["id"],
+    )
+    assert outcome == {"status": "failed", "job_id": str(job["id"])}
+    assert dict(row) == {
+        "state": "failed",
+        "error_code": "unsafe_handler_failure",
+        "error_message": "The job could not be completed.",
+    }
+    assert "TOP_SECRET_HANDLER_TOKEN" not in caplog.text
+    assert "TOP_SECRET_HANDLER_TOKEN" not in repr(dict(row))
 
 
 @pytest.mark.asyncio
