@@ -536,15 +536,17 @@ def test_validate_facets_rejects_unknown_keys():
 def test_rollup_merges_cited_corpus_dimensions():
     rollup = rollup_from_metas(
         [
-            {"stage": "S2", "geo_country": ["IDN"], "timeliness": "M2"},
-            {"stage": "S3", "geo_country": ["VNM"], "timeliness": "M1"},
+            {"entry_id": "E-1", "stage": "S2", "geo_country": ["IDN"], "timeliness": "M2"},
+            {"entry_id": "E-2", "stage": "S3", "geo_country": ["VNM"], "timeliness": "M1"},
         ],
         "2026-07-24",
     )
     assert rollup["stage"] == ["S2", "S3"]
     assert rollup["country"] == ["IDN", "VNM"]
     assert rollup["timeliness_worst"] == "M1"
-    assert apply_rollup({}, rollup)["facet_rollup"] == rollup
+    metadata = {}
+    assert apply_rollup(metadata, rollup) is True
+    assert metadata["facet_rollup"] == rollup
 ```
 
 ```python
@@ -565,7 +567,7 @@ def test_reference_extraction_deduplicates_edges():
     assert edges == [{"target_id": "src", "type": "cites", "page": 3}]
 
 
-def test_chinese_page_suffix_is_parsed():
+def test_chinese_page_suffix_with_fullwidth_comma_is_parsed():
     assert parse_citation_filename("法规汇编.pdf，第 12 页") == ("法规汇编.pdf", 12)
 ```
 

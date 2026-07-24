@@ -9,23 +9,15 @@ facet filter implicitly narrows the search to classified corpus entries.
 The same facet keys work on both backends; only the SQL dialect differs.
 """
 
-FACET_KEYS = (
-    "stage",       # S0–S4 (primary or secondary)
-    "domain",      # G1–G4 / C1–C5 / O1–O6 / Z1–Z4 / X9 (primary or secondary)
-    "genre",       # 体裁 canonical name, e.g. 政策法规
-    "rule",        # R0–R6 (any)
-    "evidence",    # E0–E4
-    "origin",      # 目的地国 / 国际 / 国内 / 混合
-    "dept",        # 归口部门 canonical name (any)
-    "country",     # ISO 3166 alpha-3 or Chinese name (any)
-    "region",      # 区域 name, e.g. 东盟 (any)
-    "industry",    # 行业 (any)
-    "mode",        # 出海形态/进入模式 (any)
-    "timeliness",  # M1–M3
-    "state",       # 生命周期状态, e.g. 待复核
-    "business",    # 业务码: scene "B4.14" exact, or class "B4" prefix
-    "entry_id",    # composite entry id, exact
-)
+from llmwiki_core.facets import FACET_KEYS, UnknownFacetError, validate_facets
+
+__all__ = [
+    "FACET_KEYS",
+    "UnknownFacetError",
+    "postgres_facet_conditions",
+    "sqlite_facet_conditions",
+    "validate_facets",
+]
 
 # facet key -> ("scalar", json path) | ("array", json path) | special-cased
 _SCALAR = {
@@ -49,34 +41,12 @@ _PRIMARY_EXT = {
 }
 
 
-class UnknownFacetError(ValueError):
-    def __init__(self, key: str):
-        self.key = key
-        super().__init__(f"unknown facet '{key}'; valid facets: {', '.join(FACET_KEYS)}")
-
-
-def validate_facets(facets: dict | None) -> dict[str, str]:
-    """Normalize a facets dict: string keys/values, known keys only."""
-    if not facets:
-        return {}
-    clean: dict[str, str] = {}
-    for key, value in facets.items():
-        k = str(key).strip()
-        if k not in FACET_KEYS:
-            raise UnknownFacetError(k)
-        v = str(value).strip()
-        if v:
-            clean[k] = v
-    return clean
-
-
 def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tuple[list[str], list]:
     """(conditions, params) for a SQLite WHERE clause. Facets must be validated."""
     raw_meta = f"{doc_alias}.metadata"
     # json_extract/json_each 遇到非法 JSON 或 BLOB 会让整条查询报错;
     # 用 CASE(求值顺序有保证)把坏值替换为空对象,坏行仅不命中分面。
-    meta = (f"CASE WHEN typeof({raw_meta})='text' AND json_valid({raw_meta}) "
-            f"THEN {raw_meta} ELSE '{{}}' END")
+    meta = f"CASE WHEN typeof({raw_meta})='text' AND json_valid({raw_meta}) THEN {raw_meta} ELSE '{{}}' END"
     conds: list[str] = []
     params: list = []
 
@@ -114,8 +84,7 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
         elif key == "business":
             if "." in value:
                 conds.append(
-                    f"(json_extract({meta}, '$.business.code') = ? "
-                    f"OR {array_contains('$.facet_rollup.business')})"
+                    f"(json_extract({meta}, '$.business.code') = ? OR {array_contains('$.facet_rollup.business')})"
                 )
                 params.extend([value, value])
             else:
@@ -131,7 +100,9 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
 
 
 def postgres_facet_conditions(
-    facets: dict[str, str], start_index: int, doc_alias: str = "d",
+    facets: dict[str, str],
+    start_index: int,
+    doc_alias: str = "d",
 ) -> tuple[list[str], list]:
     """(conditions, params) for Postgres; placeholders start at $start_index."""
     meta = f"{doc_alias}.metadata"
@@ -148,10 +119,7 @@ def postgres_facet_conditions(
     for key, value in facets.items():
         if key == "timeliness":
             i = nxt(value)
-            conds.append(
-                f"({meta}->>'timeliness' = ${i} "
-                f"OR {meta}#>>'{{facet_rollup,timeliness_worst}}' = ${i})"
-            )
+            conds.append(f"({meta}->>'timeliness' = ${i} OR {meta}#>>'{{facet_rollup,timeliness_worst}}' = ${i})")
         elif key in _SCALAR:
             field = _SCALAR[key].removeprefix("$.")
             conds.append(f"{meta}->>'{field}' = ${nxt(value)}")
@@ -162,8 +130,7 @@ def postgres_facet_conditions(
             primary, ext = (p.removeprefix("$.") for p in _PRIMARY_EXT[key])
             i = nxt(value)
             conds.append(
-                f"({meta}->>'{primary}' = ${i} OR {meta}->'{ext}' ? ${i} "
-                f"OR {meta}#>'{{facet_rollup,{key}}}' ? ${i})"
+                f"({meta}->>'{primary}' = ${i} OR {meta}->'{ext}' ? ${i} OR {meta}#>'{{facet_rollup,{key}}}' ? ${i})"
             )
         elif key == "country":
             i = nxt(value)
@@ -174,10 +141,7 @@ def postgres_facet_conditions(
         elif key == "business":
             if "." in value:
                 i = nxt(value)
-                conds.append(
-                    f"({meta}#>>'{{business,code}}' = ${i} "
-                    f"OR {meta}#>'{{facet_rollup,business}}' ? ${i})"
-                )
+                conds.append(f"({meta}#>>'{{business,code}}' = ${i} OR {meta}#>'{{facet_rollup,business}}' ? ${i})")
             else:
                 i = nxt(value)
                 j = nxt(f"{value}.%")
