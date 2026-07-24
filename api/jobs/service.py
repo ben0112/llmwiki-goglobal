@@ -73,17 +73,16 @@ class JobService:
         if document is None:
             raise JobResourceNotFound("referenced extraction document was not found")
 
-        if latest is None:
-            # A concurrent creator may have committed while this transaction waited
-            # for the document.  Re-read without taking a job lock while holding the
-            # document lock, so the global job -> document order remains acyclic.
-            latest = await conn.fetchrow(
-                "SELECT id, state::text FROM background_jobs "
-                "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
-                "ORDER BY created_at DESC, id DESC LIMIT 1",
-                user_id,
-                document_id,
-            )
+        # The initial locking statement may have waited with an older READ COMMITTED
+        # snapshot.  Re-read after the document lock without taking a job lock, so
+        # newly committed successors are authoritative without reversing job -> doc.
+        latest = await conn.fetchrow(
+            "SELECT id, state::text FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            user_id,
+            document_id,
+        )
         if latest is not None:
             state = JobState(latest["state"])
             if not state.is_terminal or (state is JobState.SUCCEEDED and document["status"] == "ready"):

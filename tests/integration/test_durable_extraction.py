@@ -1706,13 +1706,59 @@ async def test_drifted_ready_document_with_succeeded_job_gets_one_successor_acro
     )
 
     repaired = await _repair_hosted_derived_drift(pool)
-    recovered = await asyncio.gather(
-        _recover_durable_extraction_jobs(pool, JobService(pool)),
-        _recover_durable_extraction_jobs(pool, JobService(pool)),
+    await pool.execute(
+        "UPDATE documents SET status = 'failed' WHERE id <> $1 "
+        "AND status IN ('pending', 'processing') AND NOT archived AND source_kind = 'source'",
+        doc_id,
     )
+    first_locked_old_job = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+    second_pid = None
+
+    class FirstReplicaJobService(JobService):
+        async def ensure_document_extraction_in_transaction(self, conn, **kwargs):
+            if kwargs["document_id"] == doc_id:
+                await conn.execute("SET LOCAL lock_timeout = '2s'")
+                await conn.fetchval("SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE", job.id)
+                first_locked_old_job.set()
+                await release_first.wait()
+            return await super().ensure_document_extraction_in_transaction(conn, **kwargs)
+
+    class SecondReplicaJobService(JobService):
+        async def ensure_document_extraction_in_transaction(self, conn, **kwargs):
+            nonlocal second_pid
+            if kwargs["document_id"] == doc_id:
+                await conn.execute("SET LOCAL lock_timeout = '2s'")
+                second_pid = await conn.fetchval("SELECT pg_backend_pid()")
+                second_entered.set()
+            return await super().ensure_document_extraction_in_transaction(conn, **kwargs)
+
+    observer = await pool.acquire()
+    first_recovery = asyncio.create_task(_recover_durable_extraction_jobs(pool, FirstReplicaJobService(pool)))
+    second_recovery = None
+    try:
+        await asyncio.wait_for(first_locked_old_job.wait(), timeout=1)
+        second_recovery = asyncio.create_task(_recover_durable_extraction_jobs(pool, SecondReplicaJobService(pool)))
+        await asyncio.wait_for(second_entered.wait(), timeout=1)
+        assert second_pid is not None
+        await _wait_for_blocked_backend(observer, second_pid)
+        release_first.set()
+        async with asyncio.timeout(3):
+            recovered = await asyncio.gather(first_recovery, second_recovery)
+    finally:
+        release_first.set()
+        for task in (first_recovery, second_recovery):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (first_recovery, second_recovery) if task is not None),
+            return_exceptions=True,
+        )
+        await pool.release(observer)
 
     assert [row["id"] for row in repaired] == [doc_id]
-    assert sum(len(records) for records in recovered) == 1
+    assert sum(record.document_id == doc_id for records in recovered for record in records) == 1
     jobs = await pool.fetch(
         "SELECT id, state::text, idempotency_key FROM background_jobs WHERE document_id = $1 ORDER BY created_at, id",
         doc_id,
