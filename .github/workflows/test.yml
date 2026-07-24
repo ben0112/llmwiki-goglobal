@@ -113,4 +113,6 @@ jobs:
 
       - name: Run MCP Postgres isolation tests
         working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_mcp_isolation.py ../tests/integration/mcp/test_wiki_write_invariants.py::test_postgres_atomic_wiki_write -v
+        run: |
+          pytest ../tests/integration/mcp/test_mcp_isolation.py -v
+          pytest ../tests/integration/mcp/test_wiki_write_postgres.py -v

@@ -1,7 +1,6 @@
 """Shared atomic wiki-write contract for SQLite and Postgres VaultFS."""
 
 import json
-import os
 import uuid
 
 import pytest
@@ -199,19 +198,3 @@ async def test_sqlite_startup_reconciles_disk_after_database_rollback(fs):
     assert recovered["version"] == 2
     snapshot = await _snapshot(instance, str(created["id"]))
     assert {row[0] for row in snapshot["chunks"]} == {2}
-
-
-@pytest.mark.skipif("DATABASE_URL" not in os.environ, reason="requires Postgres")
-async def test_postgres_atomic_wiki_write(pg_atomic_fs):
-    instance, kb_id = pg_atomic_fs
-    await assert_atomic_wiki_write(instance, kb_id)
-
-
-if "DATABASE_URL" in os.environ:
-    from tests.integration.mcp.test_mcp_isolation import KB_A_ID
-
-    pytest_plugins = ("tests.integration.mcp.test_mcp_isolation",)
-
-    @pytest.fixture
-    async def pg_atomic_fs(fs_alice, seed_and_bind_pool):
-        return fs_alice, KB_A_ID
