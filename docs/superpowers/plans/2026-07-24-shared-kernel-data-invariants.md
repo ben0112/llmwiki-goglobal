@@ -1484,7 +1484,7 @@ Update this plan's checkboxes for steps actually completed. If a Docker build
 or Postgres suite cannot run, leave its checkbox open and record the exact
 command and blocker below that step.
 
-- [ ] **Step 6: Commit and push the milestone boundary**
+- [x] **Step 6: Commit and push the milestone boundary**
 
 ```bash
 git add docs/architecture/shared-kernel.md docs/superpowers/plans/2026-07-24-shared-kernel-data-invariants.md
