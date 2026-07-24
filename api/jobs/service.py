@@ -43,6 +43,37 @@ class JobService:
         await self._validate_resources(conn, command, authenticated_user_id)
         return await repository.create(conn, command)
 
+    async def ensure_graph_rebuild(
+        self,
+        *,
+        knowledge_base_id: UUID,
+        authenticated_user_id: UUID,
+    ) -> JobRecord:
+        """Create a graph rebuild or return the database-selected active winner."""
+        command = JobCreate(
+            job_type=JobType.GRAPH_REBUILD,
+            user_id=authenticated_user_id,
+            knowledge_base_id=knowledge_base_id,
+            payload={"knowledge_base_id": str(knowledge_base_id)},
+        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._validate_resources(conn, command, authenticated_user_id)
+            # A conflicting row can become terminal immediately after INSERT
+            # observes it. Each new statement gets a fresh READ COMMITTED
+            # snapshot, so retry only when no active winner remains visible.
+            for _ in range(3):
+                created = await repository.create_active_graph(conn, command)
+                if created is not None:
+                    return created
+                active = await repository.get_active_graph(
+                    conn,
+                    authenticated_user_id,
+                    knowledge_base_id,
+                )
+                if active is not None:
+                    return active
+        raise RuntimeError("active graph job changed too frequently")
+
     async def ensure_document_extraction_in_transaction(
         self,
         conn: asyncpg.Connection,

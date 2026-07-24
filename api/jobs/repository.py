@@ -171,6 +171,52 @@ async def create(conn: asyncpg.Connection, command: JobCreate) -> JobRecord:
     return _row_to_record(row)
 
 
+_CREATE_ACTIVE_GRAPH = """
+INSERT INTO background_jobs (
+    job_type, user_id, knowledge_base_id, document_id, payload, idempotency_key, max_attempts
+) VALUES ('graph.rebuild', $1, $2, NULL, $3::jsonb, NULL, $4)
+ON CONFLICT (user_id, knowledge_base_id, job_type)
+WHERE job_type = 'graph.rebuild'
+  AND state IN ('queued', 'running', 'retry_wait')
+DO NOTHING
+RETURNING *
+"""
+
+
+async def create_active_graph(conn: asyncpg.Connection, command: JobCreate) -> JobRecord | None:
+    """Insert one active graph job without mutating a concurrent winner."""
+    if command.job_type is not JobType.GRAPH_REBUILD:
+        raise ValueError("active graph creation requires a graph rebuild command")
+    if command.knowledge_base_id is None or command.document_id is not None:
+        raise ValueError("graph rebuild command has invalid resource scope")
+    if command.idempotency_key is not None or command.run_after is not None:
+        raise ValueError("graph rebuild command must use active-job uniqueness")
+    row = await conn.fetchrow(
+        _CREATE_ACTIVE_GRAPH,
+        command.user_id,
+        command.knowledge_base_id,
+        json.dumps(to_json_value(command.payload)),
+        command.max_attempts,
+    )
+    return None if row is None else _row_to_record(row)
+
+
+async def get_active_graph(
+    conn: asyncpg.Connection,
+    user_id: UUID,
+    knowledge_base_id: UUID,
+) -> JobRecord | None:
+    """Read the active graph winner after a uniqueness conflict."""
+    row = await conn.fetchrow(
+        "SELECT * FROM background_jobs "
+        "WHERE user_id = $1 AND knowledge_base_id = $2 AND job_type = 'graph.rebuild' "
+        "AND state IN ('queued', 'running', 'retry_wait')",
+        user_id,
+        knowledge_base_id,
+    )
+    return None if row is None else _row_to_record(row)
+
+
 async def get_for_user(conn: asyncpg.Connection, job_id: UUID, user_id: UUID) -> JobRecord | None:
     """Return one job only when its explicit tenant scope matches."""
     row = await conn.fetchrow(

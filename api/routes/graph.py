@@ -1,32 +1,32 @@
-"""Hosted graph routes — thin HTTP layer, delegates to services/graph.py."""
+"""Hosted graph routes — reads are scoped and rebuilds are durable jobs."""
 
-import asyncio
-import time
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
-
-from deps import get_scoped_db
+from deps import get_job_service, get_scoped_db, get_user_id
+from fastapi import APIRouter, Depends, HTTPException, status
+from jobs.service import JobResourceNotFound, JobService
+from pydantic import BaseModel
 from scoped_db import ScopedDB
-from services.graph import get_graph_hosted, rebuild_hosted
+from services.graph import get_graph_hosted
 
 router = APIRouter(tags=["graph"])
 
-# Per-KB cooldown + lock for graph rebuild. Rebuild is O(all docs * all wiki
-# pages) and writes to document_references — running it in a loop hammers
-# Postgres. Cooldown is generous because rebuilds are normal after batches
-# of writes; the lock prevents two concurrent rebuilds for the same KB.
-_REBUILD_COOLDOWN_SECONDS = 5 * 60
-_rebuild_locks: dict[str, asyncio.Lock] = {}
-_rebuild_last_run: dict[str, float] = {}
+
+class GraphRebuildAccepted(BaseModel):
+    job_id: UUID
 
 
-def _rebuild_lock_for(kb_id: str) -> asyncio.Lock:
-    lock = _rebuild_locks.get(kb_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _rebuild_locks[kb_id] = lock
-    return lock
+async def _get_authenticated_user_id(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> UUID:
+    try:
+        return UUID(user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authenticated subject",
+        ) from None
 
 
 @router.get("/v1/knowledge-bases/{kb_id}/graph")
@@ -37,27 +37,24 @@ async def get_kb_graph(
     return await get_graph_hosted(db.conn, kb_id, db.user_id)
 
 
-@router.post("/v1/knowledge-bases/{kb_id}/graph/rebuild")
+@router.post(
+    "/v1/knowledge-bases/{kb_id}/graph/rebuild",
+    response_model=GraphRebuildAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def rebuild_references(
     kb_id: UUID,
-    db: ScopedDB = Depends(get_scoped_db),
+    authenticated_user_id: Annotated[UUID, Depends(_get_authenticated_user_id)],
+    service: Annotated[JobService, Depends(get_job_service)],
 ):
-    key = str(kb_id)
-    last = _rebuild_last_run.get(key, 0.0)
-    elapsed = time.monotonic() - last
-    if elapsed < _REBUILD_COOLDOWN_SECONDS:
-        wait = int(_REBUILD_COOLDOWN_SECONDS - elapsed)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Graph rebuild on cooldown; retry in {wait}s",
+    try:
+        job = await service.ensure_graph_rebuild(
+            knowledge_base_id=kb_id,
+            authenticated_user_id=authenticated_user_id,
         )
-    lock = _rebuild_lock_for(key)
-    if lock.locked():
+    except JobResourceNotFound:
         raise HTTPException(
-            status_code=429,
-            detail="Graph rebuild already in progress for this knowledge base",
-        )
-    async with lock:
-        result = await rebuild_hosted(db.conn, kb_id, db.user_id)
-        _rebuild_last_run[key] = time.monotonic()
-        return result
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Knowledge base not found",
+        ) from None
+    return GraphRebuildAccepted(job_id=job.id)

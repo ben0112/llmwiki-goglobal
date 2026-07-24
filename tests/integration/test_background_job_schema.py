@@ -174,6 +174,11 @@ async def test_background_job_indexes_have_expected_columns_and_predicates(pool)
     assert "(state, lease_expires_at)" in indexes["background_jobs_lease_expiry_idx"]
     assert "WHERE (state = 'running'::text)" in indexes["background_jobs_lease_expiry_idx"]
     assert "(user_id, created_at DESC)" in indexes["background_jobs_user_created_idx"]
+    active_graph = indexes["background_jobs_one_active_graph"]
+    assert "UNIQUE INDEX background_jobs_one_active_graph" in active_graph
+    assert "(user_id, knowledge_base_id, job_type)" in active_graph
+    assert "(job_type = 'graph.rebuild'::text)" in active_graph
+    assert "state = ANY (ARRAY['queued'::text, 'running'::text, 'retry_wait'::text])" in active_graph
 
 
 @pytest.mark.asyncio

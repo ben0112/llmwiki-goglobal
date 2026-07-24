@@ -47,6 +47,11 @@ CREATE UNIQUE INDEX background_jobs_idempotency_key_unique
     ON background_jobs(user_id, job_type, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
+CREATE UNIQUE INDEX background_jobs_one_active_graph
+    ON background_jobs(user_id, knowledge_base_id, job_type)
+    WHERE job_type = 'graph.rebuild'
+      AND state IN ('queued', 'running', 'retry_wait');
+
 CREATE INDEX background_jobs_due_dispatch_idx
     ON background_jobs(state, run_after, last_dispatched_at)
     WHERE state IN ('queued', 'retry_wait');

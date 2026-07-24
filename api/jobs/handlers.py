@@ -11,7 +11,14 @@ from uuid import UUID
 import asyncpg
 
 from jobs.lease import JobLease
-from jobs.models import ERROR_MESSAGE_MAX_CHARS, JobRecord, JobType, JSONValue
+from jobs.models import (
+    ERROR_MESSAGE_MAX_CHARS,
+    JobCancelled,
+    JobRecord,
+    JobType,
+    JSONValue,
+    LeaseLost,
+)
 
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _GENERIC_ERROR_MESSAGE = "The job could not be completed."
@@ -20,9 +27,12 @@ _VETTED_ERROR_MESSAGES = MappingProxyType(
         "converter_timeout": "Converter timed out.",
         "document_not_found": "The requested document was not found.",
         "extraction_transient": "Document extraction will be retried.",
+        "graph_transient": "Graph rebuild will be retried.",
         "invalid_document": "Document is invalid.",
         "invalid_document_job": "The document extraction job is invalid.",
         "invalid_job_result": "The job produced an invalid result.",
+        "invalid_graph_job": "The graph rebuild job is invalid.",
+        "knowledge_base_not_found": "The requested knowledge base was not found.",
         "quota_exceeded": "The account quota was exceeded.",
         "unsupported_document_type": "This document type is not supported.",
         "unsupported_job_type": "This job type is not supported.",
@@ -126,8 +136,6 @@ async def handle_document_extract(
         await _set_extraction_failure_status(job, lease, context, retryable=False)
         raise TerminalJobError("invalid_document", "Document is invalid.") from None
     except Exception as exc:  # noqa: BLE001 - unknown I/O failures are safely retried.
-        from jobs.models import JobCancelled, LeaseLost
-
         if isinstance(exc, (JobCancelled, LeaseLost)):
             raise
         await _set_extraction_failure_status(job, lease, context, retryable=True)
@@ -236,8 +244,58 @@ async def handle_graph_rebuild(
     lease: JobLease,
     context: WorkerContext,
 ) -> Mapping[str, JSONValue]:
-    del job, lease, context
-    raise UnsupportedJobHandler
+    from services.graph import rebuild_hosted
+
+    try:
+        await lease.checkpoint()
+        _validate_graph_job_shape(job)
+        async with context.pool.acquire() as conn, conn.transaction():
+            await lease.checkpoint(conn)
+            exists = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id = $1 AND user_id = $2)",
+                job.knowledge_base_id,
+                job.user_id,
+            )
+            if not exists:
+                raise TerminalJobError(
+                    "knowledge_base_not_found",
+                    "The requested knowledge base was not found.",
+                )
+
+        async def final_checkpoint(conn: asyncpg.Connection) -> None:
+            await lease.checkpoint(conn)
+
+        async with context.pool.acquire() as conn:
+            raw_result = await rebuild_hosted(
+                conn,
+                job.knowledge_base_id,
+                str(job.user_id),
+                before_write=final_checkpoint,
+            )
+    except (JobCancelled, LeaseLost, TerminalJobError):
+        raise
+    except (asyncpg.PostgresError, OSError, TimeoutError):
+        raise RetryableJobError("graph_transient", "Graph rebuild will be retried.") from None
+
+    expected_keys = {"citations", "links", "facet_rollups"}
+    if set(raw_result) != expected_keys or any(
+        isinstance(raw_result[key], bool) or not isinstance(raw_result[key], int) or raw_result[key] < 0
+        for key in expected_keys
+    ):
+        raise TerminalJobError("invalid_job_result", "The job produced an invalid result.")
+    return {key: raw_result[key] for key in ("citations", "links", "facet_rollups")}
+
+
+def _validate_graph_job_shape(job: JobRecord) -> None:
+    if job.job_type is not JobType.GRAPH_REBUILD or job.knowledge_base_id is None or job.document_id is not None:
+        raise TerminalJobError("invalid_graph_job", "The graph rebuild job is invalid.")
+    payload_kb_id = job.payload.get("knowledge_base_id")
+    try:
+        parsed_payload_kb_id = UUID(payload_kb_id) if isinstance(payload_kb_id, str) else None
+    except ValueError:
+        parsed_payload_kb_id = None
+    if parsed_payload_kb_id != job.knowledge_base_id or set(job.payload) != {"knowledge_base_id"}:
+        raise TerminalJobError("invalid_graph_job", "The graph rebuild job is invalid.")
 
 
 async def handle_upload_cleanup(
