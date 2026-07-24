@@ -92,10 +92,11 @@ async def rebuild_hosted(
 ) -> dict:
     """Compute on a worker connection, then publish one tenant graph atomically.
 
-    Every read and write carries explicit user and knowledge-base predicates;
-    worker correctness does not depend on request-scoped RLS. Computation runs
-    outside the final transaction. That transaction starts with ``before_write``
-    and commits derived edges and facet rollups together.
+    Tenant-scoped reads constrain the source snapshot; edge writes use IDs from
+    that snapshot, and destructive or rollup writes retain explicit ownership
+    predicates. Worker correctness does not depend on request-scoped RLS.
+    Computation runs outside the final transaction. That transaction starts with
+    ``before_write`` and commits derived edges and facet rollups together.
     """
     all_docs = [
         dict(r)
