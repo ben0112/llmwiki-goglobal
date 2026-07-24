@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from jobs import repository
 from jobs.models import (
@@ -585,22 +587,11 @@ async def test_reaper_uses_database_time_for_all_branches_limit_and_repeat(pool)
         assert rows[job_id]["heartbeat_at"] is None
 
 
-def test_reaper_locks_bounded_candidates_before_sampling_database_time():
-    normalized = " ".join(repository._REAP_EXPIRED.split())
-    candidates = normalized.index("candidates AS MATERIALIZED")
-    lease_clock = normalized.index("lease_clock AS MATERIALIZED")
-
-    assert candidates < lease_clock
-    assert "FROM candidates" in normalized[lease_clock:]
-    assert "FOR UPDATE OF job SKIP LOCKED LIMIT $1" in normalized[candidates:lease_clock]
-
-
 @pytest.mark.asyncio
-async def test_reaper_samples_clock_after_waiting_to_select_candidates(pool):
+async def test_reaper_locks_candidates_before_entering_clock_function(pool):
     await pool.execute("DELETE FROM background_jobs")
     user_id = await _seed_user(pool)
     database_now = await _db_now(pool)
-    expires_at = database_now + timedelta(milliseconds=200)
     job = await _insert_job(
         pool,
         user_id,
@@ -608,39 +599,77 @@ async def test_reaper_samples_clock_after_waiting_to_select_candidates(pool):
         attempt_count=1,
         max_attempts=3,
         lease_owner="worker-a",
-        lease_expires_at=expires_at,
+        lease_expires_at=database_now - timedelta(minutes=1),
     )
-    conn_lock = await pool.acquire()
+    function_name = f"test_reaper_clock_{uuid4().hex}"
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", function_name) is None:
+        raise AssertionError("generated PostgreSQL identifier was not safe")
+    advisory_key = uuid4().int % 2_000_000_000 + 1
+    await pool.execute(
+        f"""
+        CREATE FUNCTION public.{function_name}() RETURNS timestamptz
+        LANGUAGE plpgsql VOLATILE AS $function$
+        BEGIN
+            PERFORM pg_advisory_xact_lock({advisory_key});
+            RETURN clock_timestamp();
+        END
+        $function$
+        """
+    )
+    conn_gate = await pool.acquire()
     conn_reaper = await pool.acquire()
+    conn_probe = await pool.acquire()
     observer = await pool.acquire()
-    transaction = conn_lock.transaction()
+    probe_transaction = conn_probe.transaction()
     pending_reaper = None
-    committed = False
+    gate_locked = False
+    probe_started = False
     try:
-        await transaction.start()
-        await conn_lock.execute("LOCK TABLE background_jobs IN ACCESS EXCLUSIVE MODE")
+        await conn_gate.fetchval("SELECT pg_advisory_lock($1)", advisory_key)
+        gate_locked = True
         reaper_pid = await conn_reaper.fetchval("SELECT pg_backend_pid()")
-        pending_reaper = asyncio.create_task(repository.reap_expired(conn_reaper))
+        assert repository._REAP_EXPIRED.count("clock_timestamp()") == 1
+        probe_query = repository._REAP_EXPIRED.replace(
+            "clock_timestamp()",
+            f"public.{function_name}()",
+        )
+        pending_reaper = asyncio.create_task(
+            conn_reaper.fetch(
+                probe_query,
+                1,
+                repository._ATTEMPTS_EXHAUSTED_MESSAGE,
+            )
+        )
         await _wait_for_lock_wait(observer, reaper_pid)
+        await probe_transaction.start()
+        probe_started = True
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await conn_probe.fetchval(
+                "SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE NOWAIT",
+                job["id"],
+            )
+        await probe_transaction.rollback()
+        probe_started = False
+        assert await conn_gate.fetchval("SELECT pg_advisory_unlock($1)", advisory_key)
+        gate_locked = False
         async with asyncio.timeout(1):
-            while not await observer.fetchval("SELECT clock_timestamp() >= $1", expires_at):
-                await asyncio.sleep(0)
-        await transaction.commit()
-        committed = True
-        async with asyncio.timeout(1):
-            reaped = await pending_reaper
+            rows = await pending_reaper
     finally:
+        if probe_started:
+            await probe_transaction.rollback()
+        if gate_locked:
+            await conn_gate.fetchval("SELECT pg_advisory_unlock($1)", advisory_key)
         if pending_reaper is not None and not pending_reaper.done():
             pending_reaper.cancel()
-            with suppress(asyncio.CancelledError):
-                await pending_reaper
-        if not committed:
-            await transaction.rollback()
+        if pending_reaper is not None:
+            await asyncio.gather(pending_reaper, return_exceptions=True)
         await pool.release(observer)
+        await pool.release(conn_probe)
         await pool.release(conn_reaper)
-        await pool.release(conn_lock)
+        await pool.release(conn_gate)
+        await pool.execute(f"DROP FUNCTION IF EXISTS public.{function_name}()")
 
-    assert reaped == [job["id"]]
+    assert [row["id"] for row in rows] == [job["id"]]
 
 
 @pytest.mark.asyncio
