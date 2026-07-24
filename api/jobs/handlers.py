@@ -110,6 +110,7 @@ async def handle_document_extract(
             str(job.document_id),
             str(job.user_id),
             before_write=final_checkpoint,
+            artifact_namespace=f"{job.id}/attempt-{job.attempt_count}",
         )
     except TerminalExtractionError as exc:
         await _set_extraction_failure_status(job, lease, context, retryable=False)
@@ -170,7 +171,10 @@ async def _prepare_document_extraction(
         supported = ocr_types | {"html", "htm", "xlsx", "xls", "csv"}
         if extension not in supported:
             await conn.execute(
-                "UPDATE documents SET status = 'failed', error_message = $2, updated_at = now() "
+                "UPDATE documents SET "
+                "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE 'failed' END, "
+                "error_message = CASE WHEN status = 'ready' AND version > 0 THEN NULL ELSE $2 END, "
+                "updated_at = now() "
                 "WHERE id = $1 AND user_id = $3 AND knowledge_base_id = $4",
                 job.document_id,
                 "This document type is not supported.",
@@ -202,12 +206,15 @@ async def _set_extraction_failure_status(
     *,
     retryable: bool,
 ) -> None:
-    status = "pending" if retryable and job.attempt_count < job.max_attempts else "failed"
-    error_message = None if status == "pending" else "Document extraction failed."
+    status = "processing" if retryable and job.attempt_count < job.max_attempts else "failed"
+    error_message = None if status == "processing" else "Document extraction failed."
     async with context.pool.acquire() as conn, conn.transaction():
         await lease.checkpoint(conn)
         updated_document_id = await conn.fetchval(
-            "UPDATE documents SET status = $2, error_message = $3, updated_at = now() "
+            "UPDATE documents SET "
+            "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE $2 END, "
+            "error_message = CASE WHEN status = 'ready' AND version > 0 THEN NULL ELSE $3 END, "
+            "updated_at = now() "
             "WHERE id = $1 AND user_id = $4 AND knowledge_base_id = $5 "
             "AND NOT archived AND source_kind = 'source' RETURNING id",
             job.document_id,

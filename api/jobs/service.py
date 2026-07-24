@@ -49,7 +49,29 @@ class JobService:
 
     async def cancel(self, job_id: UUID, *, authenticated_user_id: UUID) -> JobRecord | None:
         async with self._pool.acquire() as conn, conn.transaction():
-            return await repository.request_cancel(conn, job_id, authenticated_user_id)
+            cancelled = await repository.request_cancel(conn, job_id, authenticated_user_id)
+
+        if (
+            cancelled is not None
+            and cancelled.job_type.value == "document.extract"
+            and cancelled.document_id is not None
+        ):
+            # Deliberately use a second transaction: final publication locks the
+            # document before the job row, while cancellation locks the job first.
+            # Releasing the job lock here prevents a job/document lock inversion.
+            async with self._pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "UPDATE documents SET "
+                    "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE 'failed' END, "
+                    "error_message = CASE WHEN status = 'ready' AND version > 0 "
+                    "THEN NULL ELSE 'Document extraction was cancelled.' END, updated_at = now() "
+                    "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+                    "AND NOT archived AND source_kind = 'source'",
+                    cancelled.document_id,
+                    authenticated_user_id,
+                    cancelled.knowledge_base_id,
+                )
+        return cancelled
 
     @staticmethod
     async def _validate_resources(

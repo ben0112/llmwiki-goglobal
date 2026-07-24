@@ -23,6 +23,7 @@ class DerivedAsset(Protocol):
 
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
+AfterCommit = Callable[[list[str]], Awaitable[None]]
 
 
 async def find_inconsistent_ready_documents(
@@ -129,14 +130,16 @@ async def replace_derived_content(
     metadata_patch: dict | None = None,
     assets: Sequence[DerivedAsset] | None = None,
     before_write: BeforeWrite | None = None,
+    after_commit: AfterCommit | None = None,
 ) -> int:
     """Replace one hosted document's derived rows and publish readiness atomically."""
     conn = await pool.acquire()
     try:
         async with conn.transaction():
             document = await conn.fetchrow(
-                "SELECT version FROM documents "
-                "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 FOR UPDATE",
+                "SELECT version, metadata FROM documents "
+                "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+                "AND NOT archived AND source_kind = 'source' FOR UPDATE",
                 document_id,
                 user_id,
                 knowledge_base_id,
@@ -147,7 +150,26 @@ async def replace_derived_content(
             if before_write is not None:
                 await before_write(conn)
 
+            still_active = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM documents "
+                "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+                "AND NOT archived AND source_kind = 'source')",
+                document_id,
+                user_id,
+                knowledge_base_id,
+            )
+            if not still_active:
+                raise LookupError("active source document disappeared before derived-content write")
+
             document_version = document["version"] + 1
+            previous_metadata = document["metadata"] or {}
+            if isinstance(previous_metadata, str):
+                previous_metadata = json.loads(previous_metadata)
+            replaced_artifact_keys = [
+                previous_metadata[key]
+                for key in ("tagged_s3_key", "ocr_s3_key")
+                if previous_metadata.get(key)
+            ]
             await conn.execute("DELETE FROM document_pages WHERE document_id = $1", document_id)
             if pages:
                 await conn.executemany(
@@ -169,6 +191,17 @@ async def replace_derived_content(
                 )
 
             if assets is not None:
+                replaced_assets = await conn.fetch(
+                    "SELECT id::text, file_type FROM documents "
+                    "WHERE user_id = $1 AND source_kind = 'asset' "
+                    "AND metadata->>'parent_document_id' = $2",
+                    user_id,
+                    str(document_id),
+                )
+                replaced_artifact_keys.extend(
+                    f"{user_id}/{asset['id']}/source.{asset['file_type']}"
+                    for asset in replaced_assets
+                )
                 await _replace_assets(
                     conn,
                     parent_document_id=document_id,
@@ -191,12 +224,13 @@ async def replace_derived_content(
                 if content is not None
                 else "\n\n---\n\n".join(page_content for _, page_content in pages)
             )
-            await conn.execute(
+            updated_document = await conn.fetchval(
                 "UPDATE documents "
                 "SET status = 'ready', content = $2, page_count = $3, parser = $4, "
                 "version = $5, metadata = COALESCE(metadata, '{}'::jsonb) || $6::jsonb, "
                 "error_message = NULL, updated_at = now() "
-                "WHERE id = $1 AND user_id = $7",
+                "WHERE id = $1 AND user_id = $7 AND knowledge_base_id = $8 "
+                "AND NOT archived AND source_kind = 'source' RETURNING id",
                 document_id,
                 full_content,
                 len(pages),
@@ -204,10 +238,15 @@ async def replace_derived_content(
                 document_version,
                 json.dumps(metadata_patch or {}),
                 user_id,
+                knowledge_base_id,
             )
-            return document_version
+            if updated_document is None:
+                raise LookupError("active source document disappeared before publish")
     finally:
         await pool.release(conn)
+    if after_commit is not None:
+        await after_commit(replaced_artifact_keys)
+    return document_version
 
 
 __all__ = [

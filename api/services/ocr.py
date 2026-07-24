@@ -28,6 +28,7 @@ IMAGE_TYPES = {"png", "jpg", "jpeg", "webp", "gif"}
 OCR_TYPES = {"pdf"} | OFFICE_TYPES | IMAGE_TYPES
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
+ArtifactObject = tuple[str, bytes, str]
 
 
 class ExtractionError(RuntimeError):
@@ -83,6 +84,7 @@ class OCRService:
         user_id: str,
         *,
         before_write: BeforeWrite,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Run extraction transparently for a durable worker-owned lease."""
         async with self._semaphore:
@@ -91,10 +93,16 @@ class OCRService:
                     document_id,
                     user_id,
                     before_write=before_write,
+                    artifact_namespace=artifact_namespace,
                     set_processing=False,
                 )
             except (TerminalExtractionError, RetryableExtractionError):
                 raise
+            except LookupError:
+                raise TerminalExtractionError(
+                    "document_not_found",
+                    "Document was not found.",
+                ) from None
             except (asyncpg.PostgresError, BotoCoreError, httpx.TransportError, OSError, TimeoutError):
                 raise RetryableExtractionError(
                     "extraction_transient",
@@ -147,6 +155,7 @@ class OCRService:
         user_id: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
         set_processing: bool = True,
     ) -> int:
         await self._check_global_limits(document_id)
@@ -166,17 +175,20 @@ class OCRService:
         kb_id = doc["kb_id"]
         s3_source_key = f"{user_id}/{document_id}/source.{ext}"
 
-        kwargs = {"before_write": before_write} if before_write is not None else {}
+        write_kwargs = {"before_write": before_write} if before_write is not None else {}
+        durable_kwargs = dict(write_kwargs)
+        if artifact_namespace is not None:
+            durable_kwargs["artifact_namespace"] = artifact_namespace
         if ext in OFFICE_TYPES:
-            return await self._process_office(document_id, user_id, kb_id, s3_source_key, ext, **kwargs)
+            return await self._process_office(document_id, user_id, kb_id, s3_source_key, ext, **durable_kwargs)
         if ext in IMAGE_TYPES:
-            return await self._process_image(document_id, user_id, kb_id, s3_source_key, ext, **kwargs)
+            return await self._process_image(document_id, user_id, kb_id, s3_source_key, ext, **write_kwargs)
         if ext == "pdf":
-            return await self._process_pdf(document_id, user_id, kb_id, s3_source_key, **kwargs)
+            return await self._process_pdf(document_id, user_id, kb_id, s3_source_key, **durable_kwargs)
         if ext in ("html", "htm"):
-            return await self._process_html(document_id, user_id, kb_id, s3_source_key, **kwargs)
+            return await self._process_html(document_id, user_id, kb_id, s3_source_key, **durable_kwargs)
         if ext in ("xlsx", "xls", "csv"):
-            return await self._process_spreadsheet(document_id, user_id, kb_id, s3_source_key, ext, **kwargs)
+            return await self._process_spreadsheet(document_id, user_id, kb_id, s3_source_key, ext, **write_kwargs)
         raise TerminalExtractionError(
             "unsupported_document_type",
             "Document type is not supported.",
@@ -192,6 +204,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         if settings.PDF_BACKEND == "mistral":
             if not settings.MISTRAL_API_KEY:
@@ -206,6 +219,7 @@ class OCRService:
                 kb_id,
                 ocr_result,
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         if settings.CONVERTER_URL:
             presigned_url = await self._s3.generate_presigned_get(s3_source_key)
@@ -217,6 +231,7 @@ class OCRService:
                 pages,
                 "opendataloader",
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         return await self._process_opendataloader(
             document_id,
@@ -224,6 +239,7 @@ class OCRService:
             kb_id,
             s3_source_key,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
 
     async def _process_office(
@@ -235,6 +251,7 @@ class OCRService:
         ext: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Process Office files. Routes through converter or falls back to local LibreOffice."""
         if settings.PDF_BACKEND == "mistral":
@@ -250,6 +267,7 @@ class OCRService:
                 kb_id,
                 ocr_result,
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         if settings.CONVERTER_URL:
             presigned_url = await self._s3.generate_presigned_get(s3_source_key)
@@ -261,6 +279,7 @@ class OCRService:
                 pages,
                 "opendataloader",
                 **({"before_write": before_write} if before_write is not None else {}),
+                **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
             )
         return await self._process_office_local(
             document_id,
@@ -269,6 +288,7 @@ class OCRService:
             s3_source_key,
             ext,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
 
     # ── Converter integration (hosted mode) ───────────────────────────────
@@ -323,6 +343,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Extract PDF via opendataloader-pdf (local mode or hosted fallback)."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -342,8 +363,10 @@ class OCRService:
             page_elements=page_elements,
             assets=assets,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
-        await self._upload_assets(user_id, assets)
+        if artifact_namespace is None:
+            await self._upload_assets(user_id, assets)
         return version
 
     # ── Office local fallback (no converter) ──────────────────────────────
@@ -416,6 +439,7 @@ class OCRService:
         ext: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Convert Office file to PDF locally, then extract with opendataloader."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -459,8 +483,10 @@ class OCRService:
             page_elements=page_elements,
             assets=assets,
             **({"before_write": before_write} if before_write is not None else {}),
+            **({"artifact_namespace": artifact_namespace} if artifact_namespace is not None else {}),
         )
-        await self._upload_assets(user_id, assets)
+        if artifact_namespace is None:
+            await self._upload_assets(user_id, assets)
         return version
 
     # ── Shared page storage ───────────────────────────────────────────────
@@ -504,30 +530,110 @@ class OCRService:
         page_elements: dict[int, dict] | None = None,
         assets: list[ExtractedAsset] | None = None,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
+        artifact_objects: list[ArtifactObject] | None = None,
+        metadata_patch_extra: dict | None = None,
     ) -> int:
+        pending_artifacts = list(artifact_objects or [])
+        if artifact_namespace is not None and assets:
+            pending_artifacts.extend(
+                (
+                    f"{user_id}/{asset.document_id}/source.{asset.file_type}",
+                    asset.data,
+                    asset.content_type,
+                )
+                for asset in assets
+            )
+        uploaded_keys: list[str] = []
+
         async def check_page_limit(conn):
             if before_write is not None:
                 await before_write(conn)
+            for key, data, content_type in pending_artifacts:
+                uploaded_keys.append(key)
+                await self._s3.upload_bytes(key, data, content_type)
+                if before_write is not None:
+                    await before_write(conn)
             await self._check_user_page_limit(user_id, len(pages), conn=conn)
 
-        metadata_patch = None
+        metadata_patch = dict(metadata_patch_extra or {})
         if assets is not None:
-            metadata_patch = {"assets": [asset.metadata() for asset in assets]}
+            metadata_patch["assets"] = [asset.metadata() for asset in assets]
 
-        return await replace_derived_content(
-            self._pool,
-            document_id=document_id,
-            user_id=user_id,
-            knowledge_base_id=kb_id,
-            pages=pages,
-            chunks=chunks,
-            parser=parser,
-            content=content,
-            page_elements=page_elements,
-            metadata_patch=metadata_patch,
-            assets=assets,
-            before_write=check_page_limit,
-        )
+        try:
+            current_artifact_keys = {key for key, _, _ in pending_artifacts}
+
+            async def cleanup_replaced_artifacts(keys: list[str]) -> None:
+                await self._delete_artifact_keys([key for key in keys if key not in current_artifact_keys])
+
+            return await replace_derived_content(
+                self._pool,
+                document_id=document_id,
+                user_id=user_id,
+                knowledge_base_id=kb_id,
+                pages=pages,
+                chunks=chunks,
+                parser=parser,
+                content=content,
+                page_elements=page_elements,
+                metadata_patch=metadata_patch,
+                assets=assets,
+                before_write=check_page_limit,
+                after_commit=cleanup_replaced_artifacts,
+            )
+        except BaseException:
+            published = await self._artifacts_were_published(
+                document_id,
+                user_id,
+                metadata_patch_extra or {},
+                assets or [],
+            )
+            if published is False:
+                await self._delete_artifact_keys(uploaded_keys)
+            raise
+
+    async def _artifacts_were_published(
+        self,
+        document_id: str,
+        user_id: str,
+        metadata_values: dict,
+        assets: list[ExtractedAsset],
+    ) -> bool | None:
+        try:
+            row = await self._pool.fetchrow(
+                "SELECT status::text, metadata FROM documents WHERE id = $1 AND user_id = $2",
+                document_id,
+                user_id,
+            )
+            if row is None or row["status"] != "ready":
+                return False
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            if any((metadata or {}).get(key) != value for key, value in metadata_values.items()):
+                return False
+            if assets:
+                count = await self._pool.fetchval(
+                    "SELECT count(*) FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
+                    [asset.document_id for asset in assets],
+                    user_id,
+                )
+                if count != len(assets):
+                    return False
+            return True
+        except Exception:  # noqa: BLE001 - an uncertain commit must preserve artifacts.
+            return None
+
+    async def _delete_artifact_keys(self, keys: list[str]) -> None:
+        for key in keys:
+            try:
+                delete_key = getattr(self._s3, "delete_key", None)
+                if delete_key is not None:
+                    await delete_key(key)
+                else:
+                    await self._s3.delete_prefix(key)
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort after confirmed rollback.
+                logger.error("Derived artifact cleanup failed error_type=%s", type(exc).__name__)
 
     async def _store_extracted_pages(
         self,
@@ -539,6 +645,7 @@ class OCRService:
         page_elements: dict[int, dict] | None = None,
         assets: list[ExtractedAsset] | None = None,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Store pages/chunks and update document status."""
         num_pages = len(page_contents)
@@ -563,6 +670,7 @@ class OCRService:
             page_elements=page_elements,
             assets=assets or [],
             before_write=before_write,
+            artifact_namespace=artifact_namespace,
         )
         logger.info("Extracted (%s): doc=%s pages=%d chunks=%d", parser, document_id[:8], num_pages, len(chunks))
         return version
@@ -589,7 +697,8 @@ class OCRService:
                 version = await conn.fetchval(
                     "UPDATE documents SET status = 'ready', page_count = 1, parser = 'native', "
                     "version = version + 1, error_message = NULL, updated_at = now() "
-                    "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 RETURNING version",
+                    "WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+                    "AND NOT archived AND source_kind = 'source' RETURNING version",
                     document_id,
                     user_id,
                     kb_id,
@@ -611,6 +720,7 @@ class OCRService:
         s3_source_key: str,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         """Parse HTML with webmd parser, store markdown + tagged HTML."""
         from html_parser import Parser
@@ -624,11 +734,17 @@ class OCRService:
         await parser.embed_images()
         tagged_html = parser.html(sanitize=True)
 
-        await self._s3.upload_bytes(
-            f"{user_id}/{document_id}/tagged.html",
-            tagged_html.encode("utf-8"),
-            "text/html",
-        )
+        tagged_bytes = tagged_html.encode("utf-8")
+        tagged_key = f"{user_id}/{document_id}/tagged.html"
+        artifact_objects = None
+        metadata_patch_extra = None
+        if artifact_namespace is None:
+            await self._s3.upload_bytes(tagged_key, tagged_bytes, "text/html")
+            metadata_patch_extra = {"tagged_s3_key": None}
+        else:
+            tagged_key = f"{user_id}/{document_id}/derived/{artifact_namespace}/tagged.html"
+            artifact_objects = [(tagged_key, tagged_bytes, "text/html")]
+            metadata_patch_extra = {"tagged_s3_key": tagged_key}
 
         markdown_content = result.content
         chunks = chunk_text(markdown_content)
@@ -642,6 +758,9 @@ class OCRService:
             parser="webmd",
             content=markdown_content,
             before_write=before_write,
+            artifact_namespace=artifact_namespace,
+            artifact_objects=artifact_objects,
+            metadata_patch_extra=metadata_patch_extra,
         )
         logger.info("HTML processed: doc=%s chunks=%d", document_id[:8], len(chunks))
         return version
@@ -740,6 +859,23 @@ class OCRService:
 
     # ── Mistral OCR ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _stored_ocr_page_elements(pages: list[dict], page_elements: dict[int, dict]) -> dict[int, dict]:
+        stored_elements: dict[int, dict] = {}
+        for page in pages:
+            page_index = page.get("index", 0) + 1
+            elements = {}
+            page_assets = page_elements.get(page_index, {}).get("images")
+            if page_assets:
+                elements["images"] = page_assets
+            if page.get("dimensions"):
+                elements["dimensions"] = page["dimensions"]
+            if page.get("tables"):
+                elements["tables"] = page["tables"]
+            if elements:
+                stored_elements[page_index] = elements
+        return stored_elements
+
     async def _store_ocr_result(
         self,
         document_id: str,
@@ -748,9 +884,19 @@ class OCRService:
         ocr_result: dict,
         *,
         before_write: BeforeWrite | None = None,
+        artifact_namespace: str | None = None,
     ) -> int:
         ocr_json_bytes = json.dumps(ocr_result).encode()
-        await self._s3.upload_bytes(f"{user_id}/{document_id}/ocr.json", ocr_json_bytes, "application/json")
+        ocr_key = f"{user_id}/{document_id}/ocr.json"
+        artifact_objects = None
+        metadata_patch_extra = None
+        if artifact_namespace is None:
+            await self._s3.upload_bytes(ocr_key, ocr_json_bytes, "application/json")
+            metadata_patch_extra = {"ocr_s3_key": None}
+        else:
+            ocr_key = f"{user_id}/{document_id}/derived/{artifact_namespace}/ocr.json"
+            artifact_objects = [(ocr_key, ocr_json_bytes, "application/json")]
+            metadata_patch_extra = {"ocr_s3_key": ocr_key}
 
         pages = ocr_result.get("pages", [])
 
@@ -789,19 +935,7 @@ class OCRService:
         page_contents = [(page.get("index", 0) + 1, page.get("markdown", "")) for page in pages]
         chunks = chunk_pages(page_contents)
 
-        stored_elements: dict[int, dict] = {}
-        for page in pages:
-            page_index = page.get("index", 0) + 1
-            elements = {}
-            page_assets = page_elements.get(page_index, {}).get("images")
-            if page_assets:
-                elements["images"] = page_assets
-            if page.get("dimensions"):
-                elements["dimensions"] = page["dimensions"]
-            if page.get("tables"):
-                elements["tables"] = page["tables"]
-            if elements:
-                stored_elements[page_index] = elements
+        stored_elements = self._stored_ocr_page_elements(pages, page_elements)
 
         version = await self._commit_derived_content(
             document_id,
@@ -814,9 +948,13 @@ class OCRService:
             page_elements=stored_elements,
             assets=assets,
             before_write=before_write,
+            artifact_namespace=artifact_namespace,
+            artifact_objects=artifact_objects,
+            metadata_patch_extra=metadata_patch_extra,
         )
 
-        await self._upload_assets(user_id, assets)
+        if artifact_namespace is None:
+            await self._upload_assets(user_id, assets)
         logger.info("OCR complete: doc=%s pages=%d chunks=%d", document_id[:8], page_count, len(chunks))
         return version
 

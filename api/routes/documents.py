@@ -2,6 +2,7 @@ from typing import Annotated
 from uuid import UUID
 
 from auth import get_current_user
+from config import settings
 from deps import get_document_service
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from infra.rate_limit import limiter
@@ -15,7 +16,7 @@ from services.types import (
     UpdateMetadata,
     UpsertHighlight,
 )
-from services.url_ingest import UrlIngestService
+from services.url_ingest import UrlIngestService, _LegacyUrlIngestCompatibility
 
 router = APIRouter(tags=["documents"])
 
@@ -113,12 +114,21 @@ async def create_note(
 async def create_document_from_url(request: Request, body: CreateFromUrl, response: Response):
     user_id = await get_current_user(request)
     state = request.app.state
-    job_service = getattr(state, "job_service", None)
-    if not state.s3_service or not job_service:
+    if not state.s3_service:
         raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
-    service = UrlIngestService(state.pool, state.s3_service, job_service)
+    if settings.DURABLE_JOBS_ENABLED:
+        job_service = getattr(state, "job_service", None)
+        if not job_service:
+            raise HTTPException(status_code=501, detail="Durable URL ingestion is unavailable")
+        service = UrlIngestService(state.pool, state.s3_service, job_service)
+    else:
+        ocr_service = getattr(state, "ocr_service", None)
+        if not ocr_service:
+            raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
+        service = _LegacyUrlIngestCompatibility(state.pool, state.s3_service, ocr_service)
     result = await service.ingest_pdf(user_id, str(body.knowledge_base_id), body.url, body.path)
-    response.headers["X-Job-Id"] = result["job_id"]
+    if job_id := result.get("job_id"):
+        response.headers["X-Job-Id"] = job_id
     return result
 
 

@@ -64,6 +64,17 @@ async def _recover_durable_extraction_jobs(pool, job_service) -> list:
 
     recovered = []
     async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE documents SET status = 'failed', "
+            "error_message = 'Document extraction was cancelled.', updated_at = now() "
+            "WHERE status IN ('pending', 'processing') AND version = 0 "
+            "AND NOT archived AND source_kind = 'source' "
+            "AND (SELECT state::text FROM background_jobs "
+            "     WHERE background_jobs.user_id = documents.user_id "
+            "     AND background_jobs.job_type = 'document.extract' "
+            "     AND background_jobs.document_id = documents.id "
+            "     ORDER BY created_at DESC, id DESC LIMIT 1) = 'cancelled'"
+        )
         rows = await conn.fetch(
             "SELECT id, user_id, knowledge_base_id FROM documents "
             "WHERE status IN ('pending', 'processing') AND NOT archived "

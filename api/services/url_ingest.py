@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import suppress
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 from uuid import UUID, uuid4
@@ -15,11 +16,10 @@ import httpx
 from config import settings
 from fastapi import HTTPException
 from infra.safe_fetch import build_pinned_request, parse_public_fetch_url, redirect_location, resolve_public_ip
-from jobs.models import JobCreate, JobType
-from jobs.service import JobService
 from services.types import DownloadedPdf, IngestedPdf
 
 if TYPE_CHECKING:
+    from jobs.service import JobService
     from services.s3 import S3Service
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,8 @@ class UrlIngestService:
         path: str,
         pdf: DownloadedPdf,
     ) -> IngestedPdf:
+        from jobs.models import JobCreate, JobType
+
         document_id = str(uuid4())
         s3_key = f"{user_id}/{document_id}/source.pdf"
         try:
@@ -125,37 +127,65 @@ class UrlIngestService:
             ) from None
 
         duplicate: dict | None = None
+        job = None
+        transaction_started = False
+        commit_attempted = False
+        failure: Exception | asyncio.CancelledError | None = None
+        failure_traceback = None
+        conn = None
+        transaction = None
         try:
-            async with self.pool.acquire() as conn, conn.transaction():
-                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
-                duplicate = await self._find_by_source_url(user_id, kb_id, url, conn=conn)
-                if duplicate is None:
-                    await self._insert_within_quota(
-                        conn,
-                        document_id,
-                        kb_id,
-                        user_id,
-                        pdf,
-                        path,
-                        url,
-                    )
-                    job = await self.jobs.create_in_transaction(
-                        conn,
-                        JobCreate(
-                            job_type=JobType.DOCUMENT_EXTRACT,
-                            user_id=UUID(user_id),
-                            knowledge_base_id=UUID(kb_id),
-                            document_id=UUID(document_id),
-                            payload={"document_id": document_id},
-                            idempotency_key=f"document.extract:{document_id}",
-                        ),
-                        authenticated_user_id=UUID(user_id),
-                    )
-                else:
-                    job = await self._ensure_existing_job(conn, duplicate, user_id, kb_id)
-        except BaseException:
-            await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
-            raise
+            conn = await self.pool.acquire()
+            transaction = conn.transaction()
+            await transaction.start()
+            transaction_started = True
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
+            duplicate = await self._find_by_source_url(user_id, kb_id, url, conn=conn)
+            if duplicate is None:
+                await self._insert_within_quota(
+                    conn,
+                    document_id,
+                    kb_id,
+                    user_id,
+                    pdf,
+                    path,
+                    url,
+                )
+                job = await self.jobs.create_in_transaction(
+                    conn,
+                    JobCreate(
+                        job_type=JobType.DOCUMENT_EXTRACT,
+                        user_id=UUID(user_id),
+                        knowledge_base_id=UUID(kb_id),
+                        document_id=UUID(document_id),
+                        payload={"document_id": document_id},
+                        idempotency_key=f"document.extract:{document_id}",
+                    ),
+                    authenticated_user_id=UUID(user_id),
+                )
+            else:
+                job = await self._ensure_existing_job(conn, duplicate, user_id, kb_id)
+            commit_attempted = True
+            await self._commit_transaction(transaction)
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - compensate all persistence failures.
+            failure = exc
+            failure_traceback = exc.__traceback__
+            if transaction_started and not commit_attempted:
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(transaction.rollback())
+        finally:
+            if conn is not None:
+                await asyncio.shield(self.pool.release(conn))
+
+        if failure is not None:
+            committed: bool | None = False
+            if commit_attempted and duplicate is None and job is not None:
+                committed = await asyncio.shield(
+                    self._confirm_document_job_committed(user_id, kb_id, document_id, job.id)
+                )
+            if duplicate is not None or committed is False:
+                await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
+            raise failure.with_traceback(failure_traceback)
 
         if duplicate is not None:
             await self._delete_uploaded_document_prefix(user_id, document_id)
@@ -168,6 +198,34 @@ class UrlIngestService:
             "already_exists": False,
             "job_id": str(job.id),
         }
+
+    async def _commit_transaction(self, transaction) -> None:
+        await transaction.commit()
+
+    async def _confirm_document_job_committed(
+        self,
+        user_id: str,
+        kb_id: str,
+        document_id: str,
+        job_id,
+    ) -> bool | None:
+        """Resolve a commit error without deleting storage on an unknown outcome."""
+        try:
+            return bool(
+                await self.pool.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM documents d "
+                    "JOIN background_jobs j ON j.document_id = d.id "
+                    "WHERE d.id = $1::uuid AND d.user_id = $2::uuid "
+                    "AND d.knowledge_base_id = $3::uuid AND j.id = $4 "
+                    "AND j.user_id = d.user_id AND j.knowledge_base_id = d.knowledge_base_id)",
+                    document_id,
+                    user_id,
+                    kb_id,
+                    job_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 - unknown commit outcome must preserve the object.
+            return None
 
     async def _require_kb_owned(self, user_id: str, kb_id: str) -> None:
         owner = await self.pool.fetchval(
@@ -261,7 +319,33 @@ class UrlIngestService:
         user_id: str,
         kb_id: str,
     ):
+        from jobs import repository
+        from jobs.models import JobCreate, JobType
+
         document_id = UUID(existing["id"])
+        latest = await conn.fetchrow(
+            "SELECT id, state, idempotency_key FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'document.extract' AND document_id = $2 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
+            UUID(user_id),
+            document_id,
+        )
+        if latest is not None and latest["state"] in {"queued", "running", "retry_wait", "succeeded"}:
+            return await repository.get_for_user(conn, latest["id"], UUID(user_id))
+
+        idempotency_key = f"document.extract:{document_id}"
+        if latest is not None:
+            idempotency_key = f"{idempotency_key}:after:{latest['id']}"
+            await conn.execute(
+                "UPDATE documents SET "
+                "status = CASE WHEN status = 'ready' AND version > 0 THEN status ELSE 'pending' END, "
+                "error_message = NULL, "
+                "updated_at = now() WHERE id = $1 AND user_id = $2 AND knowledge_base_id = $3 "
+                "AND NOT archived AND source_kind = 'source'",
+                document_id,
+                UUID(user_id),
+                UUID(kb_id),
+            )
         return await self.jobs.create_in_transaction(
             conn,
             JobCreate(
@@ -270,7 +354,7 @@ class UrlIngestService:
                 knowledge_base_id=UUID(kb_id),
                 document_id=document_id,
                 payload={"document_id": str(document_id)},
-                idempotency_key=f"document.extract:{document_id}",
+                idempotency_key=idempotency_key,
             ),
             authenticated_user_id=UUID(user_id),
         )
@@ -284,6 +368,57 @@ class UrlIngestService:
                 document_id,
                 type(exc).__name__,
             )
+
+
+class _LegacyUrlIngestCompatibility(UrlIngestService):
+    """Rollback-only Hosted URL producer using process-local OCR dispatch."""
+
+    def __init__(self, pool: asyncpg.Pool, s3_service: S3Service, ocr_service: object):
+        super().__init__(pool, s3_service, job_service=None)
+        self.ocr = ocr_service
+
+    async def _return_existing(self, existing: dict, user_id: str, kb_id: str) -> dict:
+        del user_id, kb_id
+        return {**existing, "already_exists": True}
+
+    async def _create_pending_document(
+        self,
+        user_id: str,
+        kb_id: str,
+        url: str,
+        path: str,
+        pdf: DownloadedPdf,
+    ) -> dict:
+        document_id = str(uuid4())
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
+            await self._insert_within_quota(conn, document_id, kb_id, user_id, pdf, path, url)
+
+        try:
+            await self.s3.upload_bytes(
+                f"{user_id}/{document_id}/source.pdf",
+                pdf.data,
+                "application/pdf",
+            )
+        except Exception:  # noqa: BLE001 - legacy storage adapters expose different errors.
+            await self.pool.execute("DELETE FROM documents WHERE id = $1::uuid", document_id)
+            raise HTTPException(
+                status_code=502,
+                detail="Could not store the downloaded PDF — try again",
+            ) from None
+
+        from infra.tasks import spawn_logged
+
+        spawn_logged(
+            self.ocr.process_document(document_id, user_id),
+            f"url-ingest:{document_id[:8]}",
+        )
+        return {
+            "id": document_id,
+            "filename": pdf.filename,
+            "status": "pending",
+            "already_exists": False,
+        }
 
 
 def _normalize_pdf_url(url: str) -> str:

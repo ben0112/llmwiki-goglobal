@@ -95,6 +95,7 @@ async def test_create_from_url_uses_durable_job_service_and_sets_response_header
             }
 
     monkeypatch.setattr(document_routes, "get_current_user", current_user)
+    monkeypatch.setattr(document_routes.settings, "DURABLE_JOBS_ENABLED", True)
     monkeypatch.setattr(document_routes, "UrlIngestService", FakeUrlIngestService)
     body = document_routes.CreateFromUrl(
         knowledge_base_id="00000000-0000-0000-0000-000000000002",
@@ -114,10 +115,11 @@ def test_cors_exposes_durable_job_header():
     assert "X-Job-Id" in cors.kwargs["expose_headers"]
 
 
-async def test_from_url_is_unavailable_when_durable_jobs_are_disabled(monkeypatch):
+async def test_from_url_uses_legacy_ocr_producer_when_durable_jobs_are_disabled(monkeypatch):
+    ocr_service = object()
     state = SimpleNamespace(
         s3_service=object(),
-        ocr_service=object(),
+        ocr_service=ocr_service,
         job_service=None,
         pool=object(),
     )
@@ -129,16 +131,34 @@ async def test_from_url_is_unavailable_when_durable_jobs_are_disabled(monkeypatc
     async def current_user(_request):
         return "00000000-0000-0000-0000-000000000001"
 
+    captured = {}
+
+    class FakeLegacyUrlIngest:
+        def __init__(self, pool, s3_service, ocr):
+            captured["args"] = (pool, s3_service, ocr)
+
+        async def ingest_pdf(self, user_id, kb_id, url, path):
+            captured["call"] = (user_id, kb_id, url, path)
+            return {
+                "id": "00000000-0000-0000-0000-000000000010",
+                "filename": "paper.pdf",
+                "status": "pending",
+                "already_exists": False,
+            }
+
     monkeypatch.setattr(document_routes, "get_current_user", current_user)
+    monkeypatch.setattr(document_routes.settings, "DURABLE_JOBS_ENABLED", False)
+    monkeypatch.setattr(document_routes, "_LegacyUrlIngestCompatibility", FakeLegacyUrlIngest)
     body = document_routes.CreateFromUrl(
         knowledge_base_id="00000000-0000-0000-0000-000000000002",
         url="https://example.test/paper.pdf",
     )
 
-    with pytest.raises(HTTPException) as raised:
-        await document_routes.create_document_from_url.__wrapped__(request, body, response)
+    result = await document_routes.create_document_from_url.__wrapped__(request, body, response)
 
-    assert raised.value.status_code == 501
+    assert result["status"] == "pending"
+    assert "X-Job-Id" not in response.headers
+    assert captured["args"] == (state.pool, state.s3_service, ocr_service)
 
 
 class TestDeriveFilename:
