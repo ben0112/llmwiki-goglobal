@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from math import isfinite
 from random import uniform
 from types import MappingProxyType
 from typing import TypeAlias
@@ -14,11 +15,11 @@ from uuid import UUID
 PAYLOAD_MAX_BYTES = 16_384
 PROGRESS_MAX_BYTES = 8_192
 RESULT_MAX_BYTES = 16_384
+ERROR_CODE_MAX_CHARS = 2_000
 ERROR_MESSAGE_MAX_CHARS = 2_000
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
-JSONMapping: TypeAlias = Mapping[str, JSONValue]
 FrozenJSONValue: TypeAlias = JSONScalar | tuple["FrozenJSONValue", ...] | Mapping[str, "FrozenJSONValue"]
 FrozenJSONMapping: TypeAlias = Mapping[str, FrozenJSONValue]
 Jitter: TypeAlias = float | Callable[[float], float]
@@ -51,16 +52,51 @@ class JobCancelled(RuntimeError):
     """Raised when a job observes a durable cancellation request."""
 
 
-def _freeze_json(value: JSONValue | FrozenJSONValue) -> FrozenJSONValue:
+def _freeze_json(value: object) -> FrozenJSONValue:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("JSON values cannot contain bytes")
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("JSON floats must be finite")
+        return value
     if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return _freeze_mapping(value)
+    if isinstance(value, Sequence):
         return tuple(_freeze_json(item) for item in value)
-    return value
+    raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
 
 
-def _freeze_mapping(value: Mapping[str, JSONValue | FrozenJSONValue]) -> FrozenJSONMapping:
-    return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+def _freeze_mapping(value: Mapping[object, object]) -> FrozenJSONMapping:
+    frozen: dict[str, FrozenJSONValue] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError("JSON object keys must be strings")
+        frozen[key] = _freeze_json(item)
+    return MappingProxyType(frozen)
+
+
+def to_json_value(value: object) -> JSONValue:
+    """Validate and deep-thaw a frozen job JSON value for persistence or HTTP."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("JSON values cannot contain bytes")
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("JSON floats must be finite")
+        return value
+    if isinstance(value, Mapping):
+        thawed: dict[str, JSONValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            thawed[key] = to_json_value(item)
+        return thawed
+    if isinstance(value, Sequence):
+        return [to_json_value(item) for item in value]
+    raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,14 +201,6 @@ _PUBLIC_ERROR_MESSAGES = {
 }
 
 
-def _json_ready(value: FrozenJSONValue | None) -> JSONValue | None:
-    if isinstance(value, Mapping):
-        return {key: _json_ready(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_json_ready(item) for item in value]
-    return value
-
-
 def _public_error(record: JobRecord) -> dict[str, str] | None:
     if record.error_code is None:
         return None
@@ -187,8 +215,8 @@ def serialize_public_job(record: JobRecord) -> dict[str, JSONValue | None]:
         "id": str(record.id),
         "type": record.job_type.value,
         "state": record.state.value,
-        "progress": _json_ready(record.progress),
-        "result": _json_ready(record.result),
+        "progress": to_json_value(record.progress),
+        "result": to_json_value(record.result),
         "attempt_count": record.attempt_count,
         "max_attempts": record.max_attempts,
         "cancel_requested": record.cancel_requested_at is not None,

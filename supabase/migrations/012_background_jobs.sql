@@ -19,9 +19,14 @@ CREATE TABLE background_jobs (
         'cancelled'
     )),
     payload JSONB NOT NULL DEFAULT '{}'::jsonb
+        CHECK (jsonb_typeof(payload) = 'object')
         CHECK (octet_length(payload::text) <= 16384),
-    progress JSONB CHECK (octet_length(progress::text) <= 8192),
-    result JSONB CHECK (octet_length(result::text) <= 16384),
+    progress JSONB
+        CHECK (progress IS NULL OR jsonb_typeof(progress) = 'object')
+        CHECK (octet_length(progress::text) <= 8192),
+    result JSONB
+        CHECK (result IS NULL OR jsonb_typeof(result) = 'object')
+        CHECK (octet_length(result::text) <= 16384),
     idempotency_key TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts BETWEEN 1 AND 20),
@@ -31,7 +36,7 @@ CREATE TABLE background_jobs (
     heartbeat_at TIMESTAMPTZ,
     last_dispatched_at TIMESTAMPTZ,
     dispatch_attempts INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_attempts >= 0),
-    error_code TEXT,
+    error_code TEXT CHECK (char_length(error_code) <= 2000),
     error_message TEXT CHECK (char_length(error_message) <= 2000),
     cancel_requested_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

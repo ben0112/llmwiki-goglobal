@@ -1,5 +1,6 @@
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 import asyncpg
@@ -26,6 +27,15 @@ async def _insert_job(pool, user_id, *, job_type="document.extract", **values):
         f"INSERT INTO background_jobs ({', '.join(columns)}) VALUES ({values_sql}) RETURNING id",
         *parameters,
     )
+
+
+async def _json_object_with_octet_length(pool, target):
+    overhead = await pool.fetchval("SELECT octet_length(jsonb_build_object('text', '')::text)")
+    text_bytes = target - overhead
+    euro_count, ascii_count = divmod(text_bytes, len("€".encode()))
+    value = json.dumps({"text": "€" * euro_count + "x" * ascii_count}, ensure_ascii=False)
+    assert await pool.fetchval("SELECT octet_length($1::jsonb::text)", value) == target
+    return value
 
 
 @asynccontextmanager
@@ -70,8 +80,8 @@ async def test_background_jobs_enforces_json_and_error_size_limits(pool):
     user_id = await _seed_user(pool)
     limits = {"payload": 16_384, "progress": 8_192, "result": 16_384}
     for column, limit in limits.items():
-        boundary = json.dumps("x" * (limit - 2))
-        over_limit = json.dumps("x" * (limit - 1))
+        boundary = await _json_object_with_octet_length(pool, limit)
+        over_limit = await _json_object_with_octet_length(pool, limit + 1)
         await _insert_job(pool, user_id, **{column: boundary})
         with pytest.raises(asyncpg.CheckViolationError):
             await _insert_job(pool, user_id, **{column: over_limit})
@@ -79,6 +89,33 @@ async def test_background_jobs_enforces_json_and_error_size_limits(pool):
     await _insert_job(pool, user_id, error_message="x" * 2_000)
     with pytest.raises(asyncpg.CheckViolationError):
         await _insert_job(pool, user_id, error_message="x" * 2_001)
+
+    await _insert_job(pool, user_id, error_code="x" * 2_000)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _insert_job(pool, user_id, error_code="x" * 2_001)
+
+
+@pytest.mark.asyncio
+async def test_background_jobs_require_json_objects_and_preserve_nullable_json_columns(pool):
+    user_id = await _seed_user(pool)
+    invalid_json = ("null", "[]", '"text"', "1", "true")
+    for column in ("payload", "progress", "result"):
+        for value in invalid_json:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await _insert_job(pool, user_id, **{column: value})
+
+    await _insert_job(pool, user_id, progress=None, result=None)
+
+
+@pytest.mark.asyncio
+async def test_background_jobs_measure_json_size_in_utf8_octets(pool):
+    user_id = await _seed_user(pool)
+    accepted = await _json_object_with_octet_length(pool, 16_384)
+    rejected = await _json_object_with_octet_length(pool, 16_385)
+
+    await _insert_job(pool, user_id, payload=accepted)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _insert_job(pool, user_id, payload=rejected)
 
 
 @pytest.mark.asyncio
@@ -114,6 +151,7 @@ async def test_background_job_idempotency_is_tenant_scoped_and_partial(pool):
     await _insert_job(pool, user_a, idempotency_key="extract-1")
     with pytest.raises(asyncpg.UniqueViolationError):
         await _insert_job(pool, user_a, idempotency_key="extract-1")
+    await _insert_job(pool, user_a, job_type="graph.rebuild", idempotency_key="extract-1")
     await _insert_job(pool, user_b, idempotency_key="extract-1")
     await _insert_job(pool, user_a)
     await _insert_job(pool, user_a)
@@ -126,15 +164,13 @@ async def test_background_job_indexes_have_expected_columns_and_predicates(pool)
     )
     indexes = {row["indexname"]: row["indexdef"] for row in rows}
 
-    assert "UNIQUE INDEX background_jobs_idempotency_key_unique" in indexes[
-        "background_jobs_idempotency_key_unique"
-    ]
+    assert "UNIQUE INDEX background_jobs_idempotency_key_unique" in indexes["background_jobs_idempotency_key_unique"]
     assert "(user_id, job_type, idempotency_key)" in indexes["background_jobs_idempotency_key_unique"]
     assert "WHERE (idempotency_key IS NOT NULL)" in indexes["background_jobs_idempotency_key_unique"]
     assert "(state, run_after, last_dispatched_at)" in indexes["background_jobs_due_dispatch_idx"]
-    assert "WHERE (state = ANY (ARRAY['queued'::text, 'retry_wait'::text]))" in indexes[
-        "background_jobs_due_dispatch_idx"
-    ]
+    assert (
+        "WHERE (state = ANY (ARRAY['queued'::text, 'retry_wait'::text]))" in indexes["background_jobs_due_dispatch_idx"]
+    )
     assert "(state, lease_expires_at)" in indexes["background_jobs_lease_expiry_idx"]
     assert "WHERE (state = 'running'::text)" in indexes["background_jobs_lease_expiry_idx"]
     assert "(user_id, created_at DESC)" in indexes["background_jobs_user_created_idx"]
@@ -147,9 +183,7 @@ async def test_background_jobs_rls_is_enabled_and_select_is_tenant_scoped(pool):
     job_a = await _insert_job(pool, user_a)
     job_b = await _insert_job(pool, user_b)
 
-    assert await pool.fetchval(
-        "SELECT relrowsecurity FROM pg_class WHERE oid = 'background_jobs'::regclass"
-    )
+    assert await pool.fetchval("SELECT relrowsecurity FROM pg_class WHERE oid = 'background_jobs'::regclass")
     policy = await pool.fetchrow(
         "SELECT cmd, roles FROM pg_policies WHERE schemaname = 'public' "
         "AND tablename = 'background_jobs' AND policyname = 'background_jobs_select'"
@@ -183,3 +217,17 @@ async def test_background_jobs_has_no_authenticated_mutation_policy_or_access(po
         async with _authenticated_session(pool, user_id) as conn:
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await conn.execute(statement, parameter)
+
+
+def test_background_jobs_migration_and_test_schema_blocks_match():
+    root = Path(__file__).parents[2]
+    migration = (root / "supabase/migrations/012_background_jobs.sql").read_text()
+    test_schema = (root / "tests/helpers/schema.sql").read_text()
+
+    def job_block(sql):
+        start = sql.index("CREATE TABLE background_jobs")
+        trigger = "CREATE TRIGGER set_background_jobs_updated_at"
+        end = sql.index(";", sql.index(trigger, start)) + 1
+        return sql[start:end]
+
+    assert job_block(migration) == job_block(test_schema)

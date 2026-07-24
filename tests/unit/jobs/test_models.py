@@ -1,9 +1,12 @@
+import json
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import UTC, datetime
+from math import inf, nan
 from uuid import UUID, uuid4
 
 import pytest
 from jobs.models import (
+    ERROR_CODE_MAX_CHARS,
     ERROR_MESSAGE_MAX_CHARS,
     PAYLOAD_MAX_BYTES,
     PROGRESS_MAX_BYTES,
@@ -16,6 +19,7 @@ from jobs.models import (
     LeaseLost,
     retry_delay_seconds,
     serialize_public_job,
+    to_json_value,
 )
 
 
@@ -113,6 +117,47 @@ def test_job_json_fields_are_recursively_defensive_and_immutable():
         record.progress["nested"]["items"].append("value")  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize(
+    "payload, error",
+    [
+        ({"bytes": b"not-json"}, TypeError),
+        ({"bytearray": bytearray(b"not-json")}, TypeError),
+        ({"object": object()}, TypeError),
+        ({1: "not-a-string-key"}, TypeError),
+        ({"nan": nan}, ValueError),
+        ({"positive_infinity": inf}, ValueError),
+        ({"negative_infinity": -inf}, ValueError),
+    ],
+)
+def test_job_models_reject_invalid_json_values(payload, error):
+    with pytest.raises(error):
+        JobCreate(job_type=JobType.DOCUMENT_EXTRACT, user_id=uuid4(), payload=payload)
+
+
+def test_to_json_value_deep_thaws_and_validates_frozen_job_json():
+    create = JobCreate(
+        job_type=JobType.DOCUMENT_EXTRACT,
+        user_id=uuid4(),
+        payload={"nested": [{"value": 1.5}, None, True]},
+    )
+    record = JobRecord(
+        id=uuid4(),
+        job_type=JobType.DOCUMENT_EXTRACT,
+        user_id=uuid4(),
+        progress={"steps": ["queued", "running"]},
+        result={"artifacts": [{"name": "summary"}]},
+    )
+
+    assert to_json_value(create.payload) == {"nested": [{"value": 1.5}, None, True]}
+    assert to_json_value(record.progress) == {"steps": ["queued", "running"]}
+    assert to_json_value(record.result) == {"artifacts": [{"name": "summary"}]}
+    assert json.dumps(to_json_value(create.payload), allow_nan=False)
+    with pytest.raises(TypeError, match="bytes"):
+        to_json_value({"bytes": bytearray(b"not-json")})
+    with pytest.raises(ValueError, match="finite"):
+        to_json_value({"nan": nan})
+
+
 def test_job_domain_exceptions_are_runtime_errors_with_messages():
     for exception_type in (LeaseLost, JobCancelled):
         with pytest.raises(RuntimeError, match="job state changed") as raised:
@@ -168,7 +213,18 @@ def test_public_job_serialization_allow_lists_fields_and_sanitizes_errors():
         "created_at": "2026-01-02T03:04:05+00:00",
         "updated_at": "2026-01-02T03:04:05+00:00",
     }
-    assert not ({"payload", "lease_owner", "lease_expires_at", "heartbeat_at", "last_dispatched_at", "dispatch_attempts", "error_message"} & public.keys())
+    assert not (
+        {
+            "payload",
+            "lease_owner",
+            "lease_expires_at",
+            "heartbeat_at",
+            "last_dispatched_at",
+            "dispatch_attempts",
+            "error_message",
+        }
+        & public.keys()
+    )
 
 
 def test_unknown_error_code_is_replaced_with_generic_public_error():
@@ -194,3 +250,4 @@ def test_model_size_constants_match_database_contract():
     assert PROGRESS_MAX_BYTES == 8_192
     assert RESULT_MAX_BYTES == 16_384
     assert ERROR_MESSAGE_MAX_CHARS == 2_000
+    assert ERROR_CODE_MAX_CHARS == 2_000
