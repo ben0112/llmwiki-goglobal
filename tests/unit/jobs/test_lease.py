@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from math import inf, nan
 from uuid import uuid4
 
 import pytest
@@ -73,9 +74,6 @@ def make_lease(**changes):
     [
         ({"owner": ""}, "owner"),
         ({"owner": "   "}, "owner"),
-        ({"lease_seconds": 0}, "lease_seconds"),
-        ({"lease_seconds": 1.5, "heartbeat_seconds": 1}, "lease_seconds"),
-        ({"heartbeat_seconds": 0}, "heartbeat_seconds"),
         ({"heartbeat_seconds": 30}, "less than lease_seconds"),
         ({"heartbeat_seconds": 31}, "less than lease_seconds"),
     ],
@@ -83,6 +81,18 @@ def make_lease(**changes):
 def test_job_lease_validates_configuration(changes, message):
     with pytest.raises(ValueError, match=message):
         make_lease(**changes)
+
+
+@pytest.mark.parametrize("value", [True, nan, inf, -inf, 0, -1, 1.5, "30", None])
+def test_job_lease_rejects_non_positive_non_finite_or_non_integer_lease_seconds(value):
+    with pytest.raises(ValueError, match="lease_seconds"):
+        make_lease(lease_seconds=value, heartbeat_seconds=1)
+
+
+@pytest.mark.parametrize("value", [True, nan, inf, -inf, 0, -1, "10", None])
+def test_job_lease_rejects_non_real_non_finite_or_non_positive_heartbeat_seconds(value):
+    with pytest.raises(ValueError, match="heartbeat_seconds"):
+        make_lease(heartbeat_seconds=value)
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,8 @@ from jobs.models import (
     to_json_value,
 )
 
+_ATTEMPTS_EXHAUSTED_MESSAGE = "The job could not be completed after retrying."
+
 
 def _utc_now(value: datetime | None) -> datetime:
     if value is None:
@@ -382,6 +384,7 @@ SET
     END,
     error_message = CASE
         WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN $4 AND job.attempt_count >= job.max_attempts THEN $9
         ELSE $6
     END,
     result = NULL,
@@ -422,6 +425,7 @@ async def fail_or_retry(
         error_message,
         checked_at,
         retry_delays,
+        _ATTEMPTS_EXHAUSTED_MESSAGE,
     )
     if row is None:
         raise LeaseLost("background job lease is no longer active")

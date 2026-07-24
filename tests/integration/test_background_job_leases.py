@@ -163,6 +163,15 @@ async def test_claim_rejects_cancelled_terminal_running_exhausted_missing_and_ba
             await repository.claim(conn, rows[0]["id"], " ", 10, now=NOW)
         with pytest.raises(ValueError, match="lease_seconds"):
             await repository.claim(conn, rows[0]["id"], "worker", 0, now=NOW)
+        for invalid_lease_seconds in (True, 1.5):
+            with pytest.raises(ValueError, match="lease_seconds"):
+                await repository.claim(
+                    conn,
+                    rows[0]["id"],
+                    "worker",
+                    invalid_lease_seconds,
+                    now=NOW,
+                )
 
 
 @pytest.mark.asyncio
@@ -199,6 +208,15 @@ async def test_heartbeat_extends_only_a_live_owner_lease(pool):
             await repository.heartbeat(conn, live["id"], "worker-b", 30, now=NOW)
         with pytest.raises(LeaseLost):
             await repository.heartbeat(conn, expired["id"], "worker-a", 30, now=NOW)
+        for invalid_lease_seconds in (True, 1.5):
+            with pytest.raises(ValueError, match="lease_seconds"):
+                await repository.heartbeat(
+                    conn,
+                    live["id"],
+                    "worker-a",
+                    invalid_lease_seconds,
+                    now=NOW,
+                )
 
     assert beat.heartbeat_at == NOW
     assert beat.lease_expires_at == NOW + timedelta(seconds=30)
@@ -225,10 +243,28 @@ async def test_assert_active_distinguishes_cancellation_from_lost_lease(pool):
         lease_expires_at=NOW + timedelta(seconds=1),
         cancel_requested_at=NOW,
     )
+    expired_equal = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        lease_owner="worker-a",
+        lease_expires_at=NOW,
+    )
+    expired_earlier = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        lease_owner="worker-a",
+        lease_expires_at=NOW - timedelta(microseconds=1),
+        cancel_requested_at=NOW,
+    )
     async with pool.acquire() as conn:
         assert (await repository.assert_active(conn, live["id"], "worker-a", now=NOW)).id == live["id"]
         with pytest.raises(JobCancelled):
             await repository.assert_active(conn, cancelled["id"], "worker-a", now=NOW)
+        for expired in (expired_equal, expired_earlier):
+            with pytest.raises(LeaseLost):
+                await repository.assert_active(conn, expired["id"], "worker-a", now=NOW)
         for job_id, owner in ((live["id"], "worker-b"), (uuid4(), "worker-a")):
             with pytest.raises(LeaseLost):
                 await repository.assert_active(conn, job_id, owner, now=NOW)
@@ -373,6 +409,7 @@ async def test_fail_or_retry_handles_cancel_retry_failure_and_exhaustion(pool):
     assert failed_result.error_code == "invalid"
     assert exhausted_result.state is JobState.FAILED
     assert exhausted_result.error_code == "attempts_exhausted"
+    assert exhausted_result.error_message == "The job could not be completed after retrying."
     for record in (cancelled_result, retry_result, failed_result, exhausted_result):
         assert record.lease_owner is None
         assert record.lease_expires_at is None
@@ -405,8 +442,9 @@ async def test_reaper_handles_all_branches_limit_repeat_and_renewed_lease(pool):
         first = await repository.reap_expired(conn, now=NOW, limit=2)
         second = await repository.reap_expired(conn, now=NOW, limit=2)
         repeated = await repository.reap_expired(conn, now=NOW, limit=2)
-        with pytest.raises(ValueError, match="limit"):
-            await repository.reap_expired(conn, now=NOW, limit=0)
+        for invalid_limit in (0, True, 1.5):
+            with pytest.raises(ValueError, match="limit"):
+                await repository.reap_expired(conn, now=NOW, limit=invalid_limit)
 
     assert len(first) == 2
     assert len(second) == 1

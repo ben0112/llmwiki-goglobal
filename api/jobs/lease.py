@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from math import isfinite
+from numbers import Real
 from types import TracebackType
 from uuid import UUID
 
@@ -45,8 +47,13 @@ class JobLease:
             raise ValueError("owner must not be empty")
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be a positive integer")
-        if isinstance(heartbeat_seconds, bool) or heartbeat_seconds <= 0:
-            raise ValueError("heartbeat_seconds must be positive")
+        if (
+            isinstance(heartbeat_seconds, bool)
+            or not isinstance(heartbeat_seconds, Real)
+            or not isfinite(heartbeat_seconds)
+            or heartbeat_seconds <= 0
+        ):
+            raise ValueError("heartbeat_seconds must be finite and positive")
         if heartbeat_seconds >= lease_seconds:
             raise ValueError("heartbeat_seconds must be less than lease_seconds")
         self.pool = pool
