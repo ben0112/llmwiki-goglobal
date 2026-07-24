@@ -326,6 +326,70 @@ async def test_succeed_persists_strict_json_and_rejects_stale_or_cancelled_worke
 
 
 @pytest.mark.asyncio
+async def test_succeed_classifies_cancellation_from_its_locked_statement(pool):
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    cancelled = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="worker-a",
+        lease_expires_at=database_now + timedelta(minutes=1),
+        cancel_requested_at=database_now,
+    )
+    conn_succeed = await pool.acquire()
+    conn_transition = await pool.acquire()
+    statement_done = asyncio.Event()
+    release_result = asyncio.Event()
+
+    class InterleavingConnection:
+        def __init__(self, conn):
+            self.conn = conn
+            self.fetchval_calls = 0
+
+        async def fetchrow(self, query, *args):
+            row = await self.conn.fetchrow(query, *args)
+            statement_done.set()
+            await release_result.wait()
+            return row
+
+        async def fetchval(self, query, *args):
+            self.fetchval_calls += 1
+            return await self.conn.fetchval(query, *args)
+
+    interleaving = InterleavingConnection(conn_succeed)
+    pending = asyncio.create_task(repository.succeed(interleaving, cancelled["id"], "worker-a", {"ok": True}))
+    try:
+        async with asyncio.timeout(1):
+            await statement_done.wait()
+        transitioned = await repository.fail_or_retry(
+            conn_transition,
+            cancelled["id"],
+            "worker-a",
+            error_code="internal",
+            error_message="hidden",
+            retryable=False,
+        )
+        release_result.set()
+        with pytest.raises(JobCancelled):
+            async with asyncio.timeout(1):
+                await pending
+    finally:
+        release_result.set()
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        await pool.release(conn_transition)
+        await pool.release(conn_succeed)
+
+    assert transitioned.state is JobState.CANCELLED
+    assert interleaving.fetchval_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_application_clock_cannot_bypass_database_expiry(pool):
     for operation in (
         repository.claim,
@@ -519,6 +583,64 @@ async def test_reaper_uses_database_time_for_all_branches_limit_and_repeat(pool)
         assert rows[job_id]["lease_owner"] is None
         assert rows[job_id]["lease_expires_at"] is None
         assert rows[job_id]["heartbeat_at"] is None
+
+
+def test_reaper_locks_bounded_candidates_before_sampling_database_time():
+    normalized = " ".join(repository._REAP_EXPIRED.split())
+    candidates = normalized.index("candidates AS MATERIALIZED")
+    lease_clock = normalized.index("lease_clock AS MATERIALIZED")
+
+    assert candidates < lease_clock
+    assert "FROM candidates" in normalized[lease_clock:]
+    assert "FOR UPDATE OF job SKIP LOCKED LIMIT $1" in normalized[candidates:lease_clock]
+
+
+@pytest.mark.asyncio
+async def test_reaper_samples_clock_after_waiting_to_select_candidates(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    database_now = await _db_now(pool)
+    expires_at = database_now + timedelta(milliseconds=200)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="worker-a",
+        lease_expires_at=expires_at,
+    )
+    conn_lock = await pool.acquire()
+    conn_reaper = await pool.acquire()
+    observer = await pool.acquire()
+    transaction = conn_lock.transaction()
+    pending_reaper = None
+    committed = False
+    try:
+        await transaction.start()
+        await conn_lock.execute("LOCK TABLE background_jobs IN ACCESS EXCLUSIVE MODE")
+        reaper_pid = await conn_reaper.fetchval("SELECT pg_backend_pid()")
+        pending_reaper = asyncio.create_task(repository.reap_expired(conn_reaper))
+        await _wait_for_lock_wait(observer, reaper_pid)
+        async with asyncio.timeout(1):
+            while not await observer.fetchval("SELECT clock_timestamp() >= $1", expires_at):
+                await asyncio.sleep(0)
+        await transaction.commit()
+        committed = True
+        async with asyncio.timeout(1):
+            reaped = await pending_reaper
+    finally:
+        if pending_reaper is not None and not pending_reaper.done():
+            pending_reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_reaper
+        if not committed:
+            await transaction.rollback()
+        await pool.release(observer)
+        await pool.release(conn_reaper)
+        await pool.release(conn_lock)
+
+    assert reaped == [job["id"]]
 
 
 @pytest.mark.asyncio

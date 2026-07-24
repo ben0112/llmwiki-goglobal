@@ -321,10 +321,10 @@ async def assert_active(conn: asyncpg.Connection, job_id: UUID, owner: str) -> J
 
 _SUCCEED = """
 WITH target AS MATERIALIZED (
-    SELECT id FROM background_jobs WHERE id = $1 FOR UPDATE
+    SELECT job.* FROM background_jobs AS job WHERE job.id = $1 FOR UPDATE
 ), lease_clock AS MATERIALIZED (
     SELECT clock_timestamp() AS checked_at FROM target
-)
+), changed AS (
 UPDATE background_jobs AS job
 SET
     state = 'succeeded',
@@ -341,7 +341,18 @@ WHERE job.id = target.id
   AND job.lease_owner = $2
   AND job.lease_expires_at > lease_clock.checked_at
   AND job.cancel_requested_at IS NULL
-RETURNING job.*
+RETURNING job.*, 'succeeded'::text AS lease_outcome
+)
+SELECT changed.* FROM changed
+UNION ALL
+SELECT target.*, 'cancelled'::text AS lease_outcome
+FROM target
+CROSS JOIN lease_clock
+WHERE NOT EXISTS (SELECT 1 FROM changed)
+  AND target.state = 'running'
+  AND target.lease_owner = $2
+  AND target.lease_expires_at > lease_clock.checked_at
+  AND target.cancel_requested_at IS NOT NULL
 """
 
 
@@ -355,20 +366,11 @@ async def succeed(
     _validate_owner(owner)
     serialized_result = json.dumps(to_json_value(result))
     row = await conn.fetchrow(_SUCCEED, job_id, owner, serialized_result)
-    if row is not None:
-        return _row_to_record(row)
-    cancelled = await conn.fetchval(
-        "WITH lease_clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at) "
-        "SELECT EXISTS(SELECT 1 FROM background_jobs, lease_clock "
-        "WHERE id = $1 AND state = 'running' AND lease_owner = $2 "
-        "AND lease_expires_at > lease_clock.checked_at "
-        "AND cancel_requested_at IS NOT NULL)",
-        job_id,
-        owner,
-    )
-    if cancelled:
+    if row is None:
+        raise LeaseLost("background job lease is no longer active")
+    if row["lease_outcome"] == "cancelled":
         raise JobCancelled("background job cancellation was requested")
-    raise LeaseLost("background job lease is no longer active")
+    return _row_to_record(row)
 
 
 _FAIL_OR_RETRY = """
@@ -445,17 +447,17 @@ async def fail_or_retry(
 
 
 _REAP_EXPIRED = """
-WITH lease_clock AS MATERIALIZED (
-    SELECT clock_timestamp() AS checked_at
-), expired AS (
+WITH candidates AS MATERIALIZED (
     SELECT job.id
     FROM background_jobs AS job
-    CROSS JOIN lease_clock
     WHERE job.state = 'running'
-      AND job.lease_expires_at <= lease_clock.checked_at
     ORDER BY job.lease_expires_at, job.id
+    -- A live ordered candidate means no later unlocked row can be earlier-expired.
     FOR UPDATE OF job SKIP LOCKED
     LIMIT $1
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at, count(*) AS candidate_count
+    FROM candidates
 )
 UPDATE background_jobs AS job
 SET
@@ -484,8 +486,9 @@ SET
     lease_owner = NULL,
     lease_expires_at = NULL,
     heartbeat_at = NULL
-FROM expired, lease_clock
-WHERE job.id = expired.id
+FROM candidates, lease_clock
+WHERE job.id = candidates.id
+  AND job.lease_expires_at <= lease_clock.checked_at
 RETURNING job.id
 """
 
