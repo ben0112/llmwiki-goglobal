@@ -8,10 +8,12 @@ from jobs.models import (
     PAYLOAD_MAX_BYTES,
     PROGRESS_MAX_BYTES,
     RESULT_MAX_BYTES,
+    JobCancelled,
     JobCreate,
     JobRecord,
     JobState,
     JobType,
+    LeaseLost,
     retry_delay_seconds,
     serialize_public_job,
 )
@@ -77,6 +79,47 @@ def test_job_dataclasses_are_frozen_and_do_not_share_json_defaults():
         first.payload["document_id"] = "not mutable"  # type: ignore[index]
 
 
+def test_job_json_fields_are_recursively_defensive_and_immutable():
+    create_payload = {"nested": {"items": ["create"]}}
+    payload = {"nested": {"items": ["payload"]}}
+    progress = {"nested": {"items": ["progress"]}}
+    result = {"nested": {"items": ["result"]}}
+    create = JobCreate(
+        job_type=JobType.DOCUMENT_EXTRACT,
+        user_id=uuid4(),
+        payload=create_payload,
+    )
+    record = JobRecord(
+        id=uuid4(),
+        job_type=JobType.DOCUMENT_EXTRACT,
+        user_id=uuid4(),
+        payload=payload,
+        progress=progress,
+        result=result,
+    )
+
+    create_payload["nested"]["items"].append("changed")
+    payload["nested"]["items"].append("changed")
+    progress["nested"]["items"].append("changed")
+    result["nested"]["items"].append("changed")
+
+    assert create.payload == {"nested": {"items": ("create",)}}
+    assert record.payload == {"nested": {"items": ("payload",)}}
+    assert record.progress == {"nested": {"items": ("progress",)}}
+    assert record.result == {"nested": {"items": ("result",)}}
+    with pytest.raises(TypeError):
+        record.payload["nested"]["new"] = "value"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        record.progress["nested"]["items"].append("value")  # type: ignore[union-attr]
+
+
+def test_job_domain_exceptions_are_runtime_errors_with_messages():
+    for exception_type in (LeaseLost, JobCancelled):
+        with pytest.raises(RuntimeError, match="job state changed") as raised:
+            raise exception_type("job state changed")
+        assert isinstance(raised.value, exception_type)
+
+
 def test_public_job_serialization_allow_lists_fields_and_sanitizes_errors():
     job_id = UUID("11111111-1111-1111-1111-111111111111")
     user_id = UUID("22222222-2222-2222-2222-222222222222")
@@ -87,8 +130,8 @@ def test_public_job_serialization_allow_lists_fields_and_sanitizes_errors():
         user_id=user_id,
         state=JobState.FAILED,
         payload={"secret": "do not expose"},
-        progress={"percent": 50},
-        result={"document_id": "abc"},
+        progress={"percent": 50, "steps": ["queued", "running"]},
+        result={"document_id": "abc", "artifacts": [{"name": "summary"}]},
         attempt_count=3,
         max_attempts=3,
         lease_owner="worker-private",
@@ -105,12 +148,16 @@ def test_public_job_serialization_allow_lists_fields_and_sanitizes_errors():
 
     public = serialize_public_job(record)
 
+    assert isinstance(public["progress"], dict)
+    assert isinstance(public["progress"]["steps"], list)
+    assert isinstance(public["result"], dict)
+    assert isinstance(public["result"]["artifacts"], list)
     assert public == {
         "id": str(job_id),
         "type": "document.extract",
         "state": "failed",
-        "progress": {"percent": 50},
-        "result": {"document_id": "abc"},
+        "progress": {"percent": 50, "steps": ["queued", "running"]},
+        "result": {"document_id": "abc", "artifacts": [{"name": "summary"}]},
         "attempt_count": 3,
         "max_attempts": 3,
         "cancel_requested": True,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +19,8 @@ ERROR_MESSAGE_MAX_CHARS = 2_000
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 JSONMapping: TypeAlias = Mapping[str, JSONValue]
+FrozenJSONValue: TypeAlias = JSONScalar | tuple["FrozenJSONValue", ...] | Mapping[str, "FrozenJSONValue"]
+FrozenJSONMapping: TypeAlias = Mapping[str, FrozenJSONValue]
 Jitter: TypeAlias = float | Callable[[float], float]
 
 
@@ -49,8 +51,16 @@ class JobCancelled(RuntimeError):
     """Raised when a job observes a durable cancellation request."""
 
 
-def _freeze_mapping(value: Mapping[str, JSONValue]) -> JSONMapping:
-    return MappingProxyType(dict(value))
+def _freeze_json(value: JSONValue | FrozenJSONValue) -> FrozenJSONValue:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _freeze_mapping(value: Mapping[str, JSONValue | FrozenJSONValue]) -> FrozenJSONMapping:
+    return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +71,7 @@ class JobCreate:
     user_id: UUID
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
-    payload: JSONMapping = field(default_factory=dict)
+    payload: FrozenJSONMapping = field(default_factory=dict)
     idempotency_key: str | None = None
     max_attempts: int = 3
     run_after: datetime | None = None
@@ -80,9 +90,9 @@ class JobRecord:
     state: JobState = JobState.QUEUED
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
-    payload: JSONMapping = field(default_factory=dict)
-    progress: JSONMapping | None = None
-    result: JSONMapping | None = None
+    payload: FrozenJSONMapping = field(default_factory=dict)
+    progress: FrozenJSONMapping | None = None
+    result: FrozenJSONMapping | None = None
     idempotency_key: str | None = None
     attempt_count: int = 0
     max_attempts: int = 3
@@ -155,10 +165,10 @@ _PUBLIC_ERROR_MESSAGES = {
 }
 
 
-def _json_ready(value: JSONValue | Mapping[str, JSONValue] | None) -> JSONValue | None:
+def _json_ready(value: FrozenJSONValue | None) -> JSONValue | None:
     if isinstance(value, Mapping):
         return {key: _json_ready(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_json_ready(item) for item in value]
     return value
 

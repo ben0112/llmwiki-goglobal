@@ -160,3 +160,26 @@ async def test_background_jobs_rls_is_enabled_and_select_is_tenant_scoped(pool):
         visible = await conn.fetch("SELECT id FROM background_jobs ORDER BY id")
     assert [row["id"] for row in visible] == [job_a]
     assert job_b not in [row["id"] for row in visible]
+
+
+@pytest.mark.asyncio
+async def test_background_jobs_has_no_authenticated_mutation_policy_or_access(pool):
+    user_id = await _seed_user(pool)
+    job_id = await _insert_job(pool, user_id)
+    policies = await pool.fetch(
+        "SELECT policyname, cmd, roles FROM pg_policies WHERE schemaname = 'public' "
+        "AND tablename = 'background_jobs' ORDER BY policyname"
+    )
+    assert [dict(policy) for policy in policies] == [
+        {"policyname": "background_jobs_select", "cmd": "SELECT", "roles": ["authenticated"]}
+    ]
+
+    mutations = (
+        ("INSERT INTO background_jobs (user_id, job_type) VALUES ($1, 'document.extract')", user_id),
+        ("UPDATE background_jobs SET state = 'cancelled' WHERE id = $1", job_id),
+        ("DELETE FROM background_jobs WHERE id = $1", job_id),
+    )
+    for statement, parameter in mutations:
+        async with _authenticated_session(pool, user_id) as conn:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await conn.execute(statement, parameter)
