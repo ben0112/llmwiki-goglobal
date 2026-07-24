@@ -1,10 +1,12 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Confirmed design, pending implementation plan
+**Status:** Confirmed design and implementation plan, pending implementation
 
 **Branch:** `feat/platform-architecture-evolution`
 
 **Date:** 2026-07-25
+
+**Implementation plan:** [2026-07-25-durable-jobs-api-scaling.md](../plans/2026-07-25-durable-jobs-api-scaling.md)
 
 ## Scope and supersession
 
