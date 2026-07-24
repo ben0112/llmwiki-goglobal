@@ -12,6 +12,8 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+DISPATCH_RUN_AFTER = datetime(2026, 1, 1, tzinfo=UTC)
+
 
 def _runtime_settings(**changes):
     values = {
@@ -52,10 +54,10 @@ class FakeConnection:
 
     async def fetch(self, query, *args):
         self.fetch_calls.append((query, args))
-        return [{"id": job_id} for job_id in self.selected]
+        return [{"id": job_id, "run_after": DISPATCH_RUN_AFTER} for job_id in self.selected]
 
-    async def fetchval(self, query, job_id):
-        self.fetchval_calls.append((query, job_id))
+    async def fetchval(self, query, job_id, selected_run_after):
+        self.fetchval_calls.append((query, job_id, selected_run_after))
         if job_id in self.mark_errors:
             raise self.mark_errors[job_id]
         return self.mark_results.get(job_id, True)
@@ -100,26 +102,29 @@ class FakeRedis:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["batch_size", "redeliver_seconds"])
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1", None])
-async def test_select_due_job_ids_rejects_non_positive_integral_values(field, value):
-    from jobs.dispatcher import select_due_job_ids
+async def test_select_due_jobs_rejects_non_positive_integral_values(field, value):
+    from jobs.dispatcher import select_due_jobs
 
     values = {"batch_size": 10, "redeliver_seconds": 30, field: value}
     with pytest.raises(ValueError, match=field):
-        await select_due_job_ids(FakePool().connection, **values)
+        await select_due_jobs(FakePool().connection, **values)
 
 
 @pytest.mark.asyncio
-async def test_select_due_job_ids_uses_parameterized_ordered_skip_locked_query():
-    from jobs.dispatcher import select_due_job_ids
+async def test_select_due_jobs_returns_generation_tokens_with_ordered_skip_locked_query():
+    from jobs.dispatcher import DispatchCandidate, select_due_jobs
 
     selected = [uuid4(), uuid4()]
     connection = FakePool(selected).connection
 
-    assert await select_due_job_ids(connection, batch_size=2, redeliver_seconds=30) == selected
+    assert await select_due_jobs(connection, batch_size=2, redeliver_seconds=30) == [
+        DispatchCandidate(job_id=job_id, run_after=DISPATCH_RUN_AFTER) for job_id in selected
+    ]
     query, args = connection.fetch_calls[0]
     normalized = " ".join(query.split()).lower()
     assert args == (30, 2)
     assert "clock_timestamp()" in normalized
+    assert "select job.id, job.run_after" in normalized
     assert "job.last_dispatched_at < dispatch_clock.checked_at" in normalized
     assert "job.last_dispatched_at < job.run_after" in normalized
     assert "order by job.run_after, job.created_at, job.id" in normalized
@@ -149,7 +154,9 @@ async def test_dispatch_sends_only_opaque_uuid_and_marks_new_and_duplicate_deliv
         (("run_job", str(job_ids[0])), {"_job_id": str(job_ids[0])}),
         (("run_job", str(job_ids[1])), {"_job_id": str(job_ids[1])}),
     ]
-    assert [call[1] for call in pool.connection.fetchval_calls] == job_ids
+    assert [(call[1], call[2]) for call in pool.connection.fetchval_calls] == [
+        (job_id, DISPATCH_RUN_AFTER) for job_id in job_ids
+    ]
 
 
 @pytest.mark.asyncio
@@ -173,7 +180,10 @@ async def test_dispatch_continues_after_enqueue_and_mark_failures():
         enqueue_failed=1,
         mark_failed=1,
     )
-    assert [call[1] for call in pool.connection.fetchval_calls] == [mark_failed, delivered]
+    assert [(call[1], call[2]) for call in pool.connection.fetchval_calls] == [
+        (mark_failed, DISPATCH_RUN_AFTER),
+        (delivered, DISPATCH_RUN_AFTER),
+    ]
 
 
 @pytest.mark.asyncio
@@ -689,6 +699,20 @@ def test_prepare_job_result_rejects_nonmapping_and_nested_non_json_values(result
 def test_prepare_job_result_rejects_obviously_oversized_single_strings(result):
     from jobs.handlers import TerminalJobError
     from jobs.worker import _prepare_job_result
+
+    with pytest.raises(TerminalJobError) as raised:
+        _prepare_job_result(result)
+    assert raised.value.error_code == "invalid_job_result"
+
+
+def test_prepare_job_result_rejects_cumulative_small_string_bytes_over_limit():
+    from jobs.handlers import TerminalJobError
+    from jobs.worker import _prepare_job_result
+
+    result = {f"key-{index:04d}": "v" * 100 for index in range(160)}
+    assert all(len(key.encode("utf-8")) <= 16_384 for key in result)
+    assert all(len(value.encode("utf-8")) <= 16_384 for value in result.values())
+    assert sum(len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in result.items()) > 16_384
 
     with pytest.raises(TerminalJobError) as raised:
         _prepare_job_result(result)
@@ -1259,6 +1283,46 @@ async def test_startup_closes_pool_when_later_resource_creation_fails(monkeypatc
             }
         )
     assert pool.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_rejects_caller_resources_before_pool_creation(monkeypatch):
+    from jobs import worker
+
+    external_pool = PoolWithConnectionTransaction()
+
+    class ExternalS3:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+    external_s3 = ExternalS3()
+
+    create_pool_calls = []
+
+    async def create_pool(_url):
+        create_pool_calls.append(_url)
+        raise AssertionError("reserved ctx keys must fail before pool creation")
+
+    monkeypatch.setattr(worker, "_create_pool", create_pool)
+    ctx = {
+        "redis": object(),
+        "runtime_settings": _runtime_settings(),
+        "pool": external_pool,
+        "s3": external_s3,
+    }
+
+    with pytest.raises(RuntimeError, match="reserved keys: pool, s3"):
+        await worker.startup(ctx)
+    await worker.shutdown(ctx)
+
+    assert create_pool_calls == []
+    assert external_pool.close_calls == 0
+    assert external_s3.close_calls == 0
+    assert ctx["pool"] is external_pool
+    assert ctx["s3"] is external_s3
 
 
 @pytest.mark.asyncio

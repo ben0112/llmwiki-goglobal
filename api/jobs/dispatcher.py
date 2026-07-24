@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 import asyncpg
@@ -17,11 +18,19 @@ def _validate_positive_integer(value: int, field: str) -> None:
         raise ValueError(f"{field} must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchCandidate:
+    """One database-selected delivery generation."""
+
+    job_id: UUID
+    run_after: datetime
+
+
 _SELECT_DUE_JOB_IDS = """
 WITH dispatch_clock AS MATERIALIZED (
     SELECT clock_timestamp() AS checked_at
 )
-SELECT job.id
+SELECT job.id, job.run_after
 FROM background_jobs AS job
 CROSS JOIN dispatch_clock
 WHERE job.state IN ('queued', 'retry_wait')
@@ -40,17 +49,23 @@ LIMIT $2
 """
 
 
-async def select_due_job_ids(
+async def select_due_jobs(
     conn: asyncpg.Connection,
     *,
     batch_size: int,
     redeliver_seconds: int,
-) -> list[UUID]:
-    """Lock and return a deterministic bounded batch of database-due job IDs."""
+) -> list[DispatchCandidate]:
+    """Lock due job IDs with the run_after token for their selected generation."""
     _validate_positive_integer(batch_size, "batch_size")
     _validate_positive_integer(redeliver_seconds, "redeliver_seconds")
     rows = await conn.fetch(_SELECT_DUE_JOB_IDS, redeliver_seconds, batch_size)
-    return [row["id"] if isinstance(row["id"], UUID) else UUID(str(row["id"])) for row in rows]
+    return [
+        DispatchCandidate(
+            job_id=row["id"] if isinstance(row["id"], UUID) else UUID(str(row["id"])),
+            run_after=row["run_after"],
+        )
+        for row in rows
+    ]
 
 
 _MARK_DISPATCHED = """
@@ -63,14 +78,19 @@ SET
     dispatch_attempts = job.dispatch_attempts + 1
 FROM dispatch_clock
 WHERE job.id = $1
+  AND job.run_after = $2
   AND job.state IN ('queued', 'retry_wait', 'running')
 RETURNING true
 """
 
 
-async def mark_dispatched(conn: asyncpg.Connection, job_id: UUID) -> bool:
-    """Record one delivered transport message without changing durable job state."""
-    return bool(await conn.fetchval(_MARK_DISPATCHED, job_id))
+async def mark_dispatched(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    selected_run_after: datetime,
+) -> bool:
+    """Record delivery only while the selected generation remains current."""
+    return bool(await conn.fetchval(_MARK_DISPATCHED, job_id, selected_run_after))
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +115,7 @@ async def dispatch_due_jobs(
     _validate_positive_integer(redeliver_seconds, "redeliver_seconds")
 
     async with pool.acquire() as conn, conn.transaction():
-        job_ids = await select_due_job_ids(
+        selected_jobs = await select_due_jobs(
             conn,
             batch_size=batch_size,
             redeliver_seconds=redeliver_seconds,
@@ -107,7 +127,8 @@ async def dispatch_due_jobs(
     enqueue_failed = 0
     mark_failed = 0
 
-    for job_id in job_ids:
+    for candidate in selected_jobs:
+        job_id = candidate.job_id
         try:
             arq_job = await arq_redis.enqueue_job(
                 "run_job",
@@ -130,7 +151,7 @@ async def dispatch_due_jobs(
 
         try:
             async with pool.acquire() as conn, conn.transaction():
-                was_marked = await mark_dispatched(conn, job_id)
+                was_marked = await mark_dispatched(conn, job_id, candidate.run_after)
         except Exception as exc:  # noqa: BLE001 - durable redelivery recovers this mismatch.
             mark_failed += 1
             logger.warning(
@@ -147,7 +168,7 @@ async def dispatch_due_jobs(
             logger.info("job dispatch mark skipped job_id=%s", job_id)
 
     return DispatchSummary(
-        selected=len(job_ids),
+        selected=len(selected_jobs),
         enqueued=enqueued,
         already_present=already_present,
         marked=marked,

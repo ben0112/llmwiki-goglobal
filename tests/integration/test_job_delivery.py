@@ -7,7 +7,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from jobs.dispatcher import dispatch_due_jobs, mark_dispatched, select_due_job_ids
+from jobs import repository
+from jobs.dispatcher import dispatch_due_jobs, mark_dispatched, select_due_jobs
 from jobs.handlers import TerminalJobError, WorkerContext
 from jobs.models import JobState, JobType
 
@@ -42,11 +43,12 @@ async def _insert_job(pool, user_id, *, state="queued", **values):
 
 async def _select(pool, *, batch_size=100, redeliver_seconds=30):
     async with pool.acquire() as conn, conn.transaction():
-        return await select_due_job_ids(
+        selected = await select_due_jobs(
             conn,
             batch_size=batch_size,
             redeliver_seconds=redeliver_seconds,
         )
+    return [candidate.job_id for candidate in selected]
 
 
 @pytest.mark.asyncio
@@ -135,10 +137,12 @@ async def test_select_due_jobs_uses_skip_locked_with_deterministic_row_lock_evid
     tx_a = conn_a.transaction()
     try:
         await tx_a.start()
-        assert await select_due_job_ids(conn_a, batch_size=1, redeliver_seconds=30) == [first["id"]]
+        assert [
+            candidate.job_id for candidate in await select_due_jobs(conn_a, batch_size=1, redeliver_seconds=30)
+        ] == [first["id"]]
         async with conn_b.transaction(), asyncio.timeout(1):
-            skipped = await select_due_job_ids(conn_b, batch_size=1, redeliver_seconds=30)
-        assert skipped == [second["id"]]
+            skipped = await select_due_jobs(conn_b, batch_size=1, redeliver_seconds=30)
+        assert [candidate.job_id for candidate in skipped] == [second["id"]]
     finally:
         await tx_a.rollback()
         await pool.release(conn_b)
@@ -160,11 +164,13 @@ async def test_mark_dispatched_changes_only_dispatch_metadata_and_rejects_termin
         lease_expires_at=OLD,
         heartbeat_at=OLD,
     )
+    running = await _insert_job(pool, user_id, state="running", run_after=OLD)
     terminal = await _insert_job(pool, user_id, state="succeeded", run_after=OLD)
     before = await pool.fetchval("SELECT clock_timestamp()")
     async with pool.acquire() as conn, conn.transaction():
-        assert await mark_dispatched(conn, queued["id"]) is True
-        assert await mark_dispatched(conn, terminal["id"]) is False
+        assert await mark_dispatched(conn, queued["id"], queued["run_after"]) is True
+        assert await mark_dispatched(conn, running["id"], running["run_after"]) is True
+        assert await mark_dispatched(conn, terminal["id"], terminal["run_after"]) is False
     after = await pool.fetchval("SELECT clock_timestamp()")
 
     changed = await pool.fetchrow("SELECT * FROM background_jobs WHERE id = $1", queued["id"])
@@ -183,6 +189,13 @@ async def test_mark_dispatched_changes_only_dispatch_metadata_and_rejects_termin
         assert changed[field] == queued[field]
     assert changed["dispatch_attempts"] == queued["dispatch_attempts"] + 1
     assert before <= changed["last_dispatched_at"] <= after
+    assert (
+        await pool.fetchval(
+            "SELECT dispatch_attempts FROM background_jobs WHERE id = $1",
+            running["id"],
+        )
+        == 1
+    )
     assert dict(await pool.fetchrow("SELECT * FROM background_jobs WHERE id = $1", terminal["id"])) == dict(terminal)
 
 
@@ -256,6 +269,67 @@ async def test_concurrent_dispatchers_release_database_then_arq_collapses_duplic
     assert redis.calls == [expected, expected]
     assert len(redis._seen) == 1
     assert await pool.fetchval("SELECT dispatch_attempts FROM background_jobs WHERE id = $1", job["id"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_delivery_mark_cannot_throttle_a_due_retry_generation(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(pool, user_id, run_after=OLD)
+
+    class RetryBeforeDeliveryReturnsRedis:
+        def __init__(self):
+            self.retried = None
+            self.due_run_after = None
+
+        async def enqueue_job(self, function, job_id_text, **kwargs):
+            assert (function, job_id_text) == ("run_job", str(job["id"]))
+            assert kwargs == {"_job_id": str(job["id"])}
+            async with pool.acquire() as conn, conn.transaction():
+                claimed = await repository.claim(conn, job["id"], "race-worker", 30)
+                assert claimed is not None
+                self.retried = await repository.fail_or_retry(
+                    conn,
+                    job["id"],
+                    "race-worker",
+                    error_code="transient",
+                    error_message="The job could not be completed.",
+                    retryable=True,
+                )
+                self.due_run_after = await conn.fetchval(
+                    "UPDATE background_jobs "
+                    "SET run_after = clock_timestamp() - interval '1 second' "
+                    "WHERE id = $1 RETURNING run_after",
+                    job["id"],
+                )
+            return object()
+
+    redis = RetryBeforeDeliveryReturnsRedis()
+
+    async with asyncio.timeout(1):
+        summary = await dispatch_due_jobs(
+            pool,
+            redis,
+            batch_size=1,
+            redeliver_seconds=30,
+        )
+
+    assert summary.selected == 1
+    assert summary.enqueued == 1
+    assert summary.marked == 0
+    assert summary.mark_failed == 1
+    assert redis.retried is not None
+    assert redis.due_run_after is not None
+    assert redis.retried.run_after > redis.due_run_after
+    row = await pool.fetchrow(
+        "SELECT state, run_after, last_dispatched_at, dispatch_attempts FROM background_jobs WHERE id = $1",
+        job["id"],
+    )
+    assert row["state"] == "retry_wait"
+    assert row["run_after"] == redis.due_run_after
+    assert row["last_dispatched_at"] is None
+    assert row["dispatch_attempts"] == 0
+    assert job["id"] in await _select(pool, redeliver_seconds=30)
 
 
 @pytest.mark.asyncio

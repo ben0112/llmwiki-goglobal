@@ -46,6 +46,7 @@ _UNHANDLED_CODE = "unhandled_worker_error"
 _UNHANDLED_MESSAGE = "The job encountered an unexpected error."
 _INVALID_RESULT_CODE = "invalid_job_result"
 _INVALID_RESULT_MESSAGE = "The job produced an invalid result."
+_OWNED_RESOURCES_CTX_KEY = "_durable_worker_owned_resources"
 
 
 async def _create_pool(database_url: str) -> asyncpg.Pool:
@@ -93,11 +94,18 @@ async def startup(ctx: dict) -> None:
     validate_worker_runtime(runtime_settings)
     if ctx.get("redis") is None:
         raise RuntimeError("ARQ durable worker requires ctx['redis'] from ARQ")
+    reserved_keys = {"pool", "s3", _OWNED_RESOURCES_CTX_KEY}.intersection(ctx)
+    if reserved_keys:
+        names = ", ".join(sorted(reserved_keys))
+        raise RuntimeError(f"ARQ durable worker ctx contains reserved keys: {names}")
 
+    created_resources: dict[str, object | None] = {}
     try:
         pool = await _create_pool(runtime_settings.DATABASE_URL)
+        created_resources["pool"] = pool
         ctx["pool"] = pool
         s3 = _create_s3_service() if _s3_is_configured(runtime_settings) else None
+        created_resources["s3"] = s3
         ctx["s3"] = s3
         worker_context = WorkerContext(
             pool=pool,
@@ -117,23 +125,24 @@ async def startup(ctx: dict) -> None:
                 "redeliver_seconds": runtime_settings.JOB_REDELIVER_SECONDS,
             }
         )
+        ctx[_OWNED_RESOURCES_CTX_KEY] = created_resources
     except BaseException:
-        await _close_worker_resources(ctx)
+        await _close_worker_resources(ctx, owned_resources=created_resources)
         raise
 
 
-async def _close_worker_resources(ctx: dict) -> None:
+async def _close_worker_resources(
+    ctx: dict,
+    *,
+    owned_resources: Mapping[str, object | None],
+) -> None:
     """Close each tracked worker-owned resource at most once."""
-    pool = ctx.pop("pool", None)
-    s3 = ctx.pop("s3", None)
-    ctx.pop("worker_context", None)
-    ctx.pop("handlers", None)
-    ctx.pop("worker_id", None)
-    ctx.pop("lease_seconds", None)
-    ctx.pop("heartbeat_seconds", None)
-    ctx.pop("dispatch_batch_size", None)
-    ctx.pop("reap_batch_size", None)
-    ctx.pop("redeliver_seconds", None)
+    pool = owned_resources.get("pool")
+    s3 = owned_resources.get("s3")
+    if "pool" in owned_resources and ctx.get("pool") is pool:
+        ctx.pop("pool", None)
+    if "s3" in owned_resources and ctx.get("s3") is s3:
+        ctx.pop("s3", None)
 
     try:
         close_s3 = getattr(s3, "close", None)
@@ -148,7 +157,20 @@ async def _close_worker_resources(ctx: dict) -> None:
 
 async def shutdown(ctx: dict) -> None:
     """Release worker-owned resources while leaving ARQ's Redis client alone."""
-    await _close_worker_resources(ctx)
+    owned_resources = ctx.pop(_OWNED_RESOURCES_CTX_KEY, None)
+    if owned_resources is None:
+        return
+    try:
+        await _close_worker_resources(ctx, owned_resources=owned_resources)
+    finally:
+        ctx.pop("worker_context", None)
+        ctx.pop("handlers", None)
+        ctx.pop("worker_id", None)
+        ctx.pop("lease_seconds", None)
+        ctx.pop("heartbeat_seconds", None)
+        ctx.pop("dispatch_batch_size", None)
+        ctx.pop("reap_batch_size", None)
+        ctx.pop("redeliver_seconds", None)
 
 
 async def _record_failure(
@@ -187,19 +209,25 @@ def _invalid_result() -> TerminalJobError:
 
 
 def _reject_obviously_oversized_strings(value: JSONValue) -> None:
-    """Reject only strings that alone cannot fit PostgreSQL's result budget."""
-    if isinstance(value, str):
-        if len(value.encode("utf-8")) > RESULT_MAX_BYTES:
-            raise _invalid_result()
-        return
-    if isinstance(value, list):
-        for item in value:
-            _reject_obviously_oversized_strings(item)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _reject_obviously_oversized_strings(key)
-            _reject_obviously_oversized_strings(item)
+    """Reject when cumulative string bytes alone cannot fit the result budget."""
+
+    def accumulate_string_bytes(item: JSONValue, total: int) -> int:
+        if isinstance(item, str):
+            total += len(item.encode("utf-8"))
+            if total > RESULT_MAX_BYTES:
+                raise _invalid_result()
+            return total
+        if isinstance(item, list):
+            for child in item:
+                total = accumulate_string_bytes(child, total)
+            return total
+        if isinstance(item, dict):
+            for key, child in item.items():
+                total = accumulate_string_bytes(key, total)
+                total = accumulate_string_bytes(child, total)
+        return total
+
+    accumulate_string_bytes(value, 0)
 
 
 def _prepare_job_result(raw_result: object) -> tuple[dict[str, JSONValue], str]:
