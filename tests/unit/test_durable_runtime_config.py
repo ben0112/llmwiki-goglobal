@@ -25,11 +25,15 @@ def _clear_runtime_environment(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+def _settings() -> Settings:
+    return Settings(_env_file=None)
+
+
 def test_local_mode_does_not_require_redis(monkeypatch):
     _clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("MODE", "local")
 
-    settings = Settings()
+    settings = _settings()
 
     assert settings.REDIS_URL is None
 
@@ -40,7 +44,7 @@ def test_local_mode_ignores_durable_flags_for_redis_requirements(monkeypatch):
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
     monkeypatch.setenv("TUS_MULTIPART_ENABLED", "true")
 
-    settings = Settings()
+    settings = _settings()
 
     assert settings.REDIS_URL is None
 
@@ -51,7 +55,7 @@ def test_local_mode_ignores_tus_dependency_on_durable_jobs(monkeypatch):
     monkeypatch.setenv("TUS_MULTIPART_ENABLED", "true")
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "false")
 
-    settings = Settings()
+    settings = _settings()
 
     assert settings.REDIS_URL is None
     assert settings.TUS_MULTIPART_ENABLED is True
@@ -64,7 +68,7 @@ def test_hosted_durable_jobs_requires_redis(monkeypatch):
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
 
     with pytest.raises(ValueError, match="REDIS_URL"):
-        Settings()
+        _settings()
 
 
 def test_tus_multipart_requires_durable_jobs(monkeypatch):
@@ -75,7 +79,7 @@ def test_tus_multipart_requires_durable_jobs(monkeypatch):
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "false")
 
     with pytest.raises(ValueError, match="DURABLE_JOBS_ENABLED"):
-        Settings()
+        _settings()
 
 
 def test_hosted_tus_requires_redis(monkeypatch):
@@ -85,7 +89,7 @@ def test_hosted_tus_requires_redis(monkeypatch):
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
 
     with pytest.raises(ValueError, match="REDIS_URL"):
-        Settings()
+        _settings()
 
 
 @pytest.mark.parametrize(
@@ -107,7 +111,7 @@ def test_runtime_limits_must_be_positive(monkeypatch, name):
     monkeypatch.setenv(name, "0")
 
     with pytest.raises(ValueError, match=name):
-        Settings()
+        _settings()
 
 
 @pytest.mark.parametrize(
@@ -118,11 +122,23 @@ def test_runtime_limits_must_be_positive(monkeypatch, name):
             "JOB_HEARTBEAT_SECONDS",
         ),
         (
+            {"JOB_LEASE_SECONDS": "30", "JOB_HEARTBEAT_SECONDS": "31"},
+            "JOB_HEARTBEAT_SECONDS",
+        ),
+        (
             {"TUS_SESSION_TTL_SECONDS": "30", "TUS_STALE_SECONDS": "30"},
             "TUS_STALE_SECONDS",
         ),
         (
+            {"TUS_SESSION_TTL_SECONDS": "30", "TUS_STALE_SECONDS": "31"},
+            "TUS_STALE_SECONDS",
+        ),
+        (
             {"TUS_STALE_SECONDS": "30", "TUS_LOCK_SECONDS": "30"},
+            "TUS_LOCK_SECONDS",
+        ),
+        (
+            {"TUS_STALE_SECONDS": "30", "TUS_LOCK_SECONDS": "31"},
             "TUS_LOCK_SECONDS",
         ),
     ),
@@ -134,7 +150,7 @@ def test_runtime_timing_relationships_are_strict(monkeypatch, overrides, error_f
         monkeypatch.setenv(name, value)
 
     with pytest.raises(ValueError, match=error_field):
-        Settings()
+        _settings()
 
 
 def test_positive_runtime_limits_are_accepted(monkeypatch):
@@ -153,7 +169,7 @@ def test_positive_runtime_limits_are_accepted(monkeypatch):
     for name, value in expected.items():
         monkeypatch.setenv(name, str(value))
 
-    settings = Settings()
+    settings = _settings()
 
     for name, value in expected.items():
         assert getattr(settings, name) == value
@@ -163,7 +179,7 @@ def test_runtime_defaults_in_a_clean_environment(monkeypatch):
     _clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("MODE", "local")
 
-    settings = Settings()
+    settings = _settings()
 
     assert settings.REDIS_URL is None
     assert settings.DURABLE_JOBS_ENABLED is False
