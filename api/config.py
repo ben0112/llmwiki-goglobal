@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +37,18 @@ class Settings(BaseSettings):
     CONVERTER_URL: str = ""
     CONVERTER_SECRET: str = ""
 
+    REDIS_URL: str | None = None
+    DURABLE_JOBS_ENABLED: bool = False
+    TUS_MULTIPART_ENABLED: bool = False
+    JOB_LEASE_SECONDS: int = Field(default=120, gt=0)
+    JOB_HEARTBEAT_SECONDS: int = Field(default=30, gt=0)
+    JOB_DISPATCH_BATCH_SIZE: int = Field(default=100, gt=0)
+    JOB_REDELIVER_SECONDS: int = Field(default=30, gt=0)
+    TUS_SESSION_TTL_SECONDS: int = Field(default=172800, gt=0)
+    TUS_STALE_SECONDS: int = Field(default=86400, gt=0)
+    TUS_LOCK_SECONDS: int = Field(default=60, gt=0)
+    TUS_MAX_PATCH_BYTES: int = Field(default=67108864, gt=0)
+
     GLOBAL_OCR_ENABLED: bool = True
     GLOBAL_MAX_PAGES: int = 1_000_000
     GLOBAL_MAX_USERS: int = 10_000
@@ -52,6 +65,25 @@ class Settings(BaseSettings):
     EXTRACT_CONCURRENCY: int = 0  # 文档提取并发(LibreOffice/JVM);0 = CPU 感知默认
     CORPUS_AUTOCLASSIFY: bool = False  # 自动分类默认关(设置页可开)
     CORPUS_AUTO_INTERVAL: int = 30  # 自动分类轮询间隔(秒)
+
+    @model_validator(mode="after")
+    def validate_durable_runtime(self) -> "Settings":
+        if self.TUS_MULTIPART_ENABLED and not self.DURABLE_JOBS_ENABLED:
+            raise ValueError("DURABLE_JOBS_ENABLED must be true when TUS_MULTIPART_ENABLED is true")
+
+        if self.MODE == "hosted" and (
+            self.DURABLE_JOBS_ENABLED or self.TUS_MULTIPART_ENABLED
+        ) and not self.REDIS_URL:
+            raise ValueError("REDIS_URL is required for hosted durable runtime features")
+
+        if self.JOB_HEARTBEAT_SECONDS >= self.JOB_LEASE_SECONDS:
+            raise ValueError("JOB_HEARTBEAT_SECONDS must be less than JOB_LEASE_SECONDS")
+        if self.TUS_STALE_SECONDS >= self.TUS_SESSION_TTL_SECONDS:
+            raise ValueError("TUS_STALE_SECONDS must be less than TUS_SESSION_TTL_SECONDS")
+        if self.TUS_LOCK_SECONDS >= self.TUS_STALE_SECONDS:
+            raise ValueError("TUS_LOCK_SECONDS must be less than TUS_STALE_SECONDS")
+
+        return self
 
     @property
     def listen_database_url(self) -> str:
