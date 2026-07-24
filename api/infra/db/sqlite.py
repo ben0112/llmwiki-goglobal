@@ -101,10 +101,18 @@ def _serialized(method):
 
 
 @asynccontextmanager
-async def serialized_write():
-    """Hold the local write lock around a multi-statement write outside the repos."""
+async def serialized_write(db: aiosqlite.Connection | None = None):
+    """Serialize a local write span and roll its active connection back on failure."""
     async with _write_lock:
-        yield
+        try:
+            yield
+        except Exception:
+            if db is not None:
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.warning("Rollback after failed serialized write also failed")
+            raise
 
 
 async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Connection:
@@ -793,7 +801,15 @@ class SQLiteChunkRepository:
         self._db = db
 
     @_serialized
-    async def store(self, doc_id: str, user_id: str, kb_id: str, chunks: list) -> None:
+    async def store(
+        self,
+        doc_id: str,
+        user_id: str,
+        kb_id: str,
+        chunks: list,
+        *,
+        document_version: int,
+    ) -> None:
         await self._db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
         if not chunks:
             await self._db.commit()
@@ -804,11 +820,12 @@ class SQLiteChunkRepository:
         # into the chunk later. See api/services/highlight_chunks.
         await self._db.executemany(
             "INSERT INTO document_chunks "
-            "(id, document_id, chunk_index, content, source_content, page, start_char, token_count, header_breadcrumb) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, document_id, chunk_index, content, source_content, page, start_char, "
+            "token_count, header_breadcrumb, document_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
-                 c.start_char, c.token_count, c.header_breadcrumb)
+                 c.start_char, c.token_count, c.header_breadcrumb, document_version)
                 for c in chunks
             ],
         )

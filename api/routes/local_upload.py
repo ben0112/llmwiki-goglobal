@@ -66,6 +66,13 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+async def _store_chunks_for_upload(db, doc_id: str, chunks: list, document_version: int) -> None:
+    """Write upload chunks on the caller's active SQLite transaction."""
+    from domain.local_processor import _store_chunks
+
+    await _store_chunks(db, doc_id, chunks, document_version)
+
+
 async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) -> dict:
     """为已落盘的文件建立索引(哈希由调用方提供,大文件流式计算不进内存)。"""
     filename = relative.rsplit("/", 1)[-1]
@@ -86,41 +93,56 @@ async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) 
         except Exception:
             pass
 
-    from infra.db.sqlite import SQLiteDocumentRepository, SQLiteChunkRepository, serialized_write
+    from infra.db.sqlite import SQLiteDocumentRepository, serialized_write
     doc_repo = SQLiteDocumentRepository(db)
-    chunk_repo = SQLiteChunkRepository(db)
 
     doc_id = str(uuid.uuid4())
-
-    async with serialized_write():
-        try:
-            cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
-            row = await cursor.fetchone()
-            doc_number = row[0]
-            await db.execute(
-                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
-                "source_kind, file_type, file_size, status, content, tags, version, "
-                "content_hash, mtime_ns, last_indexed_at, document_number) "
-                "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, ?, ?, datetime('now'), ?)",
-                (doc_id, filename, title, dir_path, relative, source_kind,
-                 ext or "bin", size,
-                 # 超过内联上限的文本文件直接 ready(不进全文索引,避免整读)
-                 "ready" if (text_content is not None or ext in SIMPLE_TEXT_TYPES) else "pending",
-                 text_content, content_hash,
-                 int(dest.stat().st_mtime_ns), doc_number),
-            )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
-
-    # Chunk text content or kick off processing for non-text files
-    if text_content:
+    is_simple_text = ext in SIMPLE_TEXT_TYPES
+    chunks = []
+    if is_simple_text and text_content:
         from services.chunker import chunk_text
+
         chunks = chunk_text(text_content)
-        # SQLite 实现忽略 user/kb 参数(仅为与 hosted 接口对齐)
-        await chunk_repo.store(doc_id, "", "", chunks)
-    elif needs_processing:
+
+    async with serialized_write(db):
+        cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
+        row = await cursor.fetchone()
+        doc_number = row[0]
+        await db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+            "source_kind, file_type, file_size, status, content, tags, version, "
+            "content_hash, mtime_ns, last_indexed_at, document_number) "
+            "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'[]', 0, ?, ?, datetime('now'), ?)",
+            (
+                doc_id,
+                filename,
+                title,
+                dir_path,
+                relative,
+                source_kind,
+                ext or "bin",
+                size,
+                "processing" if is_simple_text else "pending",
+                text_content,
+                content_hash,
+                int(dest.stat().st_mtime_ns),
+                doc_number,
+            ),
+        )
+        if is_simple_text:
+            from domain.local_processor import _replace_text_content_on_connection
+
+            await _replace_text_content_on_connection(
+                db,
+                doc_id,
+                text_content,
+                chunks,
+                store_chunks=_store_chunks_for_upload,
+            )
+        await db.commit()
+
+    if needs_processing:
         from domain.local_processor import process_document_isolated
         from infra.tasks import spawn_logged
         spawn_logged(process_document_isolated(_workspace_root(), doc_id),

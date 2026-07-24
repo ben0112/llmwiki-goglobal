@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import uuid
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -233,7 +231,13 @@ class LocalDocumentService(DocumentService):
 
         if content:
             chunks = chunk_text(content)
-            await self.chunk_repo.store(str(row["id"]), self.user_id, kb_id, chunks)
+            await self.chunk_repo.store(
+                str(row["id"]),
+                self.user_id,
+                kb_id,
+                chunks,
+                document_version=int(row["version"]),
+            )
 
         return row
 
@@ -275,11 +279,19 @@ class LocalDocumentService(DocumentService):
             file_path.write_text(content, encoding="utf-8")
 
         row = await self.doc_repo.update_content(doc_id, self.user_id, content)
+        if row is None:
+            return None
 
         kb_id = await self.doc_repo.get_kb_id(doc_id)
         if kb_id:
             chunks = chunk_text(content) if content else []
-            await self.chunk_repo.store(doc_id, self.user_id, kb_id, chunks)
+            await self.chunk_repo.store(
+                doc_id,
+                self.user_id,
+                kb_id,
+                chunks,
+                document_version=int(row["version"]),
+            )
 
         return row
 

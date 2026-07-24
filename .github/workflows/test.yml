@@ -34,7 +34,7 @@ jobs:
         run: pytest tests/unit/core/ -v
 
       - name: Run API unit tests
-        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_facet_rollup.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py -v
+        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_facet_rollup.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py -v
 
       - name: Run MCP unit tests
         working-directory: mcp
