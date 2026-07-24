@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -69,6 +70,42 @@ def _command(user_id, **changes):
     }
     values.update(changes)
     return JobCreate(**values)
+
+
+async def _wait_for_lock_wait(observer_conn, backend_pid, timeout_seconds=1) -> None:
+    """Wait until ``backend_pid`` is blocked by another PostgreSQL lock holder."""
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_wait_event = None
+    while True:
+        row = await observer_conn.fetchrow(
+            "SELECT a.wait_event_type, EXISTS("
+            "SELECT 1 FROM pg_locks AS waiting "
+            "JOIN pg_locks AS holding "
+            "ON holding.locktype = waiting.locktype "
+            "AND holding.database IS NOT DISTINCT FROM waiting.database "
+            "AND holding.relation IS NOT DISTINCT FROM waiting.relation "
+            "AND holding.page IS NOT DISTINCT FROM waiting.page "
+            "AND holding.tuple IS NOT DISTINCT FROM waiting.tuple "
+            "AND holding.virtualxid IS NOT DISTINCT FROM waiting.virtualxid "
+            "AND holding.transactionid IS NOT DISTINCT FROM waiting.transactionid "
+            "AND holding.classid IS NOT DISTINCT FROM waiting.classid "
+            "AND holding.objid IS NOT DISTINCT FROM waiting.objid "
+            "AND holding.objsubid IS NOT DISTINCT FROM waiting.objsubid "
+            "WHERE waiting.pid = $1 AND NOT waiting.granted "
+            "AND holding.granted AND holding.pid <> waiting.pid"
+            ") AS blocked_by_other "
+            "FROM pg_stat_activity AS a WHERE a.pid = $1",
+            backend_pid,
+        )
+        if row is not None:
+            last_wait_event = row["wait_event_type"]
+            if row["wait_event_type"] == "Lock" and row["blocked_by_other"]:
+                return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"backend {backend_pid} did not enter a PostgreSQL lock wait; last wait event was {last_wait_event!r}"
+            )
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
@@ -171,12 +208,31 @@ async def test_create_idempotency_scope_distinguishes_tenants_types_and_null_key
 async def test_concurrent_create_with_one_idempotency_key_returns_one_job(pool):
     user_id = await _seed_user(pool)
     command = _command(user_id, idempotency_key="concurrent-create")
-
-    async with pool.acquire() as conn_a, pool.acquire() as conn_b:
-        first, second = await asyncio.gather(
-            repository.create(conn_a, command),
-            repository.create(conn_b, command),
-        )
+    conn_a = await pool.acquire()
+    conn_b = await pool.acquire()
+    observer = await pool.acquire()
+    transaction_a = conn_a.transaction()
+    pending_create = None
+    committed = False
+    try:
+        await transaction_a.start()
+        first = await repository.create(conn_a, command)
+        backend_b = await conn_b.fetchval("SELECT pg_backend_pid()")
+        pending_create = asyncio.create_task(repository.create(conn_b, command))
+        await _wait_for_lock_wait(observer, backend_b)
+        await transaction_a.commit()
+        committed = True
+        second = await pending_create
+    finally:
+        if not committed:
+            await transaction_a.rollback()
+        if pending_create is not None and not pending_create.done():
+            pending_create.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_create
+        await pool.release(observer)
+        await pool.release(conn_b)
+        await pool.release(conn_a)
 
     assert first.id == second.id
     assert (
@@ -265,25 +321,31 @@ async def test_cancel_race_returns_terminal_row_without_mutating_it(pool):
         created = await repository.create(conn, _command(user_id))
     conn_a = await pool.acquire()
     conn_b = await pool.acquire()
+    observer = await pool.acquire()
     transaction_a = conn_a.transaction()
-    await transaction_a.start()
+    pending_cancel = None
     committed = False
     try:
+        await transaction_a.start()
         terminal = await conn_a.fetchrow(
             "UPDATE background_jobs SET state = 'succeeded' WHERE id = $1 RETURNING *",
             created.id,
         )
+        backend_b = await conn_b.fetchval("SELECT pg_backend_pid()")
         pending_cancel = asyncio.create_task(repository.request_cancel(conn_b, created.id, user_id))
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(pending_cancel), timeout=0.05)
-
+        await _wait_for_lock_wait(observer, backend_b)
         await transaction_a.commit()
         committed = True
-        cancelled = await asyncio.wait_for(pending_cancel, timeout=1)
+        cancelled = await pending_cancel
         after = await pool.fetchrow("SELECT * FROM background_jobs WHERE id = $1", created.id)
     finally:
         if not committed:
             await transaction_a.rollback()
+        if pending_cancel is not None and not pending_cancel.done():
+            pending_cancel.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_cancel
+        await pool.release(observer)
         await pool.release(conn_b)
         await pool.release(conn_a)
 
