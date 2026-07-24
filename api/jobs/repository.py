@@ -4,13 +4,50 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 
-from jobs.models import JobCreate, JobRecord, JobState, JobType, to_json_value
+from jobs.models import (
+    ERROR_CODE_MAX_CHARS,
+    ERROR_MESSAGE_MAX_CHARS,
+    JobCancelled,
+    JobCreate,
+    JobRecord,
+    JobState,
+    JobType,
+    JSONValue,
+    LeaseLost,
+    retry_delay_seconds,
+    to_json_value,
+)
+
+
+def _utc_now(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(UTC)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _validate_owner(owner: str) -> None:
+    if not owner.strip():
+        raise ValueError("owner must not be empty")
+
+
+def _validate_positive(value: int, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+
+
+def _validate_error(error_code: str, error_message: str) -> None:
+    if len(error_code) > ERROR_CODE_MAX_CHARS:
+        raise ValueError(f"error_code must not exceed {ERROR_CODE_MAX_CHARS} characters")
+    if len(error_message) > ERROR_MESSAGE_MAX_CHARS:
+        raise ValueError(f"error_message must not exceed {ERROR_MESSAGE_MAX_CHARS} characters")
 
 
 def _uuid(value: object, field: str) -> UUID:
@@ -184,3 +221,262 @@ async def request_cancel(conn: asyncpg.Connection, job_id: UUID, user_id: UUID) 
     """Persist a cancellation request without touching terminal job rows."""
     row = await conn.fetchrow(_REQUEST_CANCEL, job_id, user_id)
     return None if row is None else _row_to_record(row)
+
+
+_CLAIM = """
+UPDATE background_jobs
+SET
+    state = 'running',
+    lease_owner = $2,
+    heartbeat_at = $3,
+    lease_expires_at = $3 + $4 * interval '1 second',
+    attempt_count = attempt_count + 1
+WHERE id = $1
+  AND (state = 'queued' OR (state = 'retry_wait' AND run_after <= $3))
+  AND cancel_requested_at IS NULL
+  AND attempt_count < max_attempts
+RETURNING *
+"""
+
+
+async def claim(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    owner: str,
+    lease_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> JobRecord | None:
+    """Atomically acquire one due job for a worker."""
+    _validate_owner(owner)
+    _validate_positive(lease_seconds, "lease_seconds")
+    row = await conn.fetchrow(_CLAIM, job_id, owner, _utc_now(now), lease_seconds)
+    return None if row is None else _row_to_record(row)
+
+
+_HEARTBEAT = """
+UPDATE background_jobs
+SET
+    heartbeat_at = $3,
+    lease_expires_at = $3 + $4 * interval '1 second'
+WHERE id = $1
+  AND state = 'running'
+  AND lease_owner = $2
+  AND lease_expires_at > $3
+RETURNING *
+"""
+
+
+async def heartbeat(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    owner: str,
+    lease_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> JobRecord:
+    """Extend a live owned lease, or report that ownership was lost."""
+    _validate_owner(owner)
+    _validate_positive(lease_seconds, "lease_seconds")
+    row = await conn.fetchrow(_HEARTBEAT, job_id, owner, _utc_now(now), lease_seconds)
+    if row is None:
+        raise LeaseLost("background job lease is no longer active")
+    return _row_to_record(row)
+
+
+async def assert_active(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    owner: str,
+    *,
+    now: datetime | None = None,
+) -> JobRecord:
+    """Check ownership, expiry, and cooperative cancellation at a worker checkpoint."""
+    _validate_owner(owner)
+    checked_at = _utc_now(now)
+    row = await conn.fetchrow(
+        "SELECT * FROM background_jobs WHERE id = $1 AND lease_owner = $2",
+        job_id,
+        owner,
+    )
+    if (
+        row is None
+        or row["state"] != JobState.RUNNING.value
+        or row["lease_expires_at"] is None
+        or row["lease_expires_at"] <= checked_at
+    ):
+        raise LeaseLost("background job lease is no longer active")
+    if row["cancel_requested_at"] is not None:
+        raise JobCancelled("background job cancellation was requested")
+    return _row_to_record(row)
+
+
+_SUCCEED = """
+UPDATE background_jobs
+SET
+    state = 'succeeded',
+    result = $4::jsonb,
+    progress = NULL,
+    error_code = NULL,
+    error_message = NULL,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    heartbeat_at = NULL
+WHERE id = $1
+  AND state = 'running'
+  AND lease_owner = $2
+  AND lease_expires_at > $3
+  AND cancel_requested_at IS NULL
+RETURNING *
+"""
+
+
+async def succeed(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    owner: str,
+    result: Mapping[str, JSONValue],
+    *,
+    now: datetime | None = None,
+) -> JobRecord:
+    """Persist successful output only while the worker still owns a live lease."""
+    _validate_owner(owner)
+    checked_at = _utc_now(now)
+    serialized_result = json.dumps(to_json_value(result))
+    row = await conn.fetchrow(_SUCCEED, job_id, owner, checked_at, serialized_result)
+    if row is not None:
+        return _row_to_record(row)
+    cancelled = await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM background_jobs "
+        "WHERE id = $1 AND state = 'running' AND lease_owner = $2 "
+        "AND lease_expires_at > $3 AND cancel_requested_at IS NOT NULL)",
+        job_id,
+        owner,
+        checked_at,
+    )
+    if cancelled:
+        raise JobCancelled("background job cancellation was requested")
+    raise LeaseLost("background job lease is no longer active")
+
+
+_FAIL_OR_RETRY = """
+UPDATE background_jobs AS job
+SET
+    state = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN 'cancelled'
+        WHEN $4 AND job.attempt_count < job.max_attempts THEN 'retry_wait'
+        ELSE 'failed'
+    END,
+    run_after = CASE
+        WHEN job.cancel_requested_at IS NULL
+         AND $4
+         AND job.attempt_count < job.max_attempts
+        THEN $7::timestamptz
+             + ($8::double precision[])[job.attempt_count] * interval '1 second'
+        ELSE job.run_after
+    END,
+    error_code = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN $4 AND job.attempt_count >= job.max_attempts THEN 'attempts_exhausted'
+        ELSE $5
+    END,
+    error_message = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        ELSE $6
+    END,
+    result = NULL,
+    progress = NULL,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    heartbeat_at = NULL
+WHERE job.id = $1
+  AND job.state = 'running'
+  AND job.lease_owner = $2
+  AND job.lease_expires_at > $3
+RETURNING job.*
+"""
+
+
+async def fail_or_retry(
+    conn: asyncpg.Connection,
+    job_id: UUID,
+    owner: str,
+    *,
+    error_code: str,
+    error_message: str,
+    retryable: bool,
+    now: datetime | None = None,
+) -> JobRecord:
+    """Record cancellation, deterministic retry, or terminal worker failure."""
+    _validate_owner(owner)
+    _validate_error(error_code, error_message)
+    checked_at = _utc_now(now)
+    retry_delays = [retry_delay_seconds(attempt, jitter=0) for attempt in range(1, 21)]
+    row = await conn.fetchrow(
+        _FAIL_OR_RETRY,
+        job_id,
+        owner,
+        checked_at,
+        retryable,
+        error_code,
+        error_message,
+        checked_at,
+        retry_delays,
+    )
+    if row is None:
+        raise LeaseLost("background job lease is no longer active")
+    return _row_to_record(row)
+
+
+_REAP_EXPIRED = """
+WITH expired AS (
+    SELECT id
+    FROM background_jobs
+    WHERE state = 'running'
+      AND lease_expires_at <= $1
+    ORDER BY lease_expires_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+)
+UPDATE background_jobs AS job
+SET
+    state = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN 'cancelled'
+        WHEN job.attempt_count < job.max_attempts THEN 'retry_wait'
+        ELSE 'failed'
+    END,
+    run_after = CASE
+        WHEN job.cancel_requested_at IS NULL AND job.attempt_count < job.max_attempts THEN $1
+        ELSE job.run_after
+    END,
+    error_code = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN job.attempt_count < job.max_attempts THEN 'lease_expired'
+        ELSE 'attempts_exhausted'
+    END,
+    error_message = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN job.attempt_count < job.max_attempts THEN 'Worker lease expired.'
+        ELSE 'Worker lease expired after all attempts were used.'
+    END,
+    result = NULL,
+    progress = NULL,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    heartbeat_at = NULL
+FROM expired
+WHERE job.id = expired.id
+RETURNING job.id
+"""
+
+
+async def reap_expired(
+    conn: asyncpg.Connection,
+    *,
+    now: datetime | None = None,
+    limit: int = 100,
+) -> list[UUID]:
+    """Recover a bounded batch of expired leases without colliding with other reapers."""
+    _validate_positive(limit, "limit")
+    rows = await conn.fetch(_REAP_EXPIRED, _utc_now(now), limit)
+    return [_uuid(row["id"], "id") for row in rows]
