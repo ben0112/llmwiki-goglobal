@@ -126,10 +126,35 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         if "extraction_attempts" not in {row[1] for row in await cur.fetchall()}:
             await db.execute(
                 "ALTER TABLE documents ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0")
+        await _ensure_derived_version_columns(db)
         await _migrate_fts_tokenizer(db, schema)
         await _migrate_reference_types(db, schema)
         await db.commit()
     return db
+
+
+async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:
+    """Add and backfill derived-version columns in pre-migration workspaces."""
+    for table in ("document_pages", "document_chunks"):
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "document_version" not in columns:
+            await db.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0"
+            )
+            await db.execute(
+                f"UPDATE {table} SET document_version = "
+                f"COALESCE((SELECT version FROM documents WHERE id = {table}.document_id), 0)"
+            )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pages_document_version "
+        "ON document_pages(document_id, document_version)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_document_version "
+        "ON document_chunks(document_id, document_version)"
+    )
 
 
 async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> None:

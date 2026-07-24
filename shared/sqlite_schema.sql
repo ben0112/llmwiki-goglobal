@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE TABLE IF NOT EXISTS document_pages (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_version INTEGER NOT NULL DEFAULT 0,
     page INTEGER NOT NULL,
     content TEXT NOT NULL,
     elements TEXT,
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS document_pages (
 CREATE TABLE IF NOT EXISTS document_chunks (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_version INTEGER NOT NULL DEFAULT 0,
     chunk_index INTEGER NOT NULL,
     -- `content` is the materialized form (source + annotations) used by FTS.
     -- `source_content` is the immutable raw chunk text; `annotations_text`

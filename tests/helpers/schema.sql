@@ -76,6 +76,7 @@ CREATE TABLE documents (
     filename TEXT NOT NULL,
     title TEXT,
     path TEXT DEFAULT '/' NOT NULL,
+    source_kind TEXT DEFAULT 'source' NOT NULL CHECK (source_kind IN ('source', 'wiki', 'asset')),
     file_type TEXT NOT NULL,
     file_size BIGINT DEFAULT 0 NOT NULL,
     document_number INTEGER,
@@ -98,6 +99,7 @@ CREATE TABLE documents (
 CREATE TABLE document_pages (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_version INTEGER NOT NULL DEFAULT 0,
     page INTEGER NOT NULL,
     content TEXT NOT NULL CHECK (length(content) <= 500000),
     elements JSONB,
@@ -107,6 +109,7 @@ CREATE TABLE document_pages (
 CREATE TABLE document_chunks (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_version INTEGER NOT NULL DEFAULT 0,
     user_id UUID NOT NULL REFERENCES users(id),
     knowledge_base_id UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
@@ -174,6 +177,8 @@ CREATE INDEX idx_documents_date ON documents(date) WHERE date IS NOT NULL;
 CREATE INDEX idx_api_keys_user_id ON api_keys(user_id);
 CREATE INDEX idx_chunks_kb ON document_chunks(knowledge_base_id);
 CREATE INDEX idx_chunks_doc ON document_chunks(document_id);
+CREATE INDEX idx_pages_document_version ON document_pages(document_id, document_version);
+CREATE INDEX idx_chunks_document_version ON document_chunks(document_id, document_version);
 
 -- PGroonga indexes intentionally omitted (requires C extension)
 

@@ -127,6 +127,30 @@ async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> Non
     logger.info("Rebuilt document_references with relation-layer types")
 
 
+async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:
+    """Add and backfill derived-version columns in pre-migration workspaces."""
+    for table in ("document_pages", "document_chunks"):
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "document_version" not in columns:
+            await db.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0"
+            )
+            await db.execute(
+                f"UPDATE {table} SET document_version = "
+                f"COALESCE((SELECT version FROM documents WHERE id = {table}.document_id), 0)"
+            )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pages_document_version "
+        "ON document_pages(document_id, document_version)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_document_version "
+        "ON document_chunks(document_id, document_version)"
+    )
+
+
 def _build_fts_match(query: str) -> str | None:
     """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
 
@@ -172,6 +196,7 @@ class SqliteVaultFS(VaultFS):
         if _SCHEMA_PATH.exists():
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)
+            await _ensure_derived_version_columns(_db)
             await _migrate_fts_tokenizer(_db, schema)
             await _migrate_reference_types(_db, schema)
             await _db.commit()

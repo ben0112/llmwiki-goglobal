@@ -98,3 +98,49 @@ async def test_search_fulltext_uses_shared_limit_contract():
             await repo.search_fulltext("ws1", "query", limit=101)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_create_pool_backfills_derived_versions_for_existing_database(tmp_path):
+    path = tmp_path / "existing.db"
+    db = await aiosqlite.connect(path)
+    current_schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    old_schema = current_schema.replace(
+        "    document_version INTEGER NOT NULL DEFAULT 0,\n",
+        "",
+    )
+    assert old_schema != current_schema
+    await db.executescript(old_schema)
+    await db.execute(
+        "INSERT INTO workspace (id, name, description, user_id) VALUES ('ws1', 'test', '', 'u1')"
+    )
+    await db.execute(
+        "INSERT INTO documents "
+        "(id, user_id, filename, path, relative_path, source_kind, file_type, status, version) "
+        "VALUES ('d1', 'u1', 'doc.md', '/', 'doc.md', 'source', 'md', 'ready', 7)"
+    )
+    await db.execute(
+        "INSERT INTO document_pages (id, document_id, page, content) VALUES ('p1', 'd1', 1, 'page')"
+    )
+    await db.execute(
+        "INSERT INTO document_chunks "
+        "(id, document_id, chunk_index, content, source_content, token_count) "
+        "VALUES ('c1', 'd1', 0, 'chunk', 'chunk', 1)"
+    )
+    await db.commit()
+    await db.close()
+
+    from infra.db.sqlite import create_pool
+
+    migrated = await create_pool(str(path))
+    try:
+        page_version = await migrated.execute_fetchall(
+            "SELECT document_version FROM document_pages WHERE id='p1'"
+        )
+        chunk_version = await migrated.execute_fetchall(
+            "SELECT document_version FROM document_chunks WHERE id='c1'"
+        )
+        assert page_version == [(7,)]
+        assert chunk_version == [(7,)]
+    finally:
+        await migrated.close()
