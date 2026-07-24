@@ -61,7 +61,7 @@ Schema and packaging files modified:
 - Create: `tests/unit/core/test_import_boundaries.py`
 - Modify: `.github/workflows/test.yml`
 
-- [ ] **Step 1: Write the failing import-boundary test**
+- [x] **Step 1: Write the failing import-boundary test**
 
 ```python
 # tests/unit/core/test_import_boundaries.py
@@ -95,13 +95,13 @@ def test_core_source_does_not_import_infrastructure_packages():
     assert offenders == []
 ```
 
-- [ ] **Step 2: Run the test and confirm the missing-package failure**
+- [x] **Step 2: Run the test and confirm the missing-package failure**
 
 Run: `pytest tests/unit/core/test_import_boundaries.py -v`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'llmwiki_core'`.
 
-- [ ] **Step 3: Add minimal package metadata and public version**
+- [x] **Step 3: Add minimal package metadata and public version**
 
 ```toml
 # pyproject.toml
@@ -123,20 +123,20 @@ include = ["llmwiki_core*"]
 __version__ = "0.1.0"
 ```
 
-- [ ] **Step 4: Install editable and rerun the import test**
+- [x] **Step 4: Install editable and rerun the import test**
 
 Run: `python -m pip install -e . --no-deps && pytest tests/unit/core/test_import_boundaries.py -v`
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Teach all CI Python jobs to install the shared package**
+- [x] **Step 5: Teach all CI Python jobs to install the shared package**
 
 Add `pip install -e . --no-deps` immediately after Python setup in the unit,
 MCP integration, and Postgres integration jobs. Do not add runtime dependencies
 to `pyproject.toml`. Add `"feat/**"` to the workflow's `push.branches` so every
 incremental push on this implementation branch runs GitHub Actions.
 
-- [ ] **Step 6: Commit the package boundary**
+- [x] **Step 6: Commit the package boundary**
 
 ```bash
 git add pyproject.toml llmwiki_core tests/unit/core .github/workflows/test.yml
@@ -152,7 +152,7 @@ git push
 - Create: `tests/unit/core/test_documents.py`
 - Modify: `llmwiki_core/__init__.py`
 
-- [ ] **Step 1: Write failing contract tests**
+- [x] **Step 1: Write failing contract tests**
 
 ```python
 # tests/unit/core/test_documents.py
@@ -226,13 +226,13 @@ def test_document_identity_is_immutable_and_tenant_scoped():
         identity.document_id = "other"
 ```
 
-- [ ] **Step 2: Run the tests and verify the missing module failure**
+- [x] **Step 2: Run the tests and verify the missing module failure**
 
 Run: `pytest tests/unit/core/test_documents.py -v`
 
 Expected: collection FAIL because `llmwiki_core.documents` does not exist.
 
-- [ ] **Step 3: Implement the minimal document contracts**
+- [x] **Step 3: Implement the minimal document contracts**
 
 ```python
 # llmwiki_core/documents.py
@@ -304,7 +304,7 @@ def join_logical_path(directory: str, filename: str) -> str:
     return normalize_directory_path(directory) + filename
 ```
 
-- [ ] **Step 4: Export contracts and rerun tests**
+- [x] **Step 4: Export contracts and rerun tests**
 
 Export the six public document symbols from `llmwiki_core/__init__.py`.
 
@@ -312,7 +312,7 @@ Run: `pytest tests/unit/core/test_documents.py tests/unit/core/test_import_bound
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit document contracts**
+- [x] **Step 5: Commit document contracts**
 
 ```bash
 git add llmwiki_core tests/unit/core
@@ -330,7 +330,7 @@ git push
 - Modify: `api/infra/db/sqlite.py`
 - Modify: `llmwiki_core/__init__.py`
 
-- [ ] **Step 1: Write failing normalization and result-contract tests**
+- [x] **Step 1: Write failing normalization and result-contract tests**
 
 ```python
 # tests/unit/core/test_search.py
@@ -372,13 +372,13 @@ def test_search_hit_has_stable_identity_fields():
     assert hit.identity == ("doc", 3, 2)
 ```
 
-- [ ] **Step 2: Run and verify the missing-contract failure**
+- [x] **Step 2: Run and verify the missing-contract failure**
 
 Run: `pytest tests/unit/core/test_search.py -v`
 
 Expected: collection FAIL because `llmwiki_core.search` does not exist.
 
-- [ ] **Step 3: Implement immutable query and hit contracts**
+- [x] **Step 3: Implement immutable query and hit contracts**
 
 Use `StrEnum` for `SearchArea` (`all`, `wiki`, `sources`) and `SearchScope`
 (`all`, `annotations`, `source`). Implement frozen `SearchQuery` and `SearchHit`
@@ -387,7 +387,7 @@ dataclasses. `SearchQuery.build` strips text, enforces a limit from 1 through
 exposes an `identity` property returning `(document_id, document_version,
 chunk_index)`.
 
-- [ ] **Step 4: Normalize API and MCP requests with the shared query**
+- [x] **Step 4: Normalize API and MCP requests with the shared query**
 
 At the start of `SearchHandler.search_chunks`, build a `SearchQuery` after
 computing the existing `path_filter`, then use its normalized text, limit,
@@ -397,7 +397,7 @@ existing query, limit, and path filter, then use its normalized values. Keep
 the public MCP/API compatibility signatures and dictionary response shape
 unchanged in this milestone.
 
-- [ ] **Step 5: Run core and search regressions**
+- [x] **Step 5: Run core and search regressions**
 
 Run:
 
@@ -408,7 +408,7 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/test_tool_handlers.py ..
 
 Expected: all selected tests pass.
 
-- [ ] **Step 6: Commit search contracts**
+- [x] **Step 6: Commit search contracts**
 
 ```bash
 git add llmwiki_core/search.py llmwiki_core/__init__.py api/infra/db/sqlite.py mcp/tools/search.py tests/unit/core/test_search.py
@@ -426,7 +426,7 @@ git push
 - Modify: `mcp/services/chunker.py`
 - Modify: `tests/unit/test_chunker.py`
 
-- [ ] **Step 1: Write a cross-runtime parity test before moving code**
+- [x] **Step 1: Write a cross-runtime parity test before moving code**
 
 ```python
 # tests/unit/core/test_chunking.py
@@ -449,13 +449,13 @@ def test_chunk_pages_assigns_global_indexes():
     assert {chunk.page for chunk in chunks} == {1, 2}
 ```
 
-- [ ] **Step 2: Run and verify the missing-module failure**
+- [x] **Step 2: Run and verify the missing-module failure**
 
 Run: `pytest tests/unit/core/test_chunking.py -v`
 
 Expected: collection FAIL because `llmwiki_core.chunking` does not exist.
 
-- [ ] **Step 3: Move only pure chunking code into the core**
+- [x] **Step 3: Move only pure chunking code into the core**
 
 Copy `Chunk`, constants, `_estimate_tokens`, `_split_paragraphs`,
 `_get_overlap`, `_split_oversized`, `chunk_text`, and `chunk_pages` from
@@ -472,7 +472,7 @@ from llmwiki_core.chunking import Chunk, chunk_pages, chunk_text
 In `mcp/services/chunker.py`, import the same symbols and retain only
 `store_chunks_pg` and `store_chunks_sqlite`.
 
-- [ ] **Step 4: Prove API, MCP, and core return identical chunks**
+- [x] **Step 4: Prove API, MCP, and core return identical chunks**
 
 Extend `tests/unit/core/test_chunking.py`:
 
@@ -493,7 +493,7 @@ Run MCP context:
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Remove duplicate algorithms and commit**
+- [x] **Step 5: Remove duplicate algorithms and commit**
 
 Verify: `rg -n "def chunk_text|def chunk_pages" api mcp llmwiki_core`
 
@@ -519,7 +519,7 @@ git push
 - Modify: `api/services/references.py`
 - Modify: `mcp/tools/references.py`
 
-- [ ] **Step 1: Write failing shared-semantics tests**
+- [x] **Step 1: Write failing shared-semantics tests**
 
 ```python
 # tests/unit/core/test_facets.py
@@ -571,13 +571,13 @@ def test_chinese_page_suffix_with_fullwidth_comma_is_parsed():
     assert parse_citation_filename("法规汇编.pdf，第 12 页") == ("法规汇编.pdf", 12)
 ```
 
-- [ ] **Step 2: Run and confirm both modules are missing**
+- [x] **Step 2: Run and confirm both modules are missing**
 
 Run: `pytest tests/unit/core/test_facets.py tests/unit/core/test_references.py -v`
 
 Expected: collection FAIL for missing core modules.
 
-- [ ] **Step 3: Move pure logic and leave persistence in adapters**
+- [x] **Step 3: Move pure logic and leave persistence in adapters**
 
 Move `FACET_KEYS`, `UnknownFacetError`, and `validate_facets` from
 `mcp/vaultfs/facets.py` into `llmwiki_core/facets.py`. Move
@@ -590,7 +590,7 @@ into `llmwiki_core/references.py`. Make the API module a compatibility re-export
 Change `mcp/tools/references.py` to call `build_lookup_maps` and
 `extract_references`, then persist returned edges through `VaultFS`.
 
-- [ ] **Step 4: Run shared and legacy tests**
+- [x] **Step 4: Run shared and legacy tests**
 
 Run:
 
@@ -601,7 +601,7 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/test_corpus_facets.py ..
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Verify one authoritative definition per behavior and commit**
+- [x] **Step 5: Verify one authoritative definition per behavior and commit**
 
 Run:
 
@@ -627,7 +627,7 @@ git push
 - Modify: `api/infra/db/sqlite.py`
 - Modify: `mcp/vaultfs/sqlite.py`
 
-- [ ] **Step 1: Write failing schema declaration tests**
+- [x] **Step 1: Write failing schema declaration tests**
 
 ```python
 # tests/unit/core/test_schema_invariants.py
@@ -649,13 +649,13 @@ def test_postgres_migration_adds_explicit_kind_and_versions():
     assert "document_version" in sql
 ```
 
-- [ ] **Step 2: Run and verify missing migration/version failures**
+- [x] **Step 2: Run and verify missing migration/version failures**
 
 Run: `pytest tests/unit/core/test_schema_invariants.py -v`
 
 Expected: both tests fail.
 
-- [ ] **Step 3: Add the Postgres migration**
+- [x] **Step 3: Add the Postgres migration**
 
 ```sql
 -- supabase/migrations/011_document_invariants.sql
@@ -689,7 +689,7 @@ CREATE INDEX idx_pages_document_version ON document_pages(document_id, document_
 CREATE INDEX idx_chunks_document_version ON document_chunks(document_id, document_version);
 ```
 
-- [ ] **Step 4: Add SQLite columns and idempotent existing-database migration**
+- [x] **Step 4: Add SQLite columns and idempotent existing-database migration**
 
 Add `document_version INTEGER NOT NULL DEFAULT 0` to `document_pages` and
 `document_chunks` in `shared/sqlite_schema.sql` and `tests/helpers/schema.sql`.
@@ -717,13 +717,13 @@ async def _ensure_derived_version_columns(db) -> None:
     await db.commit()
 ```
 
-- [ ] **Step 5: Add migration execution to Postgres integration setup**
+- [x] **Step 5: Add migration execution to Postgres integration setup**
 
 Append the migration contents to `tests/helpers/schema.sql` in schema order, so
 integration fixtures match production. Extend the Postgres fixture assertion
 to check `documents.source_kind` and both derived version columns.
 
-- [ ] **Step 6: Run schema and database contract tests**
+- [x] **Step 6: Run schema and database contract tests**
 
 Run:
 
@@ -734,7 +734,7 @@ PYTHONPATH=api MODE=hosted pytest tests/integration/isolation/test_application_o
 
 Expected: all selected tests pass with Postgres available on port 5434.
 
-- [ ] **Step 7: Commit schema invariants**
+- [x] **Step 7: Commit schema invariants**
 
 ```bash
 git add supabase/migrations/011_document_invariants.sql shared/sqlite_schema.sql tests/helpers/schema.sql api/infra/db/sqlite.py mcp/vaultfs/sqlite.py tests
@@ -752,7 +752,7 @@ git push
 - Modify: `api/services/chunker.py`
 - Modify: `api/infra/tus.py`
 
-- [ ] **Step 1: Write failing hosted transaction tests**
+- [x] **Step 1: Write failing hosted transaction tests**
 
 ```python
 # tests/integration/test_document_invariants.py
@@ -842,13 +842,13 @@ async def test_replace_derived_content_rolls_back_before_ready(seed_pending_docu
     assert await pool.fetchval("SELECT count(*) FROM document_pages WHERE document_id=$1", doc["id"]) == 0
 ```
 
-- [ ] **Step 2: Run and verify the missing adapter failure**
+- [x] **Step 2: Run and verify the missing adapter failure**
 
 Run: `PYTHONPATH=api MODE=hosted pytest tests/integration/test_document_invariants.py -v`
 
 Expected: collection FAIL because `infra.db.derived_documents` does not exist.
 
-- [ ] **Step 3: Implement one transactional hosted writer**
+- [x] **Step 3: Implement one transactional hosted writer**
 
 `replace_derived_content` must acquire one connection and transaction, lock the
 document row with `FOR UPDATE`, verify `user_id`, increment `version`, replace
@@ -867,7 +867,7 @@ WHERE id = $1 AND user_id = $7
 The adapter must raise `LookupError` if the locked document is absent and must
 never catch transaction exceptions.
 
-- [ ] **Step 4: Route every hosted extracted-text path through the adapter**
+- [x] **Step 4: Route every hosted extracted-text path through the adapter**
 
 Replace direct page/chunk/status sequences in these `OCRService` methods:
 
@@ -880,7 +880,7 @@ Image-only documents may continue to set ready without chunks, but must bump
 their version in the same update. Add `source_kind='source'` to the TUS
 document insert and `source_kind='asset'` to extracted asset inserts.
 
-- [ ] **Step 5: Run transaction, OCR, and isolation tests**
+- [x] **Step 5: Run transaction, OCR, and isolation tests**
 
 Run:
 
@@ -891,7 +891,7 @@ PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_extraction_fixe
 
 Expected: all selected tests pass.
 
-- [ ] **Step 6: Commit atomic hosted readiness**
+- [x] **Step 6: Commit atomic hosted readiness**
 
 ```bash
 git add api/infra/db/derived_documents.py api/services/ocr.py api/services/chunker.py api/infra/tus.py tests/integration
@@ -910,7 +910,7 @@ git push
 - Modify: `api/infra/db/sqlite.py`
 - Modify: `mcp/services/chunker.py`
 
-- [ ] **Step 1: Write failing local invariant tests**
+- [x] **Step 1: Write failing local invariant tests**
 
 ```python
 # tests/unit/test_local_document_invariants.py
@@ -1009,14 +1009,14 @@ async def test_inconsistent_ready_scan_finds_stale_chunk_version(tmp_path):
     await db.close()
 ```
 
-- [ ] **Step 2: Run and confirm version assertions fail**
+- [x] **Step 2: Run and confirm version assertions fail**
 
 Run: `PYTHONPATH=api pytest tests/unit/test_local_document_invariants.py -v`
 
 Expected: FAIL because local chunk inserts do not set `document_version` and
 the upload marks ready before chunk storage commits.
 
-- [ ] **Step 3: Store local text documents, chunks, and ready status together**
+- [x] **Step 3: Store local text documents, chunks, and ready status together**
 
 Change local chunk persistence functions to require a `document_version` and
 write it on every row. For simple-text upload, hold the existing serialized
@@ -1038,7 +1038,7 @@ text and extracted-page replacements, calculate
 update document content/status/version last in the same `_gated_write`
 transaction.
 
-- [ ] **Step 4: Add stale-derived reconciliation**
+- [x] **Step 4: Add stale-derived reconciliation**
 
 Implement `_inconsistent_ready_document_ids` with this query and, at the start
 of local startup reconciliation, set the returned documents to `pending` before
@@ -1059,7 +1059,7 @@ WHERE d.status = 'ready'
 
 Set those documents to `pending` before the existing extraction backlog kick.
 
-- [ ] **Step 5: Run local upload, reconciliation, and MCP SQLite tests**
+- [x] **Step 5: Run local upload, reconciliation, and MCP SQLite tests**
 
 Run:
 
@@ -1070,7 +1070,7 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/test_vaultfs_contract.py
 
 Expected: all selected tests pass.
 
-- [ ] **Step 6: Commit local invariants**
+- [x] **Step 6: Commit local invariants**
 
 ```bash
 git add api/domain/local_processor.py api/routes/local_upload.py api/infra/db/sqlite.py mcp/services/chunker.py tests/unit
@@ -1091,7 +1091,7 @@ git push
 - Modify: `mcp/tools/write.py`
 - Modify: `mcp/tools/references.py`
 
-- [ ] **Step 1: Write the failing core bundle test**
+- [x] **Step 1: Write the failing core bundle test**
 
 ```python
 # tests/unit/core/test_wiki.py
@@ -1119,7 +1119,7 @@ def test_wiki_bundle_deduplicates_derived_edges():
     assert bundle.edges == (ReferenceEdge("src", "cites", 3),)
 ```
 
-- [ ] **Step 2: Write failing adapter contract tests**
+- [x] **Step 2: Write failing adapter contract tests**
 
 The SQLite test must create a wiki page, update it with an expected version,
 and assert one commit contains the new content version, chunks, derived
@@ -1130,7 +1130,7 @@ The Postgres variant must use the same assertions and fixtures under
 `tests/integration/mcp/`. Name the common test function
 `assert_atomic_wiki_write(fs, kb_id)` and call it for each adapter fixture.
 
-- [ ] **Step 3: Run and verify missing bundle/adapter APIs**
+- [x] **Step 3: Run and verify missing bundle/adapter APIs**
 
 Run:
 
@@ -1141,7 +1141,7 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/test_wiki_write_invarian
 
 Expected: collection failures for `WikiWriteBundle` and `write_wiki_bundle`.
 
-- [ ] **Step 4: Implement the core bundle and conflict**
+- [x] **Step 4: Implement the core bundle and conflict**
 
 ```python
 # llmwiki_core/wiki.py
@@ -1180,7 +1180,7 @@ Add a frozen `ReferenceEdge` dataclass to `llmwiki_core/references.py` and
 return it from `extract_references` instead of dictionaries. Update compatibility
 tests and callers in the same red-green cycle.
 
-- [ ] **Step 5: Add one atomic adapter operation**
+- [x] **Step 5: Add one atomic adapter operation**
 
 Add to `VaultFS`:
 
@@ -1213,7 +1213,7 @@ directory, flush it, and call `os.replace` immediately before the database
 transaction. Postgres keeps its no-op disk adapter. Startup reconciliation
 repairs a database rollback after a successful local file replacement.
 
-- [ ] **Step 6: Route MCP edit, append, and overwrite through the bundle**
+- [x] **Step 6: Route MCP edit, append, and overwrite through the bundle**
 
 `WriteHandler` must fetch all documents, use shared reference lookup/extraction,
 construct `WikiWriteBundle`, call `write_wiki_bundle`, and remove the
@@ -1223,7 +1223,7 @@ current integer version. Thus document creation/update, chunks, derived edges,
 staleness, and facet rollup share one database transaction. Non-wiki assets and
 notes retain `create_document`/`update_document`.
 
-- [ ] **Step 7: Run MCP and graph regression tests**
+- [x] **Step 7: Run MCP and graph regression tests**
 
 Run:
 
@@ -1234,7 +1234,7 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/test_wiki_write_invarian
 
 Expected: all selected tests pass.
 
-- [ ] **Step 8: Commit atomic wiki updates**
+- [x] **Step 8: Commit atomic wiki updates**
 
 ```bash
 git add llmwiki_core mcp tests
@@ -1250,7 +1250,7 @@ git push
 - Modify: `api/main.py`
 - Modify: `api/infra/db/derived_documents.py`
 
-- [ ] **Step 1: Write failing audit-query tests**
+- [x] **Step 1: Write failing audit-query tests**
 
 ```python
 # tests/integration/test_derived_recovery.py
@@ -1279,13 +1279,13 @@ async def test_find_inconsistent_ready_documents(pool, seed_pending_document):
     assert {row["id"] for row in rows} == {bad["id"]}
 ```
 
-- [ ] **Step 2: Run and verify missing audit function**
+- [x] **Step 2: Run and verify missing audit function**
 
 Run: `PYTHONPATH=api MODE=hosted pytest tests/integration/test_derived_recovery.py -v`
 
 Expected: FAIL importing `find_inconsistent_ready_documents`.
 
-- [ ] **Step 3: Implement the version audit query**
+- [x] **Step 3: Implement the version audit query**
 
 Select non-asset ready documents whose chunks are absent while content is
 non-empty, or whose page/chunk versions differ from the document version. The
@@ -1295,7 +1295,7 @@ At hosted startup, set inconsistent documents to `pending` in one transaction,
 log the count, then let the existing recovery loop schedule them. Do not mark
 image-only `asset` documents inconsistent.
 
-- [ ] **Step 4: Run recovery and startup tests**
+- [x] **Step 4: Run recovery and startup tests**
 
 Run:
 
@@ -1306,7 +1306,7 @@ PYTHONPATH=api pytest tests/unit/test_auth_provider_invariant.py -v
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Commit recovery audit**
+- [x] **Step 5: Commit recovery audit**
 
 ```bash
 git add api/main.py api/infra/db/derived_documents.py tests/integration/test_derived_recovery.py
@@ -1325,7 +1325,7 @@ git push
 - Modify: `.dockerignore`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add a packaging smoke test that initially fails for hosted contexts**
+- [x] **Step 1: Add a packaging smoke test that initially fails for hosted contexts**
 
 Create `tests/unit/core/test_docker_packaging.py`:
 
@@ -1348,13 +1348,13 @@ def test_all_python_images_install_core_package():
         assert "pip install --no-deps" in text and "llmwiki_core" in text
 ```
 
-- [ ] **Step 2: Run and verify packaging assertions fail**
+- [x] **Step 2: Run and verify packaging assertions fail**
 
 Run: `pytest tests/unit/core/test_docker_packaging.py -v`
 
 Expected: both tests fail against the existing Dockerfiles and compose contexts.
 
-- [ ] **Step 3: Change hosted build contexts and install the package**
+- [x] **Step 3: Change hosted build contexts and install the package**
 
 Use repository-root build contexts:
 
@@ -1380,12 +1380,12 @@ Copy only the relevant service directory into its runtime path. Add
 `pyproject.toml` and `llmwiki_core/` to the local image and install the same
 package before copying API/MCP code.
 
-- [ ] **Step 4: Document editable installation for source development**
+- [x] **Step 4: Document editable installation for source development**
 
 Add `pip install -e . --no-deps` after the virtual environment is activated in
 the README local installation commands.
 
-- [ ] **Step 5: Run smoke tests and build all affected images**
+- [x] **Step 5: Run smoke tests and build all affected images**
 
 Run:
 
@@ -1398,7 +1398,7 @@ docker build -f Dockerfile.local -t llmwiki-local:core .
 
 Expected: tests pass and all three builds exit 0.
 
-- [ ] **Step 6: Commit packaging changes**
+- [x] **Step 6: Commit packaging changes**
 
 ```bash
 git add api/Dockerfile mcp/Dockerfile Dockerfile.local deploy/docker-compose.selfhost.yml .dockerignore README.md tests/unit/core/test_docker_packaging.py
@@ -1413,7 +1413,7 @@ git push
 - Create: `docs/architecture/shared-kernel.md`
 - Modify: `docs/superpowers/plans/2026-07-24-shared-kernel-data-invariants.md`
 
-- [ ] **Step 1: Write the architecture boundary document**
+- [x] **Step 1: Write the architecture boundary document**
 
 Document:
 
@@ -1438,7 +1438,14 @@ ruff format --check llmwiki_core api mcp tests
 
 Expected: exit 0 for both commands.
 
-- [ ] **Step 3: Run the complete Python test suite**
+Verification on 2026-07-24 remains open. The repository-wide check exits 1
+with 306 findings (191 automatically fixable), and the format check reports
+102 files that would be reformatted. Restricting the same commands to Python
+files changed on this branch still reports 105 findings and 25 unformatted
+files. This is broader lint/format debt and was not mechanically rewritten as
+part of the shared-kernel architecture milestone.
+
+- [x] **Step 3: Run the complete Python test suite**
 
 Run with Postgres test service available on port 5434:
 
@@ -1450,19 +1457,28 @@ cd mcp && PYTHONPATH=.. pytest ../tests/integration/mcp/ -v
 
 Expected: all tests pass with zero failures.
 
-- [ ] **Step 4: Run schema and duplicate-definition audits**
+Verified on 2026-07-24 with the unit suite split into core, API, MCP, corpus,
+and per-file compatibility processes to avoid the repository's colliding
+top-level API/MCP module names. All 821 tests passed: 429 unit tests, 233 API
+integration tests, 119 MCP SQLite integration tests, and 40 MCP Postgres
+integration tests. One existing Starlette deprecation warning was emitted.
+
+- [x] **Step 4: Run schema and duplicate-definition audits**
 
 Run:
 
 ```bash
 git diff --check origin/master...HEAD
-rg -n "def (chunk_text|chunk_pages|validate_facets|rollup_from_metas|apply_rollup|parse_citation_filename|parse_wiki_links|extract_references)" api mcp llmwiki_core
+rg -n "def (chunk_text|chunk_pages|validate_facets|rollup_from_metas|apply_rollup|parse_citation_filename|parse_wiki_links|extract_references)\\(" api mcp llmwiki_core
 ```
 
 Expected: no whitespace errors; each pure definition appears once under
 `llmwiki_core`.
 
-- [ ] **Step 5: Mark completed checkboxes only after fresh evidence**
+Verified on 2026-07-24: the branch diff has no whitespace errors and all eight
+pure definitions appear exactly once, under `llmwiki_core`.
+
+- [x] **Step 5: Mark completed checkboxes only after fresh evidence**
 
 Update this plan's checkboxes for steps actually completed. If a Docker build
 or Postgres suite cannot run, leave its checkbox open and record the exact
