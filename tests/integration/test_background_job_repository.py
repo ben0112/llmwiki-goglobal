@@ -96,10 +96,16 @@ async def test_create_returns_complete_typed_record_with_defaults_and_nested_pay
 async def test_create_idempotency_returns_original_tenant_job_without_overwriting_fields(pool):
     user_id = await _seed_user(pool)
     kb_id = await _seed_knowledge_base(pool, user_id)
+    document_id = await _seed_document(pool, user_id, kb_id)
+    alternative_kb_id = await _seed_knowledge_base(pool, user_id)
+    alternative_document_id = await _seed_document(pool, user_id, alternative_kb_id)
     original_run_after = datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)
+    lease_expires_at = datetime(2030, 1, 2, 4, 5, 6, tzinfo=UTC)
+    heartbeat_at = datetime(2030, 1, 2, 3, 5, 6, tzinfo=UTC)
     first = _command(
         user_id,
         knowledge_base_id=kb_id,
+        document_id=document_id,
         payload={"original": True},
         idempotency_key="key-1",
         max_attempts=4,
@@ -107,6 +113,8 @@ async def test_create_idempotency_returns_original_tenant_job_without_overwritin
     )
     second = _command(
         user_id,
+        knowledge_base_id=alternative_kb_id,
+        document_id=alternative_document_id,
         payload={"replacement": True},
         idempotency_key="key-1",
         max_attempts=8,
@@ -115,15 +123,27 @@ async def test_create_idempotency_returns_original_tenant_job_without_overwritin
 
     async with pool.acquire() as conn:
         original = await repository.create(conn, first)
+        await pool.execute(
+            "UPDATE background_jobs SET state = 'running', attempt_count = 2, dispatch_attempts = 5, "
+            "lease_owner = 'worker-a', lease_expires_at = $1, heartbeat_at = $2 WHERE id = $3",
+            lease_expires_at,
+            heartbeat_at,
+            original.id,
+        )
         duplicate = await repository.create(conn, second)
 
     assert duplicate.id == original.id
     assert duplicate.payload == {"original": True}
     assert duplicate.knowledge_base_id == kb_id
+    assert duplicate.document_id == document_id
     assert duplicate.max_attempts == 4
     assert duplicate.run_after == original_run_after
-    assert duplicate.state is JobState.QUEUED
-    assert duplicate.attempt_count == 0
+    assert duplicate.state is JobState.RUNNING
+    assert duplicate.attempt_count == 2
+    assert duplicate.dispatch_attempts == 5
+    assert duplicate.lease_owner == "worker-a"
+    assert duplicate.lease_expires_at == lease_expires_at
+    assert duplicate.heartbeat_at == heartbeat_at
 
 
 @pytest.mark.asyncio
@@ -169,12 +189,17 @@ async def test_cancel_changes_queued_retry_wait_and_running_with_stable_timestam
         retry_cancelled = await repository.request_cancel(conn, retry_wait["id"], user_id)
         running_requested = await repository.request_cancel(conn, running["id"], user_id)
         queued_repeat = await repository.request_cancel(conn, queued.id, user_id)
+        retry_repeat = await repository.request_cancel(conn, retry_wait["id"], user_id)
         running_repeat = await repository.request_cancel(conn, running["id"], user_id)
 
     assert queued_cancelled.state is JobState.CANCELLED
     assert retry_cancelled.state is JobState.CANCELLED
     assert running_requested.state is JobState.RUNNING
+    assert queued_cancelled.cancel_requested_at is not None
+    assert retry_cancelled.cancel_requested_at is not None
+    assert running_requested.cancel_requested_at is not None
     assert queued_repeat.cancel_requested_at == queued_cancelled.cancel_requested_at
+    assert retry_repeat.cancel_requested_at == retry_cancelled.cancel_requested_at
     assert running_repeat.cancel_requested_at == running_requested.cancel_requested_at
 
 
@@ -216,6 +241,8 @@ async def test_service_rejects_mismatched_user_and_non_owned_resources_without_c
     other_kb = await _seed_knowledge_base(pool, user_b)
     missing_kb = uuid4()
     other_document = await _seed_document(pool, user_b, other_kb)
+    missing_document = uuid4()
+    job_count_before = await pool.fetchval("SELECT count(*) FROM background_jobs")
 
     with pytest.raises(ValueError):
         await service.create(_command(user_b), authenticated_user_id=user_a)
@@ -223,11 +250,12 @@ async def test_service_rejects_mismatched_user_and_non_owned_resources_without_c
         _command(user_a, knowledge_base_id=missing_kb),
         _command(user_a, knowledge_base_id=other_kb),
         _command(user_a, document_id=other_document),
+        _command(user_a, document_id=missing_document),
     ):
         with pytest.raises(JobResourceNotFound):
             await service.create(command, authenticated_user_id=user_a)
 
-    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_a) == 0
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs") == job_count_before
 
 
 @pytest.mark.asyncio
@@ -237,6 +265,7 @@ async def test_service_rejects_document_knowledge_base_mismatch_for_the_same_ten
     kb_b = await _seed_knowledge_base(pool, user_id)
     document_b = await _seed_document(pool, user_id, kb_b)
     service = JobService(pool)
+    job_count_before = await pool.fetchval("SELECT count(*) FROM background_jobs")
 
     with pytest.raises(JobResourceNotFound):
         await service.create(
@@ -244,7 +273,7 @@ async def test_service_rejects_document_knowledge_base_mismatch_for_the_same_ten
             authenticated_user_id=user_id,
         )
 
-    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs") == job_count_before
 
 
 @pytest.mark.asyncio
