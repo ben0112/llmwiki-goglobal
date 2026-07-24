@@ -55,7 +55,13 @@ class JobService:
 
         if command.knowledge_base_id is None:
             document_exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1 AND user_id = $2)",
+                "SELECT EXISTS("
+                "SELECT 1 FROM documents "
+                "JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id "
+                "WHERE documents.id = $1 "
+                "AND documents.user_id = $2 "
+                "AND knowledge_bases.user_id = $2"
+                ")",
                 command.document_id,
                 authenticated_user_id,
             )

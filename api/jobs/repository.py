@@ -166,13 +166,17 @@ WITH target AS (
         cancel_requested_at = COALESCE(job.cancel_requested_at, now())
     FROM target
     WHERE job.id = target.id
-      AND target.state NOT IN ('succeeded', 'failed', 'cancelled')
+      AND (
+          target.state IN ('queued', 'retry_wait')
+          OR (target.state = 'running' AND target.cancel_requested_at IS NULL)
+      )
     RETURNING job.*
 )
 SELECT * FROM changed
 UNION ALL
 SELECT * FROM target
 WHERE state IN ('succeeded', 'failed', 'cancelled')
+   OR (state = 'running' AND cancel_requested_at IS NOT NULL)
 """
 
 

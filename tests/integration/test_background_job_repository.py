@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -167,6 +168,29 @@ async def test_create_idempotency_scope_distinguishes_tenants_types_and_null_key
 
 
 @pytest.mark.asyncio
+async def test_concurrent_create_with_one_idempotency_key_returns_one_job(pool):
+    user_id = await _seed_user(pool)
+    command = _command(user_id, idempotency_key="concurrent-create")
+
+    async with pool.acquire() as conn_a, pool.acquire() as conn_b:
+        first, second = await asyncio.gather(
+            repository.create(conn_a, command),
+            repository.create(conn_b, command),
+        )
+
+    assert first.id == second.id
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM background_jobs WHERE user_id = $1 AND job_type = $2 AND idempotency_key = $3",
+            user_id,
+            JobType.DOCUMENT_EXTRACT.value,
+            "concurrent-create",
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_for_user_returns_only_the_owner_row(pool):
     owner_id = await _seed_user(pool)
     other_id = await _seed_user(pool)
@@ -204,6 +228,20 @@ async def test_cancel_changes_queued_retry_wait_and_running_with_stable_timestam
 
 
 @pytest.mark.asyncio
+async def test_repeated_running_cancel_leaves_the_complete_row_unchanged(pool):
+    user_id = await _seed_user(pool)
+    running = await _insert_job(pool, user_id, state="running", payload='{"keep": true}')
+
+    async with pool.acquire() as conn:
+        first = await repository.request_cancel(conn, running["id"], user_id)
+        repeated = await repository.request_cancel(conn, running["id"], user_id)
+
+    assert first.state is JobState.RUNNING
+    assert first.cancel_requested_at is not None
+    assert repeated == first
+
+
+@pytest.mark.asyncio
 async def test_cancel_keeps_terminal_rows_fully_unchanged_and_typed(pool):
     user_id = await _seed_user(pool)
     terminal_rows = []
@@ -218,6 +256,41 @@ async def test_cancel_keeps_terminal_rows_fully_unchanged_and_typed(pool):
         assert isinstance(result, JobRecord)
         assert result.state.value == original["state"]
         assert dict(after) == dict(original)
+
+
+@pytest.mark.asyncio
+async def test_cancel_race_returns_terminal_row_without_mutating_it(pool):
+    user_id = await _seed_user(pool)
+    async with pool.acquire() as conn:
+        created = await repository.create(conn, _command(user_id))
+    conn_a = await pool.acquire()
+    conn_b = await pool.acquire()
+    transaction_a = conn_a.transaction()
+    await transaction_a.start()
+    committed = False
+    try:
+        terminal = await conn_a.fetchrow(
+            "UPDATE background_jobs SET state = 'succeeded' WHERE id = $1 RETURNING *",
+            created.id,
+        )
+        pending_cancel = asyncio.create_task(repository.request_cancel(conn_b, created.id, user_id))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(pending_cancel), timeout=0.05)
+
+        await transaction_a.commit()
+        committed = True
+        cancelled = await asyncio.wait_for(pending_cancel, timeout=1)
+        after = await pool.fetchrow("SELECT * FROM background_jobs WHERE id = $1", created.id)
+    finally:
+        if not committed:
+            await transaction_a.rollback()
+        await pool.release(conn_b)
+        await pool.release(conn_a)
+
+    assert cancelled.state is JobState.SUCCEEDED
+    assert cancelled.cancel_requested_at is None
+    assert cancelled.updated_at == terminal["updated_at"]
+    assert dict(after) == dict(terminal)
 
 
 @pytest.mark.asyncio
@@ -254,6 +327,24 @@ async def test_service_rejects_mismatched_user_and_non_owned_resources_without_c
     ):
         with pytest.raises(JobResourceNotFound):
             await service.create(command, authenticated_user_id=user_a)
+
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs") == job_count_before
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_document_only_when_its_knowledge_base_has_another_owner(pool):
+    user_a = await _seed_user(pool)
+    user_b = await _seed_user(pool)
+    other_kb = await _seed_knowledge_base(pool, user_b)
+    inconsistent_document = await _seed_document(pool, user_a, other_kb)
+    service = JobService(pool)
+    job_count_before = await pool.fetchval("SELECT count(*) FROM background_jobs")
+
+    with pytest.raises(JobResourceNotFound):
+        await service.create(
+            _command(user_a, document_id=inconsistent_document),
+            authenticated_user_id=user_a,
+        )
 
     assert await pool.fetchval("SELECT count(*) FROM background_jobs") == job_count_before
 
