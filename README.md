@@ -81,6 +81,7 @@
 git clone https://github.com/ben0112/llmwiki-goglobal.git
 cd llmwiki-goglobal
 python -m venv .venv && source .venv/bin/activate
+pip install -e . --no-deps
 pip install -r api/requirements.txt -r mcp/requirements.txt
 cd web && npm install && cd ..
 ```

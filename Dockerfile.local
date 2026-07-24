@@ -54,6 +54,11 @@ COPY mcp/requirements.txt /tmp/mcp-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/api-requirements.txt -r /tmp/mcp-requirements.txt \
     && rm /tmp/api-requirements.txt /tmp/mcp-requirements.txt
 
+# Shared pure-Python kernel used by both service runtimes
+COPY pyproject.toml ./
+COPY llmwiki_core/ llmwiki_core/
+RUN pip install --no-deps --no-cache-dir .
+
 # Application code (repo layout preserved so the llmwiki CLI works)
 COPY shared/ shared/
 COPY corpus/ corpus/

@@ -52,10 +52,9 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
 
   api:
-    # 上下文必须是 api/ 子目录:api/Dockerfile 按子目录上下文编写
-    # (COPY requirements.lock);hosted 运行不依赖仓库根的 corpus/shared。
     build:
-      context: ../api
+      context: ..
+      dockerfile: api/Dockerfile
     environment:
       MODE: hosted
       DATABASE_URL: ${DATABASE_URL}
@@ -85,7 +84,8 @@ services:
 
   mcp:
     build:
-      context: ../mcp
+      context: ..
+      dockerfile: mcp/Dockerfile
     environment:
       MODE: hosted
       DATABASE_URL: ${DATABASE_URL}
