@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware as _BaseCORSMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import Receive, Scope, Send
 
 
 class CORSMiddleware(_BaseCORSMiddleware):
@@ -43,6 +43,19 @@ from routes.usage import router as usage_router
 from routes.corpus_pipeline import router as corpus_pipeline_router
 
 
+async def _repair_hosted_derived_drift(pool) -> list[dict]:
+    """Reset ready documents with stale derived rows before recovery scans."""
+    from infra.db.derived_documents import reset_inconsistent_ready_documents
+
+    rows = await reset_inconsistent_ready_documents(pool)
+    if rows:
+        logger.warning(
+            "Reset %d hosted document(s) with inconsistent derived versions",
+            len(rows),
+        )
+    return rows
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.MODE == "local":
@@ -61,6 +74,8 @@ async def lifespan(app: FastAPI):
     pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=2, max_size=10)
     app.state.pool = pool
     app.state.mode = "hosted"
+
+    await _repair_hosted_derived_drift(pool)
 
     s3_service = None
     ocr_service = None

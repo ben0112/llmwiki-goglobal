@@ -8,7 +8,7 @@ from typing import Protocol
 
 import asyncpg
 
-from llmwiki_core.chunking import Chunk
+from llmwiki_core.chunking import Chunk, MIN_CHUNK_TOKENS
 from services.chunker import _store_chunks_on_conn
 
 
@@ -23,6 +23,41 @@ class DerivedAsset(Protocol):
 
 
 BeforeWrite = Callable[[asyncpg.Connection], Awaitable[None]]
+
+
+async def find_inconsistent_ready_documents(
+    executor: asyncpg.Pool | asyncpg.Connection,
+) -> list[dict]:
+    """Return ready documents whose derived rows do not match their version."""
+    rows = await executor.fetch(
+        "SELECT d.id, d.user_id FROM documents d "
+        "WHERE d.status = 'ready' AND NOT d.archived AND d.source_kind != 'asset' "
+        "AND ("
+        "  EXISTS (SELECT 1 FROM document_pages p WHERE p.document_id = d.id "
+        "          AND p.document_version != d.version) "
+        "  OR EXISTS (SELECT 1 FROM document_chunks c WHERE c.document_id = d.id "
+        "             AND c.document_version != d.version) "
+        "  OR (char_length(btrim(COALESCE(d.content, ''))) >= $1 "
+        "      AND NOT EXISTS (SELECT 1 FROM document_chunks c "
+        "                      WHERE c.document_id = d.id))"
+        ") ORDER BY d.id FOR UPDATE OF d",
+        MIN_CHUNK_TOKENS * 4,
+    )
+    return [dict(row) for row in rows]
+
+
+async def reset_inconsistent_ready_documents(pool: asyncpg.Pool) -> list[dict]:
+    """Atomically move inconsistent ready documents back to the recovery queue."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await find_inconsistent_ready_documents(conn)
+            if rows:
+                await conn.execute(
+                    "UPDATE documents SET status = 'pending', error_message = NULL, "
+                    "updated_at = now() WHERE id = ANY($1::uuid[])",
+                    [row["id"] for row in rows],
+                )
+            return rows
 
 
 async def _insert_chunks(
@@ -175,4 +210,8 @@ async def replace_derived_content(
         await pool.release(conn)
 
 
-__all__ = ["replace_derived_content"]
+__all__ = [
+    "find_inconsistent_ready_documents",
+    "replace_derived_content",
+    "reset_inconsistent_ready_documents",
+]
