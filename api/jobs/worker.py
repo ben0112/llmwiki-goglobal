@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import socket
@@ -13,6 +14,8 @@ from uuid import UUID, uuid4
 import asyncpg
 from arq import cron
 from arq.connections import RedisSettings
+from arq.worker import create_worker as arq_create_worker
+from arq.worker import run_worker as arq_run_worker
 from config import settings
 
 from jobs import repository
@@ -26,7 +29,14 @@ from jobs.handlers import (
     WorkerContext,
 )
 from jobs.lease import JobLease
-from jobs.models import JobCancelled, JobRecord, LeaseLost, to_json_value
+from jobs.models import (
+    RESULT_MAX_BYTES,
+    JobCancelled,
+    JobRecord,
+    JSONValue,
+    LeaseLost,
+    to_json_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +44,8 @@ _CANCELLED_CODE = "cancelled"
 _CANCELLED_MESSAGE = "Job cancellation was requested."
 _UNHANDLED_CODE = "unhandled_worker_error"
 _UNHANDLED_MESSAGE = "The job encountered an unexpected error."
+_INVALID_RESULT_CODE = "invalid_job_result"
+_INVALID_RESULT_MESSAGE = "The job produced an invalid result."
 
 
 async def _create_pool(database_url: str) -> asyncpg.Pool:
@@ -54,18 +66,26 @@ def _s3_is_configured() -> bool:
     return bool(settings.S3_BUCKET and settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY)
 
 
+def validate_worker_runtime(runtime_settings: object) -> None:
+    """Reject unsafe worker configuration before ARQ constructs a Worker."""
+    if getattr(runtime_settings, "MODE", None) != "hosted":
+        raise RuntimeError("ARQ durable worker requires MODE=hosted")
+    if getattr(runtime_settings, "DURABLE_JOBS_ENABLED", None) is not True:
+        raise RuntimeError("ARQ durable worker requires DURABLE_JOBS_ENABLED=true")
+
+    redis_url = getattr(runtime_settings, "REDIS_URL", None)
+    if not isinstance(redis_url, str) or not redis_url.strip():
+        raise RuntimeError("ARQ durable worker requires REDIS_URL")
+    database_url = getattr(runtime_settings, "DATABASE_URL", None)
+    if not isinstance(database_url, str) or not database_url.strip():
+        raise RuntimeError("ARQ durable worker requires DATABASE_URL")
+
+
 async def startup(ctx: dict) -> None:
     """Construct only the resources needed by a hosted durable worker."""
-    if settings.MODE != "hosted":
-        raise RuntimeError("ARQ durable worker requires MODE=hosted")
-    if not settings.DURABLE_JOBS_ENABLED:
-        raise RuntimeError("ARQ durable worker requires DURABLE_JOBS_ENABLED=true")
-    if not settings.REDIS_URL:
-        raise RuntimeError("ARQ durable worker requires REDIS_URL")
+    validate_worker_runtime(settings)
     if ctx.get("redis") is None:
         raise RuntimeError("ARQ durable worker requires ctx['redis'] from ARQ")
-    if not settings.DATABASE_URL:
-        raise RuntimeError("ARQ durable worker requires DATABASE_URL")
 
     pool: asyncpg.Pool | None = None
     try:
@@ -152,6 +172,25 @@ def _outcome(status: str, job_id: UUID | None = None) -> dict[str, str]:
     return outcome
 
 
+def _prepare_job_result(raw_result: object) -> dict[str, JSONValue]:
+    """Validate a handler result against the durable JSONB persistence boundary."""
+    try:
+        result = to_json_value(raw_result)
+        if not isinstance(result, dict):
+            raise TypeError("job handler result must be a JSON object")
+        encoded = json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(", ", ": "),
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        raise TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE) from None
+    if len(encoded) > RESULT_MAX_BYTES:
+        raise TerminalJobError(_INVALID_RESULT_CODE, _INVALID_RESULT_MESSAGE)
+    return result
+
+
 async def _run_claimed_job(
     *,
     pool: asyncpg.Pool,
@@ -174,11 +213,7 @@ async def _run_claimed_job(
             if handler is None:
                 raise UnsupportedJobHandler
             raw_result = await handler(job, lease, worker_context)
-            if not isinstance(raw_result, Mapping):
-                raise TypeError("job handler result must be a mapping")
-            result = to_json_value(raw_result)
-            if not isinstance(result, dict):  # pragma: no cover - Mapping always thaws to dict.
-                raise TypeError("job handler result must be a JSON object")
+            result = _prepare_job_result(raw_result)
             async with pool.acquire() as conn, conn.transaction():
                 await repository.succeed(conn, job.id, worker_id, result)
             return _outcome("succeeded", job.id)
@@ -214,8 +249,12 @@ async def _run_claimed_job(
                 error_message=exc.error_message,
                 retryable=False,
             )
-        except Exception:  # noqa: BLE001 - raw handler failures are sanitized at the ledger boundary.
-            logger.exception("unhandled worker failure job_id=%s", job.id)
+        except Exception as exc:  # noqa: BLE001 - raw failures are sanitized at the ledger boundary.
+            logger.error(
+                "unhandled worker failure job_id=%s error_type=%s",
+                job.id,
+                type(exc).__name__,
+            )
             recorded = await _record_failure(
                 pool,
                 job.id,
@@ -295,4 +334,41 @@ class WorkerSettings:
     job_timeout = 3600
     on_startup = startup
     on_shutdown = shutdown
-    redis_settings = RedisSettings.from_dsn(settings.REDIS_URL) if settings.REDIS_URL else None
+
+
+def build_worker_settings(runtime_settings: object) -> dict[str, object]:
+    """Build safe ARQ settings only after durable runtime preflight succeeds."""
+    validate_worker_runtime(runtime_settings)
+    redis_url = runtime_settings.REDIS_URL.strip()
+    return {
+        "functions": WorkerSettings.functions,
+        "cron_jobs": WorkerSettings.cron_jobs,
+        "max_tries": WorkerSettings.max_tries,
+        "retry_jobs": WorkerSettings.retry_jobs,
+        "keep_result": WorkerSettings.keep_result,
+        "job_timeout": WorkerSettings.job_timeout,
+        "on_startup": WorkerSettings.on_startup,
+        "on_shutdown": WorkerSettings.on_shutdown,
+        "redis_settings": RedisSettings.from_dsn(redis_url),
+    }
+
+
+def create_durable_worker(runtime_settings: object = settings, **kwargs: object) -> object:
+    """Construct an unconnected ARQ Worker after mandatory durable preflight."""
+    worker_settings = build_worker_settings(runtime_settings)
+    return arq_create_worker(worker_settings, **kwargs)
+
+
+def run_durable_worker(runtime_settings: object = settings, **kwargs: object) -> object:
+    """Run the supported durable worker launcher after mandatory preflight."""
+    worker_settings = build_worker_settings(runtime_settings)
+    return arq_run_worker(worker_settings, **kwargs)
+
+
+def main() -> None:
+    """Launch the durable worker via ``python -m jobs.worker``."""
+    run_durable_worker()
+
+
+if __name__ == "__main__":
+    main()

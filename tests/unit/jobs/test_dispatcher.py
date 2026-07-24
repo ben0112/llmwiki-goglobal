@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from uuid import uuid4
 
 import pytest
+
+
+def _runtime_settings(**changes):
+    values = {
+        "MODE": "hosted",
+        "DURABLE_JOBS_ENABLED": True,
+        "REDIS_URL": "redis://redis.internal:6380/4",
+        "DATABASE_URL": "postgresql://database.internal/jobs",
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 class FakeConnection:
@@ -277,6 +290,107 @@ def test_worker_settings_disable_arq_retry_and_results_with_unique_safe_crons():
         assert job.keep_result_s == 0
 
 
+@pytest.mark.parametrize(
+    "runtime_settings,match",
+    [
+        (_runtime_settings(MODE="local"), "MODE=hosted"),
+        (_runtime_settings(DURABLE_JOBS_ENABLED=False), "DURABLE_JOBS_ENABLED"),
+        (_runtime_settings(REDIS_URL=None), "REDIS_URL"),
+        (_runtime_settings(REDIS_URL="  "), "REDIS_URL"),
+        (_runtime_settings(DATABASE_URL=""), "DATABASE_URL"),
+        (_runtime_settings(DATABASE_URL="  "), "DATABASE_URL"),
+    ],
+)
+def test_worker_factories_validate_before_arq_construction(
+    monkeypatch,
+    runtime_settings,
+    match,
+):
+    from jobs import worker
+
+    calls = []
+
+    def create_worker(*args, **kwargs):
+        calls.append(("create", args, kwargs))
+
+    def run_worker(*args, **kwargs):
+        calls.append(("run", args, kwargs))
+
+    monkeypatch.setattr(worker, "arq_create_worker", create_worker)
+    monkeypatch.setattr(worker, "arq_run_worker", run_worker)
+
+    with pytest.raises(RuntimeError, match=match):
+        worker.create_durable_worker(runtime_settings)
+    with pytest.raises(RuntimeError, match=match):
+        worker.run_durable_worker(runtime_settings)
+    assert calls == []
+
+
+def test_build_worker_settings_preserves_safety_and_parses_validated_redis_url():
+    from jobs import worker
+
+    built = worker.build_worker_settings(_runtime_settings())
+
+    assert built["functions"] == [worker.run_job]
+    assert built["cron_jobs"] == worker.WorkerSettings.cron_jobs
+    assert built["max_tries"] == 1
+    assert built["retry_jobs"] is False
+    assert built["keep_result"] == 0
+    assert built["job_timeout"] == 3600
+    assert built["on_startup"] is worker.startup
+    assert built["on_shutdown"] is worker.shutdown
+    redis_settings = built["redis_settings"]
+    assert redis_settings.host == "redis.internal"
+    assert redis_settings.port == 6380
+    assert redis_settings.database == 4
+
+
+def test_create_durable_worker_constructs_configured_unconnected_arq_worker():
+    from jobs import worker
+
+    arq_worker = worker.create_durable_worker(
+        _runtime_settings(),
+        handle_signals=False,
+    )
+
+    assert arq_worker.redis_settings.host == "redis.internal"
+    assert arq_worker.redis_settings.port == 6380
+    assert arq_worker.redis_settings.database == 4
+    assert arq_worker.redis_settings.host != "localhost"
+    assert arq_worker._pool is None
+
+
+def test_run_durable_worker_passes_validated_dynamic_settings_to_arq(monkeypatch):
+    from jobs import worker
+
+    expected = object()
+    calls = []
+
+    def run_worker(settings_object, **kwargs):
+        calls.append((settings_object, kwargs))
+        return expected
+
+    monkeypatch.setattr(worker, "arq_run_worker", run_worker)
+
+    result = worker.run_durable_worker(_runtime_settings(), burst=True)
+
+    assert result is expected
+    assert calls[0][1] == {"burst": True}
+    assert calls[0][0]["redis_settings"].host == "redis.internal"
+    assert calls[0][0]["redis_settings"].port == 6380
+    assert calls[0][0]["redis_settings"].database == 4
+
+
+def test_worker_module_main_uses_preflight_launcher(monkeypatch):
+    from jobs import worker
+
+    calls = []
+    monkeypatch.setattr(worker, "run_durable_worker", lambda: calls.append("run"))
+
+    assert worker.main() is None
+    assert calls == ["run"]
+
+
 def _job(job_type=None):
     from jobs.models import JobRecord, JobType
 
@@ -304,16 +418,26 @@ class FakeWorkerPool:
         self.acquires = 0
         self.transactions = 0
         self.close_calls = 0
+        self.active_connections = 0
+        self.active_transactions = 0
 
     @asynccontextmanager
     async def acquire(self):
         self.acquires += 1
-        yield self.connection
+        self.active_connections += 1
+        try:
+            yield self.connection
+        finally:
+            self.active_connections -= 1
 
     @asynccontextmanager
     async def transaction(self):
         self.transactions += 1
-        yield
+        self.active_transactions += 1
+        try:
+            yield
+        finally:
+            self.active_transactions -= 1
 
     async def close(self):
         self.close_calls += 1
@@ -418,6 +542,122 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
     assert pool.transactions == 2
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"x": "a" * 16_375},
+        {"x": "你" * 5_458 + "a"},
+    ],
+)
+def test_prepare_job_result_accepts_exact_utf8_database_boundary(result):
+    from jobs.worker import _prepare_job_result
+
+    encoded = json.dumps(
+        result,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(", ", ": "),
+    ).encode("utf-8")
+    assert len(encoded) == 16_384
+    assert _prepare_job_result(result) == result
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"x": "a" * 16_376},
+        {"x": "你" * 5_458 + "aa"},
+    ],
+)
+def test_prepare_job_result_rejects_one_byte_over_database_boundary(result):
+    from jobs.handlers import TerminalJobError
+    from jobs.worker import _prepare_job_result
+
+    encoded = json.dumps(
+        result,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(", ", ": "),
+    ).encode("utf-8")
+    assert len(encoded) == 16_385
+    with pytest.raises(TerminalJobError) as raised:
+        _prepare_job_result(result)
+    assert raised.value.error_code == "invalid_job_result"
+    assert raised.value.error_message == "The job produced an invalid result."
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ["not", "a", "mapping"],
+        {"nested": {"not_finite": float("nan")}},
+        {"nested": {"bytes": b"TOP_SECRET_RESULT"}},
+        {"nested": {"object": object()}},
+    ],
+)
+def test_prepare_job_result_rejects_nonmapping_and_nested_non_json_values(result):
+    from jobs.handlers import TerminalJobError
+    from jobs.worker import _prepare_job_result
+
+    with pytest.raises(TerminalJobError) as raised:
+        _prepare_job_result(result)
+    assert raised.value.error_code == "invalid_job_result"
+    assert raised.value.error_message == "The job produced an invalid result."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        ["not", "a", "mapping"],
+        {"not_finite": float("nan")},
+        {"nested": {"bytes": b"TOP_SECRET_RESULT"}},
+        {"nested": {"object": object()}},
+        {"x": "a" * 16_376},
+    ],
+)
+async def test_run_job_records_invalid_result_as_terminal_without_succeed(
+    monkeypatch,
+    invalid_result,
+):
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+    job = _job()
+    succeeded = []
+    recorded = []
+
+    async def claim(*_args):
+        return job
+
+    async def handler(*_args):
+        return invalid_result
+
+    async def succeed(*args):
+        succeeded.append(args)
+
+    async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker.repository, "succeed", succeed)
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+
+    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    assert outcome == {"status": "failed", "job_id": str(job.id)}
+    assert succeeded == []
+    assert recorded == [
+        {
+            "error_code": "invalid_job_result",
+            "error_message": "The job produced an invalid result.",
+            "retryable": False,
+        }
+    ]
+    assert "TOP_SECRET_RESULT" not in repr(recorded)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure,retryable,code,message",
@@ -476,6 +716,90 @@ async def test_run_job_records_sanitized_handler_failures(
     ]
     assert "raw secret" not in repr(recorded)
     assert "raw cancellation" not in repr(recorded)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_handler_failure_logs_only_stable_fields(monkeypatch, caplog):
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+    job = _job()
+    recorded = []
+
+    async def claim(*_args):
+        return job
+
+    async def handler(*_args):
+        raise RuntimeError("TOP_SECRET_TOKEN")
+
+    async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+    caplog.set_level(logging.ERROR, logger="jobs.worker")
+
+    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    assert outcome == {"status": "failed", "job_id": str(job.id)}
+    assert recorded == [
+        {
+            "error_code": "unhandled_worker_error",
+            "error_message": "The job encountered an unexpected error.",
+            "retryable": True,
+        }
+    ]
+    assert str(job.id) in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "TOP_SECRET_TOKEN" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_never_logs_or_persists_failing_result(monkeypatch, caplog):
+    from jobs import worker
+
+    class FakeCheckViolationError(Exception):
+        pass
+
+    pool = PoolWithConnectionTransaction()
+    job = _job()
+    recorded = []
+
+    async def claim(*_args):
+        return job
+
+    async def handler(*_args):
+        return {"result": "RAW_RESULT_TOKEN"}
+
+    async def succeed(*_args):
+        raise FakeCheckViolationError("TOP_SECRET_TOKEN row contains RAW_RESULT_TOKEN")
+
+    async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
+        recorded.append(kwargs)
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker.repository, "succeed", succeed)
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+    caplog.set_level(logging.ERROR, logger="jobs.worker")
+
+    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    assert outcome == {"status": "failed", "job_id": str(job.id)}
+    assert recorded == [
+        {
+            "error_code": "unhandled_worker_error",
+            "error_message": "The job encountered an unexpected error.",
+            "retryable": True,
+        }
+    ]
+    assert "FakeCheckViolationError" in caplog.text
+    assert "TOP_SECRET_TOKEN" not in caplog.text
+    assert "RAW_RESULT_TOKEN" not in caplog.text
+    assert "RAW_RESULT_TOKEN" not in repr(recorded)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -583,20 +907,52 @@ async def test_run_job_propagates_worker_cancellation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_job_propagates_custom_base_exception_after_lease_cleanup(monkeypatch):
+    from jobs import worker
+
+    class WorkerShutdownSignal(BaseException):
+        pass
+
+    pool = PoolWithConnectionTransaction()
+    job = _job()
+
+    async def claim(*_args):
+        return job
+
+    async def handler(*_args):
+        raise WorkerShutdownSignal("stop worker")
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+
+    with pytest.raises(WorkerShutdownSignal):
+        await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    lease = FakeLease.instances[-1]
+    assert lease.entered is False
+    assert pool.active_connections == 0
+    assert pool.active_transactions == 0
+
+
+@pytest.mark.asyncio
 async def test_reap_cron_uses_short_transaction_and_propagates_failures(monkeypatch):
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
-    calls = []
+    failure = RuntimeError("reaper database unavailable")
 
     async def reap_expired(conn, *, limit):
-        calls.append((conn, limit))
-        return [uuid4()]
+        assert conn is pool.connection
+        assert limit == 23
+        raise failure
 
     monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
-    assert await worker.reap_cron({"pool": pool, "reap_batch_size": 23}) is None
-    assert calls == [(pool.connection, 23)]
+    with pytest.raises(RuntimeError, match="reaper database unavailable") as raised:
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
+    assert raised.value is failure
     assert pool.transactions == 1
+    assert pool.active_connections == 0
+    assert pool.active_transactions == 0
 
 
 @pytest.mark.asyncio
