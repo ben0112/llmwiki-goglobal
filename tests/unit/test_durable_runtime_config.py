@@ -45,6 +45,19 @@ def test_local_mode_ignores_durable_flags_for_redis_requirements(monkeypatch):
     assert settings.REDIS_URL is None
 
 
+def test_local_mode_ignores_tus_dependency_on_durable_jobs(monkeypatch):
+    _clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("MODE", "local")
+    monkeypatch.setenv("TUS_MULTIPART_ENABLED", "true")
+    monkeypatch.setenv("DURABLE_JOBS_ENABLED", "false")
+
+    settings = Settings()
+
+    assert settings.REDIS_URL is None
+    assert settings.TUS_MULTIPART_ENABLED is True
+    assert settings.DURABLE_JOBS_ENABLED is False
+
+
 def test_hosted_durable_jobs_requires_redis(monkeypatch):
     _clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("MODE", "hosted")
@@ -144,6 +157,25 @@ def test_positive_runtime_limits_are_accepted(monkeypatch):
 
     for name, value in expected.items():
         assert getattr(settings, name) == value
+
+
+def test_runtime_defaults_in_a_clean_environment(monkeypatch):
+    _clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("MODE", "local")
+
+    settings = Settings()
+
+    assert settings.REDIS_URL is None
+    assert settings.DURABLE_JOBS_ENABLED is False
+    assert settings.TUS_MULTIPART_ENABLED is False
+    assert settings.JOB_LEASE_SECONDS == 120
+    assert settings.JOB_HEARTBEAT_SECONDS == 30
+    assert settings.JOB_DISPATCH_BATCH_SIZE == 100
+    assert settings.JOB_REDELIVER_SECONDS == 30
+    assert settings.TUS_SESSION_TTL_SECONDS == 172800
+    assert settings.TUS_STALE_SECONDS == 86400
+    assert settings.TUS_LOCK_SECONDS == 60
+    assert settings.TUS_MAX_PATCH_BYTES == 67108864
 
 
 def test_redis_module_does_not_create_client_on_import(monkeypatch):

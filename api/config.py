@@ -68,7 +68,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_durable_runtime(self) -> "Settings":
-        if self.TUS_MULTIPART_ENABLED and not self.DURABLE_JOBS_ENABLED:
+        if (
+            self.MODE == "hosted"
+            and self.TUS_MULTIPART_ENABLED
+            and not self.DURABLE_JOBS_ENABLED
+        ):
             raise ValueError("DURABLE_JOBS_ENABLED must be true when TUS_MULTIPART_ENABLED is true")
 
         if self.MODE == "hosted" and (
