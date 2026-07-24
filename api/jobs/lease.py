@@ -109,9 +109,16 @@ class JobLease:
         return False
 
     async def checkpoint(self, conn: asyncpg.Connection | None = None) -> JobRecord:
+        """Assert the lease is active, optionally inside a caller-owned transaction.
+
+        A supplied connection must already be inside the caller's explicit final
+        business transaction so the row lock remains held through its writes.
+        """
         if self._heartbeat_failure is not None:
             raise self._heartbeat_failure
         if conn is not None:
+            if not conn.is_in_transaction():
+                raise RuntimeError("checkpoint connection must already be inside an explicit transaction")
             return await self._assert_active_fn(conn, self.job_id, self.owner)
         async with self.pool.acquire() as conn, conn.transaction():
             return await self._assert_active_fn(conn, self.job_id, self.owner)

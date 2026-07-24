@@ -11,22 +11,29 @@ from jobs.models import JobCancelled, LeaseLost
 
 
 class FakeConnection:
-    def __init__(self, calls):
+    def __init__(self, calls, *, in_transaction=False):
         self.calls = calls
+        self._in_transaction = in_transaction
+
+    def is_in_transaction(self):
+        return self._in_transaction
 
     @asynccontextmanager
     async def transaction(self):
         self.calls.append("transaction-enter")
+        previous = self._in_transaction
+        self._in_transaction = True
         try:
             yield
         finally:
+            self._in_transaction = previous
             self.calls.append("transaction-exit")
 
 
 class FakePool:
-    def __init__(self):
+    def __init__(self, *, connection_in_transaction=False):
         self.calls = []
-        self.connection = FakeConnection(self.calls)
+        self.connection = FakeConnection(self.calls, in_transaction=connection_in_transaction)
 
     @asynccontextmanager
     async def acquire(self):
@@ -46,7 +53,11 @@ class ControlledWaiter:
         self.waiting.set()
         stop_task = asyncio.create_task(stop.wait())
         pulse_task = asyncio.create_task(self.pulses.get())
-        done, pending = await asyncio.wait({stop_task, pulse_task}, return_when=asyncio.FIRST_COMPLETED)
+        async with asyncio.timeout(1):
+            done, pending = await asyncio.wait(
+                {stop_task, pulse_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -127,12 +138,12 @@ async def test_heartbeat_repeats_using_short_acquired_transactions():
     pool = FakePool()
     lease = make_lease(pool=pool, waiter=waiter, heartbeat_fn=heartbeat)
     async with lease:
-        await waiter.waiting.wait()
+        await asyncio.wait_for(waiter.waiting.wait(), timeout=1)
         await waiter.pulse()
         async with asyncio.timeout(1):
             while len(calls) < 1:
                 await asyncio.sleep(0)
-        await waiter.waiting.wait()
+        await asyncio.wait_for(waiter.waiting.wait(), timeout=1)
         await waiter.pulse()
         async with asyncio.timeout(1):
             while len(calls) < 2:
@@ -160,6 +171,7 @@ async def test_checkpoint_delegates_and_propagates_domain_errors(error):
     calls = []
 
     async def assert_active(conn, job_id, owner):
+        assert conn.is_in_transaction()
         calls.append((conn, job_id, owner))
         raise error
 
@@ -189,10 +201,11 @@ async def test_checkpoint_returns_active_record():
 
 @pytest.mark.asyncio
 async def test_checkpoint_reuses_caller_transaction_connection_without_pool_acquire():
-    pool = FakePool()
+    pool = FakePool(connection_in_transaction=True)
     calls = []
 
     async def assert_active(conn, job_id, owner):
+        assert conn.is_in_transaction()
         calls.append((conn, job_id, owner))
         return object()
 
@@ -201,6 +214,26 @@ async def test_checkpoint_reuses_caller_transaction_connection_without_pool_acqu
 
     assert result is not None
     assert calls == [(pool.connection, lease.job_id, "worker-a")]
+    assert pool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_rejects_supplied_connection_outside_explicit_transaction():
+    pool = FakePool()
+    calls = []
+
+    async def assert_active(conn, job_id, owner):
+        calls.append((conn, job_id, owner))
+        return object()
+
+    lease = make_lease(pool=pool, assert_active_fn=assert_active)
+    with pytest.raises(
+        RuntimeError,
+        match="checkpoint connection must already be inside an explicit transaction",
+    ):
+        await lease.checkpoint(pool.connection)
+
+    assert calls == []
     assert pool.calls == []
 
 
@@ -214,7 +247,7 @@ async def test_checkpoint_raises_stored_heartbeat_failure_before_database_access
 
     lease = make_lease(waiter=waiter, heartbeat_fn=heartbeat)
     async with lease:
-        await waiter.waiting.wait()
+        await asyncio.wait_for(waiter.waiting.wait(), timeout=1)
         await waiter.pulse()
         async with asyncio.timeout(1):
             while lease.heartbeat_failure is None:
@@ -261,10 +294,10 @@ async def test_caller_cancellation_stops_and_awaits_heartbeat_task():
     async def run_with_lease():
         async with lease:
             entered.set()
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
 
     caller = asyncio.create_task(run_with_lease())
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), timeout=1)
     heartbeat_task = lease.heartbeat_task
     assert heartbeat_task is not None
     caller.cancel()
