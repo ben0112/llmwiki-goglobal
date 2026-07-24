@@ -698,6 +698,14 @@ class TestSearchDeleteLifecycle:
         result = await searcher.search_chunks("quantum", "*", None, 10)
         assert "quantum" in result.lower()
 
+    async def test_search_chunks_uses_shared_limit_contract(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            await searcher.search_chunks("query", "*", None, 101)
+
     async def test_search_chunks_respects_file_glob(self, fs, insert_chunk):
         instance, kb_id = fs
         from tools.search import SearchHandler

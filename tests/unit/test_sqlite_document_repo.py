@@ -85,3 +85,16 @@ async def test_list_survives_malformed_tags_row():
         assert "坏行.md" in by_name and by_name["坏行.md"]["tags"] == []
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_search_fulltext_uses_shared_limit_contract():
+    db = await _init_db()
+    try:
+        from infra.db.sqlite import SQLiteChunkRepository
+
+        repo = SQLiteChunkRepository(db)
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            await repo.search_fulltext("ws1", "query", limit=101)
+    finally:
+        await db.close()

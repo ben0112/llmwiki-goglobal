@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
+from llmwiki_core.search import SearchArea, SearchQuery
 
 logger = logging.getLogger(__name__)
 
@@ -793,6 +794,10 @@ class SQLiteChunkRepository:
         self, kb_id: str, query: str, *, limit: int = 20,
         path_filter: str | None = None, user_id: str | None = None,
     ) -> list[dict]:
+        request = SearchQuery.build(text=query, limit=limit, area=path_filter)
+        query = request.text
+        limit = request.limit
+        path_filter = None if request.area is SearchArea.ALL else request.area.value
         match_expr = build_fts_match(query)
         params: list = []
         if match_expr is not None:

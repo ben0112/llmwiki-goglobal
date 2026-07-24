@@ -10,6 +10,8 @@ from vaultfs import VaultFS
 from vaultfs.base import RELATION_TYPES
 from vaultfs.facets import UnknownFacetError
 
+from llmwiki_core.search import SearchArea, SearchQuery
+
 from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,18 @@ class SearchHandler:
         `facets` filters by the corpus 八维 classification metadata.
         """
         path_filter = self._path_filter_key(path)
+        request = SearchQuery.build(
+            text=query,
+            limit=limit,
+            area=path_filter,
+            scope=scope,
+            facets=facets,
+        )
+        query = request.text
+        limit = request.limit
+        scope = request.scope.value
+        facets = dict(request.facets)
+        path_filter = None if request.area is SearchArea.ALL else request.area.value
 
         matches = await self.fs.search_chunks(
             self.kb_id, query, limit, path_filter,
