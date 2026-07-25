@@ -254,10 +254,10 @@ async def _record_failure(
     error_code: str,
     error_message: str,
     retryable: bool,
-) -> bool:
+) -> JobRecord | None:
     try:
         async with pool.acquire() as conn, conn.transaction():
-            await repository.fail_or_retry(
+            return await repository.fail_or_retry(
                 conn,
                 job_id,
                 worker_id,
@@ -266,8 +266,28 @@ async def _record_failure(
                 retryable=retryable,
             )
     except LeaseLost:
-        return False
-    return True
+        return None
+
+
+def _emit_finished(
+    transition: JobRecord,
+    *,
+    worker_id: str,
+    started: float,
+) -> None:
+    """Emit only fields backed by the row returned from the committed mutation."""
+    emit(
+        logger,
+        "durable_job_finished",
+        job_id=transition.id,
+        job_type=transition.job_type,
+        attempt=transition.attempt_count,
+        state=transition.state,
+        lease_owner=worker_id,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        error_code=transition.error_code,
+        replica_role="worker",
+    )
 
 
 def _outcome(status: str, job_id: UUID | None = None) -> dict[str, str]:
@@ -349,6 +369,7 @@ async def _run_claimed_job(
     heartbeat_seconds: int,
     handlers: Mapping,
     worker_context: WorkerContext,
+    started: float,
 ) -> dict[str, str]:
     async with JobLease(
         pool,
@@ -365,10 +386,12 @@ async def _run_claimed_job(
             result, serialized_result = _prepare_job_result(raw_result)
             async with pool.acquire() as conn, conn.transaction():
                 await _validate_result_in_postgres(conn, serialized_result)
-                await repository.succeed(conn, job.id, worker_id, result)
+                transition = await repository.succeed(conn, job.id, worker_id, result)
+            if transition is not None:
+                _emit_finished(transition, worker_id=worker_id, started=started)
             return _outcome("succeeded", job.id)
         except asyncio.CancelledError:
-            await asyncio.shield(
+            transition = await asyncio.shield(
                 _record_failure(
                     pool,
                     job.id,
@@ -378,6 +401,8 @@ async def _run_claimed_job(
                     retryable=True,
                 )
             )
+            if transition is not None:
+                _emit_finished(transition, worker_id=worker_id, started=started)
             raise
         except LeaseLost:
             logger.info("worker lease lost job_id=%s", job.id)
@@ -424,9 +449,10 @@ async def _run_claimed_job(
                 retryable=True,
             )
 
-        if not recorded:
+        if recorded is None:
             logger.info("worker lease lost before failure transition job_id=%s", job.id)
             return _outcome("lease_lost", job.id)
+        _emit_finished(recorded, worker_id=worker_id, started=started)
         return _outcome("failed", job.id)
 
 
@@ -447,56 +473,33 @@ async def run_job(ctx: dict, job_id_text: str) -> dict[str, str]:
         return _outcome("duplicate", job_id)
 
     started = time.monotonic()
-    try:
-        outcome = await _run_claimed_job(
-            pool=pool,
-            job=job,
-            worker_id=worker_id,
-            lease_seconds=lease_seconds,
-            heartbeat_seconds=ctx["heartbeat_seconds"],
-            handlers=ctx["handlers"],
-            worker_context=ctx["worker_context"],
-        )
-    except asyncio.CancelledError:
-        emit(
-            logger,
-            "durable_job_finished",
-            job_id=job.id,
-            job_type=job.job_type,
-            attempt=job.attempt_count,
-            state="retry_wait",
-            lease_owner=worker_id,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            error_code=_SHUTDOWN_CODE,
-            replica_role="worker",
-        )
-        raise
-    emit(
-        logger,
-        "durable_job_finished",
-        job_id=job.id,
-        job_type=job.job_type,
-        attempt=job.attempt_count,
-        state=outcome["status"],
-        lease_owner=worker_id,
-        duration_ms=int((time.monotonic() - started) * 1000),
-        error_code=None if outcome["status"] == "succeeded" else outcome["status"],
-        replica_role="worker",
+    return await _run_claimed_job(
+        pool=pool,
+        job=job,
+        worker_id=worker_id,
+        lease_seconds=lease_seconds,
+        heartbeat_seconds=ctx["heartbeat_seconds"],
+        handlers=ctx["handlers"],
+        worker_context=ctx["worker_context"],
+        started=started,
     )
-    return outcome
 
 
 async def reap_cron(ctx: dict) -> None:
     """Recover a bounded batch of jobs whose PostgreSQL leases expired."""
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        reaped = await repository.reap_expired(conn, limit=ctx["reap_batch_size"])
-    for job_id in reaped:
+        reaped = await repository.reap_expired(
+            conn,
+            limit=ctx["reap_batch_size"],
+            include_transitions=True,
+        )
+    for transition in reaped:
         emit(
             logger,
             "durable_job_lease_reaped",
-            job_id=job_id,
-            state="retry_wait",
-            error_code="lease_expired",
+            job_id=transition.id,
+            state=transition.state,
+            error_code=transition.error_code,
             replica_role="worker",
         )
 

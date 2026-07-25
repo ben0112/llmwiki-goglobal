@@ -535,7 +535,7 @@ SET
 FROM candidates, lease_clock
 WHERE job.id = candidates.id
   AND job.lease_expires_at <= lease_clock.checked_at
-RETURNING job.id
+RETURNING job.*
 """
 
 
@@ -543,8 +543,17 @@ async def reap_expired(
     conn: asyncpg.Connection,
     *,
     limit: int = 100,
-) -> list[UUID]:
-    """Recover a bounded batch of expired leases without colliding with other reapers."""
+    include_transitions: bool = False,
+) -> list[UUID] | list[JobRecord]:
+    """Recover expired leases and optionally expose their persisted transitions.
+
+    The default UUID projection preserves existing repository callers. Workers
+    request complete records so telemetry can describe the committed row rather
+    than infer an outcome from pre-mutation inputs.
+    """
     _validate_positive(limit, "limit")
     rows = await conn.fetch(_REAP_EXPIRED, limit, _ATTEMPTS_EXHAUSTED_MESSAGE)
-    return [_uuid(row["id"], "id") for row in rows]
+    records = [_row_to_record(row) for row in rows]
+    if include_transitions:
+        return records
+    return [record.id for record in records]

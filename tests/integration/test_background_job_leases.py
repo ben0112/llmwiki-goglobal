@@ -552,7 +552,8 @@ async def test_reaper_uses_database_time_for_all_branches_limit_and_repeat(pool)
     live = await expired(lease_expires_at=database_now + timedelta(hours=1))
     before = await _db_now(pool)
     async with pool.acquire() as conn:
-        first = await repository.reap_expired(conn, limit=2)
+        first_transitions = await repository.reap_expired(conn, limit=2, include_transitions=True)
+        first = [record.id for record in first_transitions]
         second = await repository.reap_expired(conn, limit=2)
         repeated = await repository.reap_expired(conn, limit=2)
         for invalid_limit in (0, True, 1.5):
@@ -564,6 +565,14 @@ async def test_reaper_uses_database_time_for_all_branches_limit_and_repeat(pool)
     assert len(second) == 1
     assert repeated == []
     assert set(first + second) == {retry["id"], cancelled["id"], exhausted["id"]}
+    for transition in first_transitions:
+        assert transition.state in {JobState.RETRY_WAIT, JobState.FAILED, JobState.CANCELLED}
+        if transition.state is JobState.RETRY_WAIT:
+            assert transition.error_code == "lease_expired"
+        elif transition.state is JobState.FAILED:
+            assert transition.error_code == "attempts_exhausted"
+        else:
+            assert transition.error_code is None
     rows = {
         row["id"]: row
         for row in await pool.fetch(

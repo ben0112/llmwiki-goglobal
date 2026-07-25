@@ -26,7 +26,7 @@ EVENT_SCHEMAS = {
     "durable_job_lease_reaped": {
         "job_id": str,
         "state": str,
-        "error_code": str,
+        "error_code": (str, type(None)),
         "replica_role": str,
     },
     "tus_session_created": {"upload_id": str, "state": str, "replica_role": str},
@@ -86,6 +86,8 @@ def assert_telemetry_event(
         assert not any(fragment in serialized for fragment in _FORBIDDEN_VALUE_FRAGMENTS)
         for value in sensitive:
             assert str(value).lower() not in serialized
+    if count == 0:
+        return {}
     body = matches[-1]
     if expected is not None:
         assert body.items() >= expected.items()

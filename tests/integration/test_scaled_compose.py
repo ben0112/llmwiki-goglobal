@@ -41,6 +41,10 @@ def _service_block(text: str, service: str) -> str:
 
 def test_scaled_compose_declares_private_replicas_and_gateway():
     text = COMPOSE.read_text(encoding="utf-8")
+    assert "minio/minio:latest" not in text
+    assert "minio/mc:latest" not in text
+    assert "minio/minio:RELEASE.2025-04-22T22-12-26Z" in text
+    assert "minio/mc:RELEASE.2025-04-16T18-13-26Z" in text
     assert "redis:7.4.2-alpine" in text
     assert "Redis 7.4.2" in DOCS.read_text(encoding="utf-8")
     assert '["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]' in text

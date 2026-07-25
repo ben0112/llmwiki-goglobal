@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implemented and verified
+**Status:** Implementation incomplete — quality-review follow-up in progress
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -419,24 +419,21 @@ The workflow invokes the complete partitions with these commands; the two
 Postgres partitions deliberately run one file per pytest process:
 
 ```bash
-python -m tests.helpers.ci_test_matrix unit-core | xargs pytest -v
-python -m tests.helpers.ci_test_matrix unit-api | xargs env PYTHONPATH=api pytest -v
-python -m tests.helpers.ci_test_matrix unit-mcp | xargs env PYTHONPATH=mcp pytest -v
-python -m tests.helpers.ci_test_matrix unit-corpus | xargs pytest -v
-python -m tests.helpers.ci_test_matrix integration-mcp | xargs env PYTHONPATH=mcp pytest -v
-python -m tests.helpers.ci_test_matrix integration-redis | xargs env PYTHONPATH=api pytest -v
-python -m tests.helpers.ci_test_matrix integration-minio | xargs env PYTHONPATH=api pytest -v
-python -m tests.helpers.ci_test_matrix integration-scaled | xargs env PYTHONPATH=api pytest -v
-
-python -m tests.helpers.ci_test_matrix integration-api |
-  while IFS= read -r test_file; do
-    PYTHONPATH=api MODE=hosted pytest "$test_file" -v
-  done
-python -m tests.helpers.ci_test_matrix integration-mcp-postgres |
-  while IFS= read -r test_file; do
-    PYTHONPATH=mcp pytest "$test_file" -v
-  done
+python -m tests.helpers.ci_test_matrix run unit-core -- pytest -v
+python -m tests.helpers.ci_test_matrix run unit-api -- env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix run unit-mcp -- env PYTHONPATH=mcp pytest -v
+python -m tests.helpers.ci_test_matrix run unit-corpus -- pytest -v
+python -m tests.helpers.ci_test_matrix run integration-mcp -- env PYTHONPATH=mcp pytest -v
+python -m tests.helpers.ci_test_matrix run integration-redis -- env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix run integration-minio -- env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix run integration-scaled -- env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix run integration-api -- env PYTHONPATH=api MODE=hosted pytest -v
+python -m tests.helpers.ci_test_matrix run integration-mcp-postgres -- env PYTHONPATH=mcp pytest -v
 ```
+
+The runner materializes a non-empty segment before launching pytest, preserves
+the one-process-per-file PostgreSQL isolation, and propagates generator and
+child-process failures without relying on shell pipeline behavior.
 
 The workflow also passed four matrix ownership contract tests and nine scaled
 static tests; the live-only scaled test was intentionally skipped in the

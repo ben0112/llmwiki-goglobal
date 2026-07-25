@@ -90,7 +90,10 @@ is why this must run on the Supabase database, not a bare Postgres.
 ## 3. MinIO
 
 Included in the compose file, with an init job that creates the bucket and an
-app-scoped access key. Two things matter:
+app-scoped access key. Compose pins the server to
+`RELEASE.2025-04-22T22-12-26Z` and its compatible `mc` client to
+`RELEASE.2025-04-16T18-13-26Z` so deployments do not silently change when a
+new image is published. Two things matter:
 
 - **Browsers fetch presigned URLs directly**, so MinIO's S3 port must be
   publicly reachable — put `minio:9000` behind your proxy as

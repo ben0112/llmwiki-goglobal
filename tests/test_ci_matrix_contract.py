@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github/workflows/test.yml"
 
@@ -7,6 +9,9 @@ WORKFLOW = ROOT / ".github/workflows/test.yml"
 def test_workflow_uses_complete_isolated_test_matrix_segments():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "mapfile" not in workflow
+    assert "| xargs" not in workflow
+    assert "ci_test_matrix integration-api |" not in workflow
+    assert "ci_test_matrix integration-mcp-postgres |" not in workflow
     for segment in (
         "unit-core",
         "unit-api",
@@ -19,14 +24,8 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
         "integration-minio",
         "integration-scaled",
     ):
-        command = f"python -m tests.helpers.ci_test_matrix {segment}"
+        command = f"python -m tests.helpers.ci_test_matrix run {segment} --"
         assert command in workflow
-        if segment in {"integration-api", "integration-mcp-postgres"}:
-            assert f"{command} |" in workflow
-            assert "while IFS= read -r test_file; do" in workflow
-            assert 'PYTHONPATH=api MODE=hosted pytest "$test_file" -v' in workflow
-        else:
-            assert f"{command} | xargs" in workflow
 
 
 def test_api_integration_files_use_fresh_pytest_session_fixtures():
@@ -35,10 +34,9 @@ def test_api_integration_files_use_fresh_pytest_session_fixtures():
     step = workflow.split("- name: Run complete isolated API integration matrix", 1)[1]
     step = step.split("- name:", 1)[0]
 
-    assert "set -o pipefail" in step
-    assert "while IFS= read -r test_file; do" in step
-    assert 'pytest "$test_file"' in step
-    assert "xargs env PYTHONPATH=api MODE=hosted pytest" not in step
+    assert "python -m tests.helpers.ci_test_matrix run integration-api --" in step
+    assert "env PYTHONPATH=api MODE=hosted pytest -v" in step
+    assert "|" not in step
 
 
 def test_mcp_postgres_files_load_module_plugins_in_separate_pytest_processes():
@@ -47,10 +45,64 @@ def test_mcp_postgres_files_load_module_plugins_in_separate_pytest_processes():
     step = workflow.split("- name: Run MCP Postgres isolation tests", 1)[1]
     step = step.split("\n\n", 1)[0]
 
-    assert "set -o pipefail" in step
-    assert "while IFS= read -r test_file; do" in step
-    assert 'PYTHONPATH=mcp pytest "$test_file" -v' in step
-    assert "xargs env PYTHONPATH=mcp pytest" not in step
+    assert "python -m tests.helpers.ci_test_matrix run integration-mcp-postgres --" in step
+    assert "env PYTHONPATH=mcp pytest -v" in step
+    assert "|" not in step
+
+
+@pytest.mark.parametrize("failure", ["error", "empty"])
+def test_run_command_fails_closed_before_launching_tests(monkeypatch, failure):
+    from tests.helpers import ci_test_matrix
+
+    launched = []
+
+    def generate(_segment):
+        if failure == "error":
+            raise RuntimeError("generator failed")
+        return ()
+
+    def launch(*args, **kwargs):
+        launched.append((args, kwargs))
+        raise AssertionError("test command must not launch")
+
+    monkeypatch.setattr(ci_test_matrix, "_segment_files", generate)
+    monkeypatch.setattr(ci_test_matrix.subprocess, "run", launch)
+
+    assert ci_test_matrix.main(["run", "unit-core", "--", "pytest", "-v"]) != 0
+    assert launched == []
+
+
+def test_run_command_propagates_child_failure_and_preserves_segment_strategy(monkeypatch):
+    from tests.helpers import ci_test_matrix
+
+    calls = []
+
+    class Result:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+    monkeypatch.setattr(
+        ci_test_matrix,
+        "_segment_files",
+        lambda _segment: ("tests/one.py", "tests/two.py"),
+    )
+
+    def launch(command, check):
+        calls.append((command, check))
+        return Result(7 if len(calls) == 2 else 0)
+
+    monkeypatch.setattr(ci_test_matrix.subprocess, "run", launch)
+
+    assert (
+        ci_test_matrix.main(
+            ["run", "integration-api", "--", "env", "PYTHONPATH=api", "pytest", "-v"]
+        )
+        == 7
+    )
+    assert calls == [
+        (["env", "PYTHONPATH=api", "pytest", "-v", "tests/one.py"], False),
+        (["env", "PYTHONPATH=api", "pytest", "-v", "tests/two.py"], False),
+    ]
 
 
 def test_each_test_file_has_exactly_one_primary_ci_segment():

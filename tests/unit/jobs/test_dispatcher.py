@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -554,14 +555,21 @@ def test_worker_module_main_uses_preflight_launcher(monkeypatch):
     assert calls == ["run"]
 
 
-def _job(job_type=None):
+def _job(job_type=None, **changes):
     from jobs.models import JobRecord, JobType
 
-    return JobRecord(
+    record = JobRecord(
         id=uuid4(),
         job_type=job_type or JobType.DOCUMENT_EXTRACT,
         user_id=uuid4(),
     )
+    return replace(record, **changes)
+
+
+def _failed_transition(job, error_code: str):
+    from jobs.models import JobState
+
+    return replace(job, state=JobState.FAILED, attempt_count=1, error_code=error_code)
 
 
 def _worker_context(pool):
@@ -687,6 +695,7 @@ async def test_run_job_claims_from_postgres_and_returns_duplicate_without_handle
 @pytest.mark.asyncio
 async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monkeypatch, caplog):
     from jobs import worker
+    from jobs.models import JobState
 
     pool = PoolWithConnectionTransaction()
     job = _job()
@@ -705,6 +714,7 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
     async def succeed(conn, job_id, owner, result):
         assert FakeLease.instances[-1].entered
         calls.append((conn, job_id, owner, result))
+        return replace(job, state=JobState.SUCCEEDED, attempt_count=1)
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "succeed", succeed)
@@ -729,7 +739,7 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
         expected={
             "job_id": str(job.id),
             "job_type": job.job_type.value,
-            "attempt": job.attempt_count,
+            "attempt": 1,
             "state": "succeeded",
             "lease_owner": "worker-test",
             "error_code": None,
@@ -876,6 +886,7 @@ async def test_postgres_result_validation_classifies_data_and_operational_errors
         assert pool.active_transactions == 1
         pool.events.append("fail")
         recorded.append(kwargs)
+        return _failed_transition(job, kwargs["error_code"])
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "succeed", succeed)
@@ -930,6 +941,7 @@ async def test_run_job_records_invalid_result_as_terminal_without_succeed(
 
     async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
         recorded.append(kwargs)
+        return _failed_transition(job, kwargs["error_code"])
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "succeed", succeed)
@@ -966,10 +978,11 @@ async def test_run_job_records_sanitized_handler_failures(
     retryable,
     code,
     message,
+    caplog,
 ):
     from jobs import worker
     from jobs.handlers import RetryableJobError, TerminalJobError
-    from jobs.models import JobCancelled
+    from jobs.models import JobCancelled, JobState
 
     pool = PoolWithConnectionTransaction()
     job = _job()
@@ -987,15 +1000,29 @@ async def test_run_job_records_sanitized_handler_failures(
             raise JobCancelled("raw cancellation detail")
         raise RuntimeError("raw secret must not be persisted")
 
+    persisted = {
+        "retryable": ("retry_wait", "converter_timeout"),
+        "terminal": ("failed", "invalid_document"),
+        "cancelled": ("cancelled", None),
+        "unexpected": ("failed", "attempts_exhausted"),
+    }[failure]
+
     async def fail_or_retry(conn, job_id, owner, **kwargs):
         assert FakeLease.instances[-1].entered
         recorded.append((conn, job_id, owner, kwargs))
+        return replace(
+            job,
+            state=JobState(persisted[0]),
+            attempt_count=2,
+            error_code=persisted[1],
+        )
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
     monkeypatch.setattr(worker, "JobLease", FakeLease)
 
-    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
 
     assert outcome == {"status": "failed", "job_id": str(job.id)}
     assert recorded == [
@@ -1008,6 +1035,17 @@ async def test_run_job_records_sanitized_handler_failures(
     ]
     assert "raw secret" not in repr(recorded)
     assert "raw cancellation" not in repr(recorded)
+    assert_telemetry_event(
+        caplog,
+        "durable_job_finished",
+        expected={
+            "job_id": str(job.id),
+            "attempt": 2,
+            "state": persisted[0],
+            "error_code": persisted[1],
+            "replica_role": "worker",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1064,7 @@ async def test_unexpected_handler_failure_logs_only_stable_fields(monkeypatch, c
 
     async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
         recorded.append(kwargs)
+        return _failed_transition(job, kwargs["error_code"])
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
@@ -1070,6 +1109,7 @@ async def test_persistence_failure_never_logs_or_persists_failing_result(monkeyp
 
     async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
         recorded.append(kwargs)
+        return _failed_transition(job, kwargs["error_code"])
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "succeed", succeed)
@@ -1107,6 +1147,7 @@ async def test_run_job_missing_handler_records_terminal_unsupported(monkeypatch)
 
     async def fail_or_retry(*_args, **kwargs):
         recorded.append(kwargs)
+        return _failed_transition(job, kwargs["error_code"])
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
@@ -1125,7 +1166,7 @@ async def test_run_job_missing_handler_records_terminal_unsupported(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_run_job_never_mutates_after_lease_loss(monkeypatch):
+async def test_run_job_never_mutates_after_lease_loss(monkeypatch, caplog):
     from jobs import worker
     from jobs.models import LeaseLost
 
@@ -1146,14 +1187,16 @@ async def test_run_job_never_mutates_after_lease_loss(monkeypatch):
     monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
     monkeypatch.setattr(worker, "JobLease", FakeLease)
 
-    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
 
     assert outcome == {"status": "lease_lost", "job_id": str(job.id)}
     assert fail_calls == []
+    assert_telemetry_event(caplog, "durable_job_finished", count=0)
 
 
 @pytest.mark.asyncio
-async def test_run_job_returns_lost_if_failure_transition_loses_lease(monkeypatch):
+async def test_run_job_returns_lost_if_failure_transition_loses_lease(monkeypatch, caplog):
     from jobs import worker
     from jobs.handlers import RetryableJobError
     from jobs.models import LeaseLost
@@ -1174,13 +1217,16 @@ async def test_run_job_returns_lost_if_failure_transition_loses_lease(monkeypatc
     monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
     monkeypatch.setattr(worker, "JobLease", FakeLease)
 
-    outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        outcome = await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
     assert outcome == {"status": "lease_lost", "job_id": str(job.id)}
+    assert_telemetry_event(caplog, "durable_job_finished", count=0)
 
 
 @pytest.mark.asyncio
-async def test_run_job_propagates_worker_cancellation(monkeypatch):
+async def test_run_job_propagates_worker_cancellation(monkeypatch, caplog):
     from jobs import worker
+    from jobs.models import JobState
 
     pool = PoolWithConnectionTransaction()
     job = _job()
@@ -1195,13 +1241,20 @@ async def test_run_job_propagates_worker_cancellation(monkeypatch):
 
     async def record_failure(*args, **kwargs):
         recorded.append((args, kwargs))
-        return True
+        return replace(
+            job,
+            state=JobState.RETRY_WAIT,
+            attempt_count=1,
+            error_code="worker_shutdown",
+        )
 
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker, "JobLease", FakeLease)
     monkeypatch.setattr(worker, "_record_failure", record_failure)
 
-    with pytest.raises(asyncio.CancelledError):
+    with caplog.at_level(logging.INFO, logger="jobs.worker"), pytest.raises(
+        asyncio.CancelledError
+    ):
         await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
 
     assert recorded[0][1] == {
@@ -1209,6 +1262,17 @@ async def test_run_job_propagates_worker_cancellation(monkeypatch):
         "error_message": "Worker shutdown interrupted the job.",
         "retryable": True,
     }
+    assert_telemetry_event(
+        caplog,
+        "durable_job_finished",
+        expected={
+            "job_id": str(job.id),
+            "attempt": 1,
+            "state": "retry_wait",
+            "error_code": "worker_shutdown",
+            "replica_role": "worker",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -1246,9 +1310,10 @@ async def test_reap_cron_uses_short_transaction_and_propagates_failures(monkeypa
     pool = PoolWithConnectionTransaction()
     failure = RuntimeError("reaper database unavailable")
 
-    async def reap_expired(conn, *, limit):
+    async def reap_expired(conn, *, limit, include_transitions):
         assert conn is pool.connection
         assert limit == 23
+        assert include_transitions is True
         raise failure
 
     monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
@@ -1261,16 +1326,35 @@ async def test_reap_cron_uses_short_transaction_and_propagates_failures(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_reap_cron_emits_stable_json_contract_for_each_expired_lease(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    "state,error_code",
+    [
+        ("retry_wait", "lease_expired"),
+        ("failed", "attempts_exhausted"),
+        ("cancelled", None),
+    ],
+)
+async def test_reap_cron_emits_persisted_transition_for_each_expired_lease(
+    monkeypatch,
+    caplog,
+    state,
+    error_code,
+):
     from jobs import worker
+    from jobs.models import JobState
 
     pool = PoolWithConnectionTransaction()
-    job_id = uuid4()
+    transition = _job(
+        state=JobState(state),
+        attempt_count=3,
+        error_code=error_code,
+    )
 
-    async def reap_expired(conn, *, limit):
+    async def reap_expired(conn, *, limit, include_transitions):
         assert conn is pool.connection
         assert limit == 23
-        return [job_id]
+        assert include_transitions is True
+        return [transition]
 
     monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
     with caplog.at_level(logging.INFO, logger="jobs.worker"):
@@ -1280,9 +1364,9 @@ async def test_reap_cron_emits_stable_json_contract_for_each_expired_lease(monke
         caplog,
         "durable_job_lease_reaped",
         expected={
-            "job_id": str(job_id),
-            "state": "retry_wait",
-            "error_code": "lease_expired",
+            "job_id": str(transition.id),
+            "state": state,
+            "error_code": error_code,
             "replica_role": "worker",
         },
         sensitive=("Worker lease expired raw text", "postgresql://private.invalid"),
