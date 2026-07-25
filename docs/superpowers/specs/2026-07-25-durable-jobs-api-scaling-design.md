@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implemented and verified
+**Status:** Implementation incomplete — final specification review in progress
 
 **Branch:** `feat/platform-architecture-evolution`
 

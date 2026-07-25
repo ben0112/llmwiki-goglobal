@@ -151,6 +151,43 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert 'subprocess.run(["docker", "kill", "--signal", "TERM"' in source
     assert "old_owner" in source
     assert "graceful" in source
+    term_at = source.index('subprocess.run(["docker", "kill", "--signal", "TERM"')
+    next_job_at = source.index("draining_response = await client.post", term_at)
+    guarded_exit_at = source.index("await _wait_for_exit_without_old_owner_claim", next_job_at)
+    assert term_at < next_job_at < guarded_exit_at
+    assert '_container_state(graceful_worker_container)["Running"]' in source
+    assert '"durable worker resources closed" in graceful_logs' in source
+    guard_source = inspect.getsource(_wait_for_exit_without_old_owner_claim)
+    assert 'last_job["lease_owner"] != old_owner' in guard_source
+    assert "await asyncio.sleep(0.05)" in guard_source
+
+
+def test_redis_restart_requires_a_local_waitaof_fsync(monkeypatch):
+    waitaof_stdout = ["0\n0\n"]
+    calls = []
+
+    def fake_compose(*args, check=True):
+        calls.append(args)
+        if "WAITAOF" in args:
+            return subprocess.CompletedProcess(args, 0, waitaof_stdout[0], "")
+        if args[-1] == "ping":
+            return subprocess.CompletedProcess(args, 0, "PONG\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setitem(_restart_redis_and_wait.__globals__, "_compose", fake_compose)
+
+    with pytest.raises(AssertionError, match="local AOF fsync"):
+        _restart_redis_and_wait()
+    assert calls == [("exec", "-T", "redis", "redis-cli", "WAITAOF", "1", "0", "5000")]
+
+    calls.clear()
+    waitaof_stdout[0] = "1\n0\n"
+    _restart_redis_and_wait()
+    assert calls == [
+        ("exec", "-T", "redis", "redis-cli", "WAITAOF", "1", "0", "5000"),
+        ("restart", "redis"),
+        ("exec", "-T", "redis", "redis-cli", "ping"),
+    ]
 
 
 def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
@@ -390,7 +427,15 @@ def _api_container_for_instance(instance_id: str) -> str:
 def _restart_redis_and_wait(timeout: float = 40) -> None:
     # Force the first PATCH state through Redis 7.4's local AOF before the
     # restart so this verifies persistence rather than a graceful memory copy.
-    _compose("exec", "-T", "redis", "redis-cli", "WAITAOF", "1", "0", "5000")
+    waitaof = _compose("exec", "-T", "redis", "redis-cli", "WAITAOF", "1", "0", "5000")
+    response_lines = [line.strip() for line in waitaof.stdout.splitlines() if line.strip()]
+    try:
+        local_fsync_count = int(response_lines[0])
+    except (IndexError, ValueError):
+        pytest.fail("Redis WAITAOF returned an invalid local fsync count")
+    assert local_fsync_count >= 1, (
+        f"Redis WAITAOF local AOF fsync count must be at least 1; got {local_fsync_count}"
+    )
     _compose("restart", "redis")
     deadline = time.monotonic() + timeout
     last = None
@@ -407,21 +452,57 @@ def _disable_restart_and_kill(container_id: str, signal: str) -> None:
     subprocess.run(["docker", "kill", "--signal", signal, container_id], check=True)
 
 
+def _container_state(container_id: str) -> dict:
+    inspected = subprocess.run(
+        ["docker", "inspect", "--format", "{{json .State}}", container_id],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return json.loads(inspected.stdout)
+
+
 def _wait_for_container_exit(container_id: str, timeout: float = 40) -> dict:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        inspected = subprocess.run(
-            ["docker", "inspect", "--format", "{{json .State}}", container_id],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        last = json.loads(inspected.stdout)
+        last = _container_state(container_id)
         if not last["Running"]:
             return last
         time.sleep(0.25)
     pytest.fail(f"container {container_id} did not exit after signal; state={last}")
+
+
+async def _wait_for_exit_without_old_owner_claim(
+    pool,
+    job_id: UUID,
+    old_owner: str,
+    container_id: str,
+    timeout: float = 40,
+) -> tuple[dict, str | None]:
+    """Observe every drain-window lease state until the signalled worker exits."""
+    deadline = time.monotonic() + timeout
+    last_job = None
+    last_container = None
+    replacement_owner = None
+    while time.monotonic() < deadline:
+        last_job = await pool.fetchrow(
+            "SELECT state::text, lease_owner FROM background_jobs WHERE id = $1",
+            job_id,
+        )
+        if last_job and last_job["lease_owner"]:
+            assert last_job["lease_owner"] != old_owner, (
+                "SIGTERM-draining worker claimed a new durable job"
+            )
+            replacement_owner = last_job["lease_owner"]
+        last_container = _container_state(container_id)
+        if not last_container["Running"]:
+            return last_container, replacement_owner
+        await asyncio.sleep(0.05)
+    pytest.fail(
+        f"container did not exit during guarded drain window; "
+        f"job_state={dict(last_job) if last_job else None}, container_state={last_container}"
+    )
 
 
 @pytest.mark.skipif(
@@ -440,6 +521,7 @@ async def test_two_api_two_worker_recovery_smoke():
     auth_headers = {"Authorization": f"Bearer {token}"}
     kb_id = uuid4()
     graceful_kb_id = uuid4()
+    draining_kb_id = uuid4()
     filename = f"scaled-{uuid4()}.pdf"
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=3)
 
@@ -449,6 +531,7 @@ async def test_two_api_two_worker_recovery_smoke():
             (
                 (kb_id, user_id, "Scaled compose smoke", f"scaled-{kb_id}"),
                 (graceful_kb_id, user_id, "Graceful worker smoke", f"graceful-{graceful_kb_id}"),
+                (draining_kb_id, user_id, "Draining worker smoke", f"draining-{draining_kb_id}"),
             ),
         )
 
@@ -635,6 +718,24 @@ async def test_two_api_two_worker_recovery_smoke():
             subprocess.run(["docker", "update", "--restart=no", graceful_worker_container], check=True)
             subprocess.run(["docker", "kill", "--signal", "TERM", graceful_worker_container], check=True)
 
+            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+                draining_response = await client.post(
+                    f"/v1/knowledge-bases/{draining_kb_id}/graph/rebuild"
+                )
+                draining_response.raise_for_status()
+                draining_job_id = UUID(draining_response.json()["job_id"])
+            assert _container_state(graceful_worker_container)["Running"], (
+                "signalled worker exited before the new job entered the drain window"
+            )
+            graceful_exit, observed_replacement_owner = (
+                await _wait_for_exit_without_old_owner_claim(
+                    pool,
+                    draining_job_id,
+                    old_owner,
+                    graceful_worker_container,
+                )
+            )
+
             deadline = time.monotonic() + 40
             graceful_transition = None
             while time.monotonic() < deadline:
@@ -656,7 +757,6 @@ async def test_two_api_two_worker_recovery_smoke():
             assert graceful_transition["lease_owner"] is None
             assert graceful_transition["lease_expires_at"] is None
 
-            graceful_exit = _wait_for_container_exit(graceful_worker_container)
             graceful_logs = subprocess.run(
                 ["docker", "logs", graceful_worker_container],
                 check=True,
@@ -665,13 +765,12 @@ async def test_two_api_two_worker_recovery_smoke():
             )
             assert graceful_exit["ExitCode"] == 0
             assert "shutdown on SIGTERM" in graceful_logs.stderr + graceful_logs.stdout
+            assert "durable worker resources closed" in graceful_logs.stderr + graceful_logs.stdout
 
-            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
-                next_response = await client.post(f"/v1/knowledge-bases/{kb_id}/graph/rebuild")
-                next_response.raise_for_status()
-                next_job_id = UUID(next_response.json()["job_id"])
-            next_running = await _wait_for_running_job(pool, next_job_id)
-            assert next_running["lease_owner"] != old_owner
+            draining_running = await _wait_for_running_job(pool, draining_job_id)
+            assert draining_running["lease_owner"] != old_owner
+            if observed_replacement_owner is not None:
+                assert draining_running["lease_owner"] == observed_replacement_owner
             old_owner_claims = await pool.fetchval(
                 "SELECT count(*) FROM background_jobs "
                 "WHERE state = 'running' AND lease_owner = $1",
@@ -689,7 +788,7 @@ async def test_two_api_two_worker_recovery_smoke():
         async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
             graceful_finished = await _wait_for_job(client, str(graceful_job_id), timeout=120)
             assert graceful_finished["attempt_count"] >= 2
-            await _wait_for_job(client, str(next_job_id), timeout=120)
+            await _wait_for_job(client, str(draining_job_id), timeout=120)
 
         _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker")
 
@@ -767,5 +866,8 @@ async def test_two_api_two_worker_recovery_smoke():
                 check=False,
             )
         finally:
-            await pool.execute("DELETE FROM knowledge_bases WHERE id = ANY($1::uuid[])", [kb_id, graceful_kb_id])
+            await pool.execute(
+                "DELETE FROM knowledge_bases WHERE id = ANY($1::uuid[])",
+                [kb_id, graceful_kb_id, draining_kb_id],
+            )
             await pool.close()

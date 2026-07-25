@@ -242,6 +242,7 @@ async def shutdown(ctx: dict) -> None:
         return
     try:
         await _close_worker_resources(ctx, owned_resources=owned_resources)
+        logger.info("durable worker resources closed")
     finally:
         _clear_worker_runtime_context(ctx)
 
