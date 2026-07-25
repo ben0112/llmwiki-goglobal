@@ -24,6 +24,7 @@ from llmwiki_core.search import (
     SearchQuery,
     SearchResult,
 )
+from llmwiki_core.signals import sanitized_process_signal
 
 logger = logging.getLogger(__name__)
 
@@ -169,16 +170,15 @@ class _VectorRetriever:
         self.available: bool | None = None
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
+        client = None
+        result = None
+        main_failure: BaseException | None = None
+        close_failure: BaseException | None = None
+        factory_failed = False
         try:
             client = self._embedding_client_factory()
-        except EmbeddingError:
-            self.available = False
-            raise RetrieverUnavailable("query embedding is unavailable") from None
-        if getattr(client, "profile", None) != self._profile:
-            await _close_embedding_client(client)
-            self.available = False
-            raise RetrieverUnavailable("query embedding is unavailable")
-        try:
+            if getattr(client, "profile", None) != self._profile:
+                raise EmbeddingUnavailable("query embedding is unavailable")
             vectors = await client.embed((query.text,))
             embedding = _validated_query_embedding(vectors, profile=self._profile)
             vector_query = _query_with_candidate_limit(query, self._candidate_limit)
@@ -188,16 +188,33 @@ class _VectorRetriever:
                 embedding=embedding,
                 profile=self._profile,
             )
-            self.available = True
-            return result
-        except EmbeddingError:
+        except BaseException as failure:
+            main_failure = failure
+            factory_failed = client is None
+        if client is not None:
+            try:
+                await _close_embedding_client(client)
+            except BaseException as failure:
+                close_failure = failure
+
+        failures = tuple(
+            failure
+            for failure in (main_failure, close_failure)
+            if failure is not None
+        )
+        if signal := sanitized_process_signal(*failures):
             self.available = False
-            raise RetrieverUnavailable("query embedding is unavailable") from None
-        except RetrieverUnavailable:
+            raise signal from None
+        if main_failure is not None:
             self.available = False
-            raise
-        finally:
-            await _close_embedding_client(client)
+            if factory_failed or isinstance(main_failure, (EmbeddingError, RetrieverUnavailable)):
+                raise RetrieverUnavailable("query embedding is unavailable") from None
+            raise main_failure
+        if result is None:
+            self.available = False
+            raise RetrieverUnavailable("query embedding is unavailable")
+        self.available = True
+        return result
 
 
 class _GraphExpander:
@@ -262,7 +279,12 @@ class _OpenAICompatibleQueryEmbeddingClient:
     ) -> None:
         self.profile = profile
         endpoint = _embedding_endpoint(base_url)
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        validated_api_key = _validated_api_key(api_key)
+        headers = (
+            {"Authorization": f"Bearer {validated_api_key}"}
+            if validated_api_key
+            else None
+        )
         self._endpoint = endpoint
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds),
@@ -298,12 +320,7 @@ class _OpenAICompatibleQueryEmbeddingClient:
 async def _close_embedding_client(client: object) -> None:
     close = getattr(client, "aclose", None)
     if callable(close):
-        try:
-            await close()
-        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-            raise
-        except Exception:  # noqa: BLE001 - cleanup cannot expose provider details.
-            pass
+        await close()
 
 
 def _embedding_endpoint(base_url: object) -> str:
@@ -322,6 +339,18 @@ def _embedding_endpoint(base_url: object) -> str:
     ):
         raise ValueError("embedding base URL is invalid")
     return f"{str(url).rstrip('/')}/embeddings"
+
+
+def _validated_api_key(api_key: object) -> str:
+    if not isinstance(api_key, str):
+        raise ValueError("embedding API key is invalid")
+    try:
+        api_key.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("embedding API key is invalid") from None
+    if "\r" in api_key or "\n" in api_key:
+        raise ValueError("embedding API key is invalid")
+    return api_key
 
 
 def _ordered_vectors(

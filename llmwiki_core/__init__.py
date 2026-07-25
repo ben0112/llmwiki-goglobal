@@ -45,6 +45,7 @@ from .search import (
     SearchResult,
     SearchScope,
 )
+from .signals import sanitized_process_signal
 
 __version__ = "0.1.0"
 
@@ -94,5 +95,6 @@ __all__ = [
     "parse_wiki_links",
     "promotion_decision",
     "rollup_from_metas",
+    "sanitized_process_signal",
     "validate_facets",
 ]

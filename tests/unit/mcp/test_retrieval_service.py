@@ -64,6 +64,23 @@ class _RawEmbeddingClient:
         return self.vectors
 
 
+class _BoundaryEmbeddingClient:
+    profile = PROFILE
+
+    def __init__(self, *, embed_failure=None, close_failure=None):
+        self.embed_failure = embed_failure
+        self.close_failure = close_failure
+
+    async def embed(self, _texts):
+        if self.embed_failure is not None:
+            raise self.embed_failure
+        return ((1.0, 0.0, 0.0),)
+
+    async def aclose(self):
+        if self.close_failure is not None:
+            raise self.close_failure
+
+
 class _Vault:
     def __init__(self):
         self.lexical = SearchResult((_hit("lexical"),), 1, profile="lexical")
@@ -255,6 +272,132 @@ async def test_invalid_query_embedding_fails_closed_to_lexical(vectors):
 
     assert result.profile == "lexical_fallback"
     assert vault.vector_queries == []
+
+
+def test_process_signal_sanitizer_recurses_with_fixed_priority_and_safe_exit_codes():
+    from llmwiki_core.signals import sanitized_process_signal
+
+    private = RuntimeError("private backend URL and key")
+    private.__cause__ = asyncio.CancelledError("private cancellation")
+    system_exit = SystemExit("private unsafe exit")
+    group = BaseExceptionGroup("private group", [private, system_exit])
+    hidden_keyboard = RuntimeError("private wrapper")
+    hidden_keyboard.__context__ = KeyboardInterrupt("private interrupt")
+
+    signal = sanitized_process_signal(group, hidden_keyboard)
+    assert type(signal) is KeyboardInterrupt
+    assert signal.args == ()
+    assert signal.__cause__ is None and signal.__context__ is None
+
+    assert sanitized_process_signal(SystemExit(True)).code == 1
+    assert sanitized_process_signal(SystemExit(False)).code == 0
+    assert sanitized_process_signal(SystemExit(17)).code == 17
+    assert sanitized_process_signal(SystemExit(None)).code == 1
+    assert sanitized_process_signal(SystemExit("private")).code == 1
+    cycle = RuntimeError("private cycle")
+    cycle.__cause__ = cycle
+    assert sanitized_process_signal(cycle) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        "embed_direct",
+        "embed_linked",
+        "embed_group",
+        "close_direct",
+        "close_linked",
+        "close_group",
+        "mixed",
+    ],
+)
+async def test_hidden_cancellation_in_embedding_or_cleanup_is_never_swallowed(location):
+    from services.retrieval import HostedRetrievalService
+
+    linked = EmbeddingUnavailable("private embedding failure")
+    linked.__cause__ = asyncio.CancelledError("private cancellation")
+    group = BaseExceptionGroup(
+        "private group", [EmbeddingUnavailable("private"), asyncio.CancelledError("private")]
+    )
+    embed_failure = (
+        asyncio.CancelledError("private")
+        if location == "embed_direct"
+        else linked
+        if location == "embed_linked"
+        else group
+        if location == "embed_group"
+        else None
+    )
+    close_failure = (
+        asyncio.CancelledError("private")
+        if location == "close_direct"
+        else linked
+        if location == "close_linked"
+        else group
+        if location == "close_group"
+        else None
+    )
+    if location == "mixed":
+        embed_failure = EmbeddingUnavailable("private ordinary")
+        close_failure = group
+    client = _BoundaryEmbeddingClient(
+        embed_failure=embed_failure,
+        close_failure=close_failure,
+    )
+    service = HostedRetrievalService(
+        _Vault(),
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=lambda: client,
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await service.retrieve(SearchQuery.build(text="private query", limit=1), profile="hybrid")
+
+    assert caught.value.args == ()
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_cleanup_failure_never_masks_success_or_typed_fallback():
+    from services.retrieval import HostedRetrievalService
+
+    success = HostedRetrievalService(
+        _Vault(),
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=lambda: _BoundaryEmbeddingClient(
+            close_failure=RuntimeError("private close")
+        ),
+    )
+    assert (await success.retrieve(SearchQuery.build(text="q", limit=1), profile="hybrid")).profile == "hybrid"
+
+    fallback = HostedRetrievalService(
+        _Vault(),
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=lambda: _BoundaryEmbeddingClient(
+            embed_failure=EmbeddingUnavailable("private embed"),
+            close_failure=RuntimeError("private close"),
+        ),
+    )
+    assert (await fallback.retrieve(SearchQuery.build(text="q", limit=1), profile="hybrid")).profile == "lexical_fallback"
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_api_key_factory_failure_is_sanitized_to_lexical_fallback():
+    from services.retrieval import HostedRetrievalService
+
+    settings = _settings(
+        EMBEDDING_API_KEY=SimpleNamespace(get_secret_value=lambda: "秘密-key"),
+        EMBEDDING_BASE_URL="https://private.invalid/v1",
+    )
+    result = await HostedRetrievalService(_Vault(), "kb-1", settings=settings).retrieve(
+        SearchQuery.build(text="private query", limit=1), profile="hybrid"
+    )
+
+    assert result.profile == "lexical_fallback"
 
 
 @pytest.mark.asyncio

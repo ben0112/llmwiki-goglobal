@@ -23,6 +23,7 @@ from llmwiki_core.search import (
     SearchResult,
     SearchScope,
 )
+from llmwiki_core.signals import sanitized_process_signal
 
 _MAX_EMBEDDINGS_PER_DOCUMENT = 10_000
 _POSTGRES_INTEGER_MAX = 2_147_483_647
@@ -318,39 +319,8 @@ class PostgresVectorStore:
         return _result_from_rows(rows, started_at=started_at)
 
 
-def _sanitized_process_signal(failure: BaseException) -> BaseException | None:
-    seen: set[int] = set()
-    pending = [failure]
-    system_exit_code = None
-    has_system_exit = False
-    has_cancellation = False
-    while pending:
-        current = pending.pop()
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if isinstance(current, KeyboardInterrupt):
-            return KeyboardInterrupt()
-        if isinstance(current, SystemExit):
-            if not has_system_exit:
-                code = current.code
-                system_exit_code = int(code) if isinstance(code, bool) else code if type(code) is int else 1
-                has_system_exit = True
-        elif isinstance(current, asyncio.CancelledError):
-            has_cancellation = True
-        if isinstance(current, BaseExceptionGroup):
-            pending.extend(reversed(current.exceptions))
-        pending.extend(linked for linked in reversed((current.__cause__, current.__context__)) if linked is not None)
-    if has_system_exit:
-        return SystemExit(system_exit_code)
-    if has_cancellation:
-        return asyncio.CancelledError()
-    return None
-
-
 def _raise_sanitized_boundary(failure: BaseException, message: str) -> Never:
-    signal = _sanitized_process_signal(failure)
+    signal = sanitized_process_signal(failure)
     if signal is not None:
         raise signal
     raise RetrieverUnavailable(message)
