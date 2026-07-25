@@ -42,6 +42,10 @@ _SESSION_FIELDS = frozenset(
 )
 _PART_FIELDS = frozenset({"part_number", "etag"})
 _SESSION_KEY_PATTERN = re.compile(r"tus:session:\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\}\Z")
+_RESERVATION_KEY_PATTERN = re.compile(
+    r"tus:reservation:\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\}:"
+    r"\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\}\Z"
+)
 
 
 class RedisClient(Protocol):
@@ -1024,6 +1028,22 @@ class TusSessionStore:
             session = await self.get(upload_id)
             if session is not None:
                 yield session
+
+    async def iter_reservations(self):
+        """Scan canonical quota markers without trusting data encoded in keys."""
+        scan_iter = getattr(self._redis, "scan_iter", None)
+        if not callable(scan_iter):
+            raise TusSessionProtocolError("Redis client does not support bounded reservation scans")
+        async for raw_key in scan_iter(match="tus:reservation:{*}:{*}", count=100):
+            key = _decode_protocol_text(raw_key, "reservation key")
+            match = _RESERVATION_KEY_PATTERN.fullmatch(key)
+            if match is None:
+                continue
+            user_id = UUID(match.group(1))
+            upload_id = UUID(match.group(2))
+            marker = await self.get_reservation(user_id, upload_id)
+            if marker is not None:
+                yield user_id, upload_id, marker
 
     async def append_part(
         self,

@@ -552,8 +552,11 @@ async def test_real_cleanup_scan_creates_claimable_successor_after_exhausted_job
     )
     first_scan = (datetime.now(UTC) + timedelta(minutes=5)).replace(second=15, microsecond=0)
 
-    await cleanup.enqueue_stale_jobs(now=first_scan)
-    await cleanup.enqueue_stale_jobs(now=first_scan.replace(second=45))
+    created = await asyncio.gather(
+        cleanup.enqueue_stale_jobs(now=first_scan),
+        cleanup.enqueue_stale_jobs(now=first_scan.replace(second=45)),
+    )
+    assert sorted(created) == [0, 1]
     first_rows = await runtime["pool"].fetch(
         "SELECT id, idempotency_key FROM background_jobs "
         "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2",
@@ -561,12 +564,42 @@ async def test_real_cleanup_scan_creates_claimable_successor_after_exhausted_job
         str(upload_id),
     )
     assert len(first_rows) == 1
+
+    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=1))
+    assert (
+        await runtime["pool"].fetchval(
+            "SELECT count(*) FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2",
+            runtime["user_id"],
+            str(upload_id),
+        )
+        == 1
+    )
+    await runtime["pool"].execute(
+        "UPDATE background_jobs SET state = 'running', updated_at = now() WHERE id = $1",
+        first_rows[0]["id"],
+    )
+    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=2))
+    await runtime["pool"].execute(
+        "UPDATE background_jobs SET state = 'retry_wait', updated_at = now() WHERE id = $1",
+        first_rows[0]["id"],
+    )
+    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=3))
+    assert (
+        await runtime["pool"].fetchval(
+            "SELECT count(*) FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2",
+            runtime["user_id"],
+            str(upload_id),
+        )
+        == 1
+    )
     await runtime["pool"].execute(
         "UPDATE background_jobs SET state = 'failed', attempt_count = max_attempts, updated_at = now() WHERE id = $1",
         first_rows[0]["id"],
     )
 
-    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=1))
+    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=4))
     rows = await runtime["pool"].fetch(
         "SELECT id, state::text, idempotency_key FROM background_jobs "
         "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2 "
@@ -581,3 +614,69 @@ async def test_real_cleanup_scan_creates_claimable_successor_after_exhausted_job
         claimed = await repository.claim(conn, rows[1]["id"], "cleanup-test-worker", lease_seconds=30)
     assert claimed is not None
     assert claimed.id == rows[1]["id"]
+
+
+async def test_real_create_active_compensation_is_scanned_and_fully_settled(multipart_runtime):
+    from infra.tus import HostedTusCleanupService
+    from infra.tus_sessions import TusReservationState
+
+    runtime = multipart_runtime
+    service = runtime["service_a"]
+    original_release = service.quota.release
+    original_create_multipart = runtime["s3"].create_multipart
+
+    async def fail_release_before_mutation(_reservation):
+        raise RuntimeError("quota unavailable before release")
+
+    async def fail_create_multipart(_key, _content_type):
+        raise RuntimeError("object store unavailable")
+
+    service.quota.release = fail_release_before_mutation
+    runtime["s3"].create_multipart = fail_create_multipart
+    try:
+        response = await runtime["a"].post(
+            "/v1/uploads",
+            headers=_headers(
+                runtime["user_id"],
+                **{
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata("quota-anchor.pdf", runtime["kb_id"]),
+                },
+            ),
+        )
+    finally:
+        service.quota.release = original_release
+        runtime["s3"].create_multipart = original_create_multipart
+
+    assert response.status_code == 503
+    reservation_ids = await runtime["redis"].zrange(quota_keys(runtime["user_id"])[1], 0, -1)
+    assert len(reservation_ids) == 1
+    upload_id = UUID(reservation_ids[0].decode() if isinstance(reservation_ids[0], bytes) else reservation_ids[0])
+    assert await runtime["store"].get(upload_id) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RESERVED
+
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+    assert await cleanup.enqueue_stale_jobs() == 1
+    assert (
+        await runtime["pool"].fetchval(
+            "SELECT count(*) FROM background_jobs "
+            "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2",
+            runtime["user_id"],
+            str(upload_id),
+        )
+        == 1
+    )
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "cleaned"
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED

@@ -78,6 +78,41 @@ async def _lock_token(module, store, upload_id):
     return acquired.token
 
 
+async def test_real_redis_reservation_scan_yields_only_canonical_marker_keys(namespace, redis_client):
+    module, store, upload_id, user_id, _ = namespace
+    owner = "Q" * 32
+    assert (
+        await store.create_reservation(user_id, upload_id, 10, owner_token=owner, ttl_seconds=60)
+        is module.ReservationCreateStatus.CREATED
+    )
+    decoy = f"tus:reservation:{{{str(user_id).upper()}}}:{{{upload_id}}}"
+    await redis_client.set(decoy, module.TusQuotaReservation(10, owner, module.TusReservationState.RESERVED).to_json())
+    try:
+        records = [record async for record in store.iter_reservations()]
+    finally:
+        await redis_client.delete(decoy)
+
+    assert records == [
+        (
+            user_id,
+            upload_id,
+            module.TusQuotaReservation(10, owner, module.TusReservationState.RESERVED),
+        )
+    ]
+
+
+async def test_real_redis_reservation_scan_fails_closed_on_malformed_canonical_value(namespace, redis_client):
+    module, store, upload_id, user_id, _ = namespace
+    key = module.reservation_key(user_id, upload_id)
+    malformed = b'{"bytes":10,"owner":"wrong","state":"reserved"}'
+    await redis_client.set(key, malformed, ex=60)
+
+    with pytest.raises(module.InvalidTusSessionError):
+        _ = [record async for record in store.iter_reservations()]
+
+    assert await redis_client.get(key) == malformed
+
+
 async def test_real_redis_concurrent_cas_allows_exactly_one_append(namespace):
     module, store, upload_id, user_id, kb_id = namespace
     assert (

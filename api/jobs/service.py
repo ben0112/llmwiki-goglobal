@@ -43,6 +43,62 @@ class JobService:
         await self._validate_resources(conn, command, authenticated_user_id)
         return await repository.create(conn, command)
 
+    async def ensure_upload_cleanup(
+        self,
+        command: JobCreate,
+        *,
+        authenticated_user_id: UUID,
+    ) -> tuple[JobRecord, bool]:
+        """Create one cleanup successor only when no cleanup for the upload is active."""
+        if command.job_type is not JobType.UPLOAD_CLEANUP:
+            raise ValueError("upload cleanup ensure requires an upload cleanup command")
+        if command.user_id != authenticated_user_id:
+            raise ValueError("command user does not match the authenticated user")
+        if command.knowledge_base_id is not None or command.document_id is not None:
+            raise ValueError("upload cleanup command cannot reference knowledge-base resources")
+        raw_upload_id = command.payload.get("upload_id")
+        if not isinstance(raw_upload_id, str) or set(command.payload) != {"upload_id"}:
+            raise ValueError("upload cleanup payload must contain exactly one upload_id")
+        try:
+            upload_id = UUID(raw_upload_id)
+        except ValueError:
+            raise ValueError("upload cleanup payload contains an invalid upload_id") from None
+        if str(upload_id) != raw_upload_id:
+            raise ValueError("upload cleanup payload upload_id must be canonical")
+        key_prefix = f"upload.cleanup:{upload_id}:scan:"
+        if command.idempotency_key is None or not command.idempotency_key.startswith(key_prefix):
+            raise ValueError("upload cleanup command requires a scan idempotency key")
+        raw_bucket = command.idempotency_key.removeprefix(key_prefix)
+        if not raw_bucket.isdecimal() or str(int(raw_bucket)) != raw_bucket:
+            raise ValueError("upload cleanup scan bucket must be canonical")
+
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"upload.cleanup:{authenticated_user_id}:{upload_id}",
+            )
+            existing_id = await conn.fetchval(
+                "SELECT id FROM background_jobs "
+                "WHERE user_id = $1 AND job_type = 'upload.cleanup' "
+                "AND payload->>'upload_id' = $2 "
+                "AND (state IN ('queued', 'running', 'retry_wait') OR idempotency_key = $3) "
+                "ORDER BY (idempotency_key = $3) DESC, created_at DESC, id DESC LIMIT 1",
+                authenticated_user_id,
+                str(upload_id),
+                command.idempotency_key,
+            )
+            if existing_id is not None:
+                existing = await repository.get_for_user(conn, existing_id, authenticated_user_id)
+                if existing is None:
+                    raise RuntimeError("authoritative upload cleanup job disappeared")
+                return existing, False
+            record = await self.create_in_transaction(
+                conn,
+                command,
+                authenticated_user_id=authenticated_user_id,
+            )
+            return record, True
+
     async def ensure_graph_rebuild(
         self,
         *,

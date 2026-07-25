@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -197,6 +197,7 @@ class Store:
         self.append_status = append_status
         self.marker_release_status = marker_release_status
         self.marker = None
+        self.marker_reads = 0
         self.renew_status = LockMutationStatus.RENEWED
 
     async def create_reservation(self, user_id, upload_id, bytes_reserved, *, owner_token, ttl_seconds):
@@ -205,7 +206,12 @@ class Store:
         return ReservationCreateStatus.CREATED
 
     async def get_reservation(self, user_id, upload_id):
-        return self.marker or TusQuotaReservation(self.session.total_length, OWNER, TusReservationState.RESERVED)
+        self.marker_reads += 1
+        if self.marker is not None:
+            return self.marker
+        if self.session is None:
+            return None
+        return TusQuotaReservation(self.session.total_length, OWNER, TusReservationState.RESERVED)
 
     async def release_reservation_once(self, user_id, upload_id, owner_token):
         self.events.append("marker.release")
@@ -602,7 +608,9 @@ async def test_create_compensation_recovers_quota_release_response_loss_atomical
 
     assert response.status_code == 503
     assert events.index("quota.release") < events.index("quota.marker_settle")
-    assert ("marker.create" in events) is (stage == "after_marker")
+    expect_marker = stage == "after_marker" or atomic_status == "active"
+    assert ("marker.create" in events) is expect_marker
+    assert (store.marker == TusQuotaReservation(100, OWNER, TusReservationState.RESERVED)) is expect_marker
     assert "marker.release" not in events
 
 
@@ -1070,12 +1078,17 @@ async def test_stale_scan_enqueues_all_sessions_without_live_knowledge_bases():
             for session in sessions:
                 yield session
 
+        async def iter_reservations(self):
+            if False:
+                yield None
+
     class Jobs:
-        async def create(self, command, *, authenticated_user_id):
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
             assert authenticated_user_id == USER_ID
             assert command.knowledge_base_id is None
             assert command.document_id is None
             commands.append(command)
+            return SimpleNamespace(), True
 
     cleanup = HostedTusCleanupService(
         Pool(),
@@ -1107,6 +1120,10 @@ async def test_cleanup_scan_uses_minute_successor_keys_and_enqueues_completed_se
         async def iter_sessions(self):
             yield completed
 
+        async def iter_reservations(self):
+            if False:
+                yield None
+
         async def get_reservation(self, user_id, upload_id):
             return marker
 
@@ -1114,8 +1131,13 @@ async def test_cleanup_scan_uses_minute_successor_keys_and_enqueues_completed_se
         def __init__(self):
             self.keys = set()
 
-        async def create(self, command, *, authenticated_user_id):
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
+            if any(key.rsplit(":", 1)[0] != command.idempotency_key.rsplit(":", 1)[0] for key in self.keys):
+                raise AssertionError("unexpected upload identity")
+            if self.keys:
+                return SimpleNamespace(), False
             self.keys.add(command.idempotency_key)
+            return SimpleNamespace(), True
 
     jobs = Jobs()
     cleanup = HostedTusCleanupService(
@@ -1134,7 +1156,89 @@ async def test_cleanup_scan_uses_minute_successor_keys_and_enqueues_completed_se
     await cleanup.enqueue_stale_jobs(now=first.replace(second=45))
     assert len(jobs.keys) == 1
     await cleanup.enqueue_stale_jobs(now=first.replace(minute=1))
+    assert len(jobs.keys) == 1
+
+
+async def test_cleanup_scan_enqueues_successor_only_after_active_job_is_terminal():
+    from infra.tus import HostedTusCleanupService
+
+    session = _session(state=TusSessionState.CLEANUP_REQUIRED)
+
+    class Sessions:
+        async def iter_sessions(self):
+            yield session
+
+        async def iter_reservations(self):
+            if False:
+                yield None
+
+    class Jobs:
+        def __init__(self):
+            self.active = False
+            self.keys = []
+
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
+            if self.active:
+                return SimpleNamespace(), False
+            self.active = True
+            self.keys.append(command.idempotency_key)
+            return SimpleNamespace(), True
+
+    jobs = Jobs()
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3([]),
+        jobs,
+        Quota([]),
+        Sessions(),
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+    first = datetime(2026, 1, 1, 0, 0, 15, tzinfo=UTC)
+
+    assert await cleanup.enqueue_stale_jobs(now=first) == 1
+    assert await cleanup.enqueue_stale_jobs(now=first + timedelta(minutes=1)) == 0
+    jobs.active = False
+    assert await cleanup.enqueue_stale_jobs(now=first + timedelta(minutes=2)) == 1
     assert len(jobs.keys) == 2
+    assert jobs.keys[0] != jobs.keys[1]
+
+
+async def test_cleanup_scan_enqueues_reserved_marker_without_session():
+    from infra.tus import HostedTusCleanupService
+
+    upload_id = uuid4()
+    marker = TusQuotaReservation(100, OWNER, TusReservationState.RESERVED)
+    commands = []
+
+    class Sessions:
+        async def iter_sessions(self):
+            if False:
+                yield None
+
+        async def iter_reservations(self):
+            yield USER_ID, upload_id, marker
+
+    class Jobs:
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
+            commands.append(command)
+            return SimpleNamespace(), True
+
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3([]),
+        Jobs(),
+        Quota([]),
+        Sessions(),
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+
+    assert await cleanup.enqueue_stale_jobs() == 1
+    assert commands[0].user_id == USER_ID
+    assert commands[0].payload == {"upload_id": str(upload_id)}
 
 
 async def test_cleanup_scan_immediately_enqueues_fresh_object_completed_unknown_commit():
@@ -1152,9 +1256,14 @@ async def test_cleanup_scan_immediately_enqueues_fresh_object_completed_unknown_
         async def iter_sessions(self):
             yield fresh
 
+        async def iter_reservations(self):
+            if False:
+                yield None
+
     class Jobs:
-        async def create(self, command, *, authenticated_user_id):
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
             commands.append(command)
+            return SimpleNamespace(), True
 
     cleanup = HostedTusCleanupService(
         Pool(),
@@ -1211,6 +1320,71 @@ async def test_worker_reconciles_object_completed_document_job_without_s3_cleanu
     assert "s3.delete" not in events
     assert "s3.abort" not in events
     assert "session.delete" not in events
+
+
+async def test_worker_fences_and_cleans_stale_object_completed_without_database_row():
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    stale_at = datetime.now(UTC) - timedelta(minutes=5)
+    session = replace(
+        _session(
+            total=5,
+            offset=5,
+            parts=(TusPart(1, "etag"),),
+            object_completed=True,
+            state=TusSessionState.UPLOADING,
+        ),
+        created_at=stale_at,
+        updated_at=stale_at,
+    )
+    store = Store(events, session=session)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3(events),
+        SimpleNamespace(),
+        Quota(events),
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+
+    result = await cleanup.cleanup(session.upload_id, USER_ID)
+
+    assert result["status"] == "cleaned"
+    assert events.index("redis.cleanup_required") < events.index("s3.delete")
+    assert events.index("redis.cleanup_required") < events.index("s3.abort")
+    assert store.session is None
+
+
+@pytest.mark.parametrize(
+    ("settlement_status", "expected_status"),
+    [("active", "retry"), ("settled", "cleaned")],
+)
+async def test_worker_settles_reserved_marker_without_session(settlement_status, expected_status):
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    upload_id = uuid4()
+    store = Store(events, session=None)
+    store.marker = TusQuotaReservation(100, OWNER, TusReservationState.RESERVED)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3(events),
+        SimpleNamespace(),
+        Quota(events, release_error=RuntimeError("response lost"), marker_settlement_status=settlement_status),
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+
+    result = await cleanup.cleanup(upload_id, USER_ID)
+
+    assert result["status"] == expected_status
+    assert events == ["quota.release", "quota.marker_settle", "lock.release"]
+    assert store.marker_reads == 1
 
 
 async def test_worker_settles_completed_session_without_deleting_committed_data():
