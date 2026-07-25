@@ -403,6 +403,28 @@ def test_promotion_gate_accepts_exact_boundary_after_macro_average_rounding():
     assert decision.reason == "eligible"
 
 
+def test_promotion_gate_strictly_rejects_one_float_below_quality_boundary():
+    decision = promotion_decision(
+        _report(recall_at_10=0.5, latency_p95_ms=10),
+        _report(recall_at_10=math.nextafter(0.55, 0.0), latency_p95_ms=10),
+    )
+
+    assert decision.recall_ratio < 1.10
+    assert decision.eligible is False
+    assert decision.reason == "gate_failed"
+
+
+def test_promotion_gate_strictly_rejects_one_float_above_latency_boundary():
+    decision = promotion_decision(
+        _report(recall_at_10=0.5, latency_p95_ms=10),
+        _report(recall_at_10=0.55, latency_p95_ms=math.nextafter(20.0, math.inf)),
+    )
+
+    assert decision.latency_ratio > 2.0
+    assert decision.eligible is False
+    assert decision.reason == "gate_failed"
+
+
 def test_promotion_decision_handles_finite_values_whose_ratio_overflows():
     minimum_positive = float.fromhex("0x0.0000000000001p-1022")
     maximum_finite = float.fromhex("0x1.fffffffffffffp+1023")

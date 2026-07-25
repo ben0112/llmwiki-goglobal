@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from math import ceil, isclose, isfinite, log2
+from math import ceil, isfinite, log2
 from numbers import Real
 from os import PathLike
 from pathlib import Path
@@ -22,7 +22,6 @@ MAX_LINE_BYTES = 256 * 1024
 MAX_CASES = 10_000
 MAX_RELEVANCE_PER_CASE = 10_000
 MAX_RANKING_LENGTH = 10_000
-PROMOTION_GATE_TOLERANCE = 1e-12
 
 _CASE_FIELDS = frozenset({"schema_version", "case_id", "query", "relevance"})
 _QUERY_FIELDS = frozenset(
@@ -520,18 +519,12 @@ def promotion_decision(
     latency_baseline = max(lexical.latency_p95_ms, 0.001)
     recall_ratio = _bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10)
     latency_ratio = _bounded_ratio(hybrid.latency_p95_ms, latency_baseline)
-    quality_gate = recall_ratio >= 1.10 or isclose(
+    quality_gate = _passes_quality_gate(
+        lexical.recall_at_10,
+        hybrid.recall_at_10,
         recall_ratio,
-        1.10,
-        rel_tol=PROMOTION_GATE_TOLERANCE,
-        abs_tol=0.0,
     )
-    latency_gate = latency_ratio <= 2.0 or isclose(
-        latency_ratio,
-        2.0,
-        rel_tol=PROMOTION_GATE_TOLERANCE,
-        abs_tol=0.0,
-    )
+    latency_gate = hybrid.latency_p95_ms <= latency_baseline * 2
     eligible = quality_gate and latency_gate
     return PromotionDecision(
         eligible=eligible,
@@ -544,6 +537,12 @@ def promotion_decision(
 def _bounded_ratio(numerator: float, denominator: float) -> float:
     ratio = numerator / denominator
     return ratio if isfinite(ratio) else float_info.max
+
+
+def _passes_quality_gate(baseline: float, candidate: float, ratio: float) -> bool:
+    if baseline < float_info.min:
+        return ratio >= 1.10
+    return candidate * 10 / 11 >= baseline
 
 
 __all__ = [
