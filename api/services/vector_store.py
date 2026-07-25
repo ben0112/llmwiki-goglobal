@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import struct
 from collections.abc import Mapping, Sequence
 from math import isfinite
 from numbers import Real
 from time import perf_counter
+from typing import Never
 from uuid import UUID
 
 from llmwiki_core.documents import DocumentKind
@@ -22,6 +25,7 @@ from llmwiki_core.search import (
 )
 
 _MAX_EMBEDDINGS_PER_DOCUMENT = 10_000
+_POSTGRES_INTEGER_MAX = 2_147_483_647
 
 _SCALAR_FACETS = {
     "genre": "genre",
@@ -54,8 +58,17 @@ class PostgresVectorStore:
     def __init__(self, pool, *, profile: EmbeddingProfile) -> None:
         if not isinstance(profile, EmbeddingProfile):
             raise TypeError("profile must be an EmbeddingProfile")
-        if len(profile.provider) > 100 or len(profile.model) > 200:
+        if (
+            not isinstance(profile.provider, str)
+            or not profile.provider
+            or not isinstance(profile.model, str)
+            or not profile.model
+            or len(profile.provider) > 100
+            or len(profile.model) > 200
+        ):
             raise ValueError("embedding profile model identity is too long")
+        if type(profile.dimensions) is not int or not 1 <= profile.dimensions <= 4096:
+            raise ValueError("embedding dimensions must be between 1 and 4096")
         self._pool = pool
         self._profile = profile
 
@@ -76,10 +89,15 @@ class PostgresVectorStore:
         user_uuid = _uuid(user_id, label="user_id")
         kb_uuid = _uuid(knowledge_base_id, label="knowledge_base_id")
         document_uuid = _uuid(document_id, label="document_id")
-        version = _bounded_int(document_version, label="document_version", minimum=0)
+        version = _bounded_int(
+            document_version,
+            label="document_version",
+            minimum=0,
+            maximum=_POSTGRES_INTEGER_MAX,
+        )
         vectors = _document_vectors(embeddings, dimensions=self._profile.dimensions)
 
-        backend_failed = False
+        failure = None
         try:
             async with self._pool.acquire() as conn, conn.transaction():
                 current_version = await conn.fetchval(
@@ -91,13 +109,9 @@ class PostgresVectorStore:
                     kb_uuid,
                 )
                 if current_version is None:
-                    raise _VectorWriteRejected(
-                        "document is not available in the requested tenant scope"
-                    )
+                    raise _VectorWriteRejected("document is not available in the requested tenant scope")
                 if current_version != version:
-                    raise _VectorWriteRejected(
-                        "document_version must equal the current document version"
-                    )
+                    raise _VectorWriteRejected("document_version must equal the current document version")
 
                 chunk_rows = await conn.fetch(
                     "SELECT chunk_index FROM document_chunks "
@@ -112,9 +126,7 @@ class PostgresVectorStore:
                 expected = tuple(row["chunk_index"] for row in chunk_rows)
                 submitted = tuple(index for index, _vector in vectors)
                 if submitted != expected:
-                    raise _VectorWriteRejected(
-                        "embeddings must match the complete current chunk set"
-                    )
+                    raise _VectorWriteRejected("embeddings must match the complete current chunk set")
 
                 if vectors:
                     await conn.executemany(
@@ -172,10 +184,14 @@ class PostgresVectorStore:
                 )
         except (_VectorWriteRejected, RetrieverUnavailable):
             raise
-        except Exception:  # noqa: BLE001 - sanitize the database adapter boundary.
-            backend_failed = True
-        if backend_failed:
-            raise RetrieverUnavailable("vector store is unavailable")
+        except (
+            asyncio.CancelledError,
+            BaseExceptionGroup,
+            Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
+        ) as caught:
+            failure = caught
+        if failure is not None:
+            _raise_sanitized_boundary(failure, "vector store is unavailable")
         return len(vectors)
 
     async def search(
@@ -192,6 +208,8 @@ class PostgresVectorStore:
         if not isinstance(query, SearchQuery):
             raise TypeError("query must be a SearchQuery")
         _candidate_limit(query)
+        if query.scope is not SearchScope.ALL:
+            raise RetrieverUnavailable("vector search does not support scoped content")
         vector = _vector(embedding, dimensions=self._profile.dimensions)
         started_at = perf_counter()
 
@@ -223,10 +241,8 @@ class PostgresVectorStore:
             "d.status != 'failed'",
             "NOT d.archived",
         ]
-        if query.annotated_only or query.scope is SearchScope.ANNOTATIONS:
+        if query.annotated_only:
             where.append("dc.has_highlight=true")
-        if query.scope is SearchScope.SOURCE:
-            where.append("dc.source_content <> ''")
         if query.area is SearchArea.WIKI:
             where.append("d.source_kind='wiki'")
         elif query.area is SearchArea.SOURCES:
@@ -265,20 +281,48 @@ class PostgresVectorStore:
         return _result_from_rows(rows, started_at=started_at)
 
 
+def _contains_cancellation(failure: BaseException, seen: set[int] | None = None) -> bool:
+    seen = set() if seen is None else seen
+    identity = id(failure)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    if isinstance(failure, asyncio.CancelledError):
+        return True
+    if isinstance(failure, BaseExceptionGroup) and any(
+        _contains_cancellation(child, seen) for child in failure.exceptions
+    ):
+        return True
+    return any(
+        linked is not None and _contains_cancellation(linked, seen)
+        for linked in (failure.__cause__, failure.__context__)
+    )
+
+
+def _raise_sanitized_boundary(failure: BaseException, message: str) -> Never:
+    if _contains_cancellation(failure):
+        raise asyncio.CancelledError
+    raise RetrieverUnavailable(message)
+
+
 async def _fetch_rows(pool, sql: str, params: Sequence[object]):
-    failed = False
+    failure = None
     rows = ()
     try:
         rows = await pool.fetch(sql, *params)
-    except Exception:  # noqa: BLE001 - sanitize the database adapter boundary.
-        failed = True
-    if failed:
-        raise RetrieverUnavailable("vector store is unavailable")
+    except (
+        asyncio.CancelledError,
+        BaseExceptionGroup,
+        Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
+    ) as caught:
+        failure = caught
+    if failure is not None:
+        _raise_sanitized_boundary(failure, "vector store is unavailable")
     return rows
 
 
 def _result_from_rows(rows, *, started_at: float) -> SearchResult:
-    invalid = False
+    failure = None
     result = None
     try:
         dictionaries = [dict(row) for row in rows]
@@ -290,9 +334,15 @@ def _result_from_rows(rows, *, started_at: float) -> SearchResult:
             latency_ms=(perf_counter() - started_at) * 1000,
             profile="vector",
         )
-    except Exception:  # noqa: BLE001 - malformed backend rows are unavailable.
-        invalid = True
-    if invalid or result is None:
+    except (
+        asyncio.CancelledError,
+        BaseExceptionGroup,
+        Exception,  # noqa: BLE001 - malformed backend rows are unavailable.
+    ) as caught:
+        failure = caught
+    if failure is not None:
+        _raise_sanitized_boundary(failure, "vector store is unavailable")
+    if result is None:
         raise RetrieverUnavailable("vector store is unavailable")
     return result
 
@@ -307,7 +357,12 @@ def _document_vectors(embeddings: object, *, dimensions: int) -> tuple[tuple[int
     for item in embeddings:
         if isinstance(item, (str, bytes)) or not isinstance(item, Sequence) or len(item) != 2:
             raise ValueError("each embedding must contain a chunk index and vector")
-        index = _bounded_int(item[0], label="chunk index", minimum=0)
+        index = _bounded_int(
+            item[0],
+            label="chunk index",
+            minimum=0,
+            maximum=_MAX_EMBEDDINGS_PER_DOCUMENT - 1,
+        )
         if index in seen:
             raise ValueError("duplicate chunk index in embeddings")
         seen.add(index)
@@ -324,14 +379,32 @@ def _vector(value: object, *, dimensions: int) -> str:
     normalized: list[float] = []
     for coordinate in value:
         if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
-            raise ValueError("embedding must contain only finite numbers")
-        number = float(coordinate)
-        if not isfinite(number):
-            raise ValueError("embedding must contain only finite numbers")
-        normalized.append(number)
+            raise ValueError("embedding coordinate must be a finite float32 number")
+        normalized.append(_float32_coordinate(coordinate))
     if not any(normalized):
         raise ValueError("embedding must contain a non-zero coordinate")
     return "[" + ",".join(format(number, ".17g") for number in normalized) + "]"
+
+
+def _float32_coordinate(coordinate: Real) -> float:
+    invalid = False
+    number = 0.0
+    try:
+        number = float(coordinate)
+    except (OverflowError, TypeError, ValueError):
+        invalid = True
+    if invalid or not isfinite(number):
+        raise ValueError("embedding coordinate must be a finite float32 number")
+
+    invalid = False
+    quantized = 0.0
+    try:
+        quantized = struct.unpack("!f", struct.pack("!f", number))[0]
+    except (OverflowError, struct.error):
+        invalid = True
+    if invalid or not isfinite(quantized) or (number != 0.0 and quantized == 0.0):
+        raise ValueError("embedding coordinate must be a finite float32 number")
+    return quantized
 
 
 def _uuid(value: object, *, label: str) -> UUID:
@@ -343,9 +416,9 @@ def _uuid(value: object, *, label: str) -> UUID:
         raise ValueError(f"{label} must be a UUID") from exc
 
 
-def _bounded_int(value: object, *, label: str, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{label} must be an integer of at least {minimum}")
+def _bounded_int(value: object, *, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
+        raise ValueError(f"{label} must be an integer between {minimum} and {maximum}")
     return value
 
 

@@ -205,7 +205,7 @@ async def test_all_search_filters_apply_before_limit(pool):
         limit=1,
         candidate_limit=1,
         area=SearchArea.WIKI,
-        scope=SearchScope.ANNOTATIONS,
+        scope=SearchScope.ALL,
         facets={"stage": "S2"},
         path_glob="/corpus/sgp/*.md",
         tags=("ALPHA", "beta"),
@@ -411,5 +411,266 @@ async def test_pgvector_backend_failures_are_sanitized(pool):
             embedding=(1.0, 0.0, 0.0),
         )
     assert "secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "source_content", "annotations_text"),
+    [
+        (SearchScope.SOURCE, "unrelated source", "semantic target"),
+        (SearchScope.ANNOTATIONS, "semantic target", "unrelated annotation"),
+    ],
+)
+async def test_scope_specific_vector_search_fails_closed_without_domain_embeddings(
+    pool, scope, source_content, annotations_text
+):
+    ids = await _seed_document(pool, chunks=("semantic target",), annotated=(0,))
+    await pool.execute(
+        "UPDATE document_chunks SET source_content=$2, annotations_text=$3, has_highlight=true WHERE document_id=$1",
+        ids[2],
+        source_content,
+        annotations_text,
+    )
+    store = _store(pool)
+    await _replace(store, ids, [(0, (1.0, 0.0, 0.0))])
+
+    with pytest.raises(RetrieverUnavailable, match="vector search does not support scoped content") as raised:
+        await store.search(
+            user_id=ids[0],
+            knowledge_base_id=ids[1],
+            query=SearchQuery(text="semantic target", limit=1, candidate_limit=1, scope=scope),
+            embedding=(1.0, 0.0, 0.0),
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("coordinate", "case"),
+    [
+        (1e300, "float32-overflow"),
+        (10**10000, "integer-overflow"),
+        (1e-300, "float32-underflow"),
+    ],
+    ids=["float32-overflow", "integer-overflow", "float32-underflow"],
+)
+async def test_pgvector_coordinate_boundary_is_rejected_before_backend(coordinate, case):
+    class UnexpectedPool:
+        async def fetch(self, *args, **kwargs):
+            raise AssertionError("database must not be reached")
+
+    with pytest.raises(ValueError, match="embedding coordinate") as raised:
+        await _store(UnexpectedPool()).search(
+            user_id=uuid4(),
+            knowledge_base_id=uuid4(),
+            query=_query(),
+            embedding=(coordinate, 1.0, 0.0),
+        )
+    assert case not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("document_version", True),
+        ("document_version", -1),
+        ("document_version", 2_147_483_648),
+        ("document_version", 10**10000),
+        ("chunk_index", True),
+        ("chunk_index", -1),
+        ("chunk_index", 10_000),
+        ("chunk_index", 2_147_483_648),
+        ("chunk_index", 10**10000),
+    ],
+    ids=[
+        "version-bool",
+        "version-negative",
+        "version-int32-overflow",
+        "version-huge",
+        "chunk-bool",
+        "chunk-negative",
+        "chunk-business-overflow",
+        "chunk-int32-overflow",
+        "chunk-huge",
+    ],
+)
+async def test_postgres_integer_write_boundaries_are_rejected_before_backend(field, value):
+    class UnexpectedPool:
+        def acquire(self):
+            raise AssertionError("database must not be reached")
+
+    version = value if field == "document_version" else 1
+    chunk_index = value if field == "chunk_index" else 0
+    message = "document_version" if field == "document_version" else "chunk index"
+    with pytest.raises(ValueError, match=message) as raised:
+        await _store(UnexpectedPool()).replace_document_embeddings(
+            user_id=uuid4(),
+            knowledge_base_id=uuid4(),
+            document_id=uuid4(),
+            document_version=version,
+            embeddings=[(chunk_index, (1.0, 0.0, 0.0))],
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [True, -1, 2_147_483_648, 10**10000],
+    ids=["bool", "negative", "int32-overflow", "huge"],
+)
+def test_embedding_dimensions_reject_non_business_postgres_integers(dimensions):
+    with pytest.raises(ValueError, match="embedding dimensions"):
+        EmbeddingProfile("openai_compatible", "model", dimensions)
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [True, -1, 4_097, 2_147_483_648, 10**10000],
+    ids=["bool", "negative", "business-overflow", "int32-overflow", "huge"],
+)
+def test_store_revalidates_profile_dimensions_at_postgres_boundary(dimensions):
+    profile = EmbeddingProfile("openai_compatible", "model", 3)
+    object.__setattr__(profile, "dimensions", dimensions)
+
+    with pytest.raises(ValueError, match="embedding dimensions"):
+        _store(object(), profile)
+
+
+class _RaisingAsyncContext:
+    def __init__(self, failure):
+        self._failure = failure
+
+    async def __aenter__(self):
+        raise self._failure
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _GroupedFailurePool:
+    def __init__(self, failure):
+        self._failure = failure
+
+    def acquire(self):
+        return _RaisingAsyncContext(self._failure)
+
+    async def fetch(self, *_args):
+        raise self._failure
+
+
+class _ReturningAsyncContext:
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _RollbackReplacingTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        if exc is not None:
+            raise RuntimeError("private rollback dsn=postgres://token")
+        return False
+
+
+class _TransactionBodyGroupConnection:
+    def __init__(self, failure):
+        self._failure = failure
+
+    def transaction(self):
+        return _RollbackReplacingTransaction()
+
+    async def fetchval(self, *_args):
+        raise self._failure
+
+
+class _TransactionBodyGroupPool:
+    def __init__(self, failure):
+        self._connection = _TransactionBodyGroupConnection(failure)
+
+    def acquire(self):
+        return _ReturningAsyncContext(self._connection)
+
+
+async def _invoke_boundary(store, operation):
+    if operation == "search":
+        return await store.search(
+            user_id=uuid4(),
+            knowledge_base_id=uuid4(),
+            query=_query(),
+            embedding=(1.0, 0.0, 0.0),
+        )
+    return await store.replace_document_embeddings(
+        user_id=uuid4(),
+        knowledge_base_id=uuid4(),
+        document_id=uuid4(),
+        document_version=1,
+        embeddings=[(0, (1.0, 0.0, 0.0))],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "replace"])
+async def test_mixed_cancellation_group_preserves_only_sanitized_cancellation(
+    operation,
+):
+    failure = BaseExceptionGroup(
+        "private SELECT group",
+        [
+            asyncio.CancelledError("private cancellation dsn=postgres://token"),
+            RuntimeError("private SELECT secret"),
+        ],
+    )
+    store = _store(_GroupedFailurePool(failure))
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await _invoke_boundary(store, operation)
+    assert str(raised.value) == ""
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "replace"])
+async def test_pure_backend_exception_group_maps_to_sanitized_unavailable(operation):
+    failure = ExceptionGroup(
+        "private SELECT group",
+        [RuntimeError("dsn=postgres://token"), ValueError("private metadata")],
+    )
+    store = _store(_GroupedFailurePool(failure))
+
+    with pytest.raises(RetrieverUnavailable, match="vector store is unavailable") as raised:
+        await _invoke_boundary(store, operation)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_transaction_cleanup_failure_cannot_mask_grouped_cancellation():
+    failure = BaseExceptionGroup(
+        "private transaction group",
+        [
+            asyncio.CancelledError("private cancellation"),
+            RuntimeError("private SELECT dsn=postgres://token"),
+        ],
+    )
+    store = _store(_TransactionBodyGroupPool(failure))
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await _invoke_boundary(store, "replace")
+    assert str(raised.value) == ""
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
