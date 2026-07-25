@@ -221,6 +221,40 @@ python3 -m corpus.import_annotations \
 | 文本与数据 | `.md` `.txt` `.csv` `.json` `.xml` `.yaml` `.svg` 等 | 直接索引分块 |
 | 图片 | `.png` `.jpg` `.webp` `.gif` | 存储并内联展示,智能体可按需读取 |
 
+# 检索评测 CLI
+
+仓库内置版本化的纯合成检索 cohort，可在不连接数据库、向量服务或外部 API 的情况下复现 lexical baseline：
+
+```bash
+PYTHONPATH=api python -m scripts.retrieval_eval \
+  --dataset tests/fixtures/retrieval/v1/cases.jsonl \
+  --profile lexical \
+  --output-json retrieval-baseline.json
+```
+
+CLI 从 dataset 同目录严格读取 `corpus.jsonl`，先应用 area、scope、facets、path glob、tags、document kind 与 annotated-only 过滤，再按正文/annotation 词项命中及标题排序信号产生可解释的确定性排名。它不会读取 relevance judgments 来生成排名。`--output-json` 使用临时文件加原子替换；已有普通文件可覆盖，目录、符号链接及其他非普通文件会被拒绝。stdout 与输出文件字节完全相同。
+
+比较 lexical 与 hybrid 并把 promotion gate 作为 CI 门禁：
+
+```bash
+PYTHONPATH=api python -m scripts.retrieval_eval \
+  --dataset tests/fixtures/retrieval/v1/cases.jsonl \
+  --compare \
+  --require-promotion-gate
+```
+
+lexical profile 始终可用。hybrid/compare 只通过托管 hybrid service 的配置边界调用；当前里程碑尚未接入后续的 embeddings、pgvector 与服务端编排，因此默认会以稳定的 `hybrid_unavailable` 配置错误失败关闭，不会伪造 hybrid 结果或静默退回 lexical。后续 hosted wiring 完成后，同一 CLI 边界可直接使用已配置服务。
+
+退出码：`0` 表示评测成功（未要求 gate 时，即使 promotion 不合格仍为 `0`）；`2` 表示参数、dataset、配置或 retrieval 错误；`3` 表示 `--require-promotion-gate` 已启用且 hybrid 未通过；`4` 表示报告输出失败。错误输出只含稳定的 `code`/`category`，不会回显路径、查询、文档内容或底层异常。
+
+当前 v1 synthetic lexical baseline（单行、键排序稳定）：
+
+```json
+{"case_count":2,"dataset_digest":"5d9969be5644602a859b1d25eba44e3881b61eb11fd84a4eb2aec1edea5e02c5","dataset_schema_version":1,"metrics":{"filtered_result_count":3,"latency_p50_ms":0.0,"latency_p95_ms":0.0,"mrr":1.0,"ndcg_at_10":1.0,"recall_at_10":1.0,"recall_at_20":1.0,"recall_at_5":1.0},"profile":"lexical","schema_version":1}
+```
+
+报告只包含 dataset identity、profile 与聚合指标；不会写出 query text、document content、API key、embedding 或原始异常字符串。baseline latency 来自 retriever 的 `SearchResult.latency_ms`（合成 adapter 固定为 `0.0`），不把 wall-clock jitter 写入稳定报告。
+
 # 许可证
 
 Apache 2.0 — 见 [LICENSE](LICENSE)。上游项目:[lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki)。
