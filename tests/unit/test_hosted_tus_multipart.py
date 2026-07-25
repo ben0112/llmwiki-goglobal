@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -29,6 +30,8 @@ from infra.tus_sessions import (
     TusSessionState,
 )
 from services.s3 import ObjectMetadata
+
+from tests.helpers.telemetry_contract import assert_telemetry_event
 
 pytestmark = pytest.mark.asyncio
 
@@ -825,6 +828,81 @@ async def test_create_lock_release_response_loss_does_not_replace_success(monkey
     assert "quota.release" not in events
 
 
+async def test_create_emits_stable_json_without_metadata_or_object_key(monkeypatch, caplog):
+    events = []
+    store = Store(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    with caplog.at_level(logging.INFO, logger="infra.tus"):
+        async with await _client(app) as client:
+            response = await client.post(
+                "/v1/uploads",
+                headers={
+                    "X-Test-User": str(USER_ID),
+                    "Tus-Resumable": "1.0.0",
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata(filename="RAW_SECRET_FILENAME.pdf"),
+                },
+            )
+
+    assert response.status_code == 201
+    assert_telemetry_event(
+        caplog,
+        "tus_session_created",
+        expected={
+            "upload_id": str(store.session.upload_id),
+            "state": "uploading",
+            "replica_role": "api",
+        },
+        sensitive=(
+            "RAW_SECRET_FILENAME.pdf",
+            store.session.s3_key,
+            OWNER,
+            "https://object.private.invalid/presigned",
+        ),
+    )
+
+
+async def test_finalize_emits_stable_json_without_document_payload(monkeypatch, caplog):
+    events = []
+    session = _session(
+        total=5,
+        offset=5,
+        parts=(TusPart(1, "RAW_SECRET_ETAG"),),
+        object_completed=True,
+    )
+    store = Store(events, session=session)
+    store.lock_token = "L" * 32
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+    service = app.state.tus_service
+    job_id = uuid4()
+
+    async def persist_document_job(_session):
+        return session.upload_id, job_id
+
+    monkeypatch.setattr(service, "_persist_document_job", persist_document_job)
+    with caplog.at_level(logging.INFO, logger="infra.tus"):
+        response = await service._finalize(session, store.lock_token)
+
+    assert response.status_code == 204
+    assert_telemetry_event(
+        caplog,
+        "tus_session_completed",
+        expected={
+            "upload_id": str(session.upload_id),
+            "state": "completed",
+            "replica_role": "api",
+        },
+        sensitive=(
+            "RAW_SECRET_ETAG",
+            session.s3_key,
+            OWNER,
+            "document raw content",
+            "https://object.private.invalid/presigned",
+        ),
+    )
+
+
 async def test_offset_is_not_committed_until_s3_returns_an_etag(monkeypatch):
     events = []
     started, release = asyncio.Event(), asyncio.Event()
@@ -1484,7 +1562,7 @@ async def test_upload_cleanup_handler_is_replay_safe_and_releases_quota_once():
     assert calls == 2
 
 
-async def test_stale_scan_enqueues_all_sessions_without_live_knowledge_bases():
+async def test_stale_scan_enqueues_all_sessions_without_live_knowledge_bases(caplog):
     from infra.tus import HostedTusCleanupService
 
     sessions = [
@@ -1524,8 +1602,16 @@ async def test_stale_scan_enqueues_all_sessions_without_live_knowledge_bases():
         lock_seconds=10,
     )
 
-    assert await cleanup.enqueue_stale_jobs() == 2
+    with caplog.at_level(logging.INFO, logger="infra.tus"):
+        assert await cleanup.enqueue_stale_jobs() == 2
     assert [command.payload["upload_id"] for command in commands] == [str(session.upload_id) for session in sessions]
+    assert_telemetry_event(
+        caplog,
+        "tus_session_stale",
+        expected={"state": "cleanup_required", "replica_role": "worker"},
+        sensitive=(OWNER, USER_ID, "RAW_STALE_METADATA", "s3://private-bucket/object"),
+        count=2,
+    )
 
 
 async def test_cleanup_scan_uses_minute_successor_keys_and_enqueues_completed_settlement():
@@ -1749,7 +1835,7 @@ async def test_worker_reconciles_object_completed_document_job_without_s3_cleanu
     assert "session.delete" not in events
 
 
-async def test_worker_fences_and_cleans_stale_object_completed_without_database_row():
+async def test_worker_fences_and_cleans_stale_object_completed_without_database_row(caplog):
     from infra.tus import HostedTusCleanupService
 
     events = []
@@ -1777,12 +1863,23 @@ async def test_worker_fences_and_cleans_stale_object_completed_without_database_
         lock_seconds=10,
     )
 
-    result = await cleanup.cleanup(session.upload_id, USER_ID)
+    with caplog.at_level(logging.INFO, logger="infra.tus"):
+        result = await cleanup.cleanup(session.upload_id, USER_ID)
 
     assert result["status"] == "cleaned"
     assert events.index("redis.cleanup_required") < events.index("s3.delete")
     assert events.index("redis.cleanup_required") < events.index("s3.abort")
     assert store.session is None
+    assert_telemetry_event(
+        caplog,
+        "upload_cleanup_finished",
+        expected={
+            "upload_id": str(session.upload_id),
+            "state": "cleaned",
+            "replica_role": "worker",
+        },
+        sensitive=(OWNER, USER_ID, session.s3_key, "RAW_CLEANUP_ERROR_TEXT"),
+    )
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,7 @@ from jobs.dispatcher import dispatch_due_jobs
 from jobs.handlers import WorkerContext
 from jobs.models import JobType
 
+from tests.helpers.telemetry_contract import assert_telemetry_event
 from tests.unit.test_hosted_tus_multipart import (
     MIB,
     S3,
@@ -139,6 +140,18 @@ async def test_redis_outage_after_acceptance_eventually_dispatches_with_json_tel
         "state": "queued",
     }
     assert dispatched[0]["dispatch_lag_ms"] >= 0
+    assert_telemetry_event(
+        caplog,
+        "durable_job_dispatched",
+        expected={
+            "job_id": str(job["id"]),
+            "job_type": "document.extract",
+            "state": "queued",
+            "dispatch_attempts": 1,
+            "replica_role": "worker",
+        },
+        sensitive=("postgresql://private.invalid", "redis://private.invalid", "RAW_SECRET_TEXT"),
+    )
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,8 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from tests.helpers.telemetry_contract import assert_telemetry_event
+
 DISPATCH_RUN_AFTER = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -683,7 +685,7 @@ async def test_run_job_claims_from_postgres_and_returns_duplicate_without_handle
 
 
 @pytest.mark.asyncio
-async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monkeypatch):
+async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monkeypatch, caplog):
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
@@ -709,7 +711,8 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
     monkeypatch.setattr(worker, "JobLease", FakeLease)
     ctx = _ctx(pool, {job.job_type: handler})
 
-    outcome = await worker.run_job(ctx, str(job.id))
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        outcome = await worker.run_job(ctx, str(job.id))
 
     assert outcome == {"status": "succeeded", "job_id": str(job.id)}
     assert calls == [
@@ -720,6 +723,20 @@ async def test_run_job_executes_persisted_handler_under_lease_and_succeeds(monke
     assert FakeLease.instances[-1].args == (pool, job.id, "worker-test", 60, 15)
     assert pool.acquires == 2
     assert pool.transactions == 2
+    assert_telemetry_event(
+        caplog,
+        "durable_job_finished",
+        expected={
+            "job_id": str(job.id),
+            "job_type": job.job_type.value,
+            "attempt": job.attempt_count,
+            "state": "succeeded",
+            "lease_owner": "worker-test",
+            "error_code": None,
+            "replica_role": "worker",
+        },
+        sensitive=("converter-secret", "RAW_RESULT_TOKEN", "postgresql://private.invalid"),
+    )
 
 
 def test_prepare_job_result_returns_strict_mapping_and_safe_json_input():
@@ -1241,6 +1258,35 @@ async def test_reap_cron_uses_short_transaction_and_propagates_failures(monkeypa
     assert pool.transactions == 1
     assert pool.active_connections == 0
     assert pool.active_transactions == 0
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_emits_stable_json_contract_for_each_expired_lease(monkeypatch, caplog):
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+    job_id = uuid4()
+
+    async def reap_expired(conn, *, limit):
+        assert conn is pool.connection
+        assert limit == 23
+        return [job_id]
+
+    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
+
+    assert_telemetry_event(
+        caplog,
+        "durable_job_lease_reaped",
+        expected={
+            "job_id": str(job_id),
+            "state": "retry_wait",
+            "error_code": "lease_expired",
+            "replica_role": "worker",
+        },
+        sensitive=("Worker lease expired raw text", "postgresql://private.invalid"),
+    )
 
 
 @pytest.mark.asyncio

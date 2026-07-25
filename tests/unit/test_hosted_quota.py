@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import secrets
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -6,6 +7,8 @@ from uuid import uuid4
 
 import pytest
 from redis.cluster import key_slot
+
+from tests.helpers.telemetry_contract import assert_telemetry_event
 
 
 def _module():
@@ -111,6 +114,39 @@ async def test_reserve_reads_committed_usage_then_writes_under_token_lock():
     assert script_args[:4] == quota.quota_keys(user_id)
     assert str(upload_id) in script_args
     assert reservation.owner_token in script_args
+
+
+async def test_reserve_and_release_emit_stable_json_without_owner_token(caplog):
+    quota = _module()
+    user_id = uuid4()
+    upload_id = uuid4()
+    redis = _Redis(set_results=[True], eval_results=[[1, 70], 1, [1]])
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 40}),
+        redis,
+    )
+
+    with caplog.at_level(logging.INFO, logger="infra.quota"):
+        reservation = await service.reserve(user_id, upload_id, 30, ttl_seconds=60)
+        assert await service.release(reservation) is True
+
+    expected = {
+        "upload_id": str(upload_id),
+        "byte_count": 30,
+        "replica_role": "api",
+    }
+    assert_telemetry_event(
+        caplog,
+        "quota_reserved",
+        expected=expected,
+        sensitive=(reservation.owner_token, user_id, "redis://private.invalid", "RAW_QUOTA_TEXT"),
+    )
+    assert_telemetry_event(
+        caplog,
+        "quota_released",
+        expected=expected,
+        sensitive=(reservation.owner_token, user_id, "redis://private.invalid", "RAW_QUOTA_TEXT"),
+    )
 
 
 async def test_final_capacity_rejection_is_typed_and_lock_is_released():
