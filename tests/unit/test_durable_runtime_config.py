@@ -1,9 +1,18 @@
 import importlib
+import importlib.util
 import sys
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from config import Settings
+
+_MCP_CONFIG_PATH = Path(__file__).parents[2] / "mcp" / "config.py"
+_MCP_SPEC = importlib.util.spec_from_file_location("test_mcp_embedding_config", _MCP_CONFIG_PATH)
+assert _MCP_SPEC is not None and _MCP_SPEC.loader is not None
+_MCP_CONFIG = importlib.util.module_from_spec(_MCP_SPEC)
+_MCP_SPEC.loader.exec_module(_MCP_CONFIG)
+McpSettings = _MCP_CONFIG.Settings
 
 RUNTIME_ENVIRONMENT = (
     "REDIS_URL",
@@ -17,6 +26,17 @@ RUNTIME_ENVIRONMENT = (
     "TUS_STALE_SECONDS",
     "TUS_LOCK_SECONDS",
     "TUS_MAX_PATCH_BYTES",
+    "HYBRID_SEARCH_ENABLED",
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_DIMENSIONS",
+    "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_TIMEOUT_SECONDS",
+    "HYBRID_LEXICAL_CANDIDATES",
+    "HYBRID_VECTOR_CANDIDATES",
+    "HYBRID_RRF_K",
 )
 
 
@@ -204,6 +224,143 @@ def test_runtime_defaults_in_a_clean_environment(monkeypatch):
     assert settings.TUS_STALE_SECONDS == 86400
     assert settings.TUS_LOCK_SECONDS == 60
     assert settings.TUS_MAX_PATCH_BYTES == 67108864
+
+
+def test_lexical_defaults_do_not_require_embedding_endpoint(monkeypatch):
+    _clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("MODE", "local")
+
+    runtime = _settings()
+
+    assert runtime.HYBRID_SEARCH_ENABLED is False
+    assert runtime.EMBEDDING_PROVIDER == "openai_compatible"
+    assert runtime.EMBEDDING_BASE_URL == ""
+    assert runtime.EMBEDDING_API_KEY == ""
+    assert runtime.EMBEDDING_MODEL == ""
+    assert runtime.EMBEDDING_DIMENSIONS == 0
+    assert runtime.EMBEDDING_BATCH_SIZE == 32
+    assert runtime.EMBEDDING_TIMEOUT_SECONDS == 30
+    assert runtime.HYBRID_LEXICAL_CANDIDATES == 50
+    assert runtime.HYBRID_VECTOR_CANDIDATES == 50
+    assert runtime.HYBRID_RRF_K == 60
+    assert runtime.embedding_profile is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        ({"MODE": "local"}, "hosted"),
+        ({"DURABLE_JOBS_ENABLED": "false"}, "DURABLE_JOBS_ENABLED"),
+        ({"EMBEDDING_BASE_URL": ""}, "EMBEDDING_BASE_URL"),
+        ({"EMBEDDING_MODEL": ""}, "EMBEDDING_MODEL"),
+        ({"EMBEDDING_DIMENSIONS": "0"}, "EMBEDDING_DIMENSIONS"),
+        ({"EMBEDDING_DIMENSIONS": "4097"}, "EMBEDDING_DIMENSIONS"),
+        ({"HYBRID_LEXICAL_CANDIDATES": "0"}, "HYBRID_LEXICAL_CANDIDATES"),
+        ({"HYBRID_VECTOR_CANDIDATES": "501"}, "HYBRID_VECTOR_CANDIDATES"),
+    ),
+)
+def test_hybrid_settings_fail_closed(monkeypatch, overrides, match):
+    _clear_runtime_environment(monkeypatch)
+    valid = {
+        "MODE": "hosted",
+        "DURABLE_JOBS_ENABLED": "true",
+        "TUS_MULTIPART_ENABLED": "true",
+        "REDIS_URL": "redis://localhost:6379/0",
+        "HYBRID_SEARCH_ENABLED": "true",
+        "EMBEDDING_BASE_URL": "https://embedding.test/v1",
+        "EMBEDDING_MODEL": "embed-v1",
+        "EMBEDDING_DIMENSIONS": "3",
+    }
+    valid.update(overrides)
+    for name, value in valid.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=match):
+        _settings()
+
+
+def test_hybrid_profile_and_request_candidate_window(monkeypatch):
+    _clear_runtime_environment(monkeypatch)
+    values = {
+        "MODE": "hosted",
+        "DURABLE_JOBS_ENABLED": "true",
+        "TUS_MULTIPART_ENABLED": "true",
+        "REDIS_URL": "redis://localhost:6379/0",
+        "HYBRID_SEARCH_ENABLED": "true",
+        "EMBEDDING_BASE_URL": "https://embedding.test/v1",
+        "EMBEDDING_API_KEY": "private-key",
+        "EMBEDDING_MODEL": "embed-v1",
+        "EMBEDDING_DIMENSIONS": "3",
+        "HYBRID_LEXICAL_CANDIDATES": "50",
+        "HYBRID_VECTOR_CANDIDATES": "60",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    runtime = _settings()
+
+    assert runtime.embedding_profile.identity == ("openai_compatible", "embed-v1", 3)
+    assert "private-key" not in repr(runtime.embedding_profile)
+    assert runtime.hybrid_candidate_limits(50) == (50, 60)
+    with pytest.raises(ValueError, match="request limit"):
+        runtime.hybrid_candidate_limits(51)
+    with pytest.raises(ValueError, match="request limit"):
+        runtime.hybrid_candidate_limits(True)
+
+
+@pytest.mark.parametrize("settings_type", (Settings, McpSettings))
+def test_api_and_mcp_embedding_defaults_have_identical_semantics(settings_type):
+    runtime = settings_type(MODE="local", _env_file=None)
+
+    assert runtime.HYBRID_SEARCH_ENABLED is False
+    assert runtime.embedding_profile is None
+    assert runtime.EMBEDDING_TIMEOUT_SECONDS == 30
+    assert runtime.hybrid_candidate_limits(50) == (50, 50)
+
+
+@pytest.mark.parametrize("settings_type", (Settings, McpSettings))
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        ({"MODE": "local"}, "hosted"),
+        ({"DURABLE_JOBS_ENABLED": False}, "DURABLE_JOBS_ENABLED"),
+        ({"EMBEDDING_BASE_URL": ""}, "EMBEDDING_BASE_URL"),
+        ({"EMBEDDING_MODEL": ""}, "EMBEDDING_MODEL"),
+        ({"EMBEDDING_DIMENSIONS": 0}, "EMBEDDING_DIMENSIONS"),
+    ),
+)
+def test_api_and_mcp_hybrid_preconditions_have_identical_semantics(settings_type, overrides, match):
+    values = {
+        "MODE": "hosted",
+        "DURABLE_JOBS_ENABLED": True,
+        "TUS_MULTIPART_ENABLED": True,
+        "REDIS_URL": "redis://localhost:6379/0",
+        "HYBRID_SEARCH_ENABLED": True,
+        "EMBEDDING_BASE_URL": "https://embedding.test/v1",
+        "EMBEDDING_MODEL": "embed-v1",
+        "EMBEDDING_DIMENSIONS": 3,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=match):
+        settings_type(_env_file=None, **values)
+
+
+@pytest.mark.parametrize("settings_type", (Settings, McpSettings))
+@pytest.mark.parametrize(
+    "field",
+    (
+        "EMBEDDING_DIMENSIONS",
+        "EMBEDDING_BATCH_SIZE",
+        "EMBEDDING_TIMEOUT_SECONDS",
+        "HYBRID_LEXICAL_CANDIDATES",
+        "HYBRID_VECTOR_CANDIDATES",
+        "HYBRID_RRF_K",
+    ),
+)
+def test_embedding_numeric_settings_reject_booleans(settings_type, field):
+    with pytest.raises(ValueError, match=field):
+        settings_type(MODE="local", _env_file=None, **{field: True})
 
 
 def test_redis_module_does_not_create_client_on_import(monkeypatch):

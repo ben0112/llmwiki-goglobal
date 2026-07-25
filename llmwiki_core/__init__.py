@@ -24,6 +24,14 @@ from .evaluation import (
     promotion_decision,
 )
 from .facets import FACET_KEYS, UnknownFacetError, apply_rollup, rollup_from_metas, validate_facets
+from .models import (
+    EmbeddingClient,
+    EmbeddingError,
+    EmbeddingInputError,
+    EmbeddingProfile,
+    EmbeddingUnavailable,
+    InvalidEmbeddingResponse,
+)
 from .references import build_lookup_maps, extract_references, parse_citation_filename, parse_wiki_links
 from .search import (
     ContextExpander,
@@ -48,11 +56,17 @@ __all__ = [
     "DocumentStatus",
     "EVALUATION_SCHEMA_VERSION",
     "EvalCase",
+    "EmbeddingClient",
+    "EmbeddingError",
+    "EmbeddingInputError",
+    "EmbeddingProfile",
+    "EmbeddingUnavailable",
     "EvaluationReport",
     "EvaluationRun",
     "FACET_KEYS",
     "HybridRetrievalService",
     "InvalidStatusTransition",
+    "InvalidEmbeddingResponse",
     "PromotionDecision",
     "RankedResult",
     "RelevanceJudgment",
