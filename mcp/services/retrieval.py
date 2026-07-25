@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from math import isfinite
+from numbers import Real
 from typing import Any, Literal
 
 import httpx
@@ -179,13 +180,12 @@ class _VectorRetriever:
             raise RetrieverUnavailable("query embedding is unavailable")
         try:
             vectors = await client.embed((query.text,))
-            if len(vectors) != 1 or len(vectors[0]) != self._profile.dimensions:
-                raise InvalidEmbeddingResponse("invalid embedding response")
+            embedding = _validated_query_embedding(vectors, profile=self._profile)
             vector_query = _query_with_candidate_limit(query, self._candidate_limit)
             result = await self._vault.retrieve_vector(
                 self._knowledge_base_id,
                 vector_query,
-                embedding=vectors[0],
+                embedding=embedding,
                 profile=self._profile,
             )
             self.available = True
@@ -355,6 +355,33 @@ def _ordered_vectors(
     if any(vector is None for vector in ordered):
         raise ValueError("invalid embedding response")
     return tuple(vector for vector in ordered if vector is not None)
+
+
+def _validated_query_embedding(
+    vectors: object,
+    *,
+    profile: EmbeddingProfile,
+) -> tuple[float, ...]:
+    if (
+        isinstance(vectors, (str, bytes))
+        or not isinstance(vectors, Sequence)
+        or len(vectors) != 1
+        or isinstance(vectors[0], (str, bytes))
+        or not isinstance(vectors[0], Sequence)
+        or len(vectors[0]) != profile.dimensions
+    ):
+        raise InvalidEmbeddingResponse("invalid embedding response")
+    embedding: list[float] = []
+    for coordinate in vectors[0]:
+        if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
+            raise InvalidEmbeddingResponse("invalid embedding response")
+        normalized = float(coordinate)
+        if not isfinite(normalized):
+            raise InvalidEmbeddingResponse("invalid embedding response")
+        embedding.append(normalized)
+    if not any(embedding):
+        raise InvalidEmbeddingResponse("invalid embedding response")
+    return tuple(embedding)
 
 
 def _query_with_candidate_limit(query: SearchQuery, candidate_limit: int) -> SearchQuery:

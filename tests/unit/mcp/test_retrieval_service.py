@@ -54,6 +54,16 @@ class _EmbeddingClient:
         return ((1.0, 0.0, 0.0),)
 
 
+class _RawEmbeddingClient:
+    profile = PROFILE
+
+    def __init__(self, vectors):
+        self.vectors = vectors
+
+    async def embed(self, _texts):
+        return self.vectors
+
+
 class _Vault:
     def __init__(self):
         self.lexical = SearchResult((_hit("lexical"),), 1, profile="lexical")
@@ -216,6 +226,30 @@ async def test_typed_vector_unavailability_falls_back_but_lexical_failure_is_vis
     vault.retrieve = broken_lexical
     with pytest.raises(RuntimeError, match="lexical failed"):
         await service.retrieve(SearchQuery.build(text="q", limit=1), profile="hybrid")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "vectors",
+    [((1.0, 2.0),), ((0.0, 0.0, 0.0),), ((float("nan"), 0.0, 1.0),)],
+)
+async def test_invalid_query_embedding_fails_closed_to_lexical(vectors):
+    from services.retrieval import HostedRetrievalService
+
+    vault = _Vault()
+    service = HostedRetrievalService(
+        vault,
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=lambda: _RawEmbeddingClient(vectors),
+    )
+
+    result = await service.retrieve(
+        SearchQuery.build(text="q", limit=1), profile="hybrid"
+    )
+
+    assert result.profile == "lexical_fallback"
+    assert vault.vector_queries == []
 
 
 @pytest.mark.asyncio
