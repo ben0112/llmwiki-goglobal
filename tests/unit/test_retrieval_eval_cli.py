@@ -214,6 +214,29 @@ def _run_cli_with_missing_descriptor(
     )
 
 
+def _run_cli_after_closing_descriptor(
+    argv: list[str],
+    *,
+    descriptor: int,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT / "api")
+    script = (
+        "import os, sys; "
+        "from scripts.retrieval_eval import main; "
+        "os.close(int(sys.argv[1])); "
+        "raise SystemExit(main(sys.argv[2:]))"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, str(descriptor), *argv],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+
 class _EmissionFailingBuffer:
     def __init__(self, failure: str) -> None:
         self.content = bytearray()
@@ -311,6 +334,32 @@ class _ExceptionalEmissionStream:
         if self.location == "buffer":
             raise self.error_type("private buffer access failure")
         return self._buffer
+
+
+class _SecondFlushFailingBuffer:
+    def __init__(self, descriptor: int, error_type: type[Exception]) -> None:
+        self.descriptor = descriptor
+        self.error_type = error_type
+        self.content = bytearray()
+        self.flush_count = 0
+
+    def fileno(self) -> int:
+        return self.descriptor
+
+    def write(self, content: memoryview) -> int:
+        self.content.extend(content)
+        return len(content)
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        if self.flush_count == 1:
+            raise BrokenPipeError("private initial flush failure")
+        raise self.error_type("private cleanup flush failure")
+
+
+class _SecondFlushFailingStream:
+    def __init__(self, descriptor: int, error_type: type[Exception]) -> None:
+        self.buffer = _SecondFlushFailingBuffer(descriptor, error_type)
 
 
 @pytest.mark.parametrize("profile", ["lexical", "hybrid"])
@@ -475,6 +524,27 @@ def test_missing_stderr_descriptor_preserves_invalid_arguments_exit_code():
     assert completed.stderr == b""
 
 
+@pytest.mark.parametrize(
+    ("argv", "descriptor", "expected_code"),
+    [
+        (["--dataset", str(DATASET), "--profile", "lexical"], 1, 4),
+        (["--help"], 1, 4),
+        ([], 2, 2),
+    ],
+    ids=["report-stdout", "help-stdout", "error-stderr"],
+)
+def test_descriptor_closed_after_python_startup_has_stable_exit_without_shutdown_diagnostics(
+    argv,
+    descriptor,
+    expected_code,
+):
+    completed = _run_cli_after_closing_descriptor(argv, descriptor=descriptor)
+
+    assert completed.returncode == expected_code
+    assert completed.stdout == b""
+    assert completed.stderr == b""
+
+
 @pytest.mark.parametrize("failure", ["write", "flush"])
 def test_stdout_emission_failure_without_file_descriptor_returns_four_and_clears_buffer(
     failure,
@@ -630,6 +700,43 @@ def test_stderr_stream_shape_failures_preserve_business_exit_code(
 
     assert code == 2
     assert stream._buffer.content == b""
+
+
+@pytest.mark.parametrize("error_type", [AttributeError, TypeError])
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [("report", 4), ("error", 2), ("help", 4)],
+)
+def test_valid_descriptor_cleanup_suppresses_second_flush_shape_failure(
+    mode,
+    expected_code,
+    error_type,
+    monkeypatch,
+    capsys,
+):
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    stream = _SecondFlushFailingStream(descriptor, error_type)
+    try:
+        target = "stderr" if mode == "error" else "stdout"
+        monkeypatch.setattr(retrieval_eval_module.sys, target, stream)
+        if mode == "report":
+            factory, _retrievers, _factory_calls = _factory()
+            code = main(
+                ["--dataset", str(DATASET), "--profile", "lexical"],
+                retriever_factory=factory,
+            )
+        elif mode == "help":
+            code = main(["--help"])
+        else:
+            code = main([])
+    finally:
+        os.close(descriptor)
+    captured = capsys.readouterr()
+
+    assert code == expected_code
+    assert captured.out == ""
+    assert captured.err == ""
+    assert stream.buffer.flush_count == 2
 
 
 @pytest.mark.parametrize(

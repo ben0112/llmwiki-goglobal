@@ -748,7 +748,10 @@ def _silence_failed_stream(buffer: Any) -> None:
             os.devnull,
             os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
         )
-        os.dup2(null_descriptor, descriptor, inheritable=False)
+        if null_descriptor == descriptor:
+            null_descriptor = -1
+        else:
+            os.dup2(null_descriptor, descriptor, inheritable=False)
     except (OSError, TypeError, ValueError):
         _discard_failed_stream_buffer(buffer)
         return
@@ -757,7 +760,7 @@ def _silence_failed_stream(buffer: Any) -> None:
             with suppress(OSError):
                 os.close(null_descriptor)
 
-    with suppress(OSError, ValueError):
+    with suppress(AttributeError, OSError, TypeError, ValueError):
         buffer.flush()
 
 
