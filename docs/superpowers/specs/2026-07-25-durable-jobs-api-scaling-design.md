@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implemented and verified
+**Status:** Implementation incomplete — specification review in progress
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -373,7 +373,11 @@ external services.
 - Local mode starts and passes its full suite without Redis, Postgres, S3, or
   worker configuration.
 
-## Implementation evidence
+## Provisional implementation evidence
+
+The commands and commit references below are retained as historical context
+only. They are not final verification evidence while the specification review
+is in progress.
 
 The durable/scaled runtime baseline is commit
 `3e23aff6bfedd66a26f8154a57850703d400c932`; the Task 14 closing commit is the

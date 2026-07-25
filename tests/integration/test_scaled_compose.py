@@ -146,6 +146,11 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert '"--scale", "worker=2", "worker"' in source
     assert "timeout=240" in source
     assert 'recovered["attempt_count"] >= 2' in source
+    assert "_restart_redis_and_wait()" in source
+    assert "_api_container_for_instance(completed_instance)" in source
+    assert 'subprocess.run(["docker", "kill", "--signal", "TERM"' in source
+    assert "old_owner" in source
+    assert "graceful" in source
 
 
 def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
@@ -279,12 +284,28 @@ def _metadata(**values: str) -> str:
     return ",".join(f"{key} {base64.b64encode(value.encode()).decode()}" for key, value in values.items())
 
 
-async def _wait_for_job(client: httpx.AsyncClient, job_id: str, timeout: float = 240) -> dict:
+async def _wait_for_job(
+    client: httpx.AsyncClient,
+    job_id: str,
+    timeout: float = 240,
+    *,
+    forbidden_instance: str | None = None,
+) -> dict:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        response = await client.get(f"/v1/jobs/{job_id}")
+        try:
+            response = await client.get(f"/v1/jobs/{job_id}", headers={"Connection": "close"})
+        except httpx.TransportError:
+            await asyncio.sleep(0.5)
+            continue
+        if response.status_code >= 500:
+            await asyncio.sleep(0.5)
+            continue
         response.raise_for_status()
+        if forbidden_instance is not None:
+            responding_instance = response.headers.get("x-api-instance-id")
+            assert responding_instance and responding_instance != forbidden_instance
         last = response.json()
         if last["state"] == "succeeded":
             return last
@@ -292,6 +313,21 @@ async def _wait_for_job(client: httpx.AsyncClient, job_id: str, timeout: float =
             pytest.fail(f"job {job_id} ended in {last['state']}: {last.get('error')}")
         await asyncio.sleep(1)
     pytest.fail(f"job {job_id} did not succeed within {timeout}s; last={last}")
+
+
+async def _wait_for_running_job(pool, job_id: UUID, timeout: float = 40):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = await pool.fetchrow(
+            "SELECT state::text, lease_owner, lease_expires_at, attempt_count "
+            "FROM background_jobs WHERE id = $1",
+            job_id,
+        )
+        if last and last["state"] == "running" and last["lease_owner"]:
+            return last
+        await asyncio.sleep(0.25)
+    pytest.fail(f"job {job_id} was not claimed within {timeout}s; last={dict(last) if last else None}")
 
 
 def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -328,9 +364,9 @@ def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]
     return subprocess.run(command, **run_kwargs)
 
 
-def _worker_container_for_owner(owner: str) -> str:
-    hostname = owner.split(":", 1)[0]
-    container_ids = _compose("ps", "-q", "worker").stdout.split()
+def _container_for_instance(service: str, instance_id: str) -> str:
+    hostname = instance_id.split(":", 1)[0]
+    container_ids = _compose("ps", "-q", service).stdout.split()
     for container_id in container_ids:
         inspected = subprocess.run(
             ["docker", "inspect", "--format", "{{.Config.Hostname}}", container_id],
@@ -340,7 +376,52 @@ def _worker_container_for_owner(owner: str) -> str:
         ).stdout.strip()
         if inspected == hostname:
             return container_id
-    pytest.fail(f"no worker container matched lease hostname {hostname!r}")
+    pytest.fail(f"no {service} container matched instance hostname {hostname!r}")
+
+
+def _worker_container_for_owner(owner: str) -> str:
+    return _container_for_instance("worker", owner)
+
+
+def _api_container_for_instance(instance_id: str) -> str:
+    return _container_for_instance("api", instance_id)
+
+
+def _restart_redis_and_wait(timeout: float = 40) -> None:
+    # Force the first PATCH state through Redis 7.4's local AOF before the
+    # restart so this verifies persistence rather than a graceful memory copy.
+    _compose("exec", "-T", "redis", "redis-cli", "WAITAOF", "1", "0", "5000")
+    _compose("restart", "redis")
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = _compose("exec", "-T", "redis", "redis-cli", "ping", check=False)
+        if last.returncode == 0 and last.stdout.strip() == "PONG":
+            return
+        time.sleep(0.25)
+    pytest.fail(f"Redis did not become ready after restart; returncode={getattr(last, 'returncode', None)}")
+
+
+def _disable_restart_and_kill(container_id: str, signal: str) -> None:
+    subprocess.run(["docker", "update", "--restart=no", container_id], check=True)
+    subprocess.run(["docker", "kill", "--signal", signal, container_id], check=True)
+
+
+def _wait_for_container_exit(container_id: str, timeout: float = 40) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .State}}", container_id],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        last = json.loads(inspected.stdout)
+        if not last["Running"]:
+            return last
+        time.sleep(0.25)
+    pytest.fail(f"container {container_id} did not exit after signal; state={last}")
 
 
 @pytest.mark.skipif(
@@ -358,17 +439,17 @@ async def test_two_api_two_worker_recovery_smoke():
     user_id = UUID(_required_env("SCALED_TEST_USER_ID"))
     auth_headers = {"Authorization": f"Bearer {token}"}
     kb_id = uuid4()
+    graceful_kb_id = uuid4()
     filename = f"scaled-{uuid4()}.pdf"
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=3)
-    killed_worker = False
 
     try:
-        await pool.execute(
+        await pool.executemany(
             "INSERT INTO knowledge_bases (id, user_id, name, slug) VALUES ($1, $2, $3, $4)",
-            kb_id,
-            user_id,
-            "Scaled compose smoke",
-            f"scaled-{kb_id}",
+            (
+                (kb_id, user_id, "Scaled compose smoke", f"scaled-{kb_id}"),
+                (graceful_kb_id, user_id, "Graceful worker smoke", f"graceful-{graceful_kb_id}"),
+            ),
         )
 
         instance_ids = set()
@@ -466,6 +547,8 @@ async def test_two_api_two_worker_recovery_smoke():
             assert first_patch_instance, "first TUS PATCH response omitted API instance identity"
             tus_instances.append(("patch-0", first_patch_instance))
 
+        _restart_redis_and_wait()
+
         resume_instance = None
         for attempt in range(80):
             async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=90) as client:
@@ -502,11 +585,113 @@ async def test_two_api_two_worker_recovery_smoke():
             assert len({instance_id for _operation, instance_id in tus_instances}) >= 2
             document_id = completed.headers["x-document-id"]
             extraction_job_id = completed.headers["x-job-id"]
-            await _wait_for_job(client, extraction_job_id)
+            accepting_api_container = _api_container_for_instance(completed_instance)
+            _disable_restart_and_kill(accepting_api_container, "KILL")
 
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            await _wait_for_job(client, extraction_job_id, forbidden_instance=completed_instance)
+
+        _compose("up", "-d", "--no-deps", "--scale", "api=2", "api")
+        restored_api_instances = set()
+        async with httpx.AsyncClient(base_url=api_url, timeout=20) as client:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and len(restored_api_instances) < 2:
+                try:
+                    response = await client.get("/health", headers={"Connection": "close"})
+                except httpx.TransportError:
+                    await asyncio.sleep(0.5)
+                    continue
+                if response.status_code == 200:
+                    restored_instance = response.headers.get("x-api-instance-id")
+                    if restored_instance:
+                        restored_api_instances.add(restored_instance)
+                await asyncio.sleep(0.25)
+        assert len(restored_api_instances) == 2
+
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
             graph = await client.post(f"/v1/knowledge-bases/{kb_id}/graph/rebuild")
             graph.raise_for_status()
             await _wait_for_job(client, graph.json()["job_id"])
+
+        graceful_lock_connection = None
+        graceful_transaction = None
+        graceful_transaction_started = False
+        try:
+            graceful_lock_connection = await pool.acquire()
+            graceful_transaction = graceful_lock_connection.transaction()
+            await graceful_transaction.start()
+            graceful_transaction_started = True
+            await graceful_lock_connection.execute("LOCK TABLE document_references IN ACCESS EXCLUSIVE MODE")
+            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+                graceful_response = await client.post(
+                    f"/v1/knowledge-bases/{graceful_kb_id}/graph/rebuild"
+                )
+                graceful_response.raise_for_status()
+                graceful_job_id = UUID(graceful_response.json()["job_id"])
+
+            graceful_running = await _wait_for_running_job(pool, graceful_job_id)
+            old_owner = graceful_running["lease_owner"]
+            graceful_worker_container = _worker_container_for_owner(old_owner)
+            subprocess.run(["docker", "update", "--restart=no", graceful_worker_container], check=True)
+            subprocess.run(["docker", "kill", "--signal", "TERM", graceful_worker_container], check=True)
+
+            deadline = time.monotonic() + 40
+            graceful_transition = None
+            while time.monotonic() < deadline:
+                graceful_transition = await pool.fetchrow(
+                    "SELECT state::text, lease_owner, lease_expires_at, error_code "
+                    "FROM background_jobs WHERE id = $1",
+                    graceful_job_id,
+                )
+                if (
+                    graceful_transition
+                    and graceful_transition["state"] in {"retry_wait", "succeeded"}
+                    and graceful_transition["lease_owner"] is None
+                    and graceful_transition["lease_expires_at"] is None
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            assert graceful_transition is not None
+            assert graceful_transition["state"] in {"retry_wait", "succeeded"}
+            assert graceful_transition["lease_owner"] is None
+            assert graceful_transition["lease_expires_at"] is None
+
+            graceful_exit = _wait_for_container_exit(graceful_worker_container)
+            graceful_logs = subprocess.run(
+                ["docker", "logs", graceful_worker_container],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            assert graceful_exit["ExitCode"] == 0
+            assert "shutdown on SIGTERM" in graceful_logs.stderr + graceful_logs.stdout
+
+            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+                next_response = await client.post(f"/v1/knowledge-bases/{kb_id}/graph/rebuild")
+                next_response.raise_for_status()
+                next_job_id = UUID(next_response.json()["job_id"])
+            next_running = await _wait_for_running_job(pool, next_job_id)
+            assert next_running["lease_owner"] != old_owner
+            old_owner_claims = await pool.fetchval(
+                "SELECT count(*) FROM background_jobs "
+                "WHERE state = 'running' AND lease_owner = $1",
+                old_owner,
+            )
+            assert old_owner_claims == 0
+        finally:
+            try:
+                if graceful_transaction_started:
+                    await graceful_transaction.rollback()
+            finally:
+                if graceful_lock_connection is not None:
+                    await pool.release(graceful_lock_connection)
+
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            graceful_finished = await _wait_for_job(client, str(graceful_job_id), timeout=120)
+            assert graceful_finished["attempt_count"] >= 2
+            await _wait_for_job(client, str(next_job_id), timeout=120)
+
+        _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker")
 
         lock_connection = None
         transaction = None
@@ -536,7 +721,6 @@ async def test_two_api_two_worker_recovery_smoke():
                 container_id = _worker_container_for_owner(owner)
                 kill_started = time.monotonic()
                 subprocess.run(["docker", "kill", "--signal", "KILL", container_id], check=True)
-                killed_worker = True
         finally:
             try:
                 if transaction_started:
@@ -570,8 +754,18 @@ async def test_two_api_two_worker_recovery_smoke():
         assert duplicate_counts["refs"] == duplicate_counts["unique_refs"]
     finally:
         try:
-            if killed_worker:
-                _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker", check=False)
+            _compose(
+                "up",
+                "-d",
+                "--no-deps",
+                "--scale",
+                "api=2",
+                "--scale",
+                "worker=2",
+                "api",
+                "worker",
+                check=False,
+            )
         finally:
-            await pool.execute("DELETE FROM knowledge_bases WHERE id = $1", kb_id)
+            await pool.execute("DELETE FROM knowledge_bases WHERE id = ANY($1::uuid[])", [kb_id, graceful_kb_id])
             await pool.close()
