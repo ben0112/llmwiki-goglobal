@@ -220,7 +220,13 @@ jobs:
           TUS_MULTIPART_S3_ACCESS_KEY: test-access
           TUS_MULTIPART_S3_SECRET_KEY: test-secret-key
           TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
-        run: python -m tests.helpers.ci_test_matrix integration-api | xargs env PYTHONPATH=api MODE=hosted pytest -v
+        run: |
+          set -e
+          set -o pipefail
+          python -m tests.helpers.ci_test_matrix integration-api |
+            while IFS= read -r test_file; do
+              PYTHONPATH=api MODE=hosted pytest "$test_file" -v
+            done
 
       - name: Run MCP Postgres isolation tests
         run: python -m tests.helpers.ci_test_matrix integration-mcp-postgres | xargs env PYTHONPATH=mcp pytest -v

@@ -21,7 +21,24 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
     ):
         command = f"python -m tests.helpers.ci_test_matrix {segment}"
         assert command in workflow
-        assert f"{command} | xargs" in workflow
+        if segment == "integration-api":
+            assert f"{command} |" in workflow
+            assert "while IFS= read -r test_file; do" in workflow
+            assert 'PYTHONPATH=api MODE=hosted pytest "$test_file" -v' in workflow
+        else:
+            assert f"{command} | xargs" in workflow
+
+
+def test_api_integration_files_use_fresh_pytest_session_fixtures():
+    """Each file must get the session fixture that recreates the Postgres schema."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("- name: Run complete isolated API integration matrix", 1)[1]
+    step = step.split("- name:", 1)[0]
+
+    assert "set -o pipefail" in step
+    assert "while IFS= read -r test_file; do" in step
+    assert 'pytest "$test_file"' in step
+    assert "xargs env PYTHONPATH=api MODE=hosted pytest" not in step
 
 
 def test_each_test_file_has_exactly_one_primary_ci_segment():
