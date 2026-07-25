@@ -377,11 +377,7 @@ class HybridRetrievalService:
     async def retrieve(self, query: SearchQuery) -> SearchResult:
         started_at = perf_counter()
         if self._vector is None:
-            lexical = _validate_backend_result(
-                await self._lexical.retrieve(query),
-                query=query,
-                label="lexical",
-            )
+            lexical = await self._retrieve_lexical(query)
             return await self._finish(
                 query,
                 lexical.hits,
@@ -391,12 +387,11 @@ class HybridRetrievalService:
                 started_at=started_at,
             )
 
-        lexical_raw, vector_raw = await _gather_retrievers(
-            self._lexical.retrieve(query),
+        lexical, vector = await _gather_retrievers(
+            self._retrieve_lexical(query),
             self._retrieve_vector(query),
         )
-        lexical = _validate_backend_result(lexical_raw, query=query, label="lexical")
-        if vector_raw is _VECTOR_UNAVAILABLE:
+        if vector is _VECTOR_UNAVAILABLE:
             return await self._finish(
                 query,
                 lexical.hits,
@@ -406,7 +401,6 @@ class HybridRetrievalService:
                 started_at=started_at,
             )
 
-        vector = _validate_backend_result(vector_raw, query=query, label="vector")
         fused = _reciprocal_rank_fusion(lexical.hits, vector.hits, rrf_k=self._rrf_k)
         return await self._finish(
             query,
@@ -417,13 +411,21 @@ class HybridRetrievalService:
             started_at=started_at,
         )
 
+    async def _retrieve_lexical(self, query: SearchQuery) -> SearchResult:
+        return _validate_backend_result(
+            await self._lexical.retrieve(query),
+            query=query,
+            label="lexical",
+        )
+
     async def _retrieve_vector(self, query: SearchQuery) -> SearchResult | object:
         if self._vector is None:  # pragma: no cover - guarded by retrieve().
             raise RuntimeError("vector retriever is not configured")
         try:
-            return await self._vector.retrieve(query)
+            result = await self._vector.retrieve(query)
         except RetrieverUnavailable:
             return _VECTOR_UNAVAILABLE
+        return _validate_backend_result(result, query=query, label="vector")
 
     async def _finish(
         self,
@@ -494,6 +496,8 @@ def _validate_backend_result(
         raise TypeError(f"{label} retriever must return exact SearchResult")
     if len(result.hits) > query.candidate_limit:
         raise ValueError(f"{label} retriever returned more hits than candidate_limit")
+    if result.candidate_count < len(result.hits):
+        raise ValueError(f"{label} retriever candidate_count is less than returned hits")
     return result
 
 

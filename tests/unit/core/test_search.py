@@ -111,6 +111,16 @@ class _FailAfterPeerStarts:
         raise self.error
 
 
+class _ReturnAfterPeerStarts:
+    def __init__(self, peer_started, result):
+        self.peer_started = peer_started
+        self.result = result
+
+    async def retrieve(self, query):
+        await self.peer_started.wait()
+        return self.result
+
+
 class _SelfCancellingRetriever:
     def __init__(self, peer_started):
         self.peer_started = peer_started
@@ -755,6 +765,49 @@ async def test_hybrid_rejects_non_search_results_symmetrically(invalid_side):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_side", ["lexical", "vector"])
+@pytest.mark.parametrize("invalid_kind", ["type", "oversized", "undercounted"])
+async def test_invalid_backend_result_cancels_blocked_peer(
+    invalid_side,
+    invalid_kind,
+):
+    blocked = _BlockingRetriever(_hit("blocked"))
+    if invalid_kind == "type":
+        invalid_result = object()
+        error = TypeError
+        message = f"{invalid_side} retriever must return exact SearchResult"
+    elif invalid_kind == "oversized":
+        invalid_result = SearchResult(
+            hits=(_hit("a"), _hit("b"), _hit("c")),
+            candidate_count=3,
+        )
+        error = ValueError
+        message = f"{invalid_side} retriever returned more hits than candidate_limit"
+    else:
+        invalid_result = SearchResult(
+            hits=(_hit("a"), _hit("b")),
+            candidate_count=1,
+        )
+        error = ValueError
+        message = f"{invalid_side} retriever candidate_count is less than returned hits"
+    invalid = _ReturnAfterPeerStarts(blocked.started, invalid_result)
+    service = HybridRetrievalService(
+        lexical=invalid if invalid_side == "lexical" else blocked,
+        vector=blocked if invalid_side == "lexical" else invalid,
+    )
+
+    with pytest.raises(error, match=message):
+        await asyncio.wait_for(
+            service.retrieve(
+                SearchQuery.build(text="q", limit=2, candidate_limit=2)
+            ),
+            timeout=0.1,
+        )
+
+    assert blocked.finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_lexical_profile_rejects_search_result_subclasses():
     class DerivedSearchResult(SearchResult):
         pass
@@ -890,6 +943,7 @@ async def test_expander_appends_unique_new_hits_without_displacing_direct_hits()
 
     assert result.hits == (direct, expansion)
     assert expander.inputs == [(direct,)]
+    assert result.returned_count == 2
     assert result.candidate_count == 1
 
 
