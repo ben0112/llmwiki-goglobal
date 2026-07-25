@@ -18,8 +18,8 @@ class MultipartPart:
     etag: str
 
     def __post_init__(self) -> None:
-        if not 1 <= self.part_number <= 10_000:
-            raise ValueError("part_number must be between 1 and 10000")
+        _validate_part_number(self.part_number)
+        _validate_etag(self.etag)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +27,16 @@ class ObjectMetadata:
     size: int
     etag: str
     content_type: str | None
+
+
+def _validate_part_number(part_number: object) -> None:
+    if isinstance(part_number, bool) or not isinstance(part_number, int) or not 1 <= part_number <= 10_000:
+        raise ValueError("part_number must be an integer between 1 and 10000")
+
+
+def _validate_etag(etag: object) -> None:
+    if not isinstance(etag, str) or not etag.strip():
+        raise ValueError("etag must be a non-empty string")
 
 
 def _normalize_etag(etag: str) -> str:
@@ -78,8 +88,7 @@ class S3Service:
         part_number: int,
         body: bytes,
     ) -> str:
-        if not 1 <= part_number <= 10_000:
-            raise ValueError("part_number must be between 1 and 10000")
+        _validate_part_number(part_number)
         async with self._session.client("s3", **s3_client_kwargs()) as s3:
             response = await s3.upload_part(
                 Bucket=self._bucket,
@@ -96,10 +105,20 @@ class S3Service:
         upload_id: str,
         parts: list[MultipartPart],
     ) -> None:
-        ordered_parts = [
-            {"PartNumber": part.part_number, "ETag": part.etag}
-            for part in sorted(parts, key=lambda part: part.part_number)
-        ]
+        if not parts:
+            raise ValueError("multipart completion requires at least one part")
+
+        seen_part_numbers: set[int] = set()
+        ordered_parts: list[dict] = []
+        for part in parts:
+            _validate_part_number(part.part_number)
+            _validate_etag(part.etag)
+            if part.part_number in seen_part_numbers:
+                raise ValueError(f"duplicate PartNumber: {part.part_number}")
+            seen_part_numbers.add(part.part_number)
+            ordered_parts.append({"PartNumber": part.part_number, "ETag": part.etag})
+        ordered_parts.sort(key=lambda part: part["PartNumber"])
+
         async with self._session.client("s3", **s3_client_kwargs()) as s3:
             await s3.complete_multipart_upload(
                 Bucket=self._bucket,

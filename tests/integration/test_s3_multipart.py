@@ -54,8 +54,10 @@ async def test_real_minio_multipart_lifecycle(minio_service):
     service = minio_service
     completed_key = f"multipart-tests/{uuid4()}/completed.bin"
     aborted_key = f"multipart-tests/{uuid4()}/aborted.bin"
+    duplicate_key = f"multipart-tests/{uuid4()}/duplicate.bin"
     completed_upload_id: str | None = None
     aborted_upload_id: str | None = None
+    duplicate_upload_id: str | None = None
 
     try:
         await service.head_bucket()
@@ -107,6 +109,37 @@ async def test_real_minio_multipart_lifecycle(minio_service):
         assert _client_error_code(exc_info.value) == "NoSuchUpload"
         aborted_upload_id = None
 
+        duplicate_upload_id = await service.create_multipart(
+            duplicate_key,
+            "application/octet-stream",
+        )
+        duplicate_first_etag = await service.upload_part(
+            duplicate_key,
+            duplicate_upload_id,
+            1,
+            first_body,
+        )
+        duplicate_second_etag = await service.upload_part(
+            duplicate_key,
+            duplicate_upload_id,
+            2,
+            b"tail",
+        )
+        with pytest.raises(ValueError, match="duplicate PartNumber"):
+            await service.complete_multipart(
+                duplicate_key,
+                duplicate_upload_id,
+                [
+                    s3_module.MultipartPart(part_number=2, etag=duplicate_second_etag),
+                    s3_module.MultipartPart(part_number=1, etag=duplicate_first_etag),
+                    s3_module.MultipartPart(part_number=1, etag=duplicate_first_etag),
+                ],
+            )
+        assert await service.head_object(duplicate_key) is None
+        await service.abort_multipart(duplicate_key, duplicate_upload_id)
+        duplicate_upload_id = None
+        assert await service.head_object(duplicate_key) is None
+
         await service.delete_object(completed_key)
         assert await service.head_object(completed_key) is None
     finally:
@@ -131,5 +164,16 @@ async def test_real_minio_multipart_lifecycle(minio_service):
                 except ClientError as exc:
                     if _client_error_code(exc) != "NoSuchUpload":
                         raise
+            if duplicate_upload_id is not None:
+                try:
+                    await client.abort_multipart_upload(
+                        Bucket=service._bucket,
+                        Key=duplicate_key,
+                        UploadId=duplicate_upload_id,
+                    )
+                except ClientError as exc:
+                    if _client_error_code(exc) != "NoSuchUpload":
+                        raise
             await client.delete_object(Bucket=service._bucket, Key=completed_key)
             await client.delete_object(Bucket=service._bucket, Key=aborted_key)
+            await client.delete_object(Bucket=service._bucket, Key=duplicate_key)

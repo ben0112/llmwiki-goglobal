@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
@@ -187,11 +188,11 @@ async def test_multipart_calls_use_exact_s3_parameters_and_order_parts():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("part_number", [0, 10_001])
+@pytest.mark.parametrize("part_number", [0, 10_001, True, 1.5, "1"])
 async def test_upload_part_rejects_part_numbers_outside_s3_bounds(part_number):
     _, service, client = _fake_service()
 
-    with pytest.raises(ValueError, match="1.*10000"):
+    with pytest.raises(ValueError, match="integer.*1.*10000"):
         await service.upload_part("object.bin", "upload-123", part_number, b"body")
 
     assert client.calls == []
@@ -204,6 +205,45 @@ async def test_upload_part_accepts_s3_boundary_part_numbers(part_number):
 
     assert await service.upload_part("object.bin", "upload-123", part_number, b"x") == "part-etag"
     assert client.calls[0][1]["PartNumber"] == part_number
+
+
+@pytest.mark.asyncio
+async def test_complete_multipart_rejects_empty_manifest_before_s3_call():
+    _, service, client = _fake_service()
+
+    with pytest.raises(ValueError, match="at least one"):
+        await service.complete_multipart("object.bin", "upload-123", [])
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_complete_multipart_rejects_duplicate_part_numbers_before_s3_call():
+    s3, service, client = _fake_service()
+    parts = [
+        s3.MultipartPart(part_number=1, etag="first"),
+        s3.MultipartPart(part_number=1, etag="duplicate"),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate PartNumber"):
+        await service.complete_multipart("object.bin", "upload-123", parts)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("etag", [None, "", "   ", 1, True])
+async def test_complete_multipart_rejects_invalid_etags_before_s3_call(etag):
+    _, service, client = _fake_service()
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        await service.complete_multipart(
+            "object.bin",
+            "upload-123",
+            [SimpleNamespace(part_number=1, etag=etag)],
+        )
+
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
@@ -262,11 +302,18 @@ def test_multipart_part_is_immutable():
         part.etag = "changed"
 
 
-@pytest.mark.parametrize("part_number", [0, 10_001])
+@pytest.mark.parametrize("part_number", [0, 10_001, True, 1.5, "1"])
 def test_multipart_part_rejects_part_numbers_outside_s3_bounds(part_number):
     s3 = _s3_module()
-    with pytest.raises(ValueError, match="1.*10000"):
+    with pytest.raises(ValueError, match="integer.*1.*10000"):
         s3.MultipartPart(part_number=part_number, etag="etag")
+
+
+@pytest.mark.parametrize("etag", [None, "", "   ", 1, True])
+def test_multipart_part_rejects_non_string_or_blank_etags(etag):
+    s3 = _s3_module()
+    with pytest.raises(ValueError, match="non-empty string"):
+        s3.MultipartPart(part_number=1, etag=etag)
 
 
 # ---------------------------------------------------------------------------
