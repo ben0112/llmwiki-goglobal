@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implementation incomplete — final specification review in progress
+**Status:** Implemented and verified
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -389,12 +389,17 @@ changes are immutable commits:
 - `01ed3a03d764242dac925776ad81afe43405bba7` and
   `8c1f57e89e0e2829fe614ba079f0234154632742` — fresh pytest processes for each
   Postgres API and MCP file, so session schema fixtures and MCP plugin fixtures
-  cannot pollute one another.
+  cannot pollute one another;
+- `512233ecb641169c9468b3a626592523c2fdb14d` and
+  `ced3a091d5478595242ba2332b91fb5f88ab63e7` — drain-window fencing that makes
+  a new independent job available after TERM while the old worker is still
+  alive, rejects any new claim by the old owner until exit, and requires a
+  local Redis `WAITAOF` fsync before restart.
 
 GitHub Actions run
-[30150825870](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30150825870)
-verified commit `8c1f57e89e0e2829fe614ba079f0234154632742`: all six jobs passed. The primary
-manifest owns 90 test files exactly once and executed 1,455 tests with no
+[30151736094](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30151736094)
+verified commit `ced3a091d5478595242ba2332b91fb5f88ab63e7`: all six jobs passed. The primary
+manifest owns 90 test files exactly once and executed 1,456 tests with no
 skips or failures:
 
 | Isolated segment | Result | Required runtime |
@@ -408,7 +413,7 @@ skips or failures:
 | `integration-mcp-postgres` | 40 passed | Postgres 16.11 |
 | `integration-redis` | 36 passed | Redis 7.4.2 |
 | `integration-minio` | 1 passed | MinIO `RELEASE.2025-04-22T22-12-26Z` |
-| `integration-scaled` | 9 passed | two API, two worker, gateway, Postgres, Redis AOF, MinIO, auth, converter |
+| `integration-scaled` | 10 passed | two API, two worker, gateway, Postgres, Redis AOF, MinIO, auth, converter |
 
 The workflow invokes the complete partitions with these commands; the two
 Postgres partitions deliberately run one file per pytest process:
@@ -433,7 +438,7 @@ python -m tests.helpers.ci_test_matrix integration-mcp-postgres |
   done
 ```
 
-The workflow also passed four matrix ownership contract tests and eight scaled
+The workflow also passed four matrix ownership contract tests and nine scaled
 static tests; the live-only scaled test was intentionally skipped in the
 static step and then passed in the required Compose job. Raw aggregate
 `tests/unit` and `tests/integration` commands are not claimed as passing:
@@ -443,3 +448,5 @@ the verified matrix uses isolated processes.
 Changed Task 14 Python paths pass Ruff. The separate repository-wide audit
 `.venv/bin/ruff check . --statistics` reports 286 pre-existing findings, 174
 automatically fixable; repository-wide Ruff is therefore not claimed clean.
+An independent final specification review found no remaining Critical,
+Important, or Minor findings.
