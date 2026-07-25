@@ -422,6 +422,19 @@ def test_promotion_decision_handles_finite_values_whose_ratio_overflows():
     assert math.isfinite(latency.latency_ratio)
 
 
+def test_promotion_gate_rejects_no_improvement_at_minimum_positive_recall():
+    minimum_positive = float.fromhex("0x0.0000000000001p-1022")
+
+    decision = promotion_decision(
+        _report(recall_at_10=minimum_positive, latency_p95_ms=1),
+        _report(recall_at_10=minimum_positive, latency_p95_ms=1),
+    )
+
+    assert decision.recall_ratio == 1
+    assert decision.eligible is False
+    assert decision.reason == "gate_failed"
+
+
 def test_public_evaluation_values_are_immutable():
     judgment = RelevanceJudgment("doc", 1)
     run = _run("case", ("doc", 0))

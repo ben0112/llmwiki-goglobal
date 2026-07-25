@@ -517,18 +517,18 @@ def promotion_decision(
         raise ValueError("promotion inputs must be EvaluationReport values")
     if lexical.recall_at_10 <= 0:
         return PromotionDecision(False, "baseline_recall_zero")
-    recall_threshold = lexical.recall_at_10 * 1.10
     latency_baseline = max(lexical.latency_p95_ms, 0.001)
-    latency_threshold = latency_baseline * 2.0
-    quality_gate = hybrid.recall_at_10 >= recall_threshold or isclose(
-        hybrid.recall_at_10,
-        recall_threshold,
+    recall_ratio = _bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10)
+    latency_ratio = _bounded_ratio(hybrid.latency_p95_ms, latency_baseline)
+    quality_gate = recall_ratio >= 1.10 or isclose(
+        recall_ratio,
+        1.10,
         rel_tol=PROMOTION_GATE_TOLERANCE,
         abs_tol=0.0,
     )
-    latency_gate = hybrid.latency_p95_ms <= latency_threshold or isclose(
-        hybrid.latency_p95_ms,
-        latency_threshold,
+    latency_gate = latency_ratio <= 2.0 or isclose(
+        latency_ratio,
+        2.0,
         rel_tol=PROMOTION_GATE_TOLERANCE,
         abs_tol=0.0,
     )
@@ -536,8 +536,8 @@ def promotion_decision(
     return PromotionDecision(
         eligible=eligible,
         reason="eligible" if eligible else "gate_failed",
-        recall_ratio=_bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10),
-        latency_ratio=_bounded_ratio(hybrid.latency_p95_ms, latency_baseline),
+        recall_ratio=recall_ratio,
+        latency_ratio=latency_ratio,
     )
 
 
