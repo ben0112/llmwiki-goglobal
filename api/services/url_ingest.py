@@ -19,6 +19,7 @@ from infra.safe_fetch import build_pinned_request, parse_public_fetch_url, redir
 from services.types import DownloadedPdf, IngestedPdf
 
 if TYPE_CHECKING:
+    from infra.quota import QuotaReservation, QuotaService
     from jobs.service import JobService
     from services.s3 import S3Service
 
@@ -28,16 +29,24 @@ MAX_PDF_BYTES = 50 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 30
 MAX_REDIRECTS = 5
 USER_AGENT = "LLMWiki/1.0 (+https://llmwiki.app)"
+URL_QUOTA_RESERVATION_TTL_SECONDS = 3600
 
 _ARXIV_ABS_RE = re.compile(r"^(https?://(?:www\.)?arxiv\.org)/abs/(.+)$")
 _DISPOSITION_FILENAME_RE = re.compile(r'filename\*?=(?:"([^"]+)"|([^;\s]+))', re.IGNORECASE)
 
 
 class UrlIngestService:
-    def __init__(self, pool: asyncpg.Pool, s3_service: S3Service, job_service: JobService):
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        s3_service: S3Service,
+        job_service: JobService,
+        quota_service: QuotaService | None,
+    ):
         self.pool = pool
         self.s3 = s3_service
         self.jobs = job_service
+        self.quota = quota_service
 
     async def ingest_pdf(self, user_id: str, kb_id: str, url: str, path: str) -> IngestedPdf:
         url = _normalize_pdf_url(url)
@@ -113,14 +122,15 @@ class UrlIngestService:
         from jobs.models import JobCreate, JobType
 
         document_id = str(uuid4())
+        reservation = await self._reserve_quota(user_id, document_id, len(pdf.data))
         s3_key = f"{user_id}/{document_id}/source.pdf"
         try:
             await self.s3.upload_bytes(s3_key, pdf.data, "application/pdf")
         except asyncio.CancelledError:
-            await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
+            await self._shield_to_completion(self._compensate_temporary_ingest(user_id, document_id, reservation))
             raise
         except Exception:  # noqa: BLE001 - storage implementations use different typed SDK errors.
-            await self._delete_uploaded_document_prefix(user_id, document_id)
+            await self._shield_to_completion(self._compensate_temporary_ingest(user_id, document_id, reservation))
             raise HTTPException(
                 status_code=502,
                 detail="Could not store the downloaded PDF — try again",
@@ -141,10 +151,13 @@ class UrlIngestService:
             transaction = conn.transaction()
             await transaction.start()
             transaction_started = True
+            # Quota's Redis lock ends after admission. Keep the existing
+            # transaction-scoped serialization for the source_url recheck so
+            # two replicas cannot insert duplicate documents for one user.
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
             duplicate = await self._find_by_source_url(user_id, kb_id, url, conn=conn)
             if duplicate is None:
-                await self._insert_within_quota(
+                await self._insert_pending_document(
                     conn,
                     document_id,
                     kb_id,
@@ -193,13 +206,15 @@ class UrlIngestService:
                 user_id=user_id,
                 kb_id=kb_id,
                 document_id=document_id,
+                reservation=reservation,
             )
 
         if duplicate is not None:
-            await self._delete_uploaded_document_prefix(user_id, document_id)
+            await self._shield_to_completion(self._compensate_temporary_ingest(user_id, document_id, reservation))
             if release_failure is not None:
                 raise release_failure.with_traceback(release_failure_traceback)
             return {**duplicate, "already_exists": True, "job_id": str(job.id)}
+        await self._shield_to_completion(self._settle_quota(reservation, finalize=True))
         if release_failure is not None:
             raise release_failure.with_traceback(release_failure_traceback)
 
@@ -222,13 +237,76 @@ class UrlIngestService:
         user_id: str,
         kb_id: str,
         document_id: str,
+        reservation: QuotaReservation,
     ) -> None:
         committed: bool | None = False
         if commit_attempted and duplicate is None and job is not None:
             committed = await asyncio.shield(self._confirm_document_job_committed(user_id, kb_id, document_id, job.id))
         if duplicate is not None or committed is False:
-            await asyncio.shield(self._delete_uploaded_document_prefix(user_id, document_id))
+            await self._shield_to_completion(self._compensate_temporary_ingest(user_id, document_id, reservation))
+        elif committed is True:
+            await self._shield_to_completion(self._settle_quota(reservation, finalize=True))
         raise failure.with_traceback(failure_traceback)
+
+    async def _reserve_quota(self, user_id: str, document_id: str, byte_count: int) -> QuotaReservation:
+        from infra.quota import QuotaExceeded, QuotaUnavailable
+
+        if self.quota is None:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable")
+        try:
+            return await self.quota.reserve(
+                UUID(user_id),
+                UUID(document_id),
+                byte_count,
+                ttl_seconds=URL_QUOTA_RESERVATION_TTL_SECONDS,
+            )
+        except QuotaExceeded as exc:
+            used_mb = exc.used_bytes / (1024 * 1024)
+            max_mb = exc.limit_bytes / (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=f"Storage quota exceeded. Using {used_mb:.0f} MB of {max_mb:.0f} MB.",
+            ) from None
+        except QuotaUnavailable:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable") from None
+
+    async def _settle_quota(self, reservation: QuotaReservation, *, finalize: bool) -> None:
+        quota = self.quota
+        if quota is None:  # Reserve cannot have produced a reservation in this state.
+            return
+        try:
+            if finalize:
+                await quota.finalize(reservation)
+            else:
+                await quota.release(reservation)
+        except Exception as exc:  # noqa: BLE001 - TTL cleanup is the conservative fallback.
+            logger.error(
+                "URL ingest quota settlement failed operation=%s upload_id=%s error_type=%s",
+                "finalize" if finalize else "release",
+                reservation.upload_id,
+                type(exc).__name__,
+            )
+
+    async def _compensate_temporary_ingest(
+        self,
+        user_id: str,
+        document_id: str,
+        reservation: QuotaReservation,
+    ) -> None:
+        try:
+            await self._delete_uploaded_document_prefix(user_id, document_id)
+        finally:
+            await self._settle_quota(reservation, finalize=False)
+
+    async def _shield_to_completion(self, operation) -> None:
+        """Finish a bounded compensation/settlement before propagating cancellation."""
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            with suppress(asyncio.CancelledError):
+                await task
+            raise cancelled
 
     async def _commit_transaction(self, transaction) -> None:
         await transaction.commit()
@@ -278,8 +356,20 @@ class UrlIngestService:
     ) -> None:
         """Quota check + pending-row insert under a per-user advisory lock, so
         concurrent ingests cannot all pass the same SUM(file_size) read."""
-        title = pdf.filename.rsplit(".", 1)[0]
         await self._check_storage_quota(conn, user_id, len(pdf.data))
+        await self._insert_pending_document(conn, document_id, kb_id, user_id, pdf, path, url)
+
+    async def _insert_pending_document(
+        self,
+        conn: asyncpg.Connection,
+        document_id: str,
+        kb_id: str,
+        user_id: str,
+        pdf: DownloadedPdf,
+        path: str,
+        url: str,
+    ) -> None:
+        title = pdf.filename.rsplit(".", 1)[0]
         await conn.execute(
             "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
             "file_type, file_size, status, metadata) "
@@ -375,7 +465,7 @@ class _LegacyUrlIngestCompatibility(UrlIngestService):
     """Rollback-only Hosted URL producer using process-local OCR dispatch."""
 
     def __init__(self, pool: asyncpg.Pool, s3_service: S3Service, ocr_service: object):
-        super().__init__(pool, s3_service, job_service=None)
+        super().__init__(pool, s3_service, job_service=None, quota_service=None)
         self.ocr = ocr_service
 
     async def _return_existing(self, existing: dict, user_id: str, kb_id: str) -> dict:

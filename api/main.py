@@ -119,6 +119,67 @@ async def _recover_hosted_extractions(
     return rows
 
 
+async def _start_hosted_quota_runtime(pool, redis_url: str):
+    """Create and verify the API replica's single shared quota Redis client."""
+    from infra.quota import HostedQuotaService
+    from infra.redis import create_redis
+
+    redis = create_redis(redis_url)
+    try:
+        await redis.ping()
+    except BaseException:
+        await redis.aclose()
+        raise
+    return redis, HostedQuotaService(pool, redis)
+
+
+async def _finish_hosted_startup(app: FastAPI, pool):
+    """Build Hosted services and background tasks after core infra is ready."""
+    await _repair_hosted_derived_drift(pool)
+
+    s3_service = None
+    ocr_service = None
+    if settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET:
+        from services.s3 import S3Service
+
+        s3_service = S3Service()
+    if s3_service:
+        from services.ocr import OCRService
+
+        ocr_service = OCRService(s3_service, pool)
+
+    app.state.s3_service = s3_service
+    app.state.ocr_service = ocr_service
+    app.state.auth_provider = None  # Uses Supabase JWKS auth via deps.py
+
+    from services.hosted import HostedServiceFactory
+
+    app.state.factory = HostedServiceFactory(pool, s3_service, ocr_service)
+
+    await _recover_hosted_extractions(
+        pool,
+        durable_jobs_enabled=settings.DURABLE_JOBS_ENABLED,
+        job_service=app.state.job_service,
+        ocr_service=ocr_service,
+    )
+
+    from routes.ws import setup_listener
+
+    listener_task = await setup_listener(settings.listen_database_url)
+    try:
+        from infra.tus import cleanup_stale_uploads
+
+        cleanup_task = asyncio.create_task(cleanup_stale_uploads())
+    except BaseException:
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
+        raise
+    return listener_task, cleanup_task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.MODE == "local":
@@ -139,54 +200,49 @@ async def lifespan(app: FastAPI):
     app.state.mode = "hosted"
 
     app.state.job_service = None
+    app.state.quota_service = None
+    quota_redis = None
     if settings.DURABLE_JOBS_ENABLED:
         from jobs.service import JobService
 
         app.state.job_service = JobService(pool)
-
-    await _repair_hosted_derived_drift(pool)
-
-    s3_service = None
-    ocr_service = None
-    if settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET:
-        from services.s3 import S3Service
-        s3_service = S3Service()
-    if s3_service:
-        from services.ocr import OCRService
-        ocr_service = OCRService(s3_service, pool)
-
-    app.state.s3_service = s3_service
-    app.state.ocr_service = ocr_service
-    app.state.auth_provider = None  # Uses Supabase JWKS auth via deps.py
-
-    from services.hosted import HostedServiceFactory
-    app.state.factory = HostedServiceFactory(pool, s3_service, ocr_service)
-
-    await _recover_hosted_extractions(
-        pool,
-        durable_jobs_enabled=settings.DURABLE_JOBS_ENABLED,
-        job_service=app.state.job_service,
-        ocr_service=ocr_service,
-    )
-
-    # Real-time document change notifications via WebSocket
-    from routes.ws import setup_listener
-    listener_task = await setup_listener(settings.listen_database_url)
-
-    from infra.tus import cleanup_stale_uploads
-    cleanup_task = asyncio.create_task(cleanup_stale_uploads())
-
-    yield
-
-    # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
-    cleanup_task.cancel()
-    listener_task.cancel()
-    for task in (cleanup_task, listener_task):
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    await pool.close()
+            quota_redis, app.state.quota_service = await _start_hosted_quota_runtime(
+                pool,
+                settings.REDIS_URL,
+            )
+        except BaseException:
+            await pool.close()
+            raise
+
+    try:
+        listener_task, cleanup_task = await _finish_hosted_startup(app, pool)
+    except BaseException:
+        try:
+            if quota_redis is not None:
+                await quota_redis.aclose()
+        finally:
+            await pool.close()
+        raise
+
+    try:
+        yield
+    finally:
+        # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
+        cleanup_task.cancel()
+        listener_task.cancel()
+        for task in (cleanup_task, listener_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - continue closing shared infrastructure.
+                logger.error("Hosted shutdown task failed error_type=%s", type(exc).__name__)
+        try:
+            if quota_redis is not None:
+                await quota_redis.aclose()
+        finally:
+            await pool.close()
 
 
 async def _local_lifespan_inner(app: FastAPI):
@@ -228,6 +284,7 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.storage_service = storage
     app.state.ocr_service = None
     app.state.job_service = None
+    app.state.quota_service = None
     app.state.auth_provider = auth_provider
     app.state.workspace_path = str(workspace)
 

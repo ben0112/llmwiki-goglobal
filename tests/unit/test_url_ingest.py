@@ -42,15 +42,22 @@ def _client_with_transport(handler):
 
 
 def _service() -> UrlIngestService:
-    return UrlIngestService(pool=None, s3_service=None, job_service=None)
+    return UrlIngestService(pool=None, s3_service=None, job_service=None, quota_service=None)
 
 
 def test_url_ingest_accepts_durable_job_service_instead_of_ocr_service():
     job_service = object()
+    quota_service = object()
 
-    service = UrlIngestService(pool=None, s3_service=None, job_service=job_service)
+    service = UrlIngestService(
+        pool=None,
+        s3_service=None,
+        job_service=job_service,
+        quota_service=quota_service,
+    )
 
     assert service.jobs is job_service
+    assert service.quota is quota_service
 
 
 class TestNormalizePdfUrl:
@@ -67,9 +74,11 @@ class TestNormalizePdfUrl:
 
 async def test_create_from_url_uses_durable_job_service_and_sets_response_header(monkeypatch):
     job_service = object()
+    quota_service = object()
     state = SimpleNamespace(
         s3_service=object(),
         job_service=job_service,
+        quota_service=quota_service,
         pool=object(),
     )
     app = SimpleNamespace(state=state)
@@ -81,8 +90,8 @@ async def test_create_from_url_uses_durable_job_service_and_sets_response_header
         return "00000000-0000-0000-0000-000000000001"
 
     class FakeUrlIngestService:
-        def __init__(self, pool, s3_service, jobs):
-            captured["args"] = (pool, s3_service, jobs)
+        def __init__(self, pool, s3_service, jobs, quota):
+            captured["args"] = (pool, s3_service, jobs, quota)
 
         async def ingest_pdf(self, user_id, kb_id, url, path):
             captured["call"] = (user_id, kb_id, url, path)
@@ -104,7 +113,7 @@ async def test_create_from_url_uses_durable_job_service_and_sets_response_header
 
     result = await document_routes.create_document_from_url.__wrapped__(request, body, response)
 
-    assert captured["args"] == (state.pool, state.s3_service, job_service)
+    assert captured["args"] == (state.pool, state.s3_service, job_service, quota_service)
     assert response.headers["X-Job-Id"] == result["job_id"]
 
 

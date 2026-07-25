@@ -118,9 +118,10 @@ async def create_document_from_url(request: Request, body: CreateFromUrl, respon
         raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
     if settings.DURABLE_JOBS_ENABLED:
         job_service = getattr(state, "job_service", None)
-        if not job_service:
-            raise HTTPException(status_code=501, detail="Durable URL ingestion is unavailable")
-        service = UrlIngestService(state.pool, state.s3_service, job_service)
+        quota_service = getattr(state, "quota_service", None)
+        if not job_service or not quota_service:
+            raise HTTPException(status_code=503, detail="Durable URL ingestion is unavailable")
+        service = UrlIngestService(state.pool, state.s3_service, job_service, quota_service)
     else:
         ocr_service = getattr(state, "ocr_service", None)
         if not ocr_service:

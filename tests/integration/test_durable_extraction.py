@@ -15,6 +15,7 @@ import pytest
 from botocore.exceptions import EndpointConnectionError
 from config import settings
 from fastapi import HTTPException
+from infra.quota import QuotaExceeded, QuotaReservation
 from jobs import repository
 from jobs.handlers import (
     RetryableJobError,
@@ -29,18 +30,21 @@ from jobs.models import JobCancelled, JobCreate, JobRecord, JobType, LeaseLost
 from jobs.service import JobService
 from services.ocr import OCRService
 from services.types import DownloadedPdf
-from services.url_ingest import UrlIngestService
+from services.url_ingest import UrlIngestService as _RealUrlIngestService
 
 
 class RecordingS3:
-    def __init__(self, *, upload_error: Exception | None = None) -> None:
+    def __init__(self, *, upload_error: Exception | None = None, events: list[str] | None = None) -> None:
         self.upload_error = upload_error
+        self.events = events
         self.objects: dict[str, bytes] = {}
         self.uploads: list[str] = []
         self.deleted_prefixes: list[str] = []
         self.presigned_gets: list[str] = []
 
     async def upload_bytes(self, key: str, data: bytes, content_type: str) -> None:
+        if self.events is not None:
+            self.events.append("s3_upload")
         self.uploads.append(key)
         if self.upload_error is not None:
             raise self.upload_error
@@ -64,6 +68,60 @@ class RecordingS3:
 
     async def delete_key(self, key: str) -> None:
         self.objects.pop(key, None)
+
+
+class RecordingQuota:
+    def __init__(
+        self,
+        *,
+        events: list[str] | None = None,
+        reserve_error: Exception | None = None,
+        finalize_error: Exception | None = None,
+        release_error: Exception | None = None,
+    ) -> None:
+        self.events = events
+        self.reserve_error = reserve_error
+        self.finalize_error = finalize_error
+        self.release_error = release_error
+        self.reservations: list[QuotaReservation] = []
+        self.finalized: list[QuotaReservation] = []
+        self.released: list[QuotaReservation] = []
+
+    async def reserve(self, user_id, upload_id, byte_count, ttl_seconds):
+        del ttl_seconds
+        if self.events is not None:
+            self.events.append("quota_reserve")
+        if self.reserve_error is not None:
+            raise self.reserve_error
+        reservation = QuotaReservation(user_id, upload_id, byte_count, f"owner-{upload_id}")
+        self.reservations.append(reservation)
+        return reservation
+
+    async def finalize(self, reservation):
+        if self.events is not None:
+            self.events.append("quota_finalize")
+        self.finalized.append(reservation)
+        if self.finalize_error is not None:
+            raise self.finalize_error
+        return True
+
+    async def release(self, reservation):
+        if self.events is not None:
+            self.events.append("quota_release")
+        self.released.append(reservation)
+        if self.release_error is not None:
+            raise self.release_error
+        return True
+
+
+def UrlIngestService(pool, s3_service, job_service, quota_service=None):
+    """Keep older extraction tests explicit about using an injectable quota contract."""
+    return _RealUrlIngestService(
+        pool,
+        s3_service,
+        job_service,
+        quota_service or RecordingQuota(),
+    )
 
 
 class ReleaseFailingPool:
@@ -204,10 +262,20 @@ async def _wait_for_blocked_backend(observer, backend_pid: int) -> None:
 @pytest.mark.asyncio
 async def test_url_ingest_commits_document_and_job_atomically_after_upload(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool)
-    s3 = RecordingS3()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    events: list[str] = []
+    s3 = RecordingS3(events=events)
+    quota = RecordingQuota(events=events)
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    original_commit = service._commit_transaction
+
+    async def recording_commit(transaction):
+        await original_commit(transaction)
+        events.append("pg_commit")
+
+    monkeypatch.setattr(service, "_commit_transaction", recording_commit)
 
     result = await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/paper.pdf", "/")
 
@@ -233,13 +301,17 @@ async def test_url_ingest_commits_document_and_job_atomically_after_upload(pool,
     assert json.loads(row["payload"]) == {"document_id": result["id"]}
     assert row["idempotency_key"] == f"document.extract:{result['id']}"
     assert s3.uploads == [f"{user_id}/{result['id']}/source.pdf"]
+    assert events == ["quota_reserve", "s3_upload", "pg_commit", "quota_finalize"]
+    assert quota.finalized == quota.reservations
+    assert quota.released == []
 
 
 @pytest.mark.asyncio
 async def test_url_ingest_transaction_failure_deletes_exact_uploaded_orphan(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool, storage_limit_bytes=1)
     s3 = RecordingS3()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota(reserve_error=QuotaExceeded(15, 1))
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -247,9 +319,8 @@ async def test_url_ingest_transaction_failure_deletes_exact_uploaded_orphan(pool
         await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/quota.pdf", "/")
 
     assert raised.value.status_code == 413
-    assert len(s3.uploads) == 1
-    document_prefix = s3.uploads[0].rsplit("source.pdf", 1)[0]
-    assert s3.deleted_prefixes == [document_prefix]
+    assert s3.uploads == []
+    assert s3.deleted_prefixes == []
     assert s3.objects == {}
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
     assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
@@ -266,7 +337,8 @@ async def test_url_ingest_job_failure_rolls_back_insert_and_deletes_uploaded_orp
             assert await conn.fetchval("SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1)", command.document_id)
             raise RuntimeError("deterministic job insert failure")
 
-    service = UrlIngestService(pool, s3, FailingJobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, FailingJobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -279,13 +351,16 @@ async def test_url_ingest_job_failure_rolls_back_insert_and_deletes_uploaded_orp
     assert s3.objects == {}
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
     assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
+    assert quota.released == quota.reservations
+    assert quota.finalized == []
 
 
 @pytest.mark.asyncio
 async def test_url_ingest_upload_failure_leaves_no_database_rows(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool)
     s3 = RecordingS3(upload_error=RuntimeError("storage offline secret=s3-token"))
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -296,6 +371,7 @@ async def test_url_ingest_upload_failure_leaves_no_database_rows(pool, monkeypat
     assert "secret" not in raised.value.detail
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
     assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
+    assert quota.released == quota.reservations
 
 
 @pytest.mark.asyncio
@@ -308,7 +384,8 @@ async def test_url_ingest_cancellation_after_upload_compensates_orphan(pool, mon
             raise asyncio.CancelledError
 
     s3 = CancelledAfterUpload()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -319,6 +396,7 @@ async def test_url_ingest_cancellation_after_upload_compensates_orphan(pool, mon
     assert s3.deleted_prefixes == [s3.uploads[0].rsplit("source.pdf", 1)[0]]
     assert s3.objects == {}
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
+    assert quota.released == quota.reservations
 
 
 @pytest.mark.asyncio
@@ -348,7 +426,8 @@ async def test_url_ingest_acquire_failure_after_upload_compensates_orphan(pool, 
 async def test_url_ingest_commit_error_preserves_artifact_when_document_and_job_committed(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool)
     s3 = RecordingS3()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -365,13 +444,16 @@ async def test_url_ingest_commit_error_preserves_artifact_when_document_and_job_
     assert s3.deleted_prefixes == []
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 1
     assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 1
+    assert quota.finalized == quota.reservations
+    assert quota.released == []
 
 
 @pytest.mark.asyncio
 async def test_url_ingest_commit_error_deletes_artifact_only_when_rollback_is_confirmed(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool)
     s3 = RecordingS3()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -386,13 +468,16 @@ async def test_url_ingest_commit_error_deletes_artifact_only_when_rollback_is_co
     assert s3.objects == {}
     assert s3.deleted_prefixes == [s3.uploads[0].rsplit("source.pdf", 1)[0]]
     assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
+    assert quota.released == quota.reservations
+    assert quota.finalized == []
 
 
 @pytest.mark.asyncio
 async def test_url_ingest_unknown_commit_outcome_preserves_artifact(pool, monkeypatch):
     user_id, kb_id = await _seed_tenant(pool)
     s3 = RecordingS3()
-    service = UrlIngestService(pool, s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -410,6 +495,26 @@ async def test_url_ingest_unknown_commit_outcome_preserves_artifact(pool, monkey
 
     assert len(s3.objects) == 1
     assert s3.deleted_prefixes == []
+    assert quota.finalized == []
+    assert quota.released == []
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_finalize_failure_never_rolls_back_committed_document(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    s3 = RecordingS3()
+    quota = RecordingQuota(finalize_error=ConnectionError("redis secret owner-token"))
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    result = await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/finalize-fail.pdf", "/")
+
+    assert await pool.fetchval("SELECT count(*) FROM documents WHERE id = $1::uuid", result["id"]) == 1
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE document_id = $1::uuid", result["id"]) == 1
+    assert len(s3.objects) == 1
+    assert quota.finalized == quota.reservations
+    assert quota.released == []
 
 
 @pytest.mark.asyncio
@@ -505,7 +610,8 @@ async def test_url_ingest_duplicate_commit_with_release_failure_deletes_only_tem
     s3 = RecordingS3()
     existing_key = f"{user_id}/{existing_doc_id}/source.pdf"
     s3.objects[existing_key] = b"existing-source"
-    service = UrlIngestService(ReleaseFailingPool(pool), s3, JobService(pool))
+    quota = RecordingQuota()
+    service = UrlIngestService(ReleaseFailingPool(pool), s3, JobService(pool), quota)
     pdf = DownloadedPdf(data=b"%PDF-1.7\ntemporary", filename="paper.pdf")
     monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
 
@@ -521,6 +627,59 @@ async def test_url_ingest_duplicate_commit_with_release_failure_deletes_only_tem
     assert s3.deleted_prefixes == [temporary_prefix]
     assert s3.objects == {existing_key: b"existing-source"}
     assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE document_id = $1", existing_doc_id) == 1
+    assert quota.released == quota.reservations
+    assert quota.finalized == []
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_duplicate_cleanup_finishes_after_caller_cancellation(pool, monkeypatch):
+    _job, user_id, kb_id, existing_doc_id = await _seed_document_job(pool)
+    source_url = "https://example.test/cancel-duplicate-cleanup.pdf"
+    existing = {
+        "id": str(existing_doc_id),
+        "knowledge_base_id": str(kb_id),
+        "title": None,
+        "path": "/",
+        "filename": "paper.pdf",
+        "status": "pending",
+    }
+    s3 = RecordingS3()
+    existing_key = f"{user_id}/{existing_doc_id}/source.pdf"
+    s3.objects[existing_key] = b"existing-source"
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ntemporary", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+
+    async def race_duplicate(_user_id, _kb_id, _url, *, conn=None):
+        return existing if conn is not None else None
+
+    monkeypatch.setattr(service, "_find_by_source_url", race_duplicate)
+    cleanup_entered = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_delete = service._delete_uploaded_document_prefix
+
+    async def controlled_delete(cleanup_user_id, cleanup_document_id):
+        cleanup_entered.set()
+        await allow_cleanup.wait()
+        await original_delete(cleanup_user_id, cleanup_document_id)
+
+    monkeypatch.setattr(service, "_delete_uploaded_document_prefix", controlled_delete)
+    ingest = asyncio.create_task(service.ingest_pdf(str(user_id), str(kb_id), source_url, "/"))
+    await cleanup_entered.wait()
+
+    ingest.cancel()
+    await asyncio.sleep(0)
+    assert not ingest.done()
+    allow_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await ingest
+
+    temporary_prefix = s3.uploads[0].rsplit("source.pdf", 1)[0]
+    assert s3.deleted_prefixes == [temporary_prefix]
+    assert s3.objects == {existing_key: b"existing-source"}
+    assert quota.released == quota.reservations
+    assert quota.finalized == []
 
 
 @pytest.mark.asyncio
