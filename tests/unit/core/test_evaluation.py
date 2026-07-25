@@ -1,9 +1,11 @@
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from llmwiki_core import evaluation as evaluation_module
 from llmwiki_core.evaluation import (
     EvalCase,
     EvaluationReport,
@@ -182,6 +184,30 @@ def test_parser_rejects_oversized_input(tmp_path):
         load_cases(_write_jsonl(tmp_path, payload))
 
 
+def test_parser_rejects_non_regular_files_before_opening(tmp_path):
+    with pytest.raises(ValueError, match="must be a regular file"):
+        load_cases(tmp_path)
+
+
+def test_parser_enforces_cumulative_bytes_while_reading(tmp_path, monkeypatch):
+    path = _write_jsonl(
+        tmp_path,
+        _case_payload("case-1"),
+        _case_payload("case-2"),
+        _case_payload("case-3"),
+    )
+    real_stat = path.stat()
+    monkeypatch.setattr(evaluation_module, "MAX_DATASET_BYTES", 100)
+    monkeypatch.setattr(
+        evaluation_module.os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_size=0, st_mode=real_stat.st_mode),
+    )
+
+    with pytest.raises(ValueError, match="exceeds the size limit"):
+        load_cases(path)
+
+
 def test_metrics_match_hand_calculated_rankings_and_macro_average():
     cases = (
         _case(
@@ -252,6 +278,37 @@ def test_nearest_rank_percentiles_are_stable():
     assert report.latency_p95_ms == 19
 
 
+def test_recall_and_ndcg_include_exact_cutoff_ranks_only():
+    ranks = (5, 6, 10, 11, 20, 21)
+    cases = tuple(_case(str(rank), (RelevanceJudgment(f"d{rank}", 1),)) for rank in ranks)
+    runs = tuple(
+        _run(
+            str(rank),
+            *((f"noise-{rank}-{index}", 0) for index in range(1, rank)),
+            (f"d{rank}", 0),
+        )
+        for rank in ranks
+    )
+
+    report = evaluate_rankings(cases, runs)
+
+    assert report.recall_at_5 == pytest.approx(1 / 6)
+    assert report.recall_at_10 == pytest.approx(3 / 6)
+    assert report.recall_at_20 == pytest.approx(5 / 6)
+    expected_ndcg = sum(1 / math.log2(rank + 1) for rank in (5, 6, 10)) / 6
+    assert report.ndcg_at_10 == pytest.approx(expected_ndcg)
+
+
+def test_very_large_grade_is_evaluated_without_materializing_a_huge_power():
+    huge_grade = 10**100
+    cases = (_case("huge", (RelevanceJudgment("relevant", huge_grade),)),)
+    runs = (_run("huge", ("relevant", 0)),)
+
+    report = evaluate_rankings(cases, runs)
+
+    assert report.ndcg_at_10 == 1
+
+
 @pytest.mark.parametrize(
     ("cases", "runs", "message"),
     [
@@ -286,6 +343,8 @@ def test_value_types_reject_invalid_rankings_latencies_and_duplicate_cases():
         )
     with pytest.raises(ValueError, match="latency_ms must be finite and non-negative"):
         EvaluationRun(case_id="a", ranking=(), latency_ms=float("nan"))
+    with pytest.raises(ValueError, match="latency_ms must be finite and non-negative"):
+        EvaluationRun(case_id="a", ranking=(), latency_ms=10**10_000)
     with pytest.raises(ValueError, match="chunk_index must be a non-negative integer or null"):
         RankedResult("doc", True)
     duplicate = _case("a", (RelevanceJudgment("doc", 1),))
@@ -342,6 +401,25 @@ def test_promotion_gate_accepts_exact_boundary_after_macro_average_rounding():
     assert hybrid / baseline == pytest.approx(1.10)
     assert decision.eligible is True
     assert decision.reason == "eligible"
+
+
+def test_promotion_decision_handles_finite_values_whose_ratio_overflows():
+    minimum_positive = float.fromhex("0x0.0000000000001p-1022")
+    maximum_finite = float.fromhex("0x1.fffffffffffffp+1023")
+
+    quality = promotion_decision(
+        _report(recall_at_10=minimum_positive, latency_p95_ms=1),
+        _report(recall_at_10=1, latency_p95_ms=1),
+    )
+    latency = promotion_decision(
+        _report(recall_at_10=1, latency_p95_ms=0),
+        _report(recall_at_10=1, latency_p95_ms=maximum_finite),
+    )
+
+    assert quality.eligible is True
+    assert math.isfinite(quality.recall_ratio)
+    assert latency.eligible is False
+    assert math.isfinite(latency.latency_ratio)
 
 
 def test_public_evaluation_values_are_immutable():

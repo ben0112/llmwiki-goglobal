@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil, isclose, isfinite, log2
 from numbers import Real
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from stat import S_ISREG
+from sys import float_info
+from typing import Any, BinaryIO
 
 from .search import SearchArea, SearchQuery, SearchScope
 
@@ -58,7 +61,10 @@ def _chunk_index(value: object) -> int | None:
 def _finite_non_negative(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be finite and non-negative")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite and non-negative") from exc
     if not isfinite(normalized) or normalized < 0:
         raise ValueError(f"{name} must be finite and non-negative")
     return normalized
@@ -329,30 +335,52 @@ def _parse_case(value: object) -> EvalCase:
     )
 
 
+def _open_dataset(dataset_path: Path) -> BinaryIO:
+    try:
+        descriptor = os.open(dataset_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise ValueError("evaluation dataset cannot be read") from exc
+    try:
+        dataset_stat = os.fstat(descriptor)
+        if not S_ISREG(dataset_stat.st_mode):
+            raise ValueError("evaluation dataset must be a regular file")
+        if dataset_stat.st_size > MAX_DATASET_BYTES:
+            raise ValueError("evaluation dataset exceeds the size limit")
+        return os.fdopen(descriptor, "rb")
+    except (OSError, ValueError):
+        os.close(descriptor)
+        raise
+
+
+def _parse_jsonl_line(raw_line: bytes, line_number: int) -> EvalCase:
+    if len(raw_line) > MAX_LINE_BYTES:
+        raise ValueError(f"line exceeds size limit at line {line_number}")
+    if not raw_line.strip():
+        raise ValueError(f"blank JSONL line at line {line_number}")
+    try:
+        value = json.loads(raw_line.decode("utf-8"), object_pairs_hook=_unique_object)
+        return _parse_case(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ValueError(f"invalid evaluation case at line {line_number}: {exc}") from exc
+
+
 def load_cases(path: str | PathLike[str]) -> tuple[EvalCase, ...]:
     """Load and strictly validate a bounded UTF-8 JSONL evaluation dataset."""
 
     dataset_path = Path(path)
-    try:
-        if dataset_path.stat().st_size > MAX_DATASET_BYTES:
-            raise ValueError("evaluation dataset exceeds the size limit")
-    except OSError as exc:
-        raise ValueError("evaluation dataset cannot be read") from exc
 
     cases: list[EvalCase] = []
     case_ids: set[str] = set()
+    total_bytes = 0
+    line_number = 0
     try:
-        with dataset_path.open("rb") as dataset:
-            for line_number, raw_line in enumerate(dataset, start=1):
-                if len(raw_line) > MAX_LINE_BYTES:
-                    raise ValueError(f"line exceeds size limit at line {line_number}")
-                if not raw_line.strip():
-                    raise ValueError(f"blank JSONL line at line {line_number}")
-                try:
-                    value = json.loads(raw_line.decode("utf-8"), object_pairs_hook=_unique_object)
-                    case = _parse_case(value)
-                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
-                    raise ValueError(f"invalid evaluation case at line {line_number}: {exc}") from exc
+        with _open_dataset(dataset_path) as dataset:
+            while raw_line := dataset.readline(MAX_LINE_BYTES + 1):
+                line_number += 1
+                total_bytes += len(raw_line)
+                if total_bytes > MAX_DATASET_BYTES:
+                    raise ValueError("evaluation dataset exceeds the size limit")
+                case = _parse_jsonl_line(raw_line, line_number)
                 if case.case_id in case_ids:
                     raise ValueError(f"duplicate case_id: {case.case_id}")
                 case_ids.add(case.case_id)
@@ -489,27 +517,33 @@ def promotion_decision(
         raise ValueError("promotion inputs must be EvaluationReport values")
     if lexical.recall_at_10 <= 0:
         return PromotionDecision(False, "baseline_recall_zero")
-    recall_ratio = hybrid.recall_at_10 / lexical.recall_at_10
-    latency_ratio = hybrid.latency_p95_ms / max(lexical.latency_p95_ms, 0.001)
-    quality_gate = recall_ratio >= 1.10 or isclose(
-        recall_ratio,
-        1.10,
+    recall_threshold = lexical.recall_at_10 * 1.10
+    latency_baseline = max(lexical.latency_p95_ms, 0.001)
+    latency_threshold = latency_baseline * 2.0
+    quality_gate = hybrid.recall_at_10 >= recall_threshold or isclose(
+        hybrid.recall_at_10,
+        recall_threshold,
         rel_tol=PROMOTION_GATE_TOLERANCE,
-        abs_tol=PROMOTION_GATE_TOLERANCE,
+        abs_tol=0.0,
     )
-    latency_gate = latency_ratio <= 2.0 or isclose(
-        latency_ratio,
-        2.0,
+    latency_gate = hybrid.latency_p95_ms <= latency_threshold or isclose(
+        hybrid.latency_p95_ms,
+        latency_threshold,
         rel_tol=PROMOTION_GATE_TOLERANCE,
-        abs_tol=PROMOTION_GATE_TOLERANCE,
+        abs_tol=0.0,
     )
     eligible = quality_gate and latency_gate
     return PromotionDecision(
         eligible=eligible,
         reason="eligible" if eligible else "gate_failed",
-        recall_ratio=recall_ratio,
-        latency_ratio=latency_ratio,
+        recall_ratio=_bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10),
+        latency_ratio=_bounded_ratio(hybrid.latency_p95_ms, latency_baseline),
     )
+
+
+def _bounded_ratio(numerator: float, denominator: float) -> float:
+    ratio = numerator / denominator
+    return ratio if isfinite(ratio) else float_info.max
 
 
 __all__ = [
