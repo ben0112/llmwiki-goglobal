@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implementation incomplete — specification review in progress
+**Status:** Implemented and verified
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -373,23 +373,73 @@ external services.
 - Local mode starts and passes its full suite without Redis, Postgres, S3, or
   worker configuration.
 
-## Provisional implementation evidence
+## Final implementation evidence
 
-The commands and commit references below are retained as historical context
-only. They are not final verification evidence while the specification review
-is in progress.
+The durable/scaled runtime baseline is
+`3e23aff6bfedd66a26f8154a57850703d400c932`. The specification-review closing
+changes are immutable commits:
 
-The durable/scaled runtime baseline is commit
-`3e23aff6bfedd66a26f8154a57850703d400c932`; the Task 14 closing commit is the
-commit containing this status change. Verification commands:
+- `b3f20dcbf1144c9733dc978c4fea24286d7ad558` — real Redis AOF restart,
+  accepting-API loss, graceful worker TERM, and retained SIGKILL recovery in
+  the required scaled test;
+- `e9c6dabce122e4d925e357881a6a7f15d18c2f3d` — exhaustive one-owner CI test
+  manifest for every unit and integration test file;
+- `8d66b608749db0920183f8f8bdde953727865982` — JSON contract and sensitive-data
+  assertions at all nine production telemetry callsites;
+- `01ed3a03d764242dac925776ad81afe43405bba7` and
+  `8c1f57e89e0e2829fe614ba079f0234154632742` — fresh pytest processes for each
+  Postgres API and MCP file, so session schema fixtures and MCP plugin fixtures
+  cannot pollute one another.
+
+GitHub Actions run
+[30150825870](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30150825870)
+verified commit `8c1f57e89e0e2829fe614ba079f0234154632742`: all six jobs passed. The primary
+manifest owns 90 test files exactly once and executed 1,455 tests with no
+skips or failures:
+
+| Isolated segment | Result | Required runtime |
+| --- | ---: | --- |
+| `unit-core` | 37 passed | none |
+| `unit-api` | 680 passed | none |
+| `unit-mcp` | 46 passed | none |
+| `unit-corpus` | 54 passed | none |
+| `integration-api` | 433 passed | Postgres 16.11, Redis 7.4.2, MinIO |
+| `integration-mcp` | 119 passed | SQLite |
+| `integration-mcp-postgres` | 40 passed | Postgres 16.11 |
+| `integration-redis` | 36 passed | Redis 7.4.2 |
+| `integration-minio` | 1 passed | MinIO `RELEASE.2025-04-22T22-12-26Z` |
+| `integration-scaled` | 9 passed | two API, two worker, gateway, Postgres, Redis AOF, MinIO, auth, converter |
+
+The workflow invokes the complete partitions with these commands; the two
+Postgres partitions deliberately run one file per pytest process:
 
 ```bash
-PYTHONPATH=api .venv/bin/pytest tests/unit/ -q
-PYTHONPATH=api MODE=hosted .venv/bin/pytest tests/integration/ -q
-(cd mcp && ../.venv/bin/pytest ../tests/unit/mcp/ ../tests/integration/mcp/ -q)
-.venv/bin/ruff check api/jobs api/infra/redis.py api/infra/quota.py api/infra/tus_sessions.py api/infra/tus.py api/routes/jobs.py api/routes/health.py api/services/ocr.py api/services/graph.py api/services/s3.py api/services/url_ingest.py tests/unit/jobs tests/unit/test_durable_runtime_config.py tests/unit/test_tus_sessions.py tests/unit/test_hosted_quota.py tests/unit/test_health_roles.py tests/integration/test_background_job_schema.py tests/integration/test_background_job_repository.py tests/integration/test_background_job_leases.py tests/integration/test_job_delivery.py tests/integration/test_durable_extraction.py tests/integration/test_durable_graph_rebuild.py tests/integration/test_s3_multipart.py tests/integration/test_tus_sessions_redis.py tests/integration/test_hosted_quota.py tests/integration/test_tus_multipart.py tests/integration/test_durable_failure_matrix.py
-docker compose -f deploy/docker-compose.selfhost.yml config --quiet
+python -m tests.helpers.ci_test_matrix unit-core | xargs pytest -v
+python -m tests.helpers.ci_test_matrix unit-api | xargs env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix unit-mcp | xargs env PYTHONPATH=mcp pytest -v
+python -m tests.helpers.ci_test_matrix unit-corpus | xargs pytest -v
+python -m tests.helpers.ci_test_matrix integration-mcp | xargs env PYTHONPATH=mcp pytest -v
+python -m tests.helpers.ci_test_matrix integration-redis | xargs env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix integration-minio | xargs env PYTHONPATH=api pytest -v
+python -m tests.helpers.ci_test_matrix integration-scaled | xargs env PYTHONPATH=api pytest -v
+
+python -m tests.helpers.ci_test_matrix integration-api |
+  while IFS= read -r test_file; do
+    PYTHONPATH=api MODE=hosted pytest "$test_file" -v
+  done
+python -m tests.helpers.ci_test_matrix integration-mcp-postgres |
+  while IFS= read -r test_file; do
+    PYTHONPATH=mcp pytest "$test_file" -v
+  done
 ```
 
-GitHub Actions runs the fault matrix with Postgres, Redis 7.4, and MinIO and a
-non-optional two-API/two-worker Compose smoke with an ephemeral ES256 identity.
+The workflow also passed four matrix ownership contract tests and eight scaled
+static tests; the live-only scaled test was intentionally skipped in the
+static step and then passed in the required Compose job. Raw aggregate
+`tests/unit` and `tests/integration` commands are not claimed as passing:
+legacy API and MCP packages use colliding top-level module names, which is why
+the verified matrix uses isolated processes.
+
+Changed Task 14 Python paths pass Ruff. The separate repository-wide audit
+`.venv/bin/ruff check . --statistics` reports 286 pre-existing findings, 174
+automatically fixable; repository-wide Ruff is therefore not claimed clean.
