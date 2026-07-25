@@ -219,6 +219,38 @@ class _EmissionFailingStream:
         self.buffer = _EmissionFailingBuffer(failure)
 
 
+class _ScriptedEmissionBuffer:
+    def __init__(self, actions: list[object]) -> None:
+        self.actions = list(actions)
+        self.content = bytearray()
+        self.flush_count = 0
+
+    def write(self, content: memoryview) -> object:
+        action = self.actions.pop(0) if self.actions else len(content)
+        if isinstance(action, BaseException):
+            raise action
+        result = len(content) if action == "all" else action
+        if type(result) is int and 0 < result <= len(content):
+            self.content.extend(content[:result])
+        return result
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def seek(self, offset: int) -> int:
+        assert offset == 0
+        return 0
+
+    def truncate(self, size: int = 0) -> int:
+        del self.content[size:]
+        return size
+
+
+class _ScriptedEmissionStream:
+    def __init__(self, actions: list[object]) -> None:
+        self.buffer = _ScriptedEmissionBuffer(actions)
+
+
 @pytest.mark.parametrize("profile", ["lexical", "hybrid"])
 def test_single_profile_report_is_deterministic_and_retrieves_each_case_once(profile, capsys):
     factory, retrievers, factory_calls = _factory()
@@ -338,6 +370,16 @@ def test_real_closed_stdout_pipe_returns_four_without_shutdown_diagnostics():
     assert b"BrokenPipeError" not in completed.stderr
 
 
+def test_real_closed_stdout_help_returns_four_without_shutdown_diagnostics():
+    completed = _run_cli_with_closed_stream(["--help"], stream="stdout")
+
+    assert completed.returncode == 4
+    assert completed.stdout == b""
+    assert b"Exception ignored" not in completed.stderr
+    assert b"Traceback" not in completed.stderr
+    assert b"BrokenPipeError" not in completed.stderr
+
+
 def test_real_closed_stderr_pipe_preserves_invalid_arguments_exit_code():
     completed = _run_cli_with_closed_stream([], stream="stderr")
 
@@ -374,6 +416,95 @@ def test_stderr_emission_failure_without_file_descriptor_preserves_business_exit
     code = main([])
 
     assert code == 2
+    assert stream.buffer.content == b""
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        [1, 1, 1, 1, 1, 1],
+        [2, 1, "all"],
+    ],
+    ids=["one-byte-at-a-time", "segmented"],
+)
+def test_emit_stream_retries_partial_writes_until_all_bytes_are_flushed(actions):
+    stream = _ScriptedEmissionStream(actions)
+
+    emitted = retrieval_eval_module._emit_stream(stream, b"abcdef")
+
+    assert emitted is True
+    assert stream.buffer.content == b"abcdef"
+    assert stream.buffer.flush_count == 1
+
+
+@pytest.mark.parametrize(
+    "invalid_result",
+    [None, 0, -1, True, False, "1", 7],
+    ids=["none", "zero", "negative", "true", "false", "non-integer", "too-large"],
+)
+def test_emit_stream_rejects_invalid_write_results_without_partial_success(invalid_result):
+    stream = _ScriptedEmissionStream([invalid_result])
+
+    emitted = retrieval_eval_module._emit_stream(stream, b"abcdef")
+
+    assert emitted is False
+    assert stream.buffer.content == b""
+    assert stream.buffer.flush_count == 0
+
+
+def test_emit_stream_clears_partial_content_when_later_write_raises():
+    stream = _ScriptedEmissionStream([2, BrokenPipeError("private second-write failure")])
+
+    emitted = retrieval_eval_module._emit_stream(stream, b"abcdef")
+
+    assert emitted is False
+    assert stream.buffer.content == b""
+    assert stream.buffer.flush_count == 0
+
+
+def test_stdout_partial_then_invalid_write_returns_four_without_partial_success(monkeypatch):
+    stream = _ScriptedEmissionStream([1, 0])
+    factory, _retrievers, _factory_calls = _factory()
+    monkeypatch.setattr(retrieval_eval_module.sys, "stdout", stream)
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+
+    assert code == 4
+    assert stream.buffer.content == b""
+
+
+def test_stderr_partial_then_invalid_write_preserves_business_exit_code(monkeypatch):
+    stream = _ScriptedEmissionStream([1, None])
+    monkeypatch.setattr(retrieval_eval_module.sys, "stderr", stream)
+
+    code = main([])
+
+    assert code == 2
+    assert stream.buffer.content == b""
+
+
+def test_help_uses_normal_parser_format(capsys):
+    expected = retrieval_eval_module._parser().format_help()
+
+    code = main(["--help"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out == expected
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_help_stdout_emission_failure_returns_four_and_clears_buffer(failure, monkeypatch):
+    stream = _EmissionFailingStream(failure)
+    monkeypatch.setattr(retrieval_eval_module.sys, "stdout", stream)
+
+    code = main(["--help"])
+
+    assert code == 4
     assert stream.buffer.content == b""
 
 

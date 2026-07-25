@@ -143,6 +143,10 @@ class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         raise _ArgumentError
 
+    def print_help(self, file: Any = None) -> None:
+        del file
+        raise _HelpRequested
+
     def exit(self, status: int = 0, _message: str | None = None) -> None:
         if status == 0:
             raise _HelpRequested
@@ -759,8 +763,13 @@ def _silence_failed_stream(buffer: Any) -> None:
 
 def _emit_stream(stream: Any, content: bytes) -> bool:
     buffer = getattr(stream, "buffer", stream)
+    remaining = memoryview(content)
     try:
-        buffer.write(content)
+        while remaining:
+            written = buffer.write(remaining)
+            if type(written) is not int or written <= 0 or written > len(remaining):
+                raise OSError
+            remaining = remaining[written:]
         buffer.flush()
     except (OSError, ValueError):
         _silence_failed_stream(buffer)
@@ -779,8 +788,8 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace | No
         if args.require_promotion_gate and not args.compare:
             raise _ArgumentError
     except _HelpRequested:
-        parser.print_help()
-        return None, 0
+        emitted = _emit_stream(sys.stdout, parser.format_help().encode("utf-8"))
+        return None, 0 if emitted else 4
     except (_ArgumentError, SystemExit):
         _emit_error("arguments", "invalid_arguments")
         return None, 2
