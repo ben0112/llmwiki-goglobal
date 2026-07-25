@@ -418,7 +418,7 @@ def _is_filtered(query: SearchQuery) -> bool:
 def _case_metrics(
     case: EvalCase,
     run: EvaluationRun,
-) -> tuple[float, float, float, float, float, Fraction]:
+) -> tuple[Fraction, Fraction, Fraction, float, float]:
     document_judgments = {item.document_id: item for item in case.relevance if item.chunk_index is None}
     chunk_judgments = {item.identity: item for item in case.relevance if item.chunk_index is not None}
     matched: set[tuple[str, int | None]] = set()
@@ -435,14 +435,13 @@ def _case_metrics(
     exact_recalls = tuple(
         Fraction(sum(rank <= cutoff for rank, _judgment in matches), relevant_count) for cutoff in (5, 10, 20)
     )
-    recalls = tuple(float(recall) for recall in exact_recalls)
     mrr = 0.0 if not matches else 1.0 / matches[0][0]
     max_grade = max(item.grade for item in case.relevance)
     dcg = sum(_scaled_gain(judgment.grade, max_grade) / log2(rank + 1) for rank, judgment in matches if rank <= 10)
     ideal_grades = sorted((item.grade for item in case.relevance), reverse=True)[:10]
     ideal_dcg = sum(_scaled_gain(grade, max_grade) / log2(rank + 1) for rank, grade in enumerate(ideal_grades, 1))
     ndcg = dcg / ideal_dcg
-    return (*recalls, mrr, ndcg, exact_recalls[1])
+    return (*exact_recalls, mrr, ndcg)
 
 
 def _nearest_rank(values: Sequence[float], percentile: float) -> float:
@@ -505,14 +504,11 @@ def evaluate_rankings(
 
     per_case = [_case_metrics(case, runs_by_id[case.case_id]) for case in case_values]
     count = len(case_values)
-    averages = [sum(metrics[index] for metrics in per_case) / count for index in range(5)]
-    exact_recall_at_10 = (
-        sum(
-            (metrics[5] for metrics in per_case),
-            start=Fraction(),
-        )
-        / count
-    )
+    exact_recalls = [sum((metrics[index] for metrics in per_case), start=Fraction()) / count for index in range(3)]
+    averages = [
+        *(float(recall) for recall in exact_recalls),
+        *(sum(metrics[index] for metrics in per_case) / count for index in range(3, 5)),
+    ]
     latencies = [runs_by_id[case.case_id].latency_ms for case in case_values]
     return EvaluationReport(
         case_count=count,
@@ -526,7 +522,7 @@ def evaluate_rankings(
         ),
         latency_p50_ms=_nearest_rank(latencies, 0.50),
         latency_p95_ms=_nearest_rank(latencies, 0.95),
-        recall_at_10_exact=exact_recall_at_10,
+        recall_at_10_exact=exact_recalls[1],
     )
 
 

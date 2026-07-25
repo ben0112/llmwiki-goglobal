@@ -520,6 +520,27 @@ def test_promotion_gate_uses_exact_recall_from_real_macro_metrics():
     assert decision.eligible is True
 
 
+def test_public_recalls_round_from_the_exact_macro_average():
+    first_relevance = tuple(RelevanceJudgment(f"first-{index}", 1) for index in range(411))
+    second_relevance = tuple(RelevanceJudgment(f"second-{index}", 1) for index in range(334))
+    cases = (
+        _case("first", first_relevance),
+        _case("second", second_relevance),
+    )
+    runs = (
+        _run("first", *((f"first-{index}", 0) for index in range(2))),
+        _run("second", *((f"second-{index}", 0) for index in range(3))),
+    )
+    exact = (Fraction(2, 411) + Fraction(3, 334)) / 2
+
+    report = evaluate_rankings(cases, runs)
+
+    assert report.recall_at_10_exact == exact
+    assert report.recall_at_5 == float(exact)
+    assert report.recall_at_10 == float(exact)
+    assert report.recall_at_20 == float(exact)
+
+
 def test_promotion_decision_handles_finite_values_whose_ratio_overflows():
     minimum_positive = float.fromhex("0x0.0000000000001p-1022")
     maximum_finite = float.fromhex("0x1.fffffffffffffp+1023")
