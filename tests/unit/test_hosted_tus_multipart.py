@@ -680,6 +680,89 @@ async def test_create_abort_failure_persists_cleanup_even_when_marker_write_fail
     assert "marker.release" not in events
 
 
+async def test_abort_failed_persists_session_before_exposing_marker_to_worker(monkeypatch):
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    marker_started = asyncio.Event()
+    allow_marker = asyncio.Event()
+
+    class OrderedRecoveryStore(Store):
+        def __init__(self, events):
+            super().__init__(events)
+            self.acquire_calls = 0
+
+        async def acquire_lock(self, upload_id, ttl_seconds):
+            self.acquire_calls += 1
+            if self.acquire_calls == 1:
+                raise RuntimeError("lock unavailable before acquisition")
+            return await super().acquire_lock(upload_id, ttl_seconds)
+
+        async def create_reservation(self, user_id, upload_id, bytes_reserved, *, owner_token, ttl_seconds):
+            events.append("marker.ensure.start")
+            marker_started.set()
+            await allow_marker.wait()
+            return await super().create_reservation(
+                user_id,
+                upload_id,
+                bytes_reserved,
+                owner_token=owner_token,
+                ttl_seconds=ttl_seconds,
+            )
+
+        async def get_reservation(self, user_id, upload_id):
+            self.marker_reads += 1
+            return self.marker
+
+    store = OrderedRecoveryStore(events)
+    quota = Quota(events)
+    s3 = S3(events, abort_error=RuntimeError("first abort unavailable"))
+    app = _app(monkeypatch, s3, quota, store)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        s3,
+        SimpleNamespace(),
+        quota,
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+
+    async with await _client(app) as client:
+        create_task = asyncio.create_task(
+            client.post(
+                "/v1/uploads",
+                headers={
+                    "X-Test-User": str(USER_ID),
+                    "Tus-Resumable": "1.0.0",
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata(),
+                },
+            )
+        )
+        await marker_started.wait()
+        assert store.session is not None and store.session.state is TusSessionState.CLEANUP_REQUIRED
+        assert events.index("session.create") < events.index("marker.ensure.start")
+        assert store.marker is None
+
+        s3.abort_error = None
+        first_cleanup = await cleanup.cleanup(store.session.upload_id, USER_ID)
+        assert first_cleanup["status"] == "cleaned"
+        assert store.session is None
+        assert "quota.release" not in events
+
+        allow_marker.set()
+        response = await create_task
+
+    assert response.status_code == 503
+    assert store.marker is not None and store.marker.state is TusReservationState.RESERVED
+    second_cleanup = await cleanup.cleanup(quota.reservation.upload_id, USER_ID)
+    assert second_cleanup["status"] == "cleaned"
+    assert events.count("quota.release") == 1
+    assert events.count("marker.release") == 1
+
+
 async def test_create_cancellation_compensates_while_initialization_lock_is_held(monkeypatch):
     events = []
     create_started = asyncio.Event()

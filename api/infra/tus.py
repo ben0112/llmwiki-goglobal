@@ -585,19 +585,6 @@ class HostedTusMultipartService:
             return
         if not abort_ok and session is not None:
             marker_anchored = marker_created
-            try:
-                if not marker_anchored:
-                    marker_anchored = await _ensure_reservation_marker(
-                        self.sessions,
-                        reservation,
-                        self.session_ttl_seconds,
-                    )
-            except Exception as exc:  # noqa: BLE001 -- session recovery must still be attempted
-                logger.error(
-                    "TUS create recovery marker failed upload_id=%s error_type=%s",
-                    reservation.upload_id,
-                    type(exc).__name__,
-                )
             from infra.tus_sessions import SessionCreateStatus, TusSessionState
 
             session_anchored = False
@@ -638,6 +625,19 @@ class HostedTusMultipartService:
                     reservation.upload_id,
                     type(exc).__name__,
                 )
+            if session_anchored and not marker_anchored:
+                try:
+                    marker_anchored = await _ensure_reservation_marker(
+                        self.sessions,
+                        reservation,
+                        self.session_ttl_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- the durable session remains independently scannable
+                    logger.error(
+                        "TUS create recovery marker failed upload_id=%s error_type=%s",
+                        reservation.upload_id,
+                        type(exc).__name__,
+                    )
             if not marker_anchored:
                 logger.error("TUS create recovery marker is uncertain upload_id=%s", reservation.upload_id)
             if not session_anchored:
