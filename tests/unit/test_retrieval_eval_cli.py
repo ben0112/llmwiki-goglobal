@@ -190,6 +190,30 @@ def _run_cli_with_closed_stream(
     )
 
 
+def _run_cli_with_missing_descriptor(
+    argv: list[str],
+    *,
+    descriptor: int,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT / "api")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "scripts.retrieval_eval", *argv],
+        cwd=REPO_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=lambda: os.close(descriptor),
+    )
+    stdout, stderr = process.communicate(timeout=10)
+    return subprocess.CompletedProcess(
+        process.args,
+        process.returncode,
+        stdout,
+        stderr,
+    )
+
+
 class _EmissionFailingBuffer:
     def __init__(self, failure: str) -> None:
         self.content = bytearray()
@@ -249,6 +273,44 @@ class _ScriptedEmissionBuffer:
 class _ScriptedEmissionStream:
     def __init__(self, actions: list[object]) -> None:
         self.buffer = _ScriptedEmissionBuffer(actions)
+
+
+class _ExceptionalEmissionBuffer:
+    def __init__(self, location: str, error_type: type[Exception]) -> None:
+        self.location = location
+        self.error_type = error_type
+        self.content = bytearray()
+
+    def write(self, content: memoryview) -> int:
+        if self.location == "write":
+            raise self.error_type("private write failure")
+        self.content.extend(content)
+        return len(content)
+
+    def flush(self) -> None:
+        if self.location == "flush":
+            raise self.error_type("private flush failure")
+
+    def seek(self, offset: int) -> int:
+        assert offset == 0
+        return 0
+
+    def truncate(self, size: int = 0) -> int:
+        del self.content[size:]
+        return size
+
+
+class _ExceptionalEmissionStream:
+    def __init__(self, location: str, error_type: type[Exception]) -> None:
+        self.location = location
+        self.error_type = error_type
+        self._buffer = _ExceptionalEmissionBuffer(location, error_type)
+
+    @property
+    def buffer(self) -> _ExceptionalEmissionBuffer:
+        if self.location == "buffer":
+            raise self.error_type("private buffer access failure")
+        return self._buffer
 
 
 @pytest.mark.parametrize("profile", ["lexical", "hybrid"])
@@ -380,11 +442,37 @@ def test_real_closed_stdout_help_returns_four_without_shutdown_diagnostics():
     assert b"BrokenPipeError" not in completed.stderr
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        ["--help"],
+    ],
+    ids=["report", "help"],
+)
+def test_missing_stdout_descriptor_returns_four_without_traceback(argv):
+    completed = _run_cli_with_missing_descriptor(argv, descriptor=1)
+
+    assert completed.returncode == 4
+    assert completed.stdout == b""
+    assert b"Traceback" not in completed.stderr
+    assert b"AttributeError" not in completed.stderr
+    assert b"TypeError" not in completed.stderr
+
+
 def test_real_closed_stderr_pipe_preserves_invalid_arguments_exit_code():
     completed = _run_cli_with_closed_stream([], stream="stderr")
 
     assert completed.returncode == 2
     assert completed.stdout == b""
+
+
+def test_missing_stderr_descriptor_preserves_invalid_arguments_exit_code():
+    completed = _run_cli_with_missing_descriptor([], descriptor=2)
+
+    assert completed.returncode == 2
+    assert completed.stdout == b""
+    assert completed.stderr == b""
 
 
 @pytest.mark.parametrize("failure", ["write", "flush"])
@@ -506,6 +594,42 @@ def test_help_stdout_emission_failure_returns_four_and_clears_buffer(failure, mo
 
     assert code == 4
     assert stream.buffer.content == b""
+
+
+@pytest.mark.parametrize("location", ["buffer", "write", "flush"])
+@pytest.mark.parametrize("error_type", [AttributeError, TypeError])
+def test_stdout_stream_shape_failures_return_four_without_partial_success(
+    location,
+    error_type,
+    monkeypatch,
+):
+    stream = _ExceptionalEmissionStream(location, error_type)
+    factory, _retrievers, _factory_calls = _factory()
+    monkeypatch.setattr(retrieval_eval_module.sys, "stdout", stream)
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+
+    assert code == 4
+    assert stream._buffer.content == b""
+
+
+@pytest.mark.parametrize("location", ["buffer", "write", "flush"])
+@pytest.mark.parametrize("error_type", [AttributeError, TypeError])
+def test_stderr_stream_shape_failures_preserve_business_exit_code(
+    location,
+    error_type,
+    monkeypatch,
+):
+    stream = _ExceptionalEmissionStream(location, error_type)
+    monkeypatch.setattr(retrieval_eval_module.sys, "stderr", stream)
+
+    code = main([])
+
+    assert code == 2
+    assert stream._buffer.content == b""
 
 
 @pytest.mark.parametrize(

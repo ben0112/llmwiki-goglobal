@@ -762,16 +762,17 @@ def _silence_failed_stream(buffer: Any) -> None:
 
 
 def _emit_stream(stream: Any, content: bytes) -> bool:
-    buffer = getattr(stream, "buffer", stream)
+    buffer = stream
     remaining = memoryview(content)
     try:
+        buffer = getattr(stream, "buffer", stream)
         while remaining:
             written = buffer.write(remaining)
             if type(written) is not int or written <= 0 or written > len(remaining):
                 raise OSError
             remaining = remaining[written:]
         buffer.flush()
-    except (OSError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError):
         _silence_failed_stream(buffer)
         return False
     return True
