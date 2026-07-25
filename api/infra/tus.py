@@ -468,11 +468,6 @@ class HostedTusMultipartService:
         lock_renewal = None
         try:
             multipart_id = await self.s3.create_multipart(key, CONTENT_TYPES.get(ext, "application/octet-stream"))
-            acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
-            if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
-                raise RuntimeError("upload initialization lock is unavailable")
-            lock_token = acquired.token
-            lock_renewal = asyncio.create_task(self._renew_upload_lock(upload_id, lock_token, lock_lost))
             now = datetime.now(UTC)
             session = TusSession(
                 upload_id=upload_id,
@@ -494,6 +489,11 @@ class HostedTusMultipartService:
                 reservation_bytes=upload_length,
                 object_completed=False,
             )
+            acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
+            if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
+                raise RuntimeError("upload initialization lock is unavailable")
+            lock_token = acquired.token
+            lock_renewal = asyncio.create_task(self._renew_upload_lock(upload_id, lock_token, lock_lost))
             marker = await self.sessions.create_reservation(
                 user_uuid,
                 upload_id,
@@ -566,26 +566,55 @@ class HostedTusMultipartService:
                     reservation.upload_id,
                     type(exc).__name__,
                 )
-        if not abort_ok and session is not None:
+        if not abort_ok and session is None:
             try:
-                if not marker_created:
-                    from infra.tus_sessions import ReservationCreateStatus
-
-                    marker_created = (
-                        await self.sessions.create_reservation(
-                            reservation.user_id,
-                            reservation.upload_id,
-                            reservation.bytes,
-                            owner_token=reservation.owner_token,
-                            ttl_seconds=self.session_ttl_seconds,
-                        )
-                        is ReservationCreateStatus.CREATED
+                anchored = await _ensure_reservation_marker(
+                    self.sessions,
+                    reservation,
+                    self.session_ttl_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 -- retain quota after uncertain object cleanup
+                anchored = False
+                logger.error(
+                    "TUS create recovery marker failed upload_id=%s error_type=%s",
+                    reservation.upload_id,
+                    type(exc).__name__,
+                )
+            if not anchored:
+                logger.error("TUS create recovery is unanchored upload_id=%s", reservation.upload_id)
+            return
+        if not abort_ok and session is not None:
+            marker_anchored = marker_created
+            try:
+                if not marker_anchored:
+                    marker_anchored = await _ensure_reservation_marker(
+                        self.sessions,
+                        reservation,
+                        self.session_ttl_seconds,
                     )
-                from infra.tus_sessions import SessionCreateStatus, TusSessionState
+            except Exception as exc:  # noqa: BLE001 -- session recovery must still be attempted
+                logger.error(
+                    "TUS create recovery marker failed upload_id=%s error_type=%s",
+                    reservation.upload_id,
+                    type(exc).__name__,
+                )
+            from infra.tus_sessions import SessionCreateStatus, TusSessionState
 
+            session_anchored = False
+            try:
                 cleanup_session = replace(session, state=TusSessionState.CLEANUP_REQUIRED)
                 created = await self.sessions.create(cleanup_session, self.session_ttl_seconds)
-                if created is SessionCreateStatus.ALREADY_EXISTS:
+                session_anchored = created is SessionCreateStatus.CREATED
+                if not session_anchored:
+                    stored = await self.sessions.get(session.upload_id)
+                    session_anchored = (
+                        stored is not None
+                        and stored.user_id == cleanup_session.user_id
+                        and stored.s3_key == cleanup_session.s3_key
+                        and stored.multipart_upload_id == cleanup_session.multipart_upload_id
+                        and stored.state is TusSessionState.CLEANUP_REQUIRED
+                    )
+                if created is SessionCreateStatus.ALREADY_EXISTS and not session_anchored:
                     cleanup_token = lock_token
                     acquired = None
                     if cleanup_token is None:
@@ -593,21 +622,26 @@ class HostedTusMultipartService:
                         cleanup_token = acquired.token
                     if cleanup_token is not None:
                         try:
-                            await self.sessions.mark_cleanup_required(
+                            marked = await self.sessions.mark_cleanup_required(
                                 session.upload_id,
                                 session.offset,
                                 self.session_ttl_seconds,
                                 lock_token=cleanup_token,
                             )
+                            session_anchored = bool(marked)
                         finally:
                             if acquired is not None:
                                 await self.sessions.release_lock(session.upload_id, cleanup_token)
-            except Exception as exc:  # noqa: BLE001 -- recovery is best effort and must retain ownership
+            except Exception as exc:  # noqa: BLE001 -- marker recovery failure must not block this attempt
                 logger.error(
-                    "TUS create recovery marker failed upload_id=%s error_type=%s",
+                    "TUS create recovery session failed upload_id=%s error_type=%s",
                     reservation.upload_id,
                     type(exc).__name__,
                 )
+            if not marker_anchored:
+                logger.error("TUS create recovery marker is uncertain upload_id=%s", reservation.upload_id)
+            if not session_anchored:
+                logger.error("TUS create recovery session is uncertain upload_id=%s", reservation.upload_id)
             return
         if session is not None:
             try:

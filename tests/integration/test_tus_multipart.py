@@ -320,6 +320,74 @@ async def test_real_create_lock_blocks_marker_only_cleanup_until_session_is_visi
     assert marker is not None and marker.state is TusReservationState.RESERVED
 
 
+async def test_real_lock_contention_and_abort_failure_leave_worker_cleanup_anchor(multipart_runtime):
+    from infra.tus import HostedTusCleanupService
+    from infra.tus_sessions import LockAcquireResult, LockAcquireStatus, TusReservationState, TusSessionState
+
+    runtime = multipart_runtime
+    service = runtime["service_a"]
+    original_acquire = service.sessions.acquire_lock
+    original_abort = runtime["s3"].abort_multipart
+    acquire_calls = 0
+    abort_calls = 0
+
+    async def contend_once(upload_id, ttl_seconds):
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 1:
+            return LockAcquireResult(LockAcquireStatus.CONTENDED, None)
+        return await original_acquire(upload_id, ttl_seconds)
+
+    async def fail_abort_once(key, multipart_id):
+        nonlocal abort_calls
+        abort_calls += 1
+        if abort_calls == 1:
+            raise RuntimeError("temporary abort failure")
+        return await original_abort(key, multipart_id)
+
+    service.sessions.acquire_lock = contend_once
+    runtime["s3"].abort_multipart = fail_abort_once
+    try:
+        response = await runtime["a"].post(
+            "/v1/uploads",
+            headers=_headers(
+                runtime["user_id"],
+                **{
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata("lock-failure.pdf", runtime["kb_id"]),
+                },
+            ),
+        )
+    finally:
+        service.sessions.acquire_lock = original_acquire
+        runtime["s3"].abort_multipart = original_abort
+
+    assert response.status_code == 503
+    reservation_ids = await runtime["redis"].zrange(quota_keys(runtime["user_id"])[1], 0, -1)
+    assert len(reservation_ids) == 1
+    upload_id = UUID(reservation_ids[0].decode() if isinstance(reservation_ids[0], bytes) else reservation_ids[0])
+    session = await runtime["store"].get(upload_id)
+    assert session is not None and session.state is TusSessionState.CLEANUP_REQUIRED
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RESERVED
+
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "cleaned"
+    assert await runtime["store"].get(upload_id) is None
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+
+
 async def test_owner_checks_lock_contention_and_actual_stream_cap(multipart_runtime):
     runtime = multipart_runtime
     location = await _create_upload(runtime, 9 * MIB)
