@@ -159,8 +159,13 @@ def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
 
 def test_compose_recovery_reuses_explicit_scaled_env_file(monkeypatch, tmp_path):
     env_file = tmp_path / "scaled.env"
-    env_file.write_text("DATABASE_URL=postgresql://postgres@ci-postgres/postgres\n")
+    env_file.write_text(
+        "DATABASE_URL=postgresql://postgres@ci-postgres/postgres\n"
+        "AWS_SECRET_ACCESS_KEY=scaled-secret\n"
+    )
     monkeypatch.setenv("SCALED_COMPOSE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres@localhost:5434/postgres")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
     captured = []
 
     def fake_run(command, **kwargs):
@@ -186,7 +191,11 @@ def test_compose_recovery_reuses_explicit_scaled_env_file(monkeypatch, tmp_path)
         "worker=2",
         "worker",
     ]
+    child_env = kwargs.pop("env")
     assert kwargs == {"check": True, "text": True, "capture_output": True}
+    assert "DATABASE_URL" not in child_env
+    assert "AWS_SECRET_ACCESS_KEY" not in child_env
+    assert child_env["PATH"] == os.environ["PATH"]
 
 
 def test_compose_command_omits_missing_default_env_file(monkeypatch, tmp_path):
@@ -296,10 +305,27 @@ def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]
     env_file = Path(configured_env_file) if configured_env_file else SELFHOST_ENV
     if not env_file.is_absolute():
         env_file = ROOT / env_file
+    run_kwargs = {"check": check, "text": True, "capture_output": True}
     if configured_env_file or env_file.is_file():
         command.extend(("--env-file", str(env_file)))
+        child_env = os.environ.copy()
+        try:
+            env_lines = env_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            env_lines = ()
+        for line in env_lines:
+            assignment = line.strip()
+            if not assignment or assignment.startswith("#"):
+                continue
+            if assignment.startswith("export "):
+                assignment = assignment.removeprefix("export ").lstrip()
+            key, separator, _ = assignment.partition("=")
+            key = key.strip()
+            if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                child_env.pop(key, None)
+        run_kwargs["env"] = child_env
     command.extend(args)
-    return subprocess.run(command, check=check, text=True, capture_output=True)
+    return subprocess.run(command, **run_kwargs)
 
 
 def _worker_container_for_owner(owner: str) -> str:
