@@ -309,6 +309,9 @@ def test_process_signal_sanitizer_recurses_with_fixed_priority_and_safe_exit_cod
         "close_direct",
         "close_linked",
         "close_group",
+        "factory_direct",
+        "factory_linked",
+        "factory_group",
         "mixed",
     ],
 )
@@ -345,11 +348,26 @@ async def test_hidden_cancellation_in_embedding_or_cleanup_is_never_swallowed(lo
         embed_failure=embed_failure,
         close_failure=close_failure,
     )
+    factory_failure = (
+        asyncio.CancelledError("private")
+        if location == "factory_direct"
+        else linked
+        if location == "factory_linked"
+        else group
+        if location == "factory_group"
+        else None
+    )
+
+    def factory():
+        if factory_failure is not None:
+            raise factory_failure
+        return client
+
     service = HostedRetrievalService(
         _Vault(),
         "kb-1",
         settings=_settings(),
-        embedding_client_factory=lambda: client,
+        embedding_client_factory=factory,
     )
 
     with pytest.raises(asyncio.CancelledError) as caught:
@@ -386,11 +404,12 @@ async def test_ordinary_cleanup_failure_never_masks_success_or_typed_fallback():
 
 
 @pytest.mark.asyncio
-async def test_non_ascii_api_key_factory_failure_is_sanitized_to_lexical_fallback():
+@pytest.mark.parametrize("api_key", ["秘密-key", "private\r\nkey"])
+async def test_invalid_api_key_factory_failure_is_sanitized_to_lexical_fallback(api_key):
     from services.retrieval import HostedRetrievalService
 
     settings = _settings(
-        EMBEDDING_API_KEY=SimpleNamespace(get_secret_value=lambda: "秘密-key"),
+        EMBEDDING_API_KEY=SimpleNamespace(get_secret_value=lambda: api_key),
         EMBEDDING_BASE_URL="https://private.invalid/v1",
     )
     result = await HostedRetrievalService(_Vault(), "kb-1", settings=settings).retrieve(
@@ -398,6 +417,129 @@ async def test_non_ascii_api_key_factory_failure_is_sanitized_to_lexical_fallbac
     )
 
     assert result.profile == "lexical_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("bug"), TypeError("bug"), AssertionError("bug")])
+async def test_injected_factory_programming_errors_remain_visible(failure):
+    from services.retrieval import HostedRetrievalService
+
+    def factory():
+        raise failure
+
+    service = HostedRetrievalService(
+        _Vault(), "kb-1", settings=_settings(), embedding_client_factory=factory
+    )
+
+    with pytest.raises(type(failure), match="bug"):
+        await service.retrieve(SearchQuery.build(text="q", limit=1), profile="hybrid")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["fallback_signal", "graph", "reranker"])
+@pytest.mark.parametrize("shape", ["linked", "group"])
+async def test_optional_callback_hidden_cancellation_is_sanitized(boundary, shape):
+    from services.retrieval import HostedRetrievalService
+
+    hidden = RuntimeError("private callback")
+    hidden.__cause__ = asyncio.CancelledError("private cancellation")
+    failure = (
+        hidden
+        if shape == "linked"
+        else BaseExceptionGroup(
+            "private group", [RuntimeError("private"), asyncio.CancelledError("private")]
+        )
+    )
+    vault = _Vault()
+    kwargs = {}
+    query = SearchQuery.build(text="q", limit=1)
+    if boundary == "fallback_signal":
+        vault.vector = RetrieverUnavailable("unavailable")
+
+        def callback(**_fields):
+            raise failure
+
+        kwargs["fallback_signal"] = callback
+    elif boundary == "graph":
+        vault.lexical = SearchResult((_hit("direct"),), 1)
+        vault.vector = SearchResult((), 0)
+        query = SearchQuery.build(text="q", limit=2)
+
+        async def expand(*_args, **_kwargs):
+            raise failure
+
+        vault.expand_references = expand
+    else:
+        class Reranker:
+            async def rerank(self, _query, _hits):
+                raise failure
+
+        kwargs["reranker"] = Reranker()
+    service = HostedRetrievalService(
+        vault,
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=_EmbeddingClient,
+        **kwargs,
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await service.retrieve(query, profile="hybrid")
+
+    assert caught.value.args == ()
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["factory", "embed", "close", "fallback_signal", "graph", "reranker"]
+)
+async def test_generator_exit_is_never_treated_as_an_ordinary_callback_error(boundary):
+    from services.retrieval import HostedRetrievalService
+
+    failure = GeneratorExit("private generator")
+    vault = _Vault()
+    kwargs = {}
+    query = SearchQuery.build(text="q", limit=1)
+    if boundary == "factory":
+        def factory():
+            raise failure
+
+        kwargs["embedding_client_factory"] = factory
+    elif boundary in ("embed", "close"):
+        kwargs["embedding_client_factory"] = lambda: _BoundaryEmbeddingClient(
+            embed_failure=failure if boundary == "embed" else None,
+            close_failure=failure if boundary == "close" else None,
+        )
+    elif boundary == "fallback_signal":
+        vault.vector = RetrieverUnavailable("unavailable")
+
+        def callback(**_fields):
+            raise failure
+
+        kwargs["fallback_signal"] = callback
+    elif boundary == "graph":
+        vault.lexical = SearchResult((_hit("direct"),), 1)
+        vault.vector = SearchResult((), 0)
+        query = SearchQuery.build(text="q", limit=2)
+
+        async def expand(*_args, **_kwargs):
+            raise failure
+
+        vault.expand_references = expand
+    else:
+        class Reranker:
+            async def rerank(self, _query, _hits):
+                raise failure
+
+        kwargs["reranker"] = Reranker()
+    kwargs.setdefault("embedding_client_factory", _EmbeddingClient)
+    service = HostedRetrievalService(vault, "kb-1", settings=_settings(), **kwargs)
+
+    expected = (GeneratorExit, RuntimeError) if boundary in ("factory", "embed", "close") else GeneratorExit
+    with pytest.raises(expected) as caught:
+        await service.retrieve(query, profile="hybrid")
+    assert not isinstance(caught.value, RetrieverUnavailable)
 
 
 @pytest.mark.asyncio

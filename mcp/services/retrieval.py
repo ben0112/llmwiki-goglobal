@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from math import isfinite
@@ -95,15 +94,19 @@ class HostedRetrievalService:
         )
         result = await service.retrieve(service_query)
         if result.profile == "lexical_fallback":
+            fallback_failure = None
             try:
                 self._fallback_signal(
                     reason="vector_unavailable",
                     candidate_count=result.candidate_count,
                 )
-            except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-                raise
-            except Exception:  # noqa: BLE001 - signals cannot fail retrieval.
-                pass
+            except BaseException as failure:  # noqa: BLE001 - sanitize hidden signals.
+                fallback_failure = failure
+            if fallback_failure is not None:
+                if signal := sanitized_process_signal(fallback_failure):
+                    raise signal from None
+                if not isinstance(fallback_failure, Exception):
+                    raise fallback_failure
         return result
 
     def _validated_hybrid_profile(self) -> EmbeddingProfile:
@@ -128,16 +131,23 @@ class HostedRetrievalService:
 
     def _new_embedding_client(self):
         if self._embedding_client_factory is not None:
-            client = self._embedding_client_factory()
-        else:
+            return self._embedding_client_factory()
+        factory_failure = None
+        try:
             api_key = self._settings.EMBEDDING_API_KEY.get_secret_value()
-            client = _OpenAICompatibleQueryEmbeddingClient(
+            return _OpenAICompatibleQueryEmbeddingClient(
                 profile=self._validated_hybrid_profile(),
                 base_url=self._settings.EMBEDDING_BASE_URL,
                 api_key=api_key,
                 timeout_seconds=self._settings.EMBEDDING_TIMEOUT_SECONDS,
             )
-        return client
+        except BaseException as failure:  # noqa: BLE001 - sanitize provider construction.
+            factory_failure = failure
+        if signal := sanitized_process_signal(factory_failure):
+            raise signal from None
+        if not isinstance(factory_failure, Exception):
+            raise factory_failure
+        raise EmbeddingUnavailable("embedding provider unavailable") from None
 
 
 class _LexicalRetriever:
@@ -174,7 +184,6 @@ class _VectorRetriever:
         result = None
         main_failure: BaseException | None = None
         close_failure: BaseException | None = None
-        factory_failed = False
         try:
             client = self._embedding_client_factory()
             if getattr(client, "profile", None) != self._profile:
@@ -188,13 +197,12 @@ class _VectorRetriever:
                 embedding=embedding,
                 profile=self._profile,
             )
-        except BaseException as failure:
+        except BaseException as failure:  # noqa: BLE001 - select one sanitized control signal.
             main_failure = failure
-            factory_failed = client is None
         if client is not None:
             try:
                 await _close_embedding_client(client)
-            except BaseException as failure:
+            except BaseException as failure:  # noqa: BLE001 - compare cleanup signals too.
                 close_failure = failure
 
         failures = tuple(
@@ -205,9 +213,15 @@ class _VectorRetriever:
         if signal := sanitized_process_signal(*failures):
             self.available = False
             raise signal from None
+        if nonordinary := next(
+            (failure for failure in failures if not isinstance(failure, Exception)),
+            None,
+        ):
+            self.available = False
+            raise nonordinary
         if main_failure is not None:
             self.available = False
-            if factory_failed or isinstance(main_failure, (EmbeddingError, RetrieverUnavailable)):
+            if isinstance(main_failure, (EmbeddingError, RetrieverUnavailable)):
                 raise RetrieverUnavailable("query embedding is unavailable") from None
             raise main_failure
         if result is None:
@@ -231,15 +245,26 @@ class _GraphExpander:
         remaining = max(0, query.limit - len(hits))
         if not remaining:
             return ()
+        graph_failure = None
+        expanded = None
         try:
-            return await self._vault.expand_references(
+            expanded = await self._vault.expand_references(
                 self._knowledge_base_id,
                 query,
                 tuple(hits),
                 limit=remaining,
             )
-        except RetrieverUnavailable:
-            return ()
+        except BaseException as failure:  # noqa: BLE001 - sanitize graph callback signals.
+            graph_failure = failure
+        if graph_failure is not None:
+            if signal := sanitized_process_signal(graph_failure):
+                raise signal from None
+            if isinstance(graph_failure, RetrieverUnavailable):
+                return ()
+            raise graph_failure
+        if expanded is None:
+            raise TypeError("graph expander must return a sequence")
+        return expanded
 
 
 class _PreservingReranker:
@@ -249,6 +274,7 @@ class _PreservingReranker:
     async def rerank(
         self, query: SearchQuery, hits: Sequence[SearchHit]
     ) -> Sequence[SearchHit]:
+        rerank_failure = None
         try:
             output = await self._reranker.rerank(query, hits)
             iterator = iter(output)
@@ -260,10 +286,13 @@ class _PreservingReranker:
                 except StopIteration:
                     return tuple(bounded)
             return tuple(hits)
-        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-            raise
-        except Exception:  # noqa: BLE001 - optional reranking must not break retrieval.
-            return tuple(hits)
+        except BaseException as failure:  # noqa: BLE001 - sanitize reranker signals.
+            rerank_failure = failure
+        if signal := sanitized_process_signal(rerank_failure):
+            raise signal from None
+        if not isinstance(rerank_failure, Exception):
+            raise rerank_failure
+        return tuple(hits)
 
 
 class _OpenAICompatibleQueryEmbeddingClient:

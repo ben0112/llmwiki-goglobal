@@ -25,6 +25,7 @@ from llmwiki_core.search import (
     SearchResult,
     SearchScope,
 )
+from llmwiki_core.signals import sanitized_process_signal
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
@@ -627,6 +628,8 @@ class PostgresVaultFS(VaultFS):
         vector = _vector_literal(embedding, dimensions=profile.dimensions)
         started_at = perf_counter()
 
+        availability_failure = None
+        available = None
         try:
             available = await scoped_queryrow(
                 self.user_id,
@@ -643,7 +646,11 @@ class PostgresVaultFS(VaultFS):
                 profile.model,
                 profile.dimensions,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError):
+        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+            availability_failure = failure
+        if availability_failure is not None:
+            if signal := sanitized_process_signal(availability_failure):
+                raise signal from None
             raise RetrieverUnavailable("vector store is unavailable") from None
         if not available or not available["available"]:
             raise RetrieverUnavailable("current embeddings are unavailable")
@@ -686,6 +693,8 @@ class PostgresVaultFS(VaultFS):
         )
         limit_param = bind(query.candidate_limit)
 
+        search_failure = None
+        rows = []
         try:
             rows = await scoped_query(
                 self.user_id,
@@ -708,7 +717,11 @@ class PostgresVaultFS(VaultFS):
                 f"LIMIT {limit_param}",
                 *params,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError):
+        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+            search_failure = failure
+        if search_failure is not None:
+            if signal := sanitized_process_signal(search_failure):
+                raise signal from None
             raise RetrieverUnavailable("vector store is unavailable") from None
         hits = tuple(_postgres_search_hit(row) for row in rows)
         candidate_count = int(rows[0]["candidate_count"]) if rows else 0
@@ -755,6 +768,8 @@ class PostgresVaultFS(VaultFS):
         )
         params.append(scan_limit)
         limit_parameter = f"${len(params)}"
+        expansion_failure = None
+        rows = []
         try:
             rows = await scoped_query(
                 self.user_id,
@@ -780,7 +795,11 @@ class PostgresVaultFS(VaultFS):
                 f"ORDER BY direct_rank, document_id LIMIT {limit_parameter}",
                 *params,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError):
+        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+            expansion_failure = failure
+        if expansion_failure is not None:
+            if signal := sanitized_process_signal(expansion_failure):
+                raise signal from None
             raise RetrieverUnavailable("reference expansion is unavailable") from None
         return tuple(_postgres_search_hit(row) for row in rows[:limit])
 
