@@ -806,6 +806,55 @@ class TestSearch:
         assert tagged.returned_count == tagged.candidate_count == 1
         assert tagged.hits[0].path == "/corrupt/corrupt-0.md"
 
+    async def test_sqlite_tag_filter_rejects_arrays_with_non_string_elements(
+        self,
+        fs,
+        insert_chunk,
+    ):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        stored_tags = [
+            ("numeric.md", "[7]"),
+            ("mixed.md", '["reviewed", 7]'),
+            ("strings.md", '["reviewed", "asean"]'),
+        ]
+        db = SqliteVaultFS._db_or_raise()
+        for filename, raw_tags in stored_tags:
+            doc = await instance.create_document(
+                kb_id,
+                filename,
+                filename,
+                "/tag-arrays/",
+                "md",
+                "",
+                [],
+            )
+            await db.execute(
+                "UPDATE documents SET tags = ? WHERE id = ?",
+                (raw_tags, str(doc["id"])),
+            )
+            await insert_chunk(str(doc["id"]), kb_id, "array permit content")
+        await db.commit()
+
+        unfiltered = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3),
+        )
+        numeric = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3, tags=["7"]),
+        )
+        reviewed = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3, tags=["reviewed"]),
+        )
+
+        assert sorted(hit.tags for hit in unfiltered.hits) == [(), (), ("asean", "reviewed")]
+        assert numeric.returned_count == numeric.candidate_count == 0
+        assert reviewed.returned_count == reviewed.candidate_count == 1
+        assert reviewed.hits[0].path == "/tag-arrays/strings.md"
+
     async def test_search_chunks_respects_limit(self, fs, insert_chunk):
         instance, kb_id = fs
         for i in range(5):

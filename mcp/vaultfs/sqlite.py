@@ -690,14 +690,22 @@ class SqliteVaultFS(VaultFS):
         if query.path_glob is not None:
             where.append("(d.path || d.filename) LIKE ? ESCAPE '\\'")
             where_params.append(logical_glob_to_sql_like(query.path_glob))
+        tags_array_sql = (
+            "CASE WHEN typeof(d.tags) = 'text' AND json_valid(d.tags) "
+            "THEN CASE WHEN json_type(d.tags) = 'array' THEN d.tags ELSE '[]' END "
+            "ELSE '[]' END"
+        )
+        if query.tags:
+            where.append(
+                "NOT EXISTS ("
+                f"SELECT 1 FROM json_each({tags_array_sql}) invalid_tag "
+                "WHERE invalid_tag.type != 'text')"
+            )
         for tag in query.tags:
             where.append(
                 "EXISTS ("
-                "SELECT 1 FROM json_each("
-                "CASE WHEN typeof(d.tags) = 'text' AND json_valid(d.tags) "
-                "THEN CASE WHEN json_type(d.tags) = 'array' THEN d.tags ELSE '[]' END "
-                "ELSE '[]' END"
-                ") tag WHERE lower(CAST(tag.value AS TEXT)) = ?)"
+                f"SELECT 1 FROM json_each({tags_array_sql}) tag "
+                "WHERE tag.type = 'text' AND lower(tag.value) = ?)"
             )
             where_params.append(tag)
 
