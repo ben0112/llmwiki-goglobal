@@ -160,6 +160,42 @@ async def test_settlement_is_owner_token_cas_and_repeated_safe(method):
 
 
 @pytest.mark.parametrize(
+    ("redis_status", "expected"),
+    [
+        (0, "settled"),
+        (1, "active"),
+        (2, "stale_generation"),
+        (4, "marker_conflict"),
+    ],
+)
+async def test_atomic_tus_marker_settlement_distinguishes_absent_owner_and_conflicts(
+    redis_status,
+    expected,
+):
+    quota = _module()
+    redis = _Redis(eval_results=[[redis_status]])
+    service = quota.HostedQuotaService(_Pool({}), redis)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    result = await service.settle_tus_marker_if_absent(reservation)
+
+    assert result is quota.QuotaMarkerSettlementStatus(expected)
+    _, numkeys, args = redis.eval_calls[0]
+    assert numkeys == 4
+    assert args[3] == f"tus:reservation:{{{reservation.user_id}}}:{{{reservation.upload_id}}}"
+    assert args[-3:] == (str(reservation.upload_id), reservation.owner_token, "10")
+
+
+async def test_atomic_tus_marker_settlement_malformed_snapshot_fails_closed():
+    quota = _module()
+    service = quota.HostedQuotaService(_Pool({}), _Redis(eval_results=[[5]]))
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    with pytest.raises(quota.QuotaUnavailable):
+        await service.settle_tus_marker_if_absent(reservation)
+
+
+@pytest.mark.parametrize(
     "user_id,upload_id,byte_count,ttl_seconds",
     [
         ("not-a-uuid", uuid4(), 1, 60),

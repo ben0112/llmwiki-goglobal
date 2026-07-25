@@ -266,7 +266,9 @@ def _validate_etag(value: object) -> str:
 
 def _validate_owner_token(value: object) -> str:
     token = _validate_ascii_opaque(value, "owner token", max_bytes=32)
-    if len(token) != 32 or any(not (character.isascii() and (character.isalnum() or character in "_-")) for character in token):
+    if len(token) != 32 or any(
+        not (character.isascii() and (character.isalnum() or character in "_-")) for character in token
+    ):
         raise ValueError("owner token must use the generated URL-safe format")
     return token
 
@@ -1242,7 +1244,11 @@ class TusSessionStore:
             owner,
             str(ttl),
         )
-        return LockMutationStatus.RENEWED if _protocol_integer(raw, "reservation renewal status", maximum=1) else LockMutationStatus.NOT_OWNER
+        return (
+            LockMutationStatus.RENEWED
+            if _protocol_integer(raw, "reservation renewal status", maximum=1)
+            else LockMutationStatus.NOT_OWNER
+        )
 
     async def release_reservation_once(
         self,

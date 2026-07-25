@@ -7,6 +7,7 @@ import logging
 import secrets
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
@@ -37,6 +38,13 @@ class QuotaExceeded(RuntimeError):
 
 class QuotaUnavailable(RuntimeError):
     """Quota admission could not be decided safely."""
+
+
+class QuotaMarkerSettlementStatus(StrEnum):
+    SETTLED = "settled"
+    ACTIVE = "active"
+    STALE_GENERATION = "stale_generation"
+    MARKER_CONFLICT = "marker_conflict"
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +280,67 @@ redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 return {1}
+"""
+)
+
+
+_SETTLE_TUS_MARKER_IF_ABSENT_SCRIPT = (
+    _LUA_RECORD_VALIDATORS
+    + f"""
+if not canonical_uuid(ARGV[1]) or not canonical_owner(ARGV[2]) or not canonical_bytes(ARGV[3]) then
+  return {{5}}
+end
+local count = redis.call('ZCARD', KEYS[1])
+if redis.call('HLEN', KEYS[2]) ~= count or redis.call('HLEN', KEYS[3]) ~= count then
+  return {{5}}
+end
+local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for index = 1, #members, 2 do
+  local upload_id = members[index]
+  local raw_score = members[index + 1]
+  local raw_bytes = redis.call('HGET', KEYS[2], upload_id)
+  local owner = redis.call('HGET', KEYS[3], upload_id)
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not canonical_bytes(raw_bytes) or not canonical_owner(owner) then
+    return {{5}}
+  end
+end
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+local byte_count = redis.call('HGET', KEYS[2], ARGV[1])
+local owner = redis.call('HGET', KEYS[3], ARGV[1])
+if score or byte_count or owner then
+  if not score or not byte_count or not owner then
+    return {{5}}
+  end
+  if owner == ARGV[2] and byte_count == ARGV[3] then
+    return {{1}}
+  end
+  return {{2}}
+end
+
+local raw = redis.call('GET', KEYS[4])
+if not raw then return {{0}} end
+if redis.call('PTTL', KEYS[4]) <= 0 then return {{5}} end
+local decoded, marker = pcall(cjson.decode, raw)
+if not decoded or type(marker) ~= 'table' then return {{5}} end
+local marker_count = 0
+for _ in pairs(marker) do marker_count = marker_count + 1 end
+if marker_count ~= 3 or type(marker.bytes) ~= 'number' or marker.bytes ~= math.floor(marker.bytes)
+   or marker.bytes < 1 or marker.bytes > {MAX_QUOTA_BYTES}
+   or not canonical_owner(marker.owner)
+   or (marker.state ~= 'reserved' and marker.state ~= 'released') then
+  return {{5}}
+end
+local canonical = '{{"bytes":' .. string.format('%.0f', marker.bytes)
+  .. ',"owner":"' .. marker.owner .. '","state":"' .. marker.state .. '"}}'
+if canonical ~= raw then return {{5}} end
+if marker.owner ~= ARGV[2] or string.format('%.0f', marker.bytes) ~= ARGV[3] then
+  return {{4}}
+end
+if marker.state == 'released' then return {{0}} end
+local released = '{{"bytes":' .. ARGV[3] .. ',"owner":"' .. ARGV[2] .. '","state":"released"}}'
+redis.call('SET', KEYS[4], released, 'KEEPTTL')
+return {{0}}
 """
 )
 
@@ -538,6 +607,47 @@ class HostedQuotaService:
 
     async def release(self, reservation: QuotaReservation) -> bool:
         return await self._settle(reservation)
+
+    async def settle_tus_marker_if_absent(
+        self,
+        reservation: QuotaReservation,
+    ) -> QuotaMarkerSettlementStatus:
+        """Atomically settle this owner's TUS marker only when its quota row is absent."""
+        self._validate_reservation(reservation)
+        _, reservations_key, bytes_key, tokens_key = quota_keys(reservation.user_id)
+        marker_key = f"tus:reservation:{{{reservation.user_id}}}:{{{reservation.upload_id}}}"
+        try:
+            items = _response_items(
+                await self._redis.eval(
+                    _SETTLE_TUS_MARKER_IF_ABSENT_SCRIPT,
+                    4,
+                    reservations_key,
+                    bytes_key,
+                    tokens_key,
+                    marker_key,
+                    str(reservation.upload_id),
+                    reservation.owner_token,
+                    str(reservation.bytes),
+                )
+            )
+        except QuotaUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Redis clients expose backend-specific failures.
+            raise QuotaUnavailable("Quota coordination is unavailable") from exc
+        if len(items) != 1:
+            raise QuotaUnavailable("Quota coordination returned an invalid response")
+        status = _response_int(items[0])
+        if status == 0:
+            return QuotaMarkerSettlementStatus.SETTLED
+        if status == 1:
+            return QuotaMarkerSettlementStatus.ACTIVE
+        if status == 2:
+            return QuotaMarkerSettlementStatus.STALE_GENERATION
+        if status == 4:
+            return QuotaMarkerSettlementStatus.MARKER_CONFLICT
+        if status == 5:
+            raise QuotaUnavailable("Quota or TUS marker state is invalid")
+        raise QuotaUnavailable("Quota coordination returned an invalid response")
 
     async def renew(self, reservation: QuotaReservation, ttl_seconds: int) -> bool:
         ttl_seconds = _require_integer(ttl_seconds, "ttl_seconds", maximum=MAX_TTL_SECONDS)

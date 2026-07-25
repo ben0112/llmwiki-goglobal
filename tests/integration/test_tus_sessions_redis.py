@@ -411,9 +411,14 @@ async def test_real_redis_reservation_release_is_once_and_marker_has_no_credenti
     lowered = raw.lower()
     assert b"token" not in lowered and b"secret" not in lowered and b"credential" not in lowered
 
-    assert await store.release_reservation_once(user_id, upload_id, "S" * 32) is module.ReservationReleaseStatus.NOT_OWNER
+    assert (
+        await store.release_reservation_once(user_id, upload_id, "S" * 32) is module.ReservationReleaseStatus.NOT_OWNER
+    )
     assert await store.release_reservation_once(user_id, upload_id, owner) is module.ReservationReleaseStatus.RELEASED
-    assert await store.release_reservation_once(user_id, upload_id, owner) is module.ReservationReleaseStatus.ALREADY_RELEASED
+    assert (
+        await store.release_reservation_once(user_id, upload_id, owner)
+        is module.ReservationReleaseStatus.ALREADY_RELEASED
+    )
 
 
 async def test_real_redis_expired_session_returns_none_with_bounded_poll(namespace, redis_client):
@@ -571,12 +576,8 @@ async def test_real_redis_zero_byte_reservation_is_malformed_and_never_renewed(n
 
     with pytest.raises(module.InvalidTusSessionError):
         await store.get_reservation(user_id, upload_id)
+    assert await store.release_reservation_once(user_id, upload_id, owner) is module.ReservationReleaseStatus.MALFORMED
     assert (
-        await store.release_reservation_once(user_id, upload_id, owner)
-        is module.ReservationReleaseStatus.MALFORMED
-    )
-    assert (
-        await store.renew_reservation(user_id, upload_id, owner, ttl_seconds=60)
-        is module.LockMutationStatus.NOT_OWNER
+        await store.renew_reservation(user_id, upload_id, owner, ttl_seconds=60) is module.LockMutationStatus.NOT_OWNER
     )
     assert await redis_client.get(key) == raw.encode()

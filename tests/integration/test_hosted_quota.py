@@ -7,7 +7,20 @@ import time
 from uuid import uuid4
 
 import pytest
-from infra.quota import HostedQuotaService, QuotaExceeded, QuotaReservation, QuotaUnavailable, quota_keys
+from infra.quota import (
+    HostedQuotaService,
+    QuotaExceeded,
+    QuotaMarkerSettlementStatus,
+    QuotaReservation,
+    QuotaUnavailable,
+    quota_keys,
+)
+from infra.tus_sessions import (
+    ReservationReleaseStatus,
+    TusReservationState,
+    TusSessionStore,
+    reservation_key,
+)
 from redis.asyncio import Redis
 
 pytestmark = pytest.mark.asyncio
@@ -146,6 +159,79 @@ async def test_owner_token_prevents_old_generation_from_releasing_replacement(po
         assert await service.release(new) is True
         assert await service.release(new) is False
     finally:
+        await _clear(redis_client, user_id)
+
+
+@pytest.mark.parametrize("loss_point", ["before_marker_cas", "after_marker_cas"])
+async def test_atomic_tus_marker_settlement_recovers_finalize_response_loss(
+    pool,
+    redis_client,
+    loss_point,
+):
+    user_id = await _seed_user(pool, limit=100)
+    upload_id = uuid4()
+    quota = HostedQuotaService(pool, redis_client)
+    tus_store = TusSessionStore(redis_client)
+    try:
+        reservation = await quota.reserve(user_id, upload_id, 10, ttl_seconds=60)
+        assert (
+            await tus_store.create_reservation(
+                user_id,
+                upload_id,
+                10,
+                owner_token=reservation.owner_token,
+                ttl_seconds=60,
+            )
+        ).value == "created"
+        assert await quota.finalize(reservation) is True
+        if loss_point == "after_marker_cas":
+            assert (
+                await tus_store.release_reservation_once(user_id, upload_id, reservation.owner_token)
+                is ReservationReleaseStatus.RELEASED
+            )
+
+        assert await quota.settle_tus_marker_if_absent(reservation) is QuotaMarkerSettlementStatus.SETTLED
+        marker = await tus_store.get_reservation(user_id, upload_id)
+        assert marker is not None
+        assert marker.owner_token == reservation.owner_token
+        assert marker.state is TusReservationState.RELEASED
+    finally:
+        await redis_client.delete(reservation_key(user_id, upload_id))
+        await _clear(redis_client, user_id)
+
+
+async def test_atomic_tus_marker_settlement_preserves_stale_generation_and_marker(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    upload_id = uuid4()
+    quota = HostedQuotaService(pool, redis_client)
+    tus_store = TusSessionStore(redis_client)
+    try:
+        old = await quota.reserve(user_id, upload_id, 10, ttl_seconds=60)
+        await tus_store.create_reservation(
+            user_id,
+            upload_id,
+            10,
+            owner_token=old.owner_token,
+            ttl_seconds=60,
+        )
+        replacement = await quota.reserve(user_id, upload_id, 20, ttl_seconds=60)
+        marker_before = await redis_client.get(reservation_key(user_id, upload_id))
+        quota_before = [
+            await redis_client.zrange(quota_keys(user_id)[1], 0, -1, withscores=True),
+            await redis_client.hgetall(quota_keys(user_id)[2]),
+            await redis_client.hgetall(quota_keys(user_id)[3]),
+        ]
+
+        assert await quota.settle_tus_marker_if_absent(old) is QuotaMarkerSettlementStatus.STALE_GENERATION
+        assert await redis_client.get(reservation_key(user_id, upload_id)) == marker_before
+        assert [
+            await redis_client.zrange(quota_keys(user_id)[1], 0, -1, withscores=True),
+            await redis_client.hgetall(quota_keys(user_id)[2]),
+            await redis_client.hgetall(quota_keys(user_id)[3]),
+        ] == quota_before
+        assert await quota.release(replacement) is True
+    finally:
+        await redis_client.delete(reservation_key(user_id, upload_id))
         await _clear(redis_client, user_id)
 
 

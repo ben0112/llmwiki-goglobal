@@ -41,9 +41,7 @@ OWNER = "Q" * 32
 
 def _metadata(*, filename: str = "fault.pdf", path: str = "/faults/") -> str:
     values = {"filename": filename, "knowledge_base_id": str(KB_ID), "path": path}
-    return ",".join(
-        f"{key} {base64.b64encode(value.encode()).decode()}" for key, value in values.items()
-    )
+    return ",".join(f"{key} {base64.b64encode(value.encode()).decode()}" for key, value in values.items())
 
 
 def _session(*, total: int = 10 * MIB, offset: int = 0, parts=(), object_completed=False, state=None):
@@ -87,6 +85,7 @@ class Quota:
         finalize_error=None,
         release_result=True,
         finalize_result=True,
+        marker_settlement_status="settled",
     ):
         self.events = events
         self.reserve_error = reserve_error
@@ -94,6 +93,7 @@ class Quota:
         self.finalize_error = finalize_error
         self.release_result = release_result
         self.finalize_result = finalize_result
+        self.marker_settlement_status_result = marker_settlement_status
         self.reservation = None
 
     async def reserve(self, user_id, upload_id, byte_count, ttl_seconds):
@@ -118,6 +118,12 @@ class Quota:
         if self.finalize_error:
             raise self.finalize_error
         return self.finalize_result
+
+    async def settle_tus_marker_if_absent(self, reservation):
+        from infra.quota import QuotaMarkerSettlementStatus
+
+        self.events.append("quota.marker_settle")
+        return QuotaMarkerSettlementStatus(self.marker_settlement_status_result)
 
 
 class S3:
@@ -237,7 +243,10 @@ class Store:
                 offset=expected_offset + byte_count,
                 parts=(*self.session.parts, TusPart(part_number, etag)),
             )
-        return AppendPartResult(self.append_status, expected_offset + byte_count if self.append_status is AppendPartStatus.APPENDED else expected_offset)
+        return AppendPartResult(
+            self.append_status,
+            expected_offset + byte_count if self.append_status is AppendPartStatus.APPENDED else expected_offset,
+        )
 
     async def mark_cleanup_required(self, upload_id, expected_offset, ttl_seconds, *, lock_token):
         self.events.append("redis.cleanup_required")
@@ -416,6 +425,42 @@ async def test_offset_is_not_committed_until_s3_returns_an_etag(monkeypatch):
     assert events.index("s3.upload.etag") < events.index("redis.append")
 
 
+async def test_single_huge_stream_chunk_buffers_only_cap_plus_one_and_never_reaches_s3(monkeypatch):
+    from infra import tus
+
+    events = []
+    session = _session(total=10 * MIB)
+    app = _app(monkeypatch, S3(events), Quota(events), Store(events, session=session), max_patch_bytes=1024)
+
+    class TrackingBytearray(bytearray):
+        peak = 0
+
+        def extend(self, value):
+            super().extend(value)
+            type(self).peak = max(type(self).peak, len(self))
+
+    monkeypatch.setattr(tus, "bytearray", TrackingBytearray, raising=False)
+
+    async def one_huge_chunk():
+        yield b"x" * (2 * MIB)
+
+    async with await _client(app) as client:
+        response = await client.patch(
+            f"/v1/uploads/{session.upload_id}",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": "0",
+                "Content-Type": "application/offset+octet-stream",
+            },
+            content=one_huge_chunk(),
+        )
+
+    assert response.status_code == 413
+    assert TrackingBytearray.peak <= 1025
+    assert "s3.upload.start" not in events
+
+
 async def test_unexpected_append_cas_failure_marks_cleanup_required_without_guessing_offset(monkeypatch):
     events = []
     session = _session()
@@ -540,6 +585,108 @@ async def test_committed_settlement_keeps_marker_reserved_when_quota_finalize_fa
     assert "marker.release" not in events
 
 
+async def test_committed_retry_releases_marker_when_same_quota_generation_is_absent(monkeypatch):
+    events = []
+    session = _session(total=5, offset=5, parts=(TusPart(1, "etag"),), object_completed=True)
+    store = Store(events, session=session)
+    quota = Quota(events, finalize_result=False, marker_settlement_status="settled")
+    app = _app(monkeypatch, S3(events), quota, store)
+    reservation = QuotaReservation(USER_ID, session.upload_id, session.total_length, OWNER)
+
+    await app.state.tus_service._settle_committed(
+        session,
+        reservation,
+        "L" * 32,
+        session.upload_id,
+        uuid4(),
+    )
+
+    assert events[-2:] == ["quota.finalize", "quota.marker_settle"]
+
+
+async def test_committed_retry_never_releases_marker_for_stale_quota_generation(monkeypatch):
+    events = []
+    session = _session(total=5, offset=5, parts=(TusPart(1, "etag"),), object_completed=True)
+    store = Store(events, session=session)
+    quota = Quota(events, finalize_result=False, marker_settlement_status="stale_generation")
+    app = _app(monkeypatch, S3(events), quota, store)
+    reservation = QuotaReservation(USER_ID, session.upload_id, session.total_length, OWNER)
+
+    with pytest.raises(Exception):
+        await app.state.tus_service._settle_committed(
+            session,
+            reservation,
+            "L" * 32,
+            session.upload_id,
+            uuid4(),
+        )
+
+    assert "quota.marker_settle" in events
+    assert "marker.release" not in events
+
+
+@pytest.mark.parametrize("loss_point", ["before_marker_cas", "after_marker_cas"])
+async def test_completed_duplicate_recovers_quota_finalize_response_loss_around_marker_cas(
+    monkeypatch,
+    loss_point,
+):
+    events = []
+    session = _session(total=5, offset=5, parts=(TusPart(1, "etag"),), object_completed=True)
+
+    class LostMarkerResponseStore(Store):
+        def __init__(self):
+            super().__init__(events, session=session)
+            self.marker_calls = 0
+
+        async def release_reservation_once(self, user_id, upload_id, owner_token):
+            self.marker_calls += 1
+            events.append("marker.release")
+            if self.marker_calls == 1:
+                if loss_point == "after_marker_cas":
+                    self.marker_release_status = ReservationReleaseStatus.ALREADY_RELEASED
+                    self.marker = TusQuotaReservation(
+                        session.total_length,
+                        OWNER,
+                        TusReservationState.RELEASED,
+                    )
+                raise RuntimeError("marker response lost")
+            return self.marker_release_status
+
+    class LostFinalizeResponseQuota(Quota):
+        def __init__(self):
+            super().__init__(events, marker_settlement_status="settled")
+            self.finalize_calls = 0
+
+        async def finalize(self, reservation):
+            self.finalize_calls += 1
+            events.append("quota.finalize")
+            return self.finalize_calls == 1
+
+    store = LostMarkerResponseStore()
+    quota = LostFinalizeResponseQuota()
+    app = _app(monkeypatch, S3(events), quota, store)
+    reservation = QuotaReservation(USER_ID, session.upload_id, session.total_length, OWNER)
+
+    with pytest.raises(RuntimeError):
+        await app.state.tus_service._settle_committed(
+            session,
+            reservation,
+            "L" * 32,
+            session.upload_id,
+            uuid4(),
+        )
+
+    await app.state.tus_service._retry_completed_settlement(store.session)
+
+    if loss_point == "before_marker_cas":
+        assert quota.finalize_calls == 2
+        assert "quota.marker_settle" in events
+    else:
+        assert quota.finalize_calls == 1
+        assert store.marker_release_status is ReservationReleaseStatus.ALREADY_RELEASED
+        assert store.marker.state is TusReservationState.RELEASED
+
+
 async def test_completed_duplicate_retries_reserved_quota_settlement(monkeypatch):
     events = []
     document_id = UUID("22222222-2222-2222-2222-222222222222")
@@ -595,6 +742,7 @@ async def test_false_quota_generation_result_never_releases_marker_or_session(mo
         events,
         release_result=operation != "release",
         finalize_result=operation != "finalize",
+        marker_settlement_status="stale_generation" if operation == "finalize" else "settled",
     )
     app = _app(monkeypatch, S3(events), quota, store)
     service = app.state.tus_service
@@ -714,7 +862,9 @@ async def test_upload_cleanup_handler_is_replay_safe_and_releases_quota_once():
         knowledge_base_id=None,
         payload={"upload_id": str(upload_id)},
     )
-    context = WorkerContext(pool=SimpleNamespace(), s3=None, converter_url="", converter_secret="", tus_cleanup=Cleanup())
+    context = WorkerContext(
+        pool=SimpleNamespace(), s3=None, converter_url="", converter_secret="", tus_cleanup=Cleanup()
+    )
 
     first = await handle_upload_cleanup(job, Lease(), context)
     second = await handle_upload_cleanup(job, Lease(), context)
@@ -754,14 +904,13 @@ async def test_stale_scan_enqueues_all_sessions_without_live_knowledge_bases():
         Jobs(),
         Quota([]),
         Sessions(),
+        session_ttl_seconds=300,
         stale_seconds=60,
         lock_seconds=10,
     )
 
     assert await cleanup.enqueue_stale_jobs() == 2
-    assert [command.payload["upload_id"] for command in commands] == [
-        str(session.upload_id) for session in sessions
-    ]
+    assert [command.payload["upload_id"] for command in commands] == [str(session.upload_id) for session in sessions]
 
 
 async def test_cleanup_service_treats_missing_objects_as_success_and_is_repeat_safe():
@@ -786,6 +935,7 @@ async def test_cleanup_service_treats_missing_objects_as_success_and_is_repeat_s
         SimpleNamespace(),
         Quota(events),
         store,
+        session_ttl_seconds=300,
         stale_seconds=60,
         lock_seconds=10,
     )
@@ -822,6 +972,7 @@ async def test_cleanup_service_stale_owner_never_deletes_after_losing_lock():
         SimpleNamespace(),
         Quota(events),
         store,
+        session_ttl_seconds=300,
         stale_seconds=60,
         lock_seconds=10,
     )
@@ -832,3 +983,111 @@ async def test_cleanup_service_stale_owner_never_deletes_after_losing_lock():
     assert "quota.release" not in events
     assert "marker.release" not in events
     assert "session.delete" not in events
+
+
+async def test_stale_uploading_cleanup_sets_fenced_state_before_any_s3_side_effect():
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    session = _session()
+    store = Store(events, session=session)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3(events),
+        SimpleNamespace(),
+        Quota(events),
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=-1,
+        lock_seconds=10,
+    )
+
+    result = await cleanup.cleanup(session.upload_id, USER_ID)
+
+    assert result["status"] == "cleaned"
+    assert events.index("redis.cleanup_required") < events.index("s3.delete")
+
+
+async def test_cleanup_state_fence_blocks_new_patch_even_if_cleanup_lock_expires(monkeypatch):
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    session = _session()
+    store = Store(events, session=session)
+
+    class GatedDeleteS3(S3):
+        async def delete_object(self, key):
+            self.events.append("s3.delete")
+            started.set()
+            await finish.wait()
+
+    s3 = GatedDeleteS3(events)
+    quota = Quota(events)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        s3,
+        SimpleNamespace(),
+        quota,
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=-1,
+        lock_seconds=1,
+    )
+    cleanup_task = asyncio.create_task(cleanup.cleanup(session.upload_id, USER_ID))
+    await started.wait()
+    assert store.session.state is TusSessionState.CLEANUP_REQUIRED
+
+    app = _app(monkeypatch, s3, quota, store, lock_seconds=1)
+    async with await _client(app) as client:
+        response = await client.patch(
+            f"/v1/uploads/{session.upload_id}",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": "0",
+                "Content-Type": "application/offset+octet-stream",
+            },
+            content=b"%PDF-" + b"a" * (5 * MIB - 5),
+        )
+
+    assert response.status_code == 409
+    assert "s3.upload.start" not in events
+    finish.set()
+    assert (await cleanup_task)["status"] == "cleaned"
+
+
+@pytest.mark.parametrize("cas_outcome", [False, RuntimeError("redis unavailable")])
+async def test_stale_uploading_cleanup_cas_failure_has_zero_s3_side_effects(cas_outcome):
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    session = _session()
+
+    class FailingFenceStore(Store):
+        async def mark_cleanup_required(self, *args, **kwargs):
+            events.append("redis.cleanup_required")
+            if isinstance(cas_outcome, Exception):
+                raise cas_outcome
+            return cas_outcome
+
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3(events),
+        SimpleNamespace(),
+        Quota(events),
+        FailingFenceStore(events, session=session),
+        session_ttl_seconds=300,
+        stale_seconds=-1,
+        lock_seconds=10,
+    )
+
+    if isinstance(cas_outcome, Exception):
+        with pytest.raises(RuntimeError):
+            await cleanup.cleanup(session.upload_id, USER_ID)
+    else:
+        assert (await cleanup.cleanup(session.upload_id, USER_ID))["status"] == "lock_lost"
+
+    assert "s3.delete" not in events
+    assert "s3.abort" not in events

@@ -25,9 +25,7 @@ MIB = 1024 * 1024
 
 def _metadata(filename: str, kb_id: UUID, path: str = "/") -> str:
     values = {"filename": filename, "knowledge_base_id": str(kb_id), "path": path}
-    return ",".join(
-        f"{key} {base64.b64encode(value.encode('utf-8')).decode('ascii')}" for key, value in values.items()
-    )
+    return ",".join(f"{key} {base64.b64encode(value.encode('utf-8')).decode('ascii')}" for key, value in values.items())
 
 
 def _headers(user_id: UUID, **extra: str) -> dict[str, str]:
@@ -95,10 +93,10 @@ async def multipart_runtime(pool, monkeypatch):
 
     monkeypatch.setattr(tus, "_get_user_id", authenticated)
 
-    def make_app() -> FastAPI:
+    def make_app() -> tuple[FastAPI, tus.HostedTusMultipartService]:
         app = FastAPI()
         store = TusSessionStore(redis)
-        app.state.tus_service = tus.HostedTusMultipartService(
+        service = tus.HostedTusMultipartService(
             pool,
             s3,
             JobService(pool),
@@ -109,11 +107,12 @@ async def multipart_runtime(pool, monkeypatch):
             lock_seconds=10,
             max_patch_bytes=8 * MIB,
         )
+        app.state.tus_service = service
         app.include_router(tus.router)
-        return app
+        return app, service
 
-    app_a = make_app()
-    app_b = make_app()
+    app_a, service_a = make_app()
+    app_b, service_b = make_app()
     clients = (
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app_a), base_url="http://replica-a"),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app_b), base_url="http://replica-b"),
@@ -131,6 +130,8 @@ async def multipart_runtime(pool, monkeypatch):
             "kb_id": kb_id,
             "a": clients[0],
             "b": clients[1],
+            "service_a": service_a,
+            "service_b": service_b,
         }
     finally:
         await clients[1].__aexit__(None, None, None)
@@ -236,12 +237,18 @@ async def test_cross_replica_resume_finalization_and_duplicate_final_patch(multi
     assert duplicate.status_code == 204
     assert UUID(duplicate.headers["x-document-id"]) == document_id
     assert UUID(duplicate.headers["x-job-id"]) == job_id
-    assert await runtime["pool"].fetchval(
-        "SELECT COUNT(*) FROM documents WHERE id = $1 AND user_id = $2", document_id, runtime["user_id"]
-    ) == 1
-    assert await runtime["pool"].fetchval(
-        "SELECT COUNT(*) FROM background_jobs WHERE id = $1 AND user_id = $2", job_id, runtime["user_id"]
-    ) == 1
+    assert (
+        await runtime["pool"].fetchval(
+            "SELECT COUNT(*) FROM documents WHERE id = $1 AND user_id = $2", document_id, runtime["user_id"]
+        )
+        == 1
+    )
+    assert (
+        await runtime["pool"].fetchval(
+            "SELECT COUNT(*) FROM background_jobs WHERE id = $1 AND user_id = $2", job_id, runtime["user_id"]
+        )
+        == 1
+    )
     after = set(temp_root.iterdir()) if temp_root.exists() else set()
     assert after == before
 
@@ -285,3 +292,188 @@ async def test_owner_checks_lock_contention_and_actual_stream_cap(multipart_runt
     )
     assert oversized.status_code == 413
     assert (await runtime["a"].head(location, headers=_headers(runtime["user_id"]))).headers["upload-offset"] == "0"
+
+
+async def test_real_s3_etag_interruption_leaves_zero_offset_and_worker_recovers(multipart_runtime):
+    from infra.tus import HostedTusCleanupService
+    from infra.tus_sessions import TusReservationState
+
+    runtime = multipart_runtime
+    body = b"%PDF-" + b"a" * (5 * MIB - 5)
+    location = await _create_upload(runtime, len(body))
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    etag_ready = asyncio.Event()
+    never_return = asyncio.Event()
+    original_upload_part = runtime["s3"].upload_part
+
+    async def gated_upload_part(key, multipart_id, part_number, payload):
+        etag = await original_upload_part(key, multipart_id, part_number, payload)
+        etag_ready.set()
+        await never_return.wait()
+        return etag
+
+    runtime["s3"].upload_part = gated_upload_part
+    patch_task = asyncio.create_task(
+        runtime["a"].patch(
+            location,
+            headers=_headers(
+                runtime["user_id"],
+                **{"Upload-Offset": "0", "Content-Type": "application/offset+octet-stream"},
+            ),
+            content=body,
+        )
+    )
+    await etag_ready.wait()
+    patch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await patch_task
+    runtime["s3"].upload_part = original_upload_part
+
+    interrupted = await runtime["store"].get(upload_id)
+    assert interrupted is not None
+    assert interrupted.offset == 0
+    assert interrupted.parts == ()
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=-1,
+        lock_seconds=10,
+    )
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "cleaned"
+    assert await runtime["store"].get(upload_id) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+
+
+async def test_real_signature_rejection_removes_object_session_and_quota(multipart_runtime):
+    from infra.tus_sessions import TusReservationState
+
+    runtime = multipart_runtime
+    body = b"not-a-pdf"
+    location = await _create_upload(runtime, len(body))
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    session = await runtime["store"].get(upload_id)
+
+    response = await runtime["b"].patch(
+        location,
+        headers=_headers(
+            runtime["user_id"],
+            **{"Upload-Offset": "0", "Content-Type": "application/offset+octet-stream"},
+        ),
+        content=body,
+    )
+
+    assert response.status_code == 400
+    assert await runtime["store"].get(upload_id) is None
+    assert await runtime["s3"].head_object(session.s3_key) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+
+
+async def test_real_postgres_rollback_orphan_is_recovered_by_durable_cleanup(multipart_runtime):
+    from infra.tus import HostedTusCleanupService
+    from infra.tus_sessions import TusReservationState, TusSessionState
+
+    runtime = multipart_runtime
+    body = b"%PDF-valid"
+    location = await _create_upload(runtime, len(body))
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    session = await runtime["store"].get(upload_id)
+    original_delete = runtime["s3"].delete_object
+    delete_calls = 0
+
+    async def rollback_commit(_transaction):
+        raise RuntimeError("forced pre-commit rollback")
+
+    async def fail_first_delete(key):
+        nonlocal delete_calls
+        delete_calls += 1
+        if delete_calls == 1:
+            raise RuntimeError("temporary object-store failure")
+        return await original_delete(key)
+
+    runtime["service_a"]._commit_transaction = rollback_commit
+    runtime["s3"].delete_object = fail_first_delete
+    response = await runtime["a"].patch(
+        location,
+        headers=_headers(
+            runtime["user_id"],
+            **{"Upload-Offset": "0", "Content-Type": "application/offset+octet-stream"},
+        ),
+        content=body,
+    )
+    runtime["s3"].delete_object = original_delete
+
+    assert response.status_code == 503
+    assert await runtime["pool"].fetchval("SELECT COUNT(*) FROM documents WHERE id = $1", upload_id) == 0
+    orphan = await runtime["store"].get(upload_id)
+    assert orphan is not None and orphan.state is TusSessionState.CLEANUP_REQUIRED
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RESERVED
+
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=180,
+        lock_seconds=10,
+    )
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "cleaned"
+    assert await runtime["store"].get(upload_id) is None
+    assert await runtime["s3"].head_object(session.s3_key) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+
+
+async def test_real_stale_cleanup_treats_nosuch_as_success_replays_and_releases_quota_once(
+    multipart_runtime,
+):
+    from infra.tus import HostedTusCleanupService
+    from infra.tus_sessions import TusReservationState
+
+    runtime = multipart_runtime
+    location = await _create_upload(runtime, 5 * MIB)
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    session = await runtime["store"].get(upload_id)
+    await runtime["s3"].abort_multipart(session.s3_key, session.multipart_upload_id)
+    await runtime["s3"].delete_object(session.s3_key)
+    delegate = HostedQuotaService(runtime["pool"], runtime["redis"])
+
+    class CountingQuota:
+        def __init__(self):
+            self.release_calls = 0
+
+        async def release(self, reservation):
+            self.release_calls += 1
+            return await delegate.release(reservation)
+
+    quota = CountingQuota()
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        quota,
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=-1,
+        lock_seconds=10,
+    )
+
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "cleaned"
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "already_clean"
+    assert quota.release_calls == 1
+    assert await runtime["store"].get(upload_id) is None
+    assert await runtime["s3"].head_object(session.s3_key) is None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None

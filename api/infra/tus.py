@@ -676,10 +676,13 @@ class HostedTusMultipartService:
                 if int(content_length) > self.max_patch_bytes or int(content_length) > remaining:
                     return b"", True
         body = bytearray()
+        limit = min(self.max_patch_bytes, remaining)
         try:
             async for chunk in request.stream():
-                body.extend(chunk)
-                if len(body) > self.max_patch_bytes or len(body) > remaining:
+                available = limit + 1 - len(body)
+                if available > 0:
+                    body.extend(chunk[:available])
+                if len(chunk) > available or len(body) > limit:
                     return bytes(body), True
         except ClientDisconnect:
             raise HTTPException(status_code=400, detail="PATCH body was interrupted") from None
@@ -884,6 +887,7 @@ class HostedTusMultipartService:
             return None
 
     async def _settle_committed(self, session, reservation, token: str, document_id: UUID, job_id: UUID) -> None:
+        from infra.quota import QuotaMarkerSettlementStatus
         from infra.tus_sessions import CompleteStatus
 
         result = await self.sessions.mark_complete(
@@ -898,7 +902,10 @@ class HostedTusMultipartService:
             raise HTTPException(status_code=503, detail="Upload completion state is unavailable")
         finalized = await self.quota.finalize(reservation)
         if finalized is not True:
-            raise RuntimeError("quota reservation generation was not finalized")
+            marker_settlement = await self.quota.settle_tus_marker_if_absent(reservation)
+            if marker_settlement is not QuotaMarkerSettlementStatus.SETTLED:
+                raise RuntimeError("quota reservation generation was not finalized")
+            return
         marker_status = await self.sessions.release_reservation_once(
             session.user_id,
             session.upload_id,
@@ -908,7 +915,7 @@ class HostedTusMultipartService:
             raise RuntimeError("upload reservation marker was not owner-settled")
 
     async def _retry_completed_settlement(self, session) -> None:
-        from infra.quota import QuotaReservation
+        from infra.quota import QuotaMarkerSettlementStatus, QuotaReservation
         from infra.tus_sessions import TusReservationState
 
         try:
@@ -918,6 +925,9 @@ class HostedTusMultipartService:
             reservation = QuotaReservation(session.user_id, session.upload_id, marker.bytes, marker.owner_token)
             finalized = await self.quota.finalize(reservation)
             if finalized is not True:
+                marker_settlement = await self.quota.settle_tus_marker_if_absent(reservation)
+                if marker_settlement is not QuotaMarkerSettlementStatus.SETTLED:
+                    return
                 return
             marker_status = await self.sessions.release_reservation_once(
                 session.user_id,
@@ -1077,6 +1087,7 @@ class HostedTusCleanupService:
         quota_service,
         session_store,
         *,
+        session_ttl_seconds: int,
         stale_seconds: int,
         lock_seconds: int,
     ) -> None:
@@ -1085,6 +1096,7 @@ class HostedTusCleanupService:
         self.jobs = job_service
         self.quota = quota_service
         self.sessions = session_store
+        self.session_ttl_seconds = session_ttl_seconds
         self.stale_seconds = stale_seconds
         self.lock_seconds = lock_seconds
 
@@ -1111,7 +1123,7 @@ class HostedTusCleanupService:
             created += 1
         return created
 
-    async def cleanup(self, upload_id: UUID, expected_user_id: UUID) -> dict[str, object]:
+    async def cleanup(self, upload_id: UUID, expected_user_id: UUID) -> dict[str, object]:  # noqa: C901
         from infra.quota import QuotaReservation
         from infra.tus_sessions import (
             LockAcquireStatus,
@@ -1138,6 +1150,16 @@ class HostedTusCleanupService:
 
             if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
                 return {"upload_id": str(upload_id), "status": "lock_lost"}
+            if session.state is TusSessionState.UPLOADING:
+                fenced = await self.sessions.mark_cleanup_required(
+                    upload_id,
+                    session.offset,
+                    self.session_ttl_seconds,
+                    lock_token=token,
+                )
+                if not fenced:
+                    return {"upload_id": str(upload_id), "status": "lock_lost"}
+                session = replace(session, state=TusSessionState.CLEANUP_REQUIRED)
             objects_clean = await self._cleanup_objects(session)
             if not objects_clean:
                 return {"upload_id": str(upload_id), "status": "retry"}

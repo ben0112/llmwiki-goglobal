@@ -123,6 +123,7 @@ async def startup(ctx: dict) -> None:
                 JobService(pool),
                 HostedQuotaService(pool, ctx["redis"]),
                 TusSessionStore(ctx["redis"]),
+                session_ttl_seconds=runtime_settings.TUS_SESSION_TTL_SECONDS,
                 stale_seconds=runtime_settings.TUS_STALE_SECONDS,
                 lock_seconds=runtime_settings.TUS_LOCK_SECONDS,
             )
