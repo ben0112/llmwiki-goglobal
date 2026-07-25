@@ -12,12 +12,22 @@ from .documents import (
 )
 from .facets import FACET_KEYS, UnknownFacetError, apply_rollup, rollup_from_metas, validate_facets
 from .references import build_lookup_maps, extract_references, parse_citation_filename, parse_wiki_links
-from .search import SearchArea, SearchHit, SearchQuery, SearchScope
+from .search import (
+    ContextExpander,
+    Reranker,
+    Retriever,
+    SearchArea,
+    SearchHit,
+    SearchQuery,
+    SearchResult,
+    SearchScope,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "Chunk",
+    "ContextExpander",
     "DocumentIdentity",
     "DocumentKind",
     "DocumentStatus",
@@ -28,9 +38,12 @@ __all__ = [
     "chunk_text",
     "join_logical_path",
     "normalize_directory_path",
+    "Reranker",
+    "Retriever",
     "SearchArea",
     "SearchHit",
     "SearchQuery",
+    "SearchResult",
     "SearchScope",
     "UnknownFacetError",
     "apply_rollup",
