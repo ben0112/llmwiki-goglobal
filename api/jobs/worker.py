@@ -36,6 +36,8 @@ from jobs.models import (
     RESULT_MAX_BYTES,
     JobCancelled,
     JobRecord,
+    JobState,
+    JobType,
     JSONValue,
     LeaseLost,
     to_json_value,
@@ -276,6 +278,7 @@ def _emit_finished(
     started: float,
 ) -> None:
     """Emit only fields backed by the row returned from the committed mutation."""
+    duration_ms = int((time.monotonic() - started) * 1000)
     emit(
         logger,
         "durable_job_finished",
@@ -284,10 +287,65 @@ def _emit_finished(
         attempt=transition.attempt_count,
         state=transition.state,
         lease_owner=worker_id,
-        duration_ms=int((time.monotonic() - started) * 1000),
+        duration_ms=duration_ms,
         error_code=transition.error_code,
         replica_role="worker",
     )
+    _emit_embedding_finished(transition, duration_ms=duration_ms)
+
+
+def _emit_embedding_finished(transition: JobRecord, *, duration_ms: int) -> None:
+    """Emit a document-embedding attempt only after its ledger transition commits."""
+    if transition.job_type is not JobType.DOCUMENT_EMBED:
+        return
+    try:
+        from services.embeddings import embedding_profile_fields
+
+        from llmwiki_core.models import EmbeddingProfile
+
+        profile = EmbeddingProfile(
+            provider=transition.payload["provider"],
+            model=transition.payload["model"],
+            dimensions=transition.payload["dimensions"],
+        )
+        profile_fields = embedding_profile_fields(profile)
+        if transition.state is JobState.SUCCEEDED:
+            result = transition.result or {}
+            if result.get("stale") is True and set(result) == {"document_id", "stale"}:
+                outcome = "stale"
+                error_code = "embedding_stale"
+                chunk_count = 0
+            else:
+                chunk_count = result.get("embedded_chunks")
+                if type(chunk_count) is not int or chunk_count < 0:
+                    return
+                outcome = "success"
+                error_code = "embedding_succeeded"
+        elif transition.state is JobState.RETRY_WAIT:
+            outcome = "retry"
+            error_code = transition.error_code
+            chunk_count = 0
+        else:
+            outcome = "terminal"
+            error_code = transition.error_code or "cancelled"
+            chunk_count = 0
+        if not isinstance(error_code, str):
+            return
+        emit(
+            logger,
+            "embedding_finished",
+            schema_version=1,
+            job_id=transition.id,
+            attempt=transition.attempt_count,
+            outcome=outcome,
+            error_code=error_code,
+            **profile_fields,
+            chunk_count=chunk_count,
+            duration_ms=duration_ms,
+            replica_role="worker",
+        )
+    except Exception:  # noqa: BLE001 - malformed persisted identity fails closed.
+        return
 
 
 def _outcome(status: str, job_id: UUID | None = None) -> dict[str, str]:

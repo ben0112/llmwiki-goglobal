@@ -21,6 +21,17 @@ _INVALID_RESPONSE = "invalid embedding response"
 _UNAVAILABLE = "embedding provider unavailable"
 
 
+def embedding_profile_fields(profile: EmbeddingProfile) -> dict[str, str | int]:
+    """Return the public profile identity; outcome telemetry belongs to the worker."""
+    if not isinstance(profile, EmbeddingProfile):
+        raise ValueError("embedding profile is required")
+    return {
+        "provider": profile.provider,
+        "model": profile.model,
+        "dimensions": profile.dimensions,
+    }
+
+
 class OpenAIEmbeddingClient:
     """Bounded, ordered adapter for an OpenAI-compatible embeddings endpoint."""
 
@@ -195,4 +206,9 @@ def _ordered_vectors(
     return tuple(vector for vector in ordered if vector is not None)
 
 
-__all__ = ["DEFAULT_MAX_INPUTS", "DEFAULT_MAX_TOTAL_CHARS", "OpenAIEmbeddingClient"]
+__all__ = [
+    "DEFAULT_MAX_INPUTS",
+    "DEFAULT_MAX_TOTAL_CHARS",
+    "OpenAIEmbeddingClient",
+    "embedding_profile_fields",
+]

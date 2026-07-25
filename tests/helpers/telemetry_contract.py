@@ -5,6 +5,37 @@ from __future__ import annotations
 import json
 
 EVENT_SCHEMAS = {
+    "retrieval_finished": {
+        "schema_version": int,
+        "retrieval_id": str,
+        "profile": str,
+        "result_count": int,
+        "candidate_count": int,
+        "duration_ms": (int, float),
+        "error_code": (str, type(None)),
+    },
+    "retrieval_fallback": {
+        "schema_version": int,
+        "retrieval_id": str,
+        "profile": str,
+        "result_count": int,
+        "candidate_count": int,
+        "duration_ms": (int, float),
+        "reason": str,
+    },
+    "embedding_finished": {
+        "schema_version": int,
+        "job_id": str,
+        "attempt": int,
+        "outcome": str,
+        "error_code": str,
+        "provider": str,
+        "model": str,
+        "dimensions": int,
+        "chunk_count": int,
+        "duration_ms": int,
+        "replica_role": str,
+    },
     "durable_job_dispatched": {
         "job_id": str,
         "job_type": str,
@@ -37,7 +68,23 @@ EVENT_SCHEMAS = {
     "upload_cleanup_finished": {"upload_id": str, "state": str, "replica_role": str},
 }
 
-_FORBIDDEN_KEY_FRAGMENTS = ("payload", "object_url", "s3_key", "secret", "token", "raw", "content")
+_FORBIDDEN_KEY_FRAGMENTS = (
+    "payload",
+    "object_url",
+    "s3_key",
+    "secret",
+    "token",
+    "raw",
+    "content",
+    "query",
+    "vector",
+    "authorization",
+    "dsn",
+    "sql",
+    "exception",
+    "metadata",
+    "path",
+)
 _FORBIDDEN_VALUE_FRAGMENTS = (
     "postgresql://",
     "redis://",
@@ -76,7 +123,8 @@ def assert_telemetry_event(
             assert type(body[field]) in allowed, (
                 f"{event}.{field} has unstable type {type(body[field]).__name__}"
             )
-        assert body["replica_role"] in {"api", "worker"}
+        if "replica_role" in body:
+            assert body["replica_role"] in {"api", "worker"}
         assert not any(
             fragment in field.lower()
             for field in body

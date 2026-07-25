@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from math import isfinite
 from numbers import Real
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 
@@ -24,11 +25,13 @@ from llmwiki_core.search import (
     SearchResult,
 )
 from llmwiki_core.signals import sanitized_process_signal
+from llmwiki_core.telemetry import TELEMETRY_SCHEMA_VERSION, emit, validated_event
 
 logger = logging.getLogger(__name__)
 
 RetrievalProfile = Literal["lexical", "hybrid"]
 FallbackSignal = Callable[..., None]
+TelemetrySink = Callable[..., None]
 
 
 class HostedRetrievalService:
@@ -43,6 +46,7 @@ class HostedRetrievalService:
         embedding_client_factory: Callable[[], object] | None = None,
         reranker=None,
         fallback_signal: FallbackSignal | None = None,
+        telemetry_sink: TelemetrySink | None = None,
     ) -> None:
         if settings is None:
             from config import settings as runtime_settings
@@ -54,6 +58,7 @@ class HostedRetrievalService:
         self._embedding_client_factory = embedding_client_factory
         self._reranker = reranker
         self._fallback_signal = fallback_signal or _log_fallback
+        self._telemetry_sink = telemetry_sink or _log_telemetry
 
     async def retrieve(
         self,
@@ -61,8 +66,11 @@ class HostedRetrievalService:
         *,
         profile: RetrievalProfile = "lexical",
     ) -> SearchResult:
+        retrieval_id = uuid4()
         if profile == "lexical":
-            return await self._vault.retrieve(self._knowledge_base_id, query)
+            result = await self._vault.retrieve(self._knowledge_base_id, query)
+            self._emit_retrieval_finished(retrieval_id, result)
+            return result
         if profile != "hybrid":
             raise ValueError("unsupported retrieval profile")
         embedding_profile = self._validated_hybrid_profile()
@@ -107,7 +115,44 @@ class HostedRetrievalService:
                     raise signal from None
                 if not isinstance(fallback_failure, Exception):
                     raise fallback_failure
+            self._emit_telemetry(
+                "retrieval_fallback",
+                schema_version=TELEMETRY_SCHEMA_VERSION,
+                retrieval_id=retrieval_id,
+                profile=result.profile,
+                result_count=len(result.hits),
+                candidate_count=result.candidate_count,
+                duration_ms=result.latency_ms,
+                reason="vector_unavailable",
+            )
+        self._emit_retrieval_finished(retrieval_id, result)
         return result
+
+    def _emit_retrieval_finished(self, retrieval_id, result: SearchResult) -> None:
+        self._emit_telemetry(
+            "retrieval_finished",
+            schema_version=TELEMETRY_SCHEMA_VERSION,
+            retrieval_id=retrieval_id,
+            profile=result.profile,
+            result_count=len(result.hits),
+            candidate_count=result.candidate_count,
+            duration_ms=result.latency_ms,
+            error_code=None,
+        )
+
+    def _emit_telemetry(self, event: str, **fields: object) -> None:
+        failure = None
+        try:
+            body = validated_event(event, **fields)
+            self._telemetry_sink(body.pop("event"), **body)
+        except BaseException as caught:  # noqa: BLE001 - sanitize injected sink boundaries.
+            failure = caught
+        if failure is None:
+            return
+        if signal := sanitized_process_signal(failure):
+            raise signal from None
+        if not isinstance(failure, Exception):
+            raise type(failure)() from None
 
     def _validated_hybrid_profile(self) -> EmbeddingProfile:
         profile = getattr(self._settings, "embedding_profile", None)
@@ -466,6 +511,10 @@ def _log_fallback(*, reason: str, candidate_count: int) -> None:
         reason,
         candidate_count,
     )
+
+
+def _log_telemetry(event: str, **fields: object) -> None:
+    emit(logger, event, **fields)
 
 
 __all__ = ["HostedRetrievalService", "RetrievalProfile"]
