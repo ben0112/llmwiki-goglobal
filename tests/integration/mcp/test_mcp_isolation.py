@@ -269,7 +269,13 @@ class TestReadIsolation:
                 filename,
                 path,
                 tags,
-                json.dumps({"geo_country": [country]}),
+                json.dumps(
+                    {
+                        "geo_country": [country],
+                        "_legacy_tags": 7,
+                        "source_hit": "user metadata source hit",
+                    }
+                ),
             )
             await pg_pool.execute(
                 "INSERT INTO document_chunks "
@@ -334,7 +340,12 @@ class TestReadIsolation:
         assert all(hit.path.startswith("/corpus/idn/eligible-") for hit in result.hits)
         assert all(hit.tags == ("asean", "reviewed") for hit in result.hits)
         assert all(
-            hit.metadata["_legacy_tags"] == ("Reviewed", "ASEAN")
+            dict(hit.metadata)
+            == {
+                "geo_country": ("IDN",),
+                "_legacy_tags": 7,
+                "source_hit": "user metadata source hit",
+            }
             for hit in result.hits
         )
         assert all(

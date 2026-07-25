@@ -13,12 +13,13 @@ from db import get_pool, scoped_execute, scoped_query, scoped_queryrow, service_
 from services.chunker import chunk_text, store_chunks_pg
 
 from llmwiki_core.documents import DocumentKind
-from llmwiki_core.search import SearchArea, SearchHit, SearchQuery, SearchResult, SearchScope
+from llmwiki_core.search import SearchArea, SearchQuery, SearchResult, SearchScope
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
     DuplicateDocumentError,
     VaultFS,
+    _vault_search_hit,
     is_wiki_directory,
     logical_glob_to_sql_like,
 )
@@ -87,7 +88,7 @@ def _slugify(name: str) -> str:
     return slug or "kb"
 
 
-def _postgres_search_hit(row: dict) -> SearchHit:
+def _postgres_search_hit(row: dict):
     raw_metadata = row.get("metadata")
     if isinstance(raw_metadata, str):
         try:
@@ -96,20 +97,7 @@ def _postgres_search_hit(row: dict) -> SearchHit:
             raw_metadata = {}
     metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
     raw_tags = row.get("tags")
-    metadata.update(
-        {
-            "_filename": row["filename"],
-            "_directory": row["path"],
-            "_file_type": row["file_type"],
-            "_source_content": row.get("source_content") or "",
-            "_annotations_text": row.get("annotations_text"),
-            "_has_highlight": bool(row.get("has_highlight")),
-            "_legacy_tags": raw_tags,
-            "source_hit": bool(row.get("source_hit")),
-            "annotation_hit": bool(row.get("annotation_hit")),
-        }
-    )
-    return SearchHit(
+    return _vault_search_hit(
         document_id=str(row["document_id"]),
         document_version=int(row["document_version"]),
         chunk_index=int(row["chunk_index"]),
@@ -119,9 +107,17 @@ def _postgres_search_hit(row: dict) -> SearchHit:
         title=row.get("title"),
         page=row.get("page"),
         header_breadcrumb=row.get("header_breadcrumb"),
-        tags=() if raw_tags is None else raw_tags,
+        tags=raw_tags,
         document_kind=DocumentKind(row["source_kind"]),
         metadata=metadata,
+        filename=row["filename"],
+        directory=row["path"],
+        file_type=row["file_type"],
+        source_content=row.get("source_content") or "",
+        annotations_text=row.get("annotations_text"),
+        has_highlight=bool(row.get("has_highlight")),
+        source_hit=bool(row.get("source_hit")),
+        annotation_hit=bool(row.get("annotation_hit")),
     )
 
 

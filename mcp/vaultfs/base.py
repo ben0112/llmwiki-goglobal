@@ -1,8 +1,6 @@
-import json
 from abc import ABC, abstractmethod
-from time import perf_counter
+from dataclasses import dataclass, field
 
-from llmwiki_core.documents import DocumentKind
 from llmwiki_core.search import SearchHit, SearchQuery, SearchResult
 from llmwiki_core.wiki import WikiWriteBundle
 
@@ -79,36 +77,8 @@ class VaultFS(ABC):
     async def get_all_pages(self, doc_id: str) -> list[dict]: ...
 
     async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
-        """Bridge legacy-only adapters into the typed retrieval contract."""
-        legacy_search = type(self).search_chunks
-        if legacy_search is VaultFS.search_chunks:
-            raise NotImplementedError(
-                "VaultFS subclass must implement retrieve or search_chunks"
-            )
-        started_at = perf_counter()
-        path_filter = None if query.area.value == "all" else query.area.value
-        rows = await legacy_search(
-            self,
-            kb_id,
-            query.text,
-            query.candidate_limit,
-            path_filter,
-            query.annotated_only,
-            query.scope.value,
-            dict(query.facets),
-        )
-        if not isinstance(rows, list):
-            raise TypeError("legacy search_chunks must return a list of dictionaries")
-        hits = tuple(
-            _legacy_search_row_to_hit(row, index)
-            for index, row in enumerate(rows[: query.candidate_limit])
-        )
-        return SearchResult(
-            hits=hits,
-            candidate_count=len(rows),
-            latency_ms=(perf_counter() - started_at) * 1000,
-            profile="lexical",
-        )
+        """Typed retrieval must be implemented natively by each adapter."""
+        raise NotImplementedError("typed contract requires native retrieve")
 
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
@@ -118,10 +88,6 @@ class VaultFS(ABC):
         facets: dict | None = None,
     ) -> list[dict]:
         """Compatibility facade over the typed lexical retrieval contract."""
-        if type(self).retrieve is VaultFS.retrieve:
-            raise NotImplementedError(
-                "VaultFS subclass must implement retrieve or search_chunks"
-            )
         request = SearchQuery.build(
             text=query,
             limit=limit,
@@ -239,79 +205,111 @@ def is_wiki_directory(path: str) -> bool:
     return normalized == "wiki" or normalized.startswith("wiki/")
 
 
-def _legacy_search_row_to_hit(row: object, index: int) -> SearchHit:
-    if not isinstance(row, dict):
-        raise TypeError("legacy search_chunks rows must be dictionaries")
-    filename = row.get("filename")
-    directory = row.get("path", "/")
-    if not isinstance(filename, str) or not filename.strip():
-        raise ValueError("legacy search_chunks row filename must be nonblank")
-    if not isinstance(directory, str) or not directory.startswith("/"):
-        raise ValueError("legacy search_chunks row path must be absolute")
-    raw_metadata = row.get("metadata")
-    if isinstance(raw_metadata, str):
-        try:
-            raw_metadata = json.loads(raw_metadata)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise ValueError("legacy search_chunks row metadata must be valid JSON") from exc
-    if raw_metadata is not None and not isinstance(raw_metadata, dict):
-        raise TypeError("legacy search_chunks row metadata must be a dictionary")
-    metadata = dict(raw_metadata or {})
-    raw_tags = row.get("tags")
-    metadata.update(
-        {
-            "_filename": filename,
-            "_directory": directory,
-            "_file_type": row.get("file_type", ""),
-            "_source_content": row.get("source_content") or "",
-            "_annotations_text": row.get("annotations_text"),
-            "_has_highlight": bool(row.get("has_highlight", False)),
-            "_legacy_tags": raw_tags,
-            "source_hit": bool(row.get("source_hit", False)),
-            "annotation_hit": bool(row.get("annotation_hit", False)),
-        }
-    )
-    source_kind = row.get("source_kind")
-    if source_kind is None:
-        source_kind = "wiki" if is_wiki_directory(directory) else "source"
-    return SearchHit(
-        document_id=str(
-            row.get("document_id")
-            or row.get("id")
-            or f"legacy:{directory}{filename}"
-        ),
-        document_version=row.get("document_version", 0),
-        chunk_index=row.get("chunk_index", index),
-        content=row.get("content"),
-        score=row.get("score", 0.0),
-        path=f"{directory}{filename}",
-        title=row.get("title"),
-        page=row.get("page"),
-        header_breadcrumb=row.get("header_breadcrumb"),
+@dataclass(frozen=True, slots=True)
+class _LegacyFields:
+    filename: str
+    directory: str
+    file_type: str
+    source_content: str
+    annotations_text: str | None
+    has_highlight: bool
+    raw_tags: tuple[str, ...] | None
+    source_hit: bool
+    annotation_hit: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class _VaultSearchHit(SearchHit):
+    """Internal transport envelope for the legacy dictionary facade."""
+
+    legacy_fields: _LegacyFields = field(compare=False, repr=False)
+
+
+def _vault_search_hit(
+    *,
+    document_id: str,
+    document_version: int,
+    chunk_index: int,
+    content: str,
+    score: float,
+    path: str,
+    title: str | None,
+    page: int | None,
+    header_breadcrumb: str | None,
+    tags: list[str] | tuple[str, ...] | None,
+    document_kind: object,
+    metadata: dict,
+    filename: str,
+    directory: str,
+    file_type: str,
+    source_content: str,
+    annotations_text: str | None,
+    has_highlight: bool,
+    source_hit: bool,
+    annotation_hit: bool,
+) -> SearchHit:
+    """Build a typed hit without storing compatibility fields in metadata."""
+    raw_tags = None if tags is None else tuple(tags)
+    return _VaultSearchHit(
+        document_id=document_id,
+        document_version=document_version,
+        chunk_index=chunk_index,
+        content=content,
+        score=score,
+        path=path,
+        title=title,
+        page=page,
+        header_breadcrumb=header_breadcrumb,
         tags=() if raw_tags is None else raw_tags,
-        document_kind=DocumentKind(source_kind),
+        document_kind=document_kind,
         metadata=metadata,
+        legacy_fields=_LegacyFields(
+            filename=filename,
+            directory=directory,
+            file_type=file_type,
+            source_content=source_content,
+            annotations_text=annotations_text,
+            has_highlight=has_highlight,
+            raw_tags=raw_tags,
+            source_hit=source_hit,
+            annotation_hit=annotation_hit,
+        ),
     )
+
+
+def _typed_path_parts(path: str) -> tuple[str, str]:
+    stripped = path.rstrip("/")
+    if not stripped:
+        return "", "/"
+    directory, separator, filename = stripped.rpartition("/")
+    if not separator:
+        return filename, "/"
+    return filename, f"{directory or ''}/"
 
 
 def search_hit_to_legacy_dict(hit: SearchHit) -> dict:
     """Convert a typed hit back to the dictionary schema used by MCP tools."""
     metadata = dict(hit.metadata)
-    filename = metadata.pop("_filename", hit.path.rsplit("/", 1)[-1])
-    directory = metadata.pop("_directory", hit.path.removesuffix(filename))
-    file_type = metadata.pop("_file_type", filename.rsplit(".", 1)[-1] if "." in filename else "")
-    source_content = metadata.pop("_source_content", "")
-    annotations_text = metadata.pop("_annotations_text", None)
-    has_highlight = bool(metadata.pop("_has_highlight", False))
-    raw_tags = metadata.pop("_legacy_tags", _NO_LEGACY_TAGS)
-    source_hit = bool(metadata.pop("source_hit", False))
-    annotation_hit = bool(metadata.pop("annotation_hit", False))
-    if raw_tags is _NO_LEGACY_TAGS:
-        legacy_tags = list(hit.tags)
-    elif raw_tags is None:
-        legacy_tags = None
+    if isinstance(hit, _VaultSearchHit):
+        fields = hit.legacy_fields
+        filename = fields.filename
+        directory = fields.directory
+        file_type = fields.file_type
+        source_content = fields.source_content
+        annotations_text = fields.annotations_text
+        has_highlight = fields.has_highlight
+        legacy_tags = None if fields.raw_tags is None else list(fields.raw_tags)
+        source_hit = fields.source_hit
+        annotation_hit = fields.annotation_hit
     else:
-        legacy_tags = list(raw_tags)
+        filename, directory = _typed_path_parts(hit.path)
+        file_type = filename.rsplit(".", 1)[-1] if "." in filename else ""
+        source_content = ""
+        annotations_text = None
+        has_highlight = False
+        legacy_tags = list(hit.tags)
+        source_hit = False
+        annotation_hit = False
     return {
         "document_id": hit.document_id,
         "document_version": hit.document_version,
@@ -333,6 +331,3 @@ def search_hit_to_legacy_dict(hit: SearchHit) -> dict:
         "metadata": metadata,
         "score": hit.score,
     }
-
-
-_NO_LEGACY_TAGS = object()

@@ -15,12 +15,13 @@ from services.chunker import chunk_text, store_chunks_sqlite
 
 from llmwiki_core.documents import DocumentKind
 from llmwiki_core.references import build_lookup_maps, extract_references
-from llmwiki_core.search import SearchArea, SearchHit, SearchQuery, SearchResult, SearchScope
+from llmwiki_core.search import SearchArea, SearchQuery, SearchResult, SearchScope
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
     DuplicateDocumentError,
     VaultFS,
+    _vault_search_hit,
     is_wiki_directory,
     logical_glob_to_sql_like,
 )
@@ -61,16 +62,36 @@ Chronological record of ingests, queries, and maintenance passes.
 """
 
 
+def _parse_tag_array(value: object) -> list[str] | None:
+    """Normalize a stored tag value, preserving only an actual SQL NULL."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if isinstance(value, list) and all(isinstance(tag, str) for tag in value):
+        return value
+    return []
+
+
+def _parse_metadata_object(value: object) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
     cols = [d[0] for d in cursor.description]
     results = []
     for row in rows:
         d = dict(zip(cols, row))
-        if "tags" in d and isinstance(d["tags"], str):
-            try:
-                d["tags"] = json.loads(d["tags"])
-            except (json.JSONDecodeError, TypeError):
-                d["tags"] = []
+        if "tags" in d:
+            d["tags"] = _parse_tag_array(d["tags"])
         if "elements" in d and isinstance(d["elements"], str):
             try:
                 d["elements"] = json.loads(d["elements"])
@@ -81,32 +102,16 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
                 d["highlights"] = json.loads(d["highlights"])
             except (json.JSONDecodeError, TypeError):
                 d["highlights"] = []
-        if "metadata" in d and isinstance(d["metadata"], str):
-            try:
-                d["metadata"] = json.loads(d["metadata"])
-            except (json.JSONDecodeError, TypeError):
-                d["metadata"] = {}
+        if "metadata" in d:
+            d["metadata"] = _parse_metadata_object(d["metadata"])
         results.append(d)
     return results
 
 
-def _sqlite_search_hit(row: dict) -> SearchHit:
+def _sqlite_search_hit(row: dict):
     metadata = dict(row.get("metadata") or {})
     raw_tags = row.get("tags")
-    metadata.update(
-        {
-            "_filename": row["filename"],
-            "_directory": row["path"],
-            "_file_type": row["file_type"],
-            "_source_content": row.get("source_content") or "",
-            "_annotations_text": row.get("annotations_text"),
-            "_has_highlight": bool(row.get("has_highlight")),
-            "_legacy_tags": raw_tags,
-            "source_hit": bool(row.get("source_hit")),
-            "annotation_hit": bool(row.get("annotation_hit")),
-        }
-    )
-    return SearchHit(
+    return _vault_search_hit(
         document_id=str(row["document_id"]),
         document_version=int(row["document_version"]),
         chunk_index=int(row["chunk_index"]),
@@ -116,9 +121,17 @@ def _sqlite_search_hit(row: dict) -> SearchHit:
         title=row.get("title"),
         page=row.get("page"),
         header_breadcrumb=row.get("header_breadcrumb"),
-        tags=() if raw_tags is None else raw_tags,
+        tags=raw_tags,
         document_kind=DocumentKind(row["source_kind"]),
         metadata=metadata,
+        filename=row["filename"],
+        directory=row["path"],
+        file_type=row["file_type"],
+        source_content=row.get("source_content") or "",
+        annotations_text=row.get("annotations_text"),
+        has_highlight=bool(row.get("has_highlight")),
+        source_hit=bool(row.get("source_hit")),
+        annotation_hit=bool(row.get("annotation_hit")),
     )
 
 
@@ -682,7 +695,8 @@ class SqliteVaultFS(VaultFS):
                 "EXISTS ("
                 "SELECT 1 FROM json_each("
                 "CASE WHEN typeof(d.tags) = 'text' AND json_valid(d.tags) "
-                "THEN d.tags ELSE '[]' END"
+                "THEN CASE WHEN json_type(d.tags) = 'array' THEN d.tags ELSE '[]' END "
+                "ELSE '[]' END"
                 ") tag WHERE lower(CAST(tag.value AS TEXT)) = ?)"
             )
             where_params.append(tag)
