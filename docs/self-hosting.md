@@ -65,6 +65,9 @@ self-hosting compose — you do **not** need most of its services.
    (GoTrue), **kong** (gateway serving `/auth/v1/*`), and **studio** if you
    want the admin UI. `rest`, `realtime`, `storage`, `imgproxy`, and
    `functions` are unused by this app and can be disabled.
+   The database image must provide pgvector 0.8.x (the CI/self-host profile
+   pins `pgvector/pgvector:0.8.0-pg16`); enable the `vector` extension before
+   hybrid retrieval is used. PGroonga remains required for lexical search.
 3. In GoTrue, configure your signup policy (email/password works out of the
    box; disable open signups if this is an internal platform and invite users
    from Studio instead). Email/password is the only login method — no OAuth
@@ -74,7 +77,7 @@ self-hosting compose — you do **not** need most of its services.
 
 ### Apply the migrations
 
-Run `supabase/migrations/001…012` in order against the stack's database:
+Run `supabase/migrations/001…013` in order against the stack's database:
 
 ```bash
 for f in supabase/migrations/*.sql; do
@@ -82,7 +85,8 @@ for f in supabase/migrations/*.sql; do
 done
 ```
 
-They create the schema, RLS policies, PGroonga full-text indexes, the
+They create the schema, RLS policies, PGroonga full-text indexes, versioned
+pgvector chunk storage, the
 `document_changes` NOTIFY trigger, and the `auth.users` trigger that
 provisions a `public.users` row (with page/storage quotas) on signup — which
 is why this must run on the Supabase database, not a bare Postgres.

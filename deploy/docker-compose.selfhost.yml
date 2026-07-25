@@ -1,9 +1,9 @@
 # Self-hosted deployment of the four application services + MinIO.
 #
 # Prerequisites (see docs/self-hosting.md):
-#   1. A self-hosted Supabase stack (Postgres + GoTrue auth behind Kong) —
+#   1. A self-hosted Supabase stack (Postgres + pgvector + GoTrue auth behind Kong) —
 #      run it from Supabase's official docker compose; it is NOT part of
-#      this file. Apply supabase/migrations/ 001..012 to its database.
+#      this file. Apply supabase/migrations/ 001..013 to its database.
 #   2. Copy deploy/.env.selfhost.example to deploy/.env.selfhost and fill it in.
 #
 # Build + run from the repository root:
@@ -17,7 +17,7 @@ name: llmwiki-selfhost
 services:
   ci-postgres:
     profiles: ["ci"]
-    image: postgres:16.11-alpine
+    image: pgvector/pgvector:0.8.0-pg16
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
