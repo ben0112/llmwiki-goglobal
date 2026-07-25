@@ -16,7 +16,12 @@ from llmwiki_core.documents import DocumentKind
 from llmwiki_core.search import SearchArea, SearchHit, SearchQuery, SearchResult, SearchScope
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
-from .base import DuplicateDocumentError, VaultFS, logical_glob_to_sql_like
+from .base import (
+    DuplicateDocumentError,
+    VaultFS,
+    is_wiki_directory,
+    logical_glob_to_sql_like,
+)
 from .facets import postgres_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,7 @@ def _postgres_search_hit(row: dict) -> SearchHit:
         except (json.JSONDecodeError, TypeError):
             raw_metadata = {}
     metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    raw_tags = row.get("tags")
     metadata.update(
         {
             "_filename": row["filename"],
@@ -98,6 +104,7 @@ def _postgres_search_hit(row: dict) -> SearchHit:
             "_source_content": row.get("source_content") or "",
             "_annotations_text": row.get("annotations_text"),
             "_has_highlight": bool(row.get("has_highlight")),
+            "_legacy_tags": raw_tags,
             "source_hit": bool(row.get("source_hit")),
             "annotation_hit": bool(row.get("annotation_hit")),
         }
@@ -112,7 +119,7 @@ def _postgres_search_hit(row: dict) -> SearchHit:
         title=row.get("title"),
         page=row.get("page"),
         header_breadcrumb=row.get("header_breadcrumb"),
-        tags=tuple(row.get("tags") or ()),
+        tags=() if raw_tags is None else raw_tags,
         document_kind=DocumentKind(row["source_kind"]),
         metadata=metadata,
     )
@@ -187,17 +194,18 @@ class PostgresVaultFS(VaultFS):
     async def create_document(self, kb_id: str, filename: str, title: str, dir_path: str, file_type: str, content: str, tags: list[str], date: str | None = None, metadata: dict | None = None) -> dict:
         import json as _json
         pool = await get_pool()
+        source_kind = "wiki" if is_wiki_directory(dir_path) else "source"
         async with pool.acquire() as conn:
             async with conn.transaction():
                 try:
                     row = await conn.fetchrow(
                         "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-                        "file_type, status, content, tags, date, metadata, version) "
-                        "SELECT $1, $2, $3, $4, $5, $6, 'ready', $7, $8, $9, $10::jsonb, 1 "
+                        "source_kind, file_type, status, content, tags, date, metadata, version) "
+                        "SELECT $1, $2, $3, $4, $5, $6, $7, 'ready', $8, $9, $10, $11::jsonb, 1 "
                         "WHERE EXISTS (SELECT 1 FROM knowledge_bases WHERE id = $1 AND user_id = $2) "
                         "RETURNING id, filename, path",
-                        kb_id, self.user_id, filename, title, dir_path, file_type, content, tags,
-                        date, _json.dumps(metadata) if metadata else None,
+                        kb_id, self.user_id, filename, title, dir_path, source_kind, file_type,
+                        content, tags, date, _json.dumps(metadata) if metadata else None,
                     )
                 except asyncpg.UniqueViolationError as e:
                     # Only re-raise as DuplicateDocumentError for the path/filename index.

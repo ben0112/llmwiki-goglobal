@@ -21,6 +21,7 @@ from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 from .base import (
     DuplicateDocumentError,
     VaultFS,
+    is_wiki_directory,
     logical_glob_to_sql_like,
 )
 from .facets import sqlite_facet_conditions, validate_facets
@@ -91,6 +92,7 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
 
 def _sqlite_search_hit(row: dict) -> SearchHit:
     metadata = dict(row.get("metadata") or {})
+    raw_tags = row.get("tags")
     metadata.update(
         {
             "_filename": row["filename"],
@@ -99,6 +101,7 @@ def _sqlite_search_hit(row: dict) -> SearchHit:
             "_source_content": row.get("source_content") or "",
             "_annotations_text": row.get("annotations_text"),
             "_has_highlight": bool(row.get("has_highlight")),
+            "_legacy_tags": raw_tags,
             "source_hit": bool(row.get("source_hit")),
             "annotation_hit": bool(row.get("annotation_hit")),
         }
@@ -113,7 +116,7 @@ def _sqlite_search_hit(row: dict) -> SearchHit:
         title=row.get("title"),
         page=row.get("page"),
         header_breadcrumb=row.get("header_breadcrumb"),
-        tags=tuple(row.get("tags") or ()),
+        tags=() if raw_tags is None else raw_tags,
         document_kind=DocumentKind(row["source_kind"]),
         metadata=metadata,
     )
@@ -365,7 +368,7 @@ class SqliteVaultFS(VaultFS):
         db = self._db_or_raise()
         doc_id = str(uuid.uuid4())
         relative_path = (dir_path.rstrip("/") + "/" + filename).lstrip("/")
-        source_kind = "wiki" if dir_path.strip("/").startswith("wiki") else "source"
+        source_kind = "wiki" if is_wiki_directory(dir_path) else "source"
 
         cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
         row = await cursor.fetchone()

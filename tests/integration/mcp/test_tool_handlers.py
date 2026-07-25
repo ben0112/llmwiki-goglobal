@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from llmwiki_core.search import SearchQuery
+from llmwiki_core.search import SearchQuery, SearchResult
 
 
 def _make_kb(kb_id: str) -> dict:
@@ -753,6 +753,81 @@ class TestSearchDeleteLifecycle:
         result = await searcher.search_chunks("quantum", "*.pdf", None, 10)
         assert "paper.pdf" in result
         assert "notes.md" not in result
+
+    @pytest.mark.parametrize(
+        ("path", "expected_area", "expected_kinds"),
+        [
+            ("/wiki", "wiki", ("wiki",)),
+            ("/wiki/deep/*.md", "wiki", ("wiki",)),
+            ("/wikipedia/*.md", "all", ()),
+            ("/wiki*", "all", ()),
+        ],
+    )
+    async def test_search_chunks_only_classifies_exact_wiki_directory(
+        self,
+        fs,
+        path,
+        expected_area,
+        expected_kinds,
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        captured = []
+
+        async def capture(kb, request):
+            captured.append(request)
+            return SearchResult(hits=(), candidate_count=0)
+
+        instance.retrieve = capture
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        await searcher.search_chunks("permit", path, None, 2)
+
+        assert len(captured) == 1
+        assert captured[0].area.value == expected_area
+        assert tuple(kind.value for kind in captured[0].document_kinds) == expected_kinds
+        assert captured[0].path_glob == path
+
+    async def test_search_chunks_wikipedia_glob_reaches_sqlite_adapter(
+        self,
+        fs,
+        insert_chunk,
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        wikipedia = await instance.create_document(
+            kb_id,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "md",
+            "",
+            ["reference"],
+        )
+        wiki = await instance.create_document(
+            kb_id,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "md",
+            "",
+            ["wiki"],
+        )
+        await insert_chunk(str(wikipedia["id"]), kb_id, "permit wikipedia result")
+        await insert_chunk(str(wiki["id"]), kb_id, "permit wiki result")
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        result = await searcher.search_chunks(
+            "permit",
+            "/wikipedia/*.md",
+            None,
+            2,
+        )
+
+        assert "article.md" in result
+        assert "page.md" not in result
 
     async def test_search_chunks_pushes_full_query_before_limit(self, fs):
         instance, kb_id = fs

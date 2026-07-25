@@ -7,8 +7,127 @@ import uuid
 
 import pytest
 
-from llmwiki_core.search import SearchQuery
+from llmwiki_core.search import SearchQuery, SearchResult
 from tests.integration.mcp.conftest import TEST_USER_ID
+
+
+def _legacy_compatible_vault_type(*, search_chunks=None):
+    """Build a concrete test double without implementing the new retrieve port."""
+    from vaultfs.base import VaultFS
+
+    async def unused(*args, **kwargs):
+        return None
+
+    implementations = {
+        name: unused
+        for name in VaultFS.__abstractmethods__
+        if name != "retrieve"
+    }
+    if search_chunks is not None:
+        implementations["search_chunks"] = search_chunks
+    return type("LegacyCompatibleVault", (VaultFS,), implementations)
+
+
+class TestRetrievalCompatibility:
+
+    async def test_legacy_only_subclass_is_instantiable_and_bounded(self):
+        from vaultfs.base import search_hit_to_legacy_dict
+
+        calls = []
+        raw_tags = ["Policy", "policy", "ASEAN", "Policy"]
+
+        async def legacy_search(
+            self,
+            kb_id,
+            query,
+            limit,
+            path_filter=None,
+            annotated_only=False,
+            scope="all",
+            facets=None,
+        ):
+            calls.append(
+                (kb_id, query, limit, path_filter, annotated_only, scope, facets)
+            )
+            return [
+                {
+                    "document_id": f"doc-{index}",
+                    "document_version": 2,
+                    "chunk_index": index,
+                    "content": f"permit {index}",
+                    "score": 10 - index,
+                    "path": "/legacy/",
+                    "filename": f"row-{index}.md",
+                    "file_type": "md",
+                    "tags": raw_tags if index == 0 else None,
+                    "source_kind": "source",
+                }
+                for index in range(3)
+            ]
+
+        legacy_type = _legacy_compatible_vault_type(search_chunks=legacy_search)
+        instance = legacy_type()
+        instance.user_id = TEST_USER_ID
+        request = SearchQuery.build(
+            text="permit",
+            limit=1,
+            candidate_limit=2,
+            area="sources",
+            annotated_only=True,
+            scope="source",
+            facets={"country": "IDN"},
+        )
+
+        result = await instance.retrieve("kb-1", request)
+
+        assert isinstance(result, SearchResult)
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+        assert calls == [
+            ("kb-1", "permit", 2, "sources", True, "source", {"country": "IDN"})
+        ]
+        assert result.hits[0].tags == ("asean", "policy")
+        assert search_hit_to_legacy_dict(result.hits[0])["tags"] == raw_tags
+        assert search_hit_to_legacy_dict(result.hits[1])["tags"] is None
+
+    async def test_vault_without_retrieval_implementation_fails_without_recursion(self):
+        vault_type = _legacy_compatible_vault_type()
+        instance = vault_type()
+        instance.user_id = TEST_USER_ID
+
+        with pytest.raises(NotImplementedError, match="retrieve or search_chunks"):
+            await instance.retrieve("kb-1", SearchQuery.build(text="permit", limit=1))
+        with pytest.raises(NotImplementedError, match="retrieve or search_chunks"):
+            await instance.search_chunks("kb-1", "permit", 1)
+
+    @pytest.mark.parametrize("legacy_value", [None, {}, ["not-a-row"]])
+    async def test_legacy_retrieval_rejects_invalid_result_shapes(self, legacy_value):
+        async def legacy_search(self, *args, **kwargs):
+            return legacy_value
+
+        legacy_type = _legacy_compatible_vault_type(search_chunks=legacy_search)
+        instance = legacy_type()
+        instance.user_id = TEST_USER_ID
+
+        with pytest.raises((TypeError, ValueError), match="legacy search_chunks"):
+            await instance.retrieve(
+                "kb-1",
+                SearchQuery.build(text="permit", limit=1),
+            )
+
+    async def test_legacy_retrieval_propagates_adapter_exceptions(self):
+        async def legacy_search(self, *args, **kwargs):
+            raise RuntimeError("legacy backend unavailable")
+
+        legacy_type = _legacy_compatible_vault_type(search_chunks=legacy_search)
+        instance = legacy_type()
+        instance.user_id = TEST_USER_ID
+
+        with pytest.raises(RuntimeError, match="legacy backend unavailable"):
+            await instance.retrieve(
+                "kb-1",
+                SearchQuery.build(text="permit", limit=1),
+            )
 
 
 class TestWorkspace:
@@ -538,6 +657,91 @@ class TestSearch:
         results = await instance.search_chunks(kb_id, "hello", 10)
         assert len(results) >= 1
         assert "hello" in results[0]["content"]
+
+    async def test_create_and_retrieve_use_exact_wiki_path_segment(self, fs, insert_chunk):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        wikipedia = await instance.create_document(
+            kb_id,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "md",
+            "",
+            ["reference"],
+        )
+        wiki = await instance.create_document(
+            kb_id,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "md",
+            "",
+            ["wiki"],
+        )
+        await insert_chunk(str(wikipedia["id"]), kb_id, "permit wikipedia result")
+        await insert_chunk(str(wiki["id"]), kb_id, "permit wiki result")
+
+        db = SqliteVaultFS._db_or_raise()
+        cursor = await db.execute(
+            "SELECT relative_path, source_kind FROM documents "
+            "WHERE id IN (?, ?) ORDER BY relative_path",
+            (str(wikipedia["id"]), str(wiki["id"])),
+        )
+        assert await cursor.fetchall() == [
+            ("wiki/page.md", "wiki"),
+            ("wikipedia/article.md", "source"),
+        ]
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                path_glob="/wikipedia/*.md",
+                document_kinds=["source"],
+            ),
+        )
+        assert [hit.path for hit in result.hits] == ["/wikipedia/article.md"]
+
+    async def test_sqlite_typed_and_legacy_results_preserve_raw_tags(self, fs, insert_chunk):
+        from vaultfs.base import search_hit_to_legacy_dict
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        raw_tags = ["Policy", "policy", "ASEAN", "Policy"]
+        doc = await instance.create_document(
+            kb_id,
+            "raw-tags.md",
+            "Raw tags",
+            "/",
+            "md",
+            "",
+            raw_tags,
+        )
+        await insert_chunk(str(doc["id"]), kb_id, "raw tags permit")
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=1),
+        )
+
+        assert result.hits[0].tags == ("asean", "policy")
+        assert result.hits[0].metadata["_legacy_tags"] == tuple(raw_tags)
+        assert search_hit_to_legacy_dict(result.hits[0])["tags"] == raw_tags
+
+        db = SqliteVaultFS._db_or_raise()
+        await db.execute("UPDATE documents SET tags = NULL WHERE id = ?", (str(doc["id"]),))
+        await db.commit()
+        null_result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=1),
+        )
+
+        assert null_result.hits[0].tags == ()
+        assert null_result.hits[0].metadata["_legacy_tags"] is None
+        assert search_hit_to_legacy_dict(null_result.hits[0])["tags"] is None
 
     async def test_search_chunks_respects_limit(self, fs, insert_chunk):
         instance, kb_id = fs

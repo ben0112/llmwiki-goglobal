@@ -269,7 +269,7 @@ class SearchHandler:
         """Map a path pattern to a coarse wiki/sources search filter key."""
         if path in ("*", "**", "**/*"):
             return None
-        if path.startswith("/wiki"):
+        if path == "/wiki" or path.startswith("/wiki/"):
             return "wiki"
         if path in ("/", "/*"):
             return "sources"

@@ -15,6 +15,7 @@ import uuid
 import asyncpg
 import db as mcp_db
 import pytest
+from vaultfs.base import search_hit_to_legacy_dict
 from vaultfs.postgres import PostgresVaultFS
 
 from llmwiki_core.search import SearchQuery
@@ -209,6 +210,38 @@ class TestReadIsolation:
         doc = await fs_alice.find_document_by_name(str(KB_B_ID), "notes.md")
         assert doc is None
 
+    async def test_create_document_uses_exact_wiki_path_segment(
+        self,
+        fs_alice,
+        pg_pool,
+    ):
+        wikipedia = await fs_alice.create_document(
+            KB_A_ID,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "pdf",
+            "",
+            ["reference"],
+        )
+        wiki = await fs_alice.create_document(
+            KB_A_ID,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "pdf",
+            "",
+            ["wiki"],
+        )
+
+        rows = await pg_pool.fetch(
+            "SELECT id, source_kind FROM documents WHERE id = ANY($1::uuid[])",
+            [str(wikipedia["id"]), str(wiki["id"])],
+        )
+        by_id = {str(row["id"]): row["source_kind"] for row in rows}
+        assert by_id[str(wikipedia["id"])] == "source"
+        assert by_id[str(wiki["id"])] == "wiki"
+
     async def test_retrieve_filters_before_limit_and_isolates_tenant(
         self,
         fs_alice,
@@ -299,6 +332,15 @@ class TestReadIsolation:
         assert result.returned_count == 2
         assert result.candidate_count == 3
         assert all(hit.path.startswith("/corpus/idn/eligible-") for hit in result.hits)
+        assert all(hit.tags == ("asean", "reviewed") for hit in result.hits)
+        assert all(
+            hit.metadata["_legacy_tags"] == ("Reviewed", "ASEAN")
+            for hit in result.hits
+        )
+        assert all(
+            search_hit_to_legacy_dict(hit)["tags"] == ["Reviewed", "ASEAN"]
+            for hit in result.hits
+        )
 
     async def test_load_asset_bytes_other_tenant_returns_none(self, fs_alice, monkeypatch):
         calls: list[str] = []
