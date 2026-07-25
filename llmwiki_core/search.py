@@ -144,6 +144,32 @@ def _validated_int(name: str, value: object) -> int:
     return value
 
 
+def _validated_nonblank_string(name: str, value: object) -> str:
+    if not isinstance(value, str) or not (normalized := value.strip()):
+        raise ValueError(f"{name} must be a nonblank string")
+    return normalized
+
+
+def _validated_string(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def _validated_optional_string(name: str, value: object) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{name} must be a string or None")
+    return value
+
+
+def _validated_optional_page(value: object) -> int | None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+    ):
+        raise ValueError("page must be a non-negative integer or None")
+    return value
+
+
 def _normalize_path_glob(path_glob: str | None) -> str | None:
     if path_glob is None:
         return None
@@ -204,10 +230,13 @@ class SearchHit:
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        if not isinstance(self.document_id, str) or not (
-            document_id := self.document_id.strip()
-        ):
-            raise ValueError("document_id must be a nonblank string")
+        document_id = _validated_nonblank_string("document_id", self.document_id)
+        path = _validated_nonblank_string("path", self.path)
+        _validated_string("content", self.content)
+        _validated_optional_string("title", self.title)
+        _validated_optional_string("header_breadcrumb", self.header_breadcrumb)
+        page = _validated_optional_page(self.page)
+
         document_version = _validated_int("document_version", self.document_version)
         chunk_index = _validated_int("chunk_index", self.chunk_index)
         if document_version < 0:
@@ -230,6 +259,8 @@ class SearchHit:
                 raise ValueError("unsupported document kind") from exc
 
         object.__setattr__(self, "document_id", document_id)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "page", page)
         object.__setattr__(self, "document_version", document_version)
         object.__setattr__(self, "chunk_index", chunk_index)
         object.__setattr__(self, "score", normalized_score)

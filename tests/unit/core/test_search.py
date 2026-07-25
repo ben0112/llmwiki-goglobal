@@ -216,6 +216,15 @@ def test_search_hit_keeps_old_construction_and_defaults_metadata():
     assert hit.metadata == {}
 
 
+def test_search_hit_normalizes_path_and_keeps_legacy_scalar_values():
+    hit = SearchHit("doc", 0, 0, "", 1, " relative/policy.md ", None, 0, None)
+
+    assert hit.content == ""
+    assert hit.path == "relative/policy.md"
+    assert hit.page == 0
+    assert hit.score == 1.0
+
+
 def test_search_hit_copies_and_freezes_metadata():
     metadata = {"country": "IDN"}
     hit = SearchHit(
@@ -292,6 +301,33 @@ def test_search_hit_rejects_invalid_identity_or_score_numbers(field, value):
 def test_search_hit_rejects_invalid_document_id(document_id):
     with pytest.raises(ValueError, match="document_id must be a nonblank string"):
         SearchHit(document_id, 1, 0, "text", 0.5, "/doc.md")
+
+
+@pytest.mark.parametrize("path", ["", "   ", 7])
+def test_search_hit_rejects_invalid_path(path):
+    with pytest.raises(ValueError, match="path must be a nonblank string"):
+        SearchHit("doc", 1, 0, "text", 0.5, path)
+
+
+def test_search_hit_rejects_non_string_content():
+    with pytest.raises(ValueError, match="content must be a string"):
+        SearchHit("doc", 1, 0, 7, 0.5, "/doc.md")
+
+
+def test_search_hit_rejects_non_string_title():
+    with pytest.raises(ValueError, match="title must be a string or None"):
+        SearchHit("doc", 1, 0, "text", 0.5, "/doc.md", 7)
+
+
+@pytest.mark.parametrize("page", [True, -1, 1.5])
+def test_search_hit_rejects_invalid_page(page):
+    with pytest.raises(ValueError, match="page must be a non-negative integer or None"):
+        SearchHit("doc", 1, 0, "text", 0.5, "/doc.md", page=page)
+
+
+def test_search_hit_rejects_non_string_header_breadcrumb():
+    with pytest.raises(ValueError, match="header_breadcrumb must be a string or None"):
+        SearchHit("doc", 1, 0, "text", 0.5, "/doc.md", header_breadcrumb=7)
 
 
 def test_search_result_distinguishes_candidates_from_returned_hits():
