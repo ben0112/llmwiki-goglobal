@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Implementation incomplete — quality-review follow-up in progress
+**Status:** Implemented and verified
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -394,18 +394,25 @@ changes are immutable commits:
   `ced3a091d5478595242ba2332b91fb5f88ab63e7` — drain-window fencing that makes
   a new independent job available after TERM while the old worker is still
   alive, rejects any new claim by the old owner until exit, and requires a
-  local Redis `WAITAOF` fsync before restart.
+  local Redis `WAITAOF` fsync before restart;
+- `08892110d85c09b8d64027cd8ab468c107ee5490` — a fail-closed matrix runner
+  that rejects generator failure and empty segments before launching pytest,
+  telemetry derived only from persisted job transitions with no false event
+  after lease loss, and reproducible MinIO server/client image pins
+  (`minio/minio:RELEASE.2025-04-22T22-12-26Z` and
+  `minio/mc:RELEASE.2025-04-16T18-13-26Z`).
 
 GitHub Actions run
-[30151736094](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30151736094)
-verified commit `ced3a091d5478595242ba2332b91fb5f88ab63e7`: all six jobs passed. The primary
-manifest owns 90 test files exactly once and executed 1,456 tests with no
+[30152538145](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30152538145)
+verified implementation commit `08892110d85c09b8d64027cd8ab468c107ee5490`:
+all six jobs passed. The primary manifest owns 90 test files exactly once and
+executed 1,458 tests with no
 skips or failures:
 
 | Isolated segment | Result | Required runtime |
 | --- | ---: | --- |
 | `unit-core` | 37 passed | none |
-| `unit-api` | 680 passed | none |
+| `unit-api` | 682 passed | none |
 | `unit-mcp` | 46 passed | none |
 | `unit-corpus` | 54 passed | none |
 | `integration-api` | 433 passed | Postgres 16.11, Redis 7.4.2, MinIO |
@@ -435,9 +442,10 @@ The runner materializes a non-empty segment before launching pytest, preserves
 the one-process-per-file PostgreSQL isolation, and propagates generator and
 child-process failures without relying on shell pipeline behavior.
 
-The workflow also passed four matrix ownership contract tests and nine scaled
-static tests; the live-only scaled test was intentionally skipped in the
-static step and then passed in the required Compose job. Raw aggregate
+The workflow also passed seven matrix ownership/runner contract tests and nine
+scaled static tests; the one live-only scaled test was intentionally skipped
+in the static step. The required Compose job then passed all ten live scaled
+tests in 192.69 seconds. Raw aggregate
 `tests/unit` and `tests/integration` commands are not claimed as passing:
 legacy API and MCP packages use colliding top-level module names, which is why
 the verified matrix uses isolated processes.
@@ -445,5 +453,5 @@ the verified matrix uses isolated processes.
 Changed Task 14 Python paths pass Ruff. The separate repository-wide audit
 `.venv/bin/ruff check . --statistics` reports 286 pre-existing findings, 174
 automatically fixable; repository-wide Ruff is therefore not claimed clean.
-An independent final specification review found no remaining Critical,
-Important, or Minor findings.
+The final quality gate is **Ready: Yes**. Independent review found zero
+Critical, zero Important, and zero Minor findings.
