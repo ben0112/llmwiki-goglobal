@@ -1,3 +1,4 @@
+import asyncio
 from inspect import iscoroutinefunction
 from typing import get_type_hints
 
@@ -12,6 +13,7 @@ from llmwiki_core import (
     RetrieverUnavailable,
     SearchResult,
 )
+from llmwiki_core import search as search_module
 from llmwiki_core.search import (
     SearchArea,
     SearchHit,
@@ -93,6 +95,18 @@ class _FakeExpander:
     async def expand(self, query, hits):
         self.inputs.append(tuple(hits))
         return self.output
+
+
+class _CoordinatedRetriever:
+    def __init__(self, started, peer_started, hit):
+        self.started = started
+        self.peer_started = peer_started
+        self.hit = hit
+
+    async def retrieve(self, query):
+        self.started.set()
+        await asyncio.wait_for(self.peer_started.wait(), timeout=0.1)
+        return SearchResult(hits=(self.hit,), candidate_count=1)
 
 
 def test_search_query_normalizes_shared_filters():
@@ -512,6 +526,20 @@ async def test_hybrid_fuses_by_rrf_and_deduplicates_identity():
 
 
 @pytest.mark.asyncio
+async def test_hybrid_runs_lexical_and_vector_retrieval_concurrently():
+    lexical_started = asyncio.Event()
+    vector_started = asyncio.Event()
+    service = HybridRetrievalService(
+        lexical=_CoordinatedRetriever(lexical_started, vector_started, _hit("lexical")),
+        vector=_CoordinatedRetriever(vector_started, lexical_started, _hit("vector")),
+    )
+
+    result = await service.retrieve(SearchQuery.build(text="q"))
+
+    assert {hit.document_id for hit in result.hits} == {"lexical", "vector"}
+
+
+@pytest.mark.asyncio
 async def test_hybrid_uses_identity_for_stable_rrf_tie_breaking():
     service = HybridRetrievalService(
         lexical=_FakeRetriever([_hit("z", version=2), _hit("middle")]),
@@ -578,6 +606,20 @@ async def test_hybrid_falls_back_to_lexical_when_vector_is_unavailable():
 
 
 @pytest.mark.asyncio
+async def test_fallback_latency_includes_time_spent_on_unavailable_vector(monkeypatch):
+    ticks = iter((10.0, 10.025))
+    monkeypatch.setattr(search_module, "perf_counter", lambda: next(ticks))
+    service = HybridRetrievalService(
+        lexical=_FakeRetriever([_hit("a")], latency_ms=2.5),
+        vector=_UnavailableRetriever(),
+    )
+
+    result = await service.retrieve(SearchQuery.build(text="q"))
+
+    assert result.latency_ms == pytest.approx(25.0)
+
+
+@pytest.mark.asyncio
 async def test_hybrid_does_not_swallow_vector_programming_errors():
     service = HybridRetrievalService(
         lexical=_FakeRetriever([_hit("a")]),
@@ -632,17 +674,20 @@ async def test_reranker_can_only_reorder_known_unique_direct_hits():
 
 
 @pytest.mark.asyncio
-async def test_reranker_receives_only_the_bounded_direct_set():
-    reranker = _FakeReranker([])
+async def test_reranker_can_promote_hits_from_the_bounded_candidate_pool():
+    promoted = _hit("c")
+    reranker = _FakeReranker([promoted, _hit("a"), _hit("b")])
     service = HybridRetrievalService(
-        lexical=_FakeRetriever([_hit("a"), _hit("b"), _hit("c")]),
+        lexical=_FakeRetriever([_hit("a"), _hit("b"), promoted, _hit("outside")]),
         reranker=reranker,
     )
 
-    result = await service.retrieve(SearchQuery.build(text="q", limit=2))
+    result = await service.retrieve(
+        SearchQuery.build(text="q", limit=2, candidate_limit=3)
+    )
 
-    assert [item.document_id for item in reranker.inputs[0]] == ["a", "b"]
-    assert [item.document_id for item in result.hits] == ["a", "b"]
+    assert [item.document_id for item in reranker.inputs[0]] == ["a", "b", "c"]
+    assert [item.document_id for item in result.hits] == ["c", "a"]
 
 
 @pytest.mark.asyncio

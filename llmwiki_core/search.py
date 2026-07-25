@@ -1,10 +1,12 @@
 """Backend-neutral search request, result, and retrieval port contracts."""
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
 from numbers import Real
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -334,6 +336,9 @@ class RetrieverUnavailable(RuntimeError):
     """A retriever cannot currently serve the request."""
 
 
+_VECTOR_UNAVAILABLE = object()
+
+
 class HybridRetrievalService:
     """Compose lexical and optional vector retrieval with bounded post-processing."""
 
@@ -355,27 +360,34 @@ class HybridRetrievalService:
         self._rrf_k = rrf_k
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
-        lexical = await self._lexical.retrieve(query)
+        started_at = perf_counter()
         if self._vector is None:
+            lexical = await self._lexical.retrieve(query)
             return await self._finish(
                 query,
                 lexical.hits,
                 candidate_count=lexical.candidate_count,
                 latency_ms=lexical.latency_ms,
                 profile="lexical",
+                started_at=started_at,
             )
 
-        try:
-            vector = await self._vector.retrieve(query)
-        except RetrieverUnavailable:
+        lexical, vector = await asyncio.gather(
+            self._lexical.retrieve(query),
+            self._retrieve_vector(query),
+        )
+        if vector is _VECTOR_UNAVAILABLE:
             return await self._finish(
                 query,
                 lexical.hits,
                 candidate_count=lexical.candidate_count,
                 latency_ms=lexical.latency_ms,
                 profile="lexical_fallback",
+                started_at=started_at,
             )
 
+        if not isinstance(vector, SearchResult):
+            raise TypeError("vector retriever must return SearchResult")
         fused = _reciprocal_rank_fusion(lexical.hits, vector.hits, rrf_k=self._rrf_k)
         return await self._finish(
             query,
@@ -383,7 +395,16 @@ class HybridRetrievalService:
             candidate_count=lexical.candidate_count + vector.candidate_count,
             latency_ms=max(lexical.latency_ms, vector.latency_ms),
             profile="hybrid",
+            started_at=started_at,
         )
+
+    async def _retrieve_vector(self, query: SearchQuery) -> SearchResult | object:
+        if self._vector is None:  # pragma: no cover - guarded by retrieve().
+            raise RuntimeError("vector retriever is not configured")
+        try:
+            return await self._vector.retrieve(query)
+        except RetrieverUnavailable:
+            return _VECTOR_UNAVAILABLE
 
     async def _finish(
         self,
@@ -393,11 +414,13 @@ class HybridRetrievalService:
         candidate_count: int,
         latency_ms: float,
         profile: str,
+        started_at: float,
     ) -> SearchResult:
-        direct = list(_unique_hits(hits))[: query.limit]
-        if self._reranker is not None and direct:
-            reranked = await self._reranker.rerank(query, tuple(direct))
-            direct = _sanitize_reranked(direct, reranked)
+        candidates = list(_unique_hits(hits))[: query.candidate_limit]
+        if self._reranker is not None and candidates:
+            reranked = await self._reranker.rerank(query, tuple(candidates))
+            candidates = _sanitize_reranked(candidates, reranked)
+        direct = candidates[: query.limit]
 
         final = direct
         if self._expander is not None and final and len(final) < query.limit:
@@ -407,7 +430,7 @@ class HybridRetrievalService:
         return SearchResult(
             hits=tuple(final),
             candidate_count=candidate_count,
-            latency_ms=latency_ms,
+            latency_ms=max(latency_ms, (perf_counter() - started_at) * 1000),
             profile=profile,
         )
 
