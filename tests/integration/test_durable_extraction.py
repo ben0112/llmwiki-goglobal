@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import sys
 from contextlib import suppress
 from dataclasses import replace
@@ -93,7 +94,7 @@ class RecordingQuota:
             self.events.append("quota_reserve")
         if self.reserve_error is not None:
             raise self.reserve_error
-        reservation = QuotaReservation(user_id, upload_id, byte_count, f"owner-{upload_id}")
+        reservation = QuotaReservation(user_id, upload_id, byte_count, secrets.token_urlsafe(24))
         self.reservations.append(reservation)
         return reservation
 

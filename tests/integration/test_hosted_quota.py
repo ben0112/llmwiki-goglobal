@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
+import time
 from uuid import uuid4
 
 import pytest
-from infra.quota import HostedQuotaService, QuotaExceeded, QuotaUnavailable, quota_keys
+from infra.quota import HostedQuotaService, QuotaExceeded, QuotaReservation, QuotaUnavailable, quota_keys
 from redis.asyncio import Redis
 
 pytestmark = pytest.mark.asyncio
@@ -60,6 +62,32 @@ async def _clear(redis_client, *user_ids):
     keys = [key for user_id in user_ids for key in quota_keys(user_id)]
     if keys:
         await redis_client.delete(*keys)
+
+
+async def _reservation_state(redis_client, user_id):
+    _, reservations_key, bytes_key, tokens_key = quota_keys(user_id)
+    return (
+        await redis_client.zrange(reservations_key, 0, -1, withscores=True),
+        await redis_client.hgetall(bytes_key),
+        await redis_client.hgetall(tokens_key),
+    )
+
+
+async def _seed_raw_reservation(
+    redis_client,
+    user_id,
+    member: str,
+    owner: str,
+    *,
+    expired: bool = False,
+    raw_bytes: str = "10",
+    score: float | int | None = None,
+):
+    _, reservations_key, bytes_key, tokens_key = quota_keys(user_id)
+    score = score if score is not None else (0 if expired else int(time.time() * 1000) + 60_000)
+    await redis_client.zadd(reservations_key, {member: score})
+    await redis_client.hset(bytes_key, member, raw_bytes)
+    await redis_client.hset(tokens_key, member, owner)
 
 
 async def test_committed_plus_live_reservations_determine_acceptance(pool, redis_client):
@@ -171,5 +199,112 @@ async def test_stale_writer_after_lock_expiry_reacquires_before_reserving(pool, 
         assert reservation.bytes == 10
         with pytest.raises(QuotaExceeded):
             await HostedQuotaService(pool, redis_client).reserve(user_id, uuid4(), 1, ttl_seconds=60)
+    finally:
+        await _clear(redis_client, user_id)
+
+
+@pytest.mark.parametrize(
+    "member,owner",
+    [
+        ("NOT-A-UUID", secrets.token_urlsafe(24)),
+        ("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", secrets.token_urlsafe(24)),
+        (str(uuid4()), "short"),
+        (str(uuid4()), "a" * 31 + "+"),
+        (str(uuid4()), "a" * 31 + "\n"),
+        (str(uuid4()), "é" * 32),
+    ],
+)
+async def test_internally_consistent_noncanonical_record_blocks_admission_without_mutation(
+    pool,
+    redis_client,
+    member,
+    owner,
+):
+    user_id = await _seed_user(pool, limit=100)
+    service = HostedQuotaService(pool, redis_client)
+    try:
+        await _seed_raw_reservation(redis_client, user_id, member, owner)
+        before = await _reservation_state(redis_client, user_id)
+
+        with pytest.raises(QuotaUnavailable):
+            await service.reserve(user_id, uuid4(), 1, ttl_seconds=60)
+
+        assert await _reservation_state(redis_client, user_id) == before
+    finally:
+        await _clear(redis_client, user_id)
+
+
+async def test_cleanup_fails_closed_on_nonexpired_malformed_record(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    service = HostedQuotaService(pool, redis_client)
+    try:
+        await _seed_raw_reservation(redis_client, user_id, str(uuid4()), "short")
+        before = await _reservation_state(redis_client, user_id)
+
+        with pytest.raises(QuotaUnavailable):
+            await service.cleanup_expired(user_id)
+
+        assert await _reservation_state(redis_client, user_id) == before
+    finally:
+        await _clear(redis_client, user_id)
+
+
+async def test_cleanup_does_not_guess_or_delete_expired_malformed_record(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    service = HostedQuotaService(pool, redis_client)
+    try:
+        await _seed_raw_reservation(redis_client, user_id, "malformed-expired-member", "short", expired=True)
+        before = await _reservation_state(redis_client, user_id)
+
+        with pytest.raises(QuotaUnavailable):
+            await service.cleanup_expired(user_id)
+
+        assert await _reservation_state(redis_client, user_id) == before
+    finally:
+        await _clear(redis_client, user_id)
+
+
+@pytest.mark.parametrize(
+    "raw_bytes,score",
+    [
+        ("01", None),
+        ("1.5", None),
+        ("10", 1.5),
+    ],
+)
+async def test_noncanonical_bytes_or_score_remain_fail_closed(pool, redis_client, raw_bytes, score):
+    user_id = await _seed_user(pool, limit=100)
+    service = HostedQuotaService(pool, redis_client)
+    try:
+        await _seed_raw_reservation(
+            redis_client,
+            user_id,
+            str(uuid4()),
+            secrets.token_urlsafe(24),
+            raw_bytes=raw_bytes,
+            score=score,
+        )
+        before = await _reservation_state(redis_client, user_id)
+
+        with pytest.raises(QuotaUnavailable):
+            await service.reserve(user_id, uuid4(), 1, ttl_seconds=60)
+
+        assert await _reservation_state(redis_client, user_id) == before
+    finally:
+        await _clear(redis_client, user_id)
+
+
+async def test_canonical_raw_record_with_dash_and_underscore_remains_operable(pool, redis_client):
+    user_id = await _seed_user(pool, limit=10)
+    upload_id = uuid4()
+    owner = "A_b-" * 8
+    service = HostedQuotaService(pool, redis_client)
+    try:
+        await _seed_raw_reservation(redis_client, user_id, str(upload_id), owner)
+
+        with pytest.raises(QuotaExceeded):
+            await service.reserve(user_id, uuid4(), 1, ttl_seconds=60)
+        assert await service.release(QuotaReservation(user_id, upload_id, 10, owner)) is True
+        assert await _reservation_state(redis_client, user_id) == ([], {}, {})
     finally:
         await _clear(redis_client, user_id)

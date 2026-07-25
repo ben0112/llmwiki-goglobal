@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from uuid import uuid4
@@ -95,7 +96,8 @@ async def test_reserve_reads_committed_usage_then_writes_under_token_lock():
     assert reservation.user_id == user_id
     assert reservation.upload_id == upload_id
     assert reservation.bytes == 30
-    assert reservation.owner_token
+    assert len(reservation.owner_token) == 32
+    assert set(reservation.owner_token) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
     with pytest.raises(FrozenInstanceError):
         reservation.bytes = 10
     assert "SUM(d.file_size)" in pool.connection.calls[0][0]
@@ -143,12 +145,13 @@ async def test_settlement_is_owner_token_cas_and_repeated_safe(method):
     quota = _module()
     redis = _Redis(eval_results=[[1], [0]])
     service = quota.HostedQuotaService(_Pool({}), redis)
-    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, "opaque-owner")
+    owner_token = secrets.token_urlsafe(24)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, owner_token)
 
     assert await getattr(service, method)(reservation) is True
     assert await getattr(service, method)(reservation) is False
     assert all(call[1] == 3 for call in redis.eval_calls)
-    assert all(call[2][-1] == "opaque-owner" for call in redis.eval_calls)
+    assert all(call[2][-2:] == (owner_token, "10") for call in redis.eval_calls)
 
 
 @pytest.mark.parametrize(
@@ -186,6 +189,53 @@ async def test_malformed_or_unavailable_redis_fails_closed_without_leaking_owner
         await service.reserve(uuid4(), uuid4(), 1, ttl_seconds=60)
 
     assert "token" not in str(raised.value).lower()
+
+
+@pytest.mark.parametrize(
+    "owner_token",
+    [
+        "short",
+        "a" * 31,
+        "a" * 33,
+        "a" * 31 + "\n",
+        "é" * 32,
+        "a" * 31 + "+",
+    ],
+)
+def test_reservation_rejects_owner_tokens_outside_generated_canonical_format(owner_token):
+    quota = _module()
+
+    with pytest.raises(ValueError, match="owner_token"):
+        quota.QuotaReservation(uuid4(), uuid4(), 10, owner_token)
+
+
+async def test_settlement_revalidates_a_forged_reservation_before_redis():
+    quota = _module()
+    redis = _Redis(eval_results=[[1]])
+    service = quota.HostedQuotaService(_Pool({}), redis)
+    forged = object.__new__(quota.QuotaReservation)
+    object.__setattr__(forged, "user_id", uuid4())
+    object.__setattr__(forged, "upload_id", uuid4())
+    object.__setattr__(forged, "bytes", 10)
+    object.__setattr__(forged, "owner_token", "short")
+
+    with pytest.raises(ValueError, match="owner_token"):
+        await service.release(forged)
+
+    assert redis.eval_calls == []
+
+
+async def test_settlement_cas_includes_immutable_reservation_bytes():
+    quota = _module()
+    redis = _Redis(eval_results=[[2]])
+    service = quota.HostedQuotaService(_Pool({}), redis)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    assert await service.release(reservation) is False
+
+    _, key_count, args = redis.eval_calls[0]
+    assert key_count == 3
+    assert args[-3:] == (str(reservation.upload_id), reservation.owner_token, "10")
 
 
 async def test_hosted_runtime_builds_one_pinged_shared_quota_service(monkeypatch):

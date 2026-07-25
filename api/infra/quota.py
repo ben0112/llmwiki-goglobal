@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Lua numbers are IEEE-754 doubles. This bound also stays below lua-cjson's
 # practical 14-significant-digit serialization boundary.
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_QUOTA_BYTES = 9_999_999_999_999
 MAX_TTL_SECONDS = 2_147_483_647
 DEFAULT_LOCK_TTL_MS = 5_000
@@ -47,13 +48,7 @@ class QuotaReservation:
         _require_uuid(self.user_id, "user_id")
         _require_uuid(self.upload_id, "upload_id")
         _require_integer(self.bytes, "bytes", maximum=MAX_QUOTA_BYTES)
-        if (
-            not isinstance(self.owner_token, str)
-            or not 1 <= len(self.owner_token) <= 128
-            or not self.owner_token.isascii()
-            or any(not 33 <= ord(character) <= 126 for character in self.owner_token)
-        ):
-            raise ValueError("owner_token must be opaque printable ASCII")
+        _require_owner_token(self.owner_token)
 
 
 class QuotaService(Protocol):
@@ -83,6 +78,13 @@ def _require_uuid(value: object, name: str) -> UUID:
 def _require_integer(value: object, name: str, *, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
+    return value
+
+
+def _require_owner_token(value: object) -> str:
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+    if not isinstance(value, str) or len(value) != 32 or any(character not in allowed for character in value):
+        raise ValueError("owner_token must match the generated URL-safe format")
     return value
 
 
@@ -119,20 +121,52 @@ return 0
 """
 
 
-_RESERVE_SCRIPT = f"""
+_LUA_RECORD_VALIDATORS = f"""
+local function canonical_uuid(value)
+  if type(value) ~= 'string' or string.len(value) ~= 36
+     or string.sub(value, 9, 9) ~= '-' or string.sub(value, 14, 14) ~= '-'
+     or string.sub(value, 19, 19) ~= '-' or string.sub(value, 24, 24) ~= '-' then
+    return false
+  end
+  local compact, hyphens = string.gsub(value, '%-', '')
+  return hyphens == 4 and string.len(compact) == 32
+     and string.match(compact, '^[0-9a-f]+$') ~= nil
+end
+
+local function canonical_owner(value)
+  return type(value) == 'string' and string.len(value) == 32
+     and string.match(value, '^[A-Za-z0-9_%-]+$') ~= nil
+end
+
+local function canonical_score(value)
+  local parsed = tonumber(value)
+  return parsed and parsed >= 0 and parsed <= {MAX_SAFE_INTEGER}
+     and parsed % 1 == 0 and string.format('%.0f', parsed) == value
+end
+
+local function canonical_bytes(value)
+  local parsed = tonumber(value)
+  if not parsed or parsed < 1 or parsed > {MAX_QUOTA_BYTES}
+     or parsed % 1 ~= 0 or string.format('%.0f', parsed) ~= value then
+    return nil
+  end
+  return parsed
+end
+"""
+
+
+# Validate the complete snapshot before removing even an expired member. An
+# expired malformed record is retained and blocks admission until repaired;
+# guessing which correlated fields to delete could erase another generation.
+_RESERVE_SCRIPT = (
+    _LUA_RECORD_VALIDATORS
+    + f"""
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return {{3}}
 end
 
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now_ms)
-for _, upload_id in ipairs(expired) do
-  redis.call('ZREM', KEYS[2], upload_id)
-  redis.call('HDEL', KEYS[3], upload_id)
-  redis.call('HDEL', KEYS[4], upload_id)
-end
-
 local members = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
 local member_count = #members / 2
 if redis.call('HLEN', KEYS[3]) ~= member_count or redis.call('HLEN', KEYS[4]) ~= member_count then
@@ -142,18 +176,20 @@ end
 local live = 0
 for index = 1, #members, 2 do
   local upload_id = members[index]
-  local score = tonumber(members[index + 1])
+  local raw_score = members[index + 1]
+  local score = tonumber(raw_score)
   local raw_bytes = redis.call('HGET', KEYS[3], upload_id)
   local owner = redis.call('HGET', KEYS[4], upload_id)
-  local byte_count = tonumber(raw_bytes)
-  if not score or score <= now_ms or not raw_bytes or not owner or owner == ''
-     or not byte_count or byte_count < 1 or byte_count > {MAX_QUOTA_BYTES}
-     or byte_count % 1 ~= 0 or string.format('%.0f', byte_count) ~= raw_bytes then
+  local byte_count = canonical_bytes(raw_bytes)
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not byte_count or not canonical_owner(owner) then
     return {{4}}
   end
-  live = live + byte_count
-  if live > {MAX_QUOTA_BYTES} then
-    return {{4}}
+  if score > now_ms then
+    live = live + byte_count
+    if live > {MAX_QUOTA_BYTES} then
+      return {{4}}
+    end
   end
 end
 
@@ -161,7 +197,8 @@ local committed = tonumber(ARGV[4])
 local storage_limit = tonumber(ARGV[5])
 local incoming = tonumber(ARGV[6])
 local ttl_ms = tonumber(ARGV[7])
-if not committed or not storage_limit or not incoming or not ttl_ms
+if not canonical_uuid(ARGV[2]) or not canonical_owner(ARGV[3])
+   or not committed or not storage_limit or not incoming or not ttl_ms
    or committed < 0 or committed > {MAX_QUOTA_BYTES}
    or storage_limit < 0 or storage_limit > {MAX_QUOTA_BYTES}
    or incoming < 1 or incoming > {MAX_QUOTA_BYTES}
@@ -170,7 +207,8 @@ if not committed or not storage_limit or not incoming or not ttl_ms
 end
 
 local replaced = redis.call('HGET', KEYS[3], ARGV[2])
-if replaced then
+local replaced_score = redis.call('ZSCORE', KEYS[2], ARGV[2])
+if replaced and replaced_score and tonumber(replaced_score) > now_ms then
   live = live - tonumber(replaced)
 end
 local used = committed + live + incoming
@@ -178,19 +216,41 @@ if used > storage_limit then
   return {{2, string.format('%.0f', used), string.format('%.0f', storage_limit)}}
 end
 
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now_ms)
+for _, upload_id in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], upload_id)
+  redis.call('HDEL', KEYS[3], upload_id)
+  redis.call('HDEL', KEYS[4], upload_id)
+end
 local expires_at = now_ms + ttl_ms
 redis.call('ZADD', KEYS[2], expires_at, ARGV[2])
 redis.call('HSET', KEYS[3], ARGV[2], ARGV[6])
 redis.call('HSET', KEYS[4], ARGV[2], ARGV[3])
 return {{1, string.format('%.0f', expires_at)}}
 """
+)
 
 
 _SETTLE_SCRIPT = (
-    """
+    _LUA_RECORD_VALIDATORS
+    + """
+if not canonical_uuid(ARGV[1]) or not canonical_owner(ARGV[2]) or not canonical_bytes(ARGV[3]) then
+  return {3}
+end
 local count = redis.call('ZCARD', KEYS[1])
 if redis.call('HLEN', KEYS[2]) ~= count or redis.call('HLEN', KEYS[3]) ~= count then
   return {3}
+end
+local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for index = 1, #members, 2 do
+  local upload_id = members[index]
+  local raw_score = members[index + 1]
+  local raw_bytes = redis.call('HGET', KEYS[2], upload_id)
+  local owner = redis.call('HGET', KEYS[3], upload_id)
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not canonical_bytes(raw_bytes) or not canonical_owner(owner) then
+    return {3}
+  end
 end
 local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
 local byte_count = redis.call('HGET', KEYS[2], ARGV[1])
@@ -198,18 +258,10 @@ local owner = redis.call('HGET', KEYS[3], ARGV[1])
 if not score and not byte_count and not owner then
   return {0}
 end
-if not score or not byte_count or not owner or owner == '' then
+if not score or not byte_count or not owner then
   return {3}
 end
-local parsed_bytes = tonumber(byte_count)
-if not tonumber(score) or not parsed_bytes or parsed_bytes < 1 or parsed_bytes > """
-    + str(MAX_QUOTA_BYTES)
-    + """
-   or parsed_bytes % 1 ~= 0 or string.format('%.0f', parsed_bytes) ~= byte_count
-   or string.len(owner) > 128 then
-  return {3}
-end
-if owner ~= ARGV[2] then
+if owner ~= ARGV[2] or byte_count ~= ARGV[3] then
   return {2}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
@@ -221,15 +273,10 @@ return {1}
 
 
 _CLEANUP_SCRIPT = (
-    """
+    _LUA_RECORD_VALIDATORS
+    + """
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms)
-for _, upload_id in ipairs(expired) do
-  redis.call('ZREM', KEYS[1], upload_id)
-  redis.call('HDEL', KEYS[2], upload_id)
-  redis.call('HDEL', KEYS[3], upload_id)
-end
 local count = redis.call('ZCARD', KEYS[1])
 if redis.call('HLEN', KEYS[2]) ~= count or redis.call('HLEN', KEYS[3]) ~= count then
   return {0}
@@ -237,18 +284,19 @@ end
 local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
 for index = 1, #members, 2 do
   local upload_id = members[index]
-  local score = tonumber(members[index + 1])
+  local raw_score = members[index + 1]
   local raw_bytes = redis.call('HGET', KEYS[2], upload_id)
   local owner = redis.call('HGET', KEYS[3], upload_id)
-  local byte_count = tonumber(raw_bytes)
-  if not score or score <= now_ms or not raw_bytes or not owner or owner == ''
-     or string.len(owner) > 128 or not byte_count or byte_count < 1
-     or byte_count > """
-    + str(MAX_QUOTA_BYTES)
-    + """ or byte_count % 1 ~= 0
-     or string.format('%.0f', byte_count) ~= raw_bytes then
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not canonical_bytes(raw_bytes) or not canonical_owner(owner) then
     return {0}
   end
+end
+local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+for _, upload_id in ipairs(expired) do
+  redis.call('ZREM', KEYS[1], upload_id)
+  redis.call('HDEL', KEYS[2], upload_id)
+  redis.call('HDEL', KEYS[3], upload_id)
 end
 return {1, #expired}
 """
@@ -431,6 +479,10 @@ class HostedQuotaService:
     async def _settle(self, reservation: QuotaReservation) -> bool:
         if not isinstance(reservation, QuotaReservation):
             raise ValueError("reservation must be a QuotaReservation")
+        _require_uuid(reservation.user_id, "user_id")
+        _require_uuid(reservation.upload_id, "upload_id")
+        _require_integer(reservation.bytes, "bytes", maximum=MAX_QUOTA_BYTES)
+        _require_owner_token(reservation.owner_token)
         _, reservations_key, bytes_key, tokens_key = quota_keys(reservation.user_id)
         try:
             items = _response_items(
@@ -442,6 +494,7 @@ class HostedQuotaService:
                     tokens_key,
                     str(reservation.upload_id),
                     reservation.owner_token,
+                    str(reservation.bytes),
                 )
             )
         except QuotaUnavailable:
