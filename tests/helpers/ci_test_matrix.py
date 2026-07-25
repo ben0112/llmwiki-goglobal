@@ -1,0 +1,60 @@
+"""Deterministic, exhaustive test-file partitions for isolated CI processes."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+ROOT = Path(__file__).parents[2]
+UNIT = ROOT / "tests/unit"
+INTEGRATION = ROOT / "tests/integration"
+
+
+def _relative(paths) -> tuple[str, ...]:
+    return tuple(sorted(path.relative_to(ROOT).as_posix() for path in paths))
+
+
+unit_files = set(UNIT.rglob("test_*.py"))
+unit_core = set((UNIT / "core").rglob("test_*.py"))
+unit_corpus = set((UNIT / "corpus").rglob("test_*.py"))
+unit_mcp = set((UNIT / "mcp").rglob("test_*.py"))
+
+integration_files = set(INTEGRATION.rglob("test_*.py"))
+integration_mcp = set((INTEGRATION / "mcp").rglob("test_*.py"))
+integration_mcp_postgres = {
+    INTEGRATION / "mcp/test_mcp_isolation.py",
+    INTEGRATION / "mcp/test_wiki_write_postgres.py",
+}
+integration_redis = {INTEGRATION / "test_tus_sessions_redis.py"}
+integration_minio = {INTEGRATION / "test_s3_multipart.py"}
+integration_scaled = {INTEGRATION / "test_scaled_compose.py"}
+
+SEGMENTS: dict[str, tuple[str, ...]] = {
+    "unit-core": _relative(unit_core),
+    "unit-api": _relative(unit_files - unit_core - unit_corpus - unit_mcp),
+    "unit-mcp": _relative(unit_mcp),
+    "unit-corpus": _relative(unit_corpus),
+    "integration-api": _relative(
+        integration_files
+        - integration_mcp
+        - integration_redis
+        - integration_minio
+        - integration_scaled
+    ),
+    "integration-mcp": _relative(integration_mcp - integration_mcp_postgres),
+    "integration-mcp-postgres": _relative(integration_mcp_postgres),
+    "integration-redis": _relative(integration_redis),
+    "integration-minio": _relative(integration_minio),
+    "integration-scaled": _relative(integration_scaled),
+}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("segment", choices=sorted(SEGMENTS))
+    args = parser.parse_args()
+    print("\n".join(SEGMENTS[args.segment]))
+
+
+if __name__ == "__main__":
+    main()

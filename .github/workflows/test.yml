@@ -31,20 +31,22 @@ jobs:
           pip install -r tests/requirements.txt cryptography
 
       - name: Run shared core unit tests
-        run: pytest tests/unit/core/ -v
+        run: python -m tests.helpers.ci_test_matrix unit-core | xargs pytest -v
 
       - name: Run API unit tests
-        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_tus_sessions.py tests/unit/test_hosted_tus_multipart.py tests/unit/test_hosted_quota.py tests/unit/test_health_roles.py tests/unit/test_ws_listener.py tests/unit/test_url_ingest.py tests/unit/test_facet_rollup.py tests/unit/test_graph_local.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py tests/unit/jobs/ -v
+        run: python -m tests.helpers.ci_test_matrix unit-api | xargs env PYTHONPATH=api pytest -v
+
+      - name: Verify complete CI test matrix ownership
+        run: pytest tests/test_ci_matrix_contract.py -v
 
       - name: Run durable scaling static tests
         run: PYTHONPATH=api pytest tests/integration/test_scaled_compose.py -v
 
       - name: Run MCP unit tests
-        working-directory: mcp
-        run: pytest ../tests/unit/mcp/ -v
+        run: python -m tests.helpers.ci_test_matrix unit-mcp | xargs env PYTHONPATH=mcp pytest -v
 
       - name: Run corpus classification tests
-        run: pytest tests/unit/corpus/ -v
+        run: python -m tests.helpers.ci_test_matrix unit-corpus | xargs pytest -v
 
   mcp-integration:
     name: MCP integration tests (SQLite)
@@ -67,8 +69,7 @@ jobs:
         run: pip install -r tests/requirements.txt cryptography
 
       - name: Run MCP VaultFS + tool handler tests
-        working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_atomic_wiki_write ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_startup_reconciles_disk_after_database_rollback -v
+        run: python -m tests.helpers.ci_test_matrix integration-mcp | xargs env PYTHONPATH=mcp pytest -v
 
   s3-integration:
     name: Integration tests (MinIO)
@@ -111,7 +112,7 @@ jobs:
           S3_MULTIPART_TEST_ACCESS_KEY: test-access
           S3_MULTIPART_TEST_SECRET_KEY: test-secret-key
           S3_MULTIPART_TEST_BUCKET: llmwiki-multipart-test
-        run: PYTHONPATH=api pytest tests/integration/test_s3_multipart.py -v
+        run: python -m tests.helpers.ci_test_matrix integration-minio | xargs env PYTHONPATH=api pytest -v
 
   redis-integration:
     name: Integration tests (Redis)
@@ -144,7 +145,7 @@ jobs:
       - name: Run Redis TUS coordination tests
         env:
           TUS_REDIS_TEST_URL: redis://127.0.0.1:6379/0
-        run: PYTHONPATH=api pytest tests/integration/test_tus_sessions_redis.py -v
+        run: python -m tests.helpers.ci_test_matrix integration-redis | xargs env PYTHONPATH=api pytest -v
 
   postgres-integration:
     name: Integration tests (Postgres)
@@ -193,17 +194,6 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt cryptography
 
-      - name: Run API isolation + lifecycle tests
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_derived_recovery.py tests/integration/test_durable_extraction.py tests/integration/test_durable_graph_rebuild.py tests/integration/isolation/ tests/integration/test_kb_lifecycle.py tests/integration/test_note_lifecycle.py tests/integration/test_document_invariants.py tests/integration/test_converter_isolation.py -v
-
-      - name: Run durable job ledger and delivery tests
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_background_job_schema.py tests/integration/test_background_job_repository.py tests/integration/test_job_delivery.py -v
-
-      - name: Run Hosted quota coordination tests
-        env:
-          QUOTA_REDIS_TEST_URL: redis://127.0.0.1:6379/0
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_hosted_quota.py -v
-
       - name: Start fixed-version MinIO for Hosted TUS
         run: |
           docker run --detach --name llmwiki-tus-minio \
@@ -222,32 +212,18 @@ jobs:
             sleep 0.25
           done
 
-      - name: Run cross-replica Hosted TUS tests
+      - name: Run complete isolated API integration matrix
         env:
+          QUOTA_REDIS_TEST_URL: redis://127.0.0.1:6379/0
           TUS_MULTIPART_REDIS_URL: redis://127.0.0.1:6379/0
           TUS_MULTIPART_S3_ENDPOINT: http://127.0.0.1:9000
           TUS_MULTIPART_S3_ACCESS_KEY: test-access
           TUS_MULTIPART_S3_SECRET_KEY: test-secret-key
           TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_tus_multipart.py -v
-
-      - name: Run durable fault-injection matrix
-        env:
-          TUS_MULTIPART_REDIS_URL: redis://127.0.0.1:6379/0
-          TUS_MULTIPART_S3_ENDPOINT: http://127.0.0.1:9000
-          TUS_MULTIPART_S3_ACCESS_KEY: test-access
-          TUS_MULTIPART_S3_SECRET_KEY: test-secret-key
-          TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_durable_failure_matrix.py -v
-
-      - name: Run API-key auth + hosted corpus import tests
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_api_key_auth.py tests/integration/test_corpus_hosted_import.py tests/integration/test_corpus_hosted_pipeline.py -v
+        run: python -m tests.helpers.ci_test_matrix integration-api | xargs env PYTHONPATH=api MODE=hosted pytest -v
 
       - name: Run MCP Postgres isolation tests
-        working-directory: mcp
-        run: |
-          pytest ../tests/integration/mcp/test_mcp_isolation.py -v
-          pytest ../tests/integration/mcp/test_wiki_write_postgres.py -v
+        run: python -m tests.helpers.ci_test_matrix integration-mcp-postgres | xargs env PYTHONPATH=mcp pytest -v
 
   scaled-compose:
     name: Required scaled Compose (2 API / 2 worker)
@@ -290,7 +266,7 @@ jobs:
         env:
           SCALED_COMPOSE_TEST: "1"
           SCALED_COMPOSE_ENV_FILE: deploy/.env.selfhost
-        run: PYTHONPATH=api pytest tests/integration/test_scaled_compose.py -v
+        run: python -m tests.helpers.ci_test_matrix integration-scaled | xargs env PYTHONPATH=api pytest -v
 
       - name: Print scaled service logs on failure
         if: failure()
