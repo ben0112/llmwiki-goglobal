@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fractions import Fraction
 from math import ceil, isfinite, log2
 from numbers import Real
 from os import PathLike
@@ -236,6 +237,7 @@ class EvaluationReport:
     filtered_result_count: int
     latency_p50_ms: float
     latency_p95_ms: float
+    recall_at_10_exact: Fraction | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.case_count, bool) or not isinstance(self.case_count, int) or self.case_count <= 0:
@@ -261,6 +263,14 @@ class EvaluationReport:
             "latency_p95_ms",
             _finite_non_negative("latency_p95_ms", self.latency_p95_ms),
         )
+        exact_recall = self.recall_at_10_exact
+        if exact_recall is None:
+            exact_recall = Fraction(*self.recall_at_10.as_integer_ratio())
+        if not isinstance(exact_recall, Fraction) or not 0 <= exact_recall <= 1:
+            raise ValueError("recall_at_10_exact must be a Fraction between 0 and 1")
+        if float(exact_recall) != self.recall_at_10:
+            raise ValueError("recall_at_10_exact must round to recall_at_10")
+        object.__setattr__(self, "recall_at_10_exact", exact_recall)
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,7 +415,10 @@ def _is_filtered(query: SearchQuery) -> bool:
     )
 
 
-def _case_metrics(case: EvalCase, run: EvaluationRun) -> tuple[float, float, float, float, float]:
+def _case_metrics(
+    case: EvalCase,
+    run: EvaluationRun,
+) -> tuple[float, float, float, float, float, Fraction]:
     document_judgments = {item.document_id: item for item in case.relevance if item.chunk_index is None}
     chunk_judgments = {item.identity: item for item in case.relevance if item.chunk_index is not None}
     matched: set[tuple[str, int | None]] = set()
@@ -419,14 +432,17 @@ def _case_metrics(case: EvalCase, run: EvaluationRun) -> tuple[float, float, flo
             matches.append((rank, judgment))
 
     relevant_count = len(case.relevance)
-    recalls = tuple(sum(rank <= cutoff for rank, _judgment in matches) / relevant_count for cutoff in (5, 10, 20))
+    exact_recalls = tuple(
+        Fraction(sum(rank <= cutoff for rank, _judgment in matches), relevant_count) for cutoff in (5, 10, 20)
+    )
+    recalls = tuple(float(recall) for recall in exact_recalls)
     mrr = 0.0 if not matches else 1.0 / matches[0][0]
     max_grade = max(item.grade for item in case.relevance)
     dcg = sum(_scaled_gain(judgment.grade, max_grade) / log2(rank + 1) for rank, judgment in matches if rank <= 10)
     ideal_grades = sorted((item.grade for item in case.relevance), reverse=True)[:10]
     ideal_dcg = sum(_scaled_gain(grade, max_grade) / log2(rank + 1) for rank, grade in enumerate(ideal_grades, 1))
     ndcg = dcg / ideal_dcg
-    return (*recalls, mrr, ndcg)
+    return (*recalls, mrr, ndcg, exact_recalls[1])
 
 
 def _nearest_rank(values: Sequence[float], percentile: float) -> float:
@@ -490,6 +506,13 @@ def evaluate_rankings(
     per_case = [_case_metrics(case, runs_by_id[case.case_id]) for case in case_values]
     count = len(case_values)
     averages = [sum(metrics[index] for metrics in per_case) / count for index in range(5)]
+    exact_recall_at_10 = (
+        sum(
+            (metrics[5] for metrics in per_case),
+            start=Fraction(),
+        )
+        / count
+    )
     latencies = [runs_by_id[case.case_id].latency_ms for case in case_values]
     return EvaluationReport(
         case_count=count,
@@ -503,6 +526,7 @@ def evaluate_rankings(
         ),
         latency_p50_ms=_nearest_rank(latencies, 0.50),
         latency_p95_ms=_nearest_rank(latencies, 0.95),
+        recall_at_10_exact=exact_recall_at_10,
     )
 
 
@@ -519,12 +543,14 @@ def promotion_decision(
     latency_baseline = max(lexical.latency_p95_ms, 0.001)
     recall_ratio = _bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10)
     latency_ratio = _bounded_ratio(hybrid.latency_p95_ms, latency_baseline)
-    quality_gate = _passes_quality_gate(
-        lexical.recall_at_10,
-        hybrid.recall_at_10,
-        recall_ratio,
-    )
-    latency_gate = hybrid.latency_p95_ms <= latency_baseline * 2
+    lexical_recall = lexical.recall_at_10_exact
+    hybrid_recall = hybrid.recall_at_10_exact
+    if lexical_recall is None or hybrid_recall is None:  # pragma: no cover - normalized.
+        raise RuntimeError("evaluation report exact recall is missing")
+    quality_gate = hybrid_recall * 10 >= lexical_recall * 11
+    hybrid_latency = Fraction(*hybrid.latency_p95_ms.as_integer_ratio())
+    baseline_latency = Fraction(*latency_baseline.as_integer_ratio())
+    latency_gate = hybrid_latency <= baseline_latency * 2
     eligible = quality_gate and latency_gate
     return PromotionDecision(
         eligible=eligible,
@@ -537,12 +563,6 @@ def promotion_decision(
 def _bounded_ratio(numerator: float, denominator: float) -> float:
     ratio = numerator / denominator
     return ratio if isfinite(ratio) else float_info.max
-
-
-def _passes_quality_gate(baseline: float, candidate: float, ratio: float) -> bool:
-    if baseline < float_info.min:
-        return ratio >= 1.10
-    return candidate * 10 / 11 >= baseline
 
 
 __all__ = [

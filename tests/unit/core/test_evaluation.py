@@ -1,5 +1,6 @@
 import json
 import math
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,7 +65,13 @@ def _run(
     )
 
 
-def _report(*, recall_at_10: float, latency_p95_ms: float) -> EvaluationReport:
+def _report(
+    *,
+    recall_at_10: float,
+    latency_p95_ms: float,
+    exact_recall_at_10: Fraction | None = None,
+) -> EvaluationReport:
+    exact = {} if exact_recall_at_10 is None else {"recall_at_10_exact": exact_recall_at_10}
     return EvaluationReport(
         case_count=1,
         recall_at_5=recall_at_10,
@@ -75,6 +82,7 @@ def _report(*, recall_at_10: float, latency_p95_ms: float) -> EvaluationReport:
         filtered_result_count=0,
         latency_p50_ms=latency_p95_ms,
         latency_p95_ms=latency_p95_ms,
+        **exact,
     )
 
 
@@ -353,12 +361,20 @@ def test_value_types_reject_invalid_rankings_latencies_and_duplicate_cases():
 
 
 @pytest.mark.parametrize(
-    ("baseline_recall", "hybrid_recall", "baseline_latency", "hybrid_latency", "eligible"),
+    (
+        "baseline_recall",
+        "hybrid_recall",
+        "baseline_latency",
+        "hybrid_latency",
+        "exact_baseline",
+        "exact_hybrid",
+        "eligible",
+    ),
     [
-        (0.50, 0.55, 10.0, 20.0, True),
-        (0.75, 0.825, 0.3, 0.6, True),
-        (0.50, 0.549999, 10.0, 20.0, False),
-        (0.50, 0.55, 10.0, 20.000001, False),
+        (0.50, 0.55, 10.0, 20.0, Fraction(1, 2), Fraction(11, 20), True),
+        (0.75, 0.825, 0.3, 0.6, Fraction(3, 4), Fraction(33, 40), True),
+        (0.50, 0.549999, 10.0, 20.0, None, None, False),
+        (0.50, 0.55, 10.0, 20.000001, Fraction(1, 2), Fraction(11, 20), False),
     ],
 )
 def test_promotion_gate_has_stable_inclusive_boundaries(
@@ -366,11 +382,21 @@ def test_promotion_gate_has_stable_inclusive_boundaries(
     hybrid_recall,
     baseline_latency,
     hybrid_latency,
+    exact_baseline,
+    exact_hybrid,
     eligible,
 ):
     decision = promotion_decision(
-        _report(recall_at_10=baseline_recall, latency_p95_ms=baseline_latency),
-        _report(recall_at_10=hybrid_recall, latency_p95_ms=hybrid_latency),
+        _report(
+            recall_at_10=baseline_recall,
+            latency_p95_ms=baseline_latency,
+            exact_recall_at_10=exact_baseline,
+        ),
+        _report(
+            recall_at_10=hybrid_recall,
+            latency_p95_ms=hybrid_latency,
+            exact_recall_at_10=exact_hybrid,
+        ),
     )
 
     assert decision.eligible is eligible
@@ -394,8 +420,16 @@ def test_promotion_gate_accepts_exact_boundary_after_macro_average_rounding():
     hybrid = (1 + 4 / 7) / 2
 
     decision = promotion_decision(
-        _report(recall_at_10=baseline, latency_p95_ms=1),
-        _report(recall_at_10=hybrid, latency_p95_ms=2),
+        _report(
+            recall_at_10=baseline,
+            latency_p95_ms=1,
+            exact_recall_at_10=Fraction(5, 7),
+        ),
+        _report(
+            recall_at_10=hybrid,
+            latency_p95_ms=2,
+            exact_recall_at_10=Fraction(11, 14),
+        ),
     )
 
     assert hybrid / baseline == pytest.approx(1.10)
@@ -423,6 +457,67 @@ def test_promotion_gate_strictly_rejects_one_float_above_latency_boundary():
     assert decision.latency_ratio > 2.0
     assert decision.eligible is False
     assert decision.reason == "gate_failed"
+
+
+def test_promotion_gate_strictly_rejects_small_nextafter_quality_value():
+    decision = promotion_decision(
+        _report(recall_at_10=0.0003, latency_p95_ms=10),
+        _report(
+            recall_at_10=math.nextafter(0.00033, 0.0),
+            latency_p95_ms=10,
+        ),
+    )
+
+    assert decision.recall_ratio < 1.10
+    assert decision.eligible is False
+
+
+def test_promotion_gate_strictly_rejects_milliscale_nextafter_boundaries():
+    baseline = 0.001
+    quality = promotion_decision(
+        _report(recall_at_10=baseline, latency_p95_ms=baseline),
+        _report(
+            recall_at_10=math.nextafter(baseline * 1.1, 0.0),
+            latency_p95_ms=baseline,
+        ),
+    )
+    latency = promotion_decision(
+        _report(recall_at_10=0.5, latency_p95_ms=baseline),
+        _report(
+            recall_at_10=0.55,
+            latency_p95_ms=math.nextafter(baseline * 2, math.inf),
+        ),
+    )
+
+    assert quality.eligible is False
+    assert latency.eligible is False
+
+
+def test_promotion_gate_uses_exact_recall_from_real_macro_metrics():
+    one = _case("one", (RelevanceJudgment("one", 1),))
+    many_relevance = tuple(RelevanceJudgment(f"many-{index}", 1) for index in range(48))
+    many = _case("many", many_relevance)
+    cases = (one, many)
+    lexical = evaluate_rankings(
+        cases,
+        (
+            _run("one", ("one", 0)),
+            _run("many", *((f"many-{index}", 0) for index in range(2))),
+        ),
+    )
+    hybrid = evaluate_rankings(
+        cases,
+        (
+            _run("one", ("one", 0)),
+            _run("many", *((f"many-{index}", 0) for index in range(7))),
+        ),
+    )
+
+    decision = promotion_decision(lexical, hybrid)
+
+    assert lexical.recall_at_10 == pytest.approx(25 / 48)
+    assert hybrid.recall_at_10 == pytest.approx(55 / 96)
+    assert decision.eligible is True
 
 
 def test_promotion_decision_handles_finite_values_whose_ratio_overflows():
