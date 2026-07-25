@@ -729,6 +729,39 @@ class TestSearchDeleteLifecycle:
         result = await searcher.search_chunks("quantum", "*", None, 10)
         assert "quantum" in result.lower()
 
+    async def test_omitted_and_explicit_lexical_profiles_are_byte_identical(
+        self, fs, insert_chunk
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        doc = await instance.create_document(
+            kb_id, "compat.md", "Compat", "/", "md", "", ["search"]
+        )
+        await insert_chunk(str(doc["id"]), kb_id, "stable lexical output")
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        omitted = await searcher.search_chunks("stable", "*", None, 10)
+        explicit = await searcher.search_chunks(
+            "stable", "*", None, 10, retrieval_profile="lexical"
+        )
+
+        assert explicit.encode() == omitted.encode()
+
+    async def test_local_search_strictly_rejects_hybrid_and_unknown_profiles(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        with pytest.raises(ValueError, match="hybrid retrieval is unavailable"):
+            await searcher.search_chunks(
+                "query", "*", None, 10, retrieval_profile="hybrid"
+            )
+        with pytest.raises(ValueError, match="unsupported retrieval profile"):
+            await searcher.search_chunks(
+                "query", "*", None, 10, retrieval_profile="unknown"
+            )
+
     async def test_search_chunks_uses_shared_limit_contract(self, fs):
         instance, kb_id = fs
         from tools.search import SearchHandler

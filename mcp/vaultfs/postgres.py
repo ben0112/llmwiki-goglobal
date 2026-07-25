@@ -3,7 +3,10 @@
 import json
 import logging
 import re
+from collections.abc import Sequence
 from datetime import date
+from math import isfinite
+from numbers import Real
 from time import perf_counter
 
 import aioboto3
@@ -13,7 +16,15 @@ from db import get_pool, scoped_execute, scoped_query, scoped_queryrow, service_
 from services.chunker import chunk_text, store_chunks_pg
 
 from llmwiki_core.documents import DocumentKind
-from llmwiki_core.search import SearchArea, SearchQuery, SearchResult, SearchScope
+from llmwiki_core.models import EmbeddingProfile
+from llmwiki_core.search import (
+    RetrieverUnavailable,
+    SearchArea,
+    SearchHit,
+    SearchQuery,
+    SearchResult,
+    SearchScope,
+)
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
@@ -119,6 +130,66 @@ def _postgres_search_hit(row: dict):
         source_hit=bool(row.get("source_hit")),
         annotation_hit=bool(row.get("annotation_hit")),
     )
+
+
+def _vector_literal(value: object, *, dimensions: int) -> str:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("embedding must be a sequence of finite numbers")
+    if len(value) != dimensions:
+        raise ValueError("embedding dimensions do not match the configured profile")
+    coordinates: list[float] = []
+    for coordinate in value:
+        if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
+            raise ValueError("embedding must contain finite numbers")
+        normalized = float(coordinate)
+        if not isfinite(normalized):
+            raise ValueError("embedding must contain finite numbers")
+        coordinates.append(normalized)
+    if not any(coordinates):
+        raise ValueError("embedding must contain a non-zero coordinate")
+    return "[" + ",".join(format(number, ".17g") for number in coordinates) + "]"
+
+
+def _postgres_document_filters(
+    query: SearchQuery,
+    params: list,
+    *,
+    doc_alias: str,
+    chunk_alias: str,
+) -> list[str]:
+    def bind(value) -> str:
+        params.append(value)
+        return f"${len(params)}"
+
+    where: list[str] = []
+    if query.annotated_only:
+        where.append(f"{chunk_alias}.has_highlight=true")
+    if query.area is SearchArea.WIKI:
+        where.append(f"{doc_alias}.source_kind='wiki'")
+    elif query.area is SearchArea.SOURCES:
+        where.append(f"{doc_alias}.source_kind!='wiki'")
+    if query.document_kinds:
+        kinds = bind([kind.value for kind in query.document_kinds])
+        where.append(f"{doc_alias}.source_kind=ANY({kinds}::text[])")
+    if query.path_glob is not None:
+        path_pattern = bind(logical_glob_to_sql_like(query.path_glob))
+        where.append(
+            f"({doc_alias}.path || {doc_alias}.filename) LIKE {path_pattern} ESCAPE '\\'"
+        )
+    if query.tags:
+        tags = bind(list(query.tags))
+        where.append(
+            "ARRAY(SELECT lower(tag) FROM unnest(COALESCE("
+            f"{doc_alias}.tags, ARRAY[]::text[])) tag) @> {tags}::text[]"
+        )
+    facet_conds, facet_params = postgres_facet_conditions(
+        validate_facets(dict(query.facets)),
+        start_index=len(params) + 1,
+        doc_alias=doc_alias,
+    )
+    where.extend(facet_conds)
+    params.extend(facet_params)
+    return where
 
 
 class PostgresVaultFS(VaultFS):
@@ -539,6 +610,179 @@ class PostgresVaultFS(VaultFS):
             latency_ms=(perf_counter() - started_at) * 1000,
             profile="lexical",
         )
+
+    async def retrieve_vector(
+        self,
+        kb_id: str,
+        query: SearchQuery,
+        *,
+        embedding: tuple[float, ...],
+        profile: EmbeddingProfile,
+    ) -> SearchResult:
+        """Retrieve exact cosine candidates inside the authenticated tenant scope."""
+        if not isinstance(profile, EmbeddingProfile):
+            raise TypeError("profile must be an EmbeddingProfile")
+        if query.scope is not SearchScope.ALL:
+            raise RetrieverUnavailable("vector retrieval does not support scoped content")
+        vector = _vector_literal(embedding, dimensions=profile.dimensions)
+        started_at = perf_counter()
+
+        try:
+            available = await scoped_queryrow(
+                self.user_id,
+                "SELECT EXISTS(SELECT 1 FROM chunk_embeddings ce "
+                "JOIN documents d ON d.id=ce.document_id "
+                "WHERE ce.user_id=$1::uuid AND ce.knowledge_base_id=$2::uuid "
+                "AND ce.provider=$3 AND ce.model=$4 AND ce.dimensions=$5 "
+                "AND d.user_id=$1::uuid AND d.knowledge_base_id=$2::uuid "
+                "AND ce.document_version=d.version AND NOT d.archived "
+                "AND d.status != 'failed') AS available",
+                self.user_id,
+                kb_id,
+                profile.provider,
+                profile.model,
+                profile.dimensions,
+            )
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            raise RetrieverUnavailable("vector store is unavailable") from None
+        if not available or not available["available"]:
+            raise RetrieverUnavailable("current embeddings are unavailable")
+
+        params: list = [
+            self.user_id,
+            kb_id,
+            profile.provider,
+            profile.model,
+            profile.dimensions,
+            vector,
+        ]
+
+        def bind(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        where = [
+            "ce.user_id=$1::uuid",
+            "ce.knowledge_base_id=$2::uuid",
+            "ce.provider=$3",
+            "ce.model=$4",
+            "ce.dimensions=$5",
+            "d.user_id=$1::uuid",
+            "d.knowledge_base_id=$2::uuid",
+            "dc.user_id=$1::uuid",
+            "dc.knowledge_base_id=$2::uuid",
+            "ce.document_version=d.version",
+            "dc.document_version=d.version",
+            "d.status != 'failed'",
+            "NOT d.archived",
+        ]
+        where.extend(
+            _postgres_document_filters(
+                query,
+                params,
+                doc_alias="d",
+                chunk_alias="dc",
+            )
+        )
+        limit_param = bind(query.candidate_limit)
+
+        try:
+            rows = await scoped_query(
+                self.user_id,
+                "WITH filtered AS ("
+                "SELECT ce.document_id, ce.document_version, ce.chunk_index, "
+                "dc.content, dc.source_content, dc.annotations_text, dc.has_highlight, "
+                "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, d.file_type, "
+                "d.tags, d.source_kind, d.metadata, "
+                "ce.embedding <=> $6::vector AS distance "
+                "FROM chunk_embeddings ce JOIN documents d ON d.id=ce.document_id "
+                "JOIN document_chunks dc ON dc.document_id=ce.document_id "
+                "AND dc.document_version=ce.document_version "
+                "AND dc.chunk_index=ce.chunk_index "
+                f"WHERE {' AND '.join(where)}"
+                "), counted AS ("
+                "SELECT *, count(*) OVER () AS candidate_count FROM filtered"
+                ") SELECT *, 1.0-distance AS score, false AS source_hit, "
+                "false AS annotation_hit FROM counted "
+                "ORDER BY distance, document_id, document_version, chunk_index "
+                f"LIMIT {limit_param}",
+                *params,
+            )
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            raise RetrieverUnavailable("vector store is unavailable") from None
+        hits = tuple(_postgres_search_hit(row) for row in rows)
+        candidate_count = int(rows[0]["candidate_count"]) if rows else 0
+        return SearchResult(
+            hits=hits,
+            candidate_count=candidate_count,
+            latency_ms=(perf_counter() - started_at) * 1000,
+            profile="vector",
+        )
+
+    async def expand_references(
+        self,
+        kb_id: str,
+        query: SearchQuery,
+        hits: tuple[SearchHit, ...],
+        *,
+        limit: int,
+    ) -> tuple[SearchHit, ...]:
+        """Follow one outbound edge and fetch one current chunk per related doc."""
+        if type(limit) is not int or limit <= 0 or not hits:
+            return ()
+        direct_ids = tuple(dict.fromkeys(hit.document_id for hit in hits))[:100]
+        if not direct_ids:
+            return ()
+        scan_limit = min(100, limit)
+        params: list = [kb_id, list(direct_ids), self.user_id]
+        where = [
+            "ref.knowledge_base_id=$1::uuid",
+            "target.knowledge_base_id=$1::uuid",
+            "target.user_id=$3::uuid",
+            "dc.user_id=$3::uuid",
+            "dc.knowledge_base_id=$1::uuid",
+            "NOT target.archived",
+            "target.status != 'failed'",
+            "NOT (target.id=ANY($2::uuid[]))",
+        ]
+        where.extend(
+            _postgres_document_filters(
+                query,
+                params,
+                doc_alias="target",
+                chunk_alias="dc",
+            )
+        )
+        params.append(scan_limit)
+        limit_parameter = f"${len(params)}"
+        try:
+            rows = await scoped_query(
+                self.user_id,
+                "WITH direct AS ("
+                "SELECT document_id, direct_rank FROM "
+                "unnest($2::uuid[]) WITH ORDINALITY AS input(document_id, direct_rank)"
+                "), related AS ("
+                "SELECT DISTINCT ON (target.id) direct.direct_rank, "
+                "target.id AS document_id, target.version AS document_version, "
+                "dc.chunk_index, dc.content, dc.source_content, dc.annotations_text, "
+                "dc.has_highlight, dc.page, dc.header_breadcrumb, target.path, "
+                "target.filename, target.title, target.file_type, target.tags, "
+                "target.source_kind, target.metadata "
+                "FROM direct JOIN document_references ref "
+                "ON ref.source_document_id=direct.document_id "
+                "JOIN documents target ON target.id=ref.target_document_id "
+                "JOIN document_chunks dc ON dc.document_id=target.id "
+                "AND dc.document_version=target.version "
+                f"WHERE {' AND '.join(where)} "
+                "ORDER BY target.id, direct.direct_rank, dc.chunk_index"
+                ") SELECT *, 0.0::double precision AS score, "
+                "false AS source_hit, false AS annotation_hit FROM related "
+                f"ORDER BY direct_rank, document_id LIMIT {limit_parameter}",
+                *params,
+            )
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            raise RetrieverUnavailable("reference expansion is unavailable") from None
+        return tuple(_postgres_search_hit(row) for row in rows[:limit])
 
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,

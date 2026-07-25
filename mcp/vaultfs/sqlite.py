@@ -14,8 +14,15 @@ import aiosqlite
 from services.chunker import chunk_text, store_chunks_sqlite
 
 from llmwiki_core.documents import DocumentKind
+from llmwiki_core.models import EmbeddingProfile
 from llmwiki_core.references import build_lookup_maps, extract_references
-from llmwiki_core.search import SearchArea, SearchQuery, SearchResult, SearchScope
+from llmwiki_core.search import (
+    RetrieverUnavailable,
+    SearchArea,
+    SearchQuery,
+    SearchResult,
+    SearchScope,
+)
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
@@ -750,6 +757,17 @@ class SqliteVaultFS(VaultFS):
             latency_ms=(perf_counter() - started_at) * 1000,
             profile="lexical",
         )
+
+    async def retrieve_vector(
+        self,
+        kb_id: str,
+        query: SearchQuery,
+        *,
+        embedding: tuple[float, ...],
+        profile: EmbeddingProfile,
+    ) -> SearchResult:
+        """SQLite stays lexical-only and never initializes vector machinery."""
+        raise RetrieverUnavailable("vector retrieval is unavailable in local mode")
 
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,

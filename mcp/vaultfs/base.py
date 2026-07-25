@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from llmwiki_core.search import SearchHit, SearchQuery, SearchResult
+from llmwiki_core.models import EmbeddingProfile
+from llmwiki_core.search import RetrieverUnavailable, SearchHit, SearchQuery, SearchResult
 from llmwiki_core.wiki import WikiWriteBundle
 
 # Content-derived edge types, rebuilt from wiki page text on every write.
@@ -79,6 +80,28 @@ class VaultFS(ABC):
     async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
         """Typed retrieval must be implemented natively by each adapter."""
         raise NotImplementedError("typed contract requires native retrieve")
+
+    async def retrieve_vector(
+        self,
+        kb_id: str,
+        query: SearchQuery,
+        *,
+        embedding: tuple[float, ...],
+        profile: EmbeddingProfile,
+    ) -> SearchResult:
+        """Hosted adapters may implement tenant-scoped current-version vectors."""
+        raise RetrieverUnavailable("vector retrieval is unavailable")
+
+    async def expand_references(
+        self,
+        kb_id: str,
+        query: SearchQuery,
+        hits: tuple[SearchHit, ...],
+        *,
+        limit: int,
+    ) -> tuple[SearchHit, ...]:
+        """Return bounded one-hop context; local adapters deliberately do nothing."""
+        return ()
 
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,

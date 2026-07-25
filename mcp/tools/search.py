@@ -93,6 +93,7 @@ class SearchHandler:
         self, query: str, path: str, tags: list[str] | None, limit: int,
         annotated_only: bool = False, scope: str = "all",
         facets: dict | None = None,
+        retrieval_profile: Literal["lexical", "hybrid"] = "lexical",
     ) -> str:
         """Full-text search across document chunks.
 
@@ -125,7 +126,17 @@ class SearchHandler:
         )
         query = request.text
         scope = request.scope.value
-        result = await self.fs.retrieve(self.kb_id, request)
+        if retrieval_profile == "lexical":
+            result = await self.fs.retrieve(self.kb_id, request)
+        elif retrieval_profile == "hybrid":
+            from services.retrieval import HostedRetrievalService
+
+            result = await HostedRetrievalService(self.fs, self.kb_id).retrieve(
+                request,
+                profile="hybrid",
+            )
+        else:
+            raise ValueError("unsupported retrieval profile")
         matches = [search_hit_to_legacy_dict(hit) for hit in result.hits]
 
         matches = await self._fold_corpus(matches)
@@ -439,6 +450,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         annotated_only: bool = False,
         scope: Literal["all", "annotations", "source"] = "all",
         facets: dict[str, str] | None = None,
+        retrieval_profile: Literal["lexical", "hybrid"] = "lexical",
     ) -> str:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
@@ -461,6 +473,7 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
                 return await handler.search_chunks(
                     query, path, tags, min(limit, MAX_SEARCH),
                     annotated_only=annotated_only, scope=scope, facets=facets,
+                    retrieval_profile=retrieval_profile,
                 )
             if mode == "references":
                 return await handler.query_references(path, query)
