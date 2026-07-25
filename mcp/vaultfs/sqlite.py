@@ -8,13 +8,21 @@ import tempfile
 import uuid
 from datetime import date
 from pathlib import Path
+from time import perf_counter
 
 import aiosqlite
-
 from services.chunker import chunk_text, store_chunks_sqlite
+
+from llmwiki_core.documents import DocumentKind
 from llmwiki_core.references import build_lookup_maps, extract_references
+from llmwiki_core.search import SearchArea, SearchHit, SearchQuery, SearchResult, SearchScope
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
-from .base import VaultFS, DuplicateDocumentError
+
+from .base import (
+    DuplicateDocumentError,
+    VaultFS,
+    logical_glob_to_sql_like,
+)
 from .facets import sqlite_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
@@ -79,6 +87,36 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
                 d["metadata"] = {}
         results.append(d)
     return results
+
+
+def _sqlite_search_hit(row: dict) -> SearchHit:
+    metadata = dict(row.get("metadata") or {})
+    metadata.update(
+        {
+            "_filename": row["filename"],
+            "_directory": row["path"],
+            "_file_type": row["file_type"],
+            "_source_content": row.get("source_content") or "",
+            "_annotations_text": row.get("annotations_text"),
+            "_has_highlight": bool(row.get("has_highlight")),
+            "source_hit": bool(row.get("source_hit")),
+            "annotation_hit": bool(row.get("annotation_hit")),
+        }
+    )
+    return SearchHit(
+        document_id=str(row["document_id"]),
+        document_version=int(row["document_version"]),
+        chunk_index=int(row["chunk_index"]),
+        content=row["content"],
+        score=float(row["score"]),
+        path=f"{row['path']}{row['filename']}",
+        title=row.get("title"),
+        page=row.get("page"),
+        header_breadcrumb=row.get("header_breadcrumb"),
+        tags=tuple(row.get("tags") or ()),
+        document_kind=DocumentKind(row["source_kind"]),
+        metadata=metadata,
+    )
 
 
 async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:
@@ -585,6 +623,109 @@ class SqliteVaultFS(VaultFS):
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
 
+    async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
+        db = self._db_or_raise()
+        started_at = perf_counter()
+        match_expr = _build_fts_match(query.text)
+        patterns = _like_patterns(query.text)
+        if not patterns:
+            return SearchResult(hits=(), candidate_count=0)
+
+        def like_expression(column: str) -> str:
+            return " AND ".join(
+                f"{column} LIKE ? ESCAPE '\\'" for _ in patterns
+            )
+
+        source_match = like_expression("dc.source_content")
+        annotation_match = like_expression("COALESCE(dc.annotations_text, '')")
+        select_params: list = [*patterns, *patterns]
+        where: list[str] = ["d.status != 'failed'", "d.user_id = ?"]
+        where_params: list = [self.user_id]
+
+        if match_expr is not None:
+            from_sql = (
+                "document_chunks dc "
+                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                "JOIN documents d ON dc.document_id = d.id"
+            )
+            score_sql = "fts.rank"
+            where.append("chunks_fts MATCH ?")
+            where_params.append(match_expr)
+        else:
+            from_sql = "document_chunks dc JOIN documents d ON dc.document_id = d.id"
+            score_sql = "0.0"
+            where.append(like_expression("dc.content"))
+            where_params.extend(patterns)
+
+        where.append(
+            "EXISTS (SELECT 1 FROM workspace w WHERE w.id = ? AND w.user_id = ?)"
+        )
+        where_params.extend([kb_id, self.user_id])
+        if query.annotated_only:
+            where.append("dc.has_highlight = 1")
+        if query.area is SearchArea.WIKI:
+            where.append("d.source_kind = 'wiki'")
+        elif query.area is SearchArea.SOURCES:
+            where.append("d.source_kind != 'wiki'")
+        if query.document_kinds:
+            placeholders = ", ".join("?" for _ in query.document_kinds)
+            where.append(f"d.source_kind IN ({placeholders})")
+            where_params.extend(kind.value for kind in query.document_kinds)
+        if query.path_glob is not None:
+            where.append("(d.path || d.filename) LIKE ? ESCAPE '\\'")
+            where_params.append(logical_glob_to_sql_like(query.path_glob))
+        for tag in query.tags:
+            where.append(
+                "EXISTS ("
+                "SELECT 1 FROM json_each("
+                "CASE WHEN typeof(d.tags) = 'text' AND json_valid(d.tags) "
+                "THEN d.tags ELSE '[]' END"
+                ") tag WHERE lower(CAST(tag.value AS TEXT)) = ?)"
+            )
+            where_params.append(tag)
+
+        facet_conds, facet_params = sqlite_facet_conditions(
+            validate_facets(dict(query.facets))
+        )
+        where.extend(facet_conds)
+        where_params.extend(facet_params)
+
+        scope_where = ""
+        if query.scope is SearchScope.SOURCE:
+            scope_where = "WHERE source_hit"
+        elif query.scope is SearchScope.ANNOTATIONS:
+            scope_where = "WHERE annotation_hit"
+
+        sql = (
+            "WITH labeled AS ("
+            "SELECT dc.document_id, dc.document_version, dc.content, "
+            "dc.source_content, dc.annotations_text, dc.has_highlight, "
+            "dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, d.metadata, "
+            "d.source_kind, "
+            f"{score_sql} AS score, "
+            f"({source_match}) AS source_hit, "
+            f"({annotation_match}) AS annotation_hit "
+            f"FROM {from_sql} WHERE {' AND '.join(where)}"
+            "), filtered AS ("
+            f"SELECT * FROM labeled {scope_where}"
+            "), counted AS ("
+            "SELECT *, COUNT(*) OVER () AS candidate_count FROM filtered"
+            ") SELECT * FROM counted "
+            "ORDER BY score ASC, document_id, document_version, chunk_index LIMIT ?"
+        )
+        params = [*select_params, *where_params, query.candidate_limit]
+        cursor = await db.execute(sql, params)
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        hits = tuple(_sqlite_search_hit(row) for row in rows)
+        candidate_count = int(rows[0]["candidate_count"]) if rows else 0
+        return SearchResult(
+            hits=hits,
+            candidate_count=candidate_count,
+            latency_ms=(perf_counter() - started_at) * 1000,
+            profile="lexical",
+        )
+
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
         path_filter: str | None = None,
@@ -592,83 +733,15 @@ class SqliteVaultFS(VaultFS):
         scope: str = "all",
         facets: dict | None = None,
     ) -> list[dict]:
-        db = self._db_or_raise()
-        # SQLite's chunks_fts only indexes `content` (which already includes
-        # annotations after sync). Scope filtering is a Python-side
-        # substring check; to avoid scope filters returning fewer rows than
-        # requested, over-fetch by 3x when scope narrows the set, then
-        # slice to the requested limit. Acceptable at personal scale;
-        # production hosted-mode uses Postgres + PGroonga per-column matches.
-        sql_limit = limit if scope == "all" else limit * 3
-
-        # Trigram MATCH when every token is indexable; otherwise a LIKE scan
-        # (short tokens — e.g. 2-char Chinese terms — have no trigrams).
-        match_expr = _build_fts_match(query)
-        params: list = []
-        if match_expr is not None:
-            sql = (
-                "SELECT dc.content, dc.source_content, dc.annotations_text, "
-                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-                "d.filename, d.title, d.path, d.file_type, d.tags, "
-                "rank as score "
-                "FROM document_chunks dc "
-                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-                "JOIN documents d ON dc.document_id = d.id "
-                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
-            )
-            params.append(match_expr)
-        else:
-            patterns = _like_patterns(query)
-            if not patterns:
-                return []
-            like_conds = " AND ".join("dc.content LIKE ? ESCAPE '\\'" for _ in patterns)
-            sql = (
-                "SELECT dc.content, dc.source_content, dc.annotations_text, "
-                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-                "d.filename, d.title, d.path, d.file_type, d.tags, "
-                "0 as score "
-                "FROM document_chunks dc "
-                "JOIN documents d ON dc.document_id = d.id "
-                f"WHERE {like_conds} AND d.status != 'failed' "
-            )
-            params.extend(patterns)
-
-        if annotated_only:
-            sql += "AND dc.has_highlight = 1 "
-        if path_filter == "wiki":
-            sql += "AND d.source_kind = 'wiki' "
-        elif path_filter == "sources":
-            sql += "AND d.source_kind != 'wiki' "
-
-        facet_conds, facet_params = sqlite_facet_conditions(validate_facets(facets))
-        for cond in facet_conds:
-            sql += f"AND {cond} "
-        params.extend(facet_params)
-
-        sql += "ORDER BY score LIMIT ?" if match_expr is not None else "ORDER BY d.path, d.filename, dc.chunk_index LIMIT ?"
-        params.append(sql_limit)
-
-        cursor = await db.execute(sql, params)
-        rows = _rows_to_dicts(cursor, await cursor.fetchall())
-
-        # Label each row + apply scope filter, then slice to `limit`.
-        q_lower = query.lower()
-        labeled: list[dict] = []
-        for r in rows:
-            src = (r.get("source_content") or "").lower()
-            ann = (r.get("annotations_text") or "").lower()
-            source_hit = q_lower in src
-            annotation_hit = bool(ann) and q_lower in ann
-            if scope == "annotations" and not annotation_hit:
-                continue
-            if scope == "source" and not source_hit:
-                continue
-            r["source_hit"] = source_hit
-            r["annotation_hit"] = annotation_hit
-            labeled.append(r)
-            if len(labeled) >= limit:
-                break
-        return labeled
+        return await super().search_chunks(
+            kb_id,
+            query,
+            limit,
+            path_filter,
+            annotated_only,
+            scope,
+            facets,
+        )
 
 
     async def corpus_search_context(self, kb_id: str, relpaths: list[str]) -> dict:

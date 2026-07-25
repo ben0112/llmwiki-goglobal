@@ -1,18 +1,22 @@
 """Postgres + S3 implementation of VaultFS."""
 
+import json
 import logging
 import re
 from datetime import date
-import json
+from time import perf_counter
 
 import aioboto3
 import asyncpg
-
 from config import settings
-from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute, get_pool
+from db import get_pool, scoped_execute, scoped_query, scoped_queryrow, service_execute, service_queryrow
 from services.chunker import chunk_text, store_chunks_pg
+
+from llmwiki_core.documents import DocumentKind
+from llmwiki_core.search import SearchArea, SearchHit, SearchQuery, SearchResult, SearchScope
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
-from .base import VaultFS, DuplicateDocumentError
+
+from .base import DuplicateDocumentError, VaultFS, logical_glob_to_sql_like
 from .facets import postgres_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
@@ -76,6 +80,42 @@ def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = re.sub(r"[\s-]+", "-", slug).strip("-")
     return slug or "kb"
+
+
+def _postgres_search_hit(row: dict) -> SearchHit:
+    raw_metadata = row.get("metadata")
+    if isinstance(raw_metadata, str):
+        try:
+            raw_metadata = json.loads(raw_metadata)
+        except (json.JSONDecodeError, TypeError):
+            raw_metadata = {}
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    metadata.update(
+        {
+            "_filename": row["filename"],
+            "_directory": row["path"],
+            "_file_type": row["file_type"],
+            "_source_content": row.get("source_content") or "",
+            "_annotations_text": row.get("annotations_text"),
+            "_has_highlight": bool(row.get("has_highlight")),
+            "source_hit": bool(row.get("source_hit")),
+            "annotation_hit": bool(row.get("annotation_hit")),
+        }
+    )
+    return SearchHit(
+        document_id=str(row["document_id"]),
+        document_version=int(row["document_version"]),
+        chunk_index=int(row["chunk_index"]),
+        content=row["content"],
+        score=float(row["score"]),
+        path=f"{row['path']}{row['filename']}",
+        title=row.get("title"),
+        page=row.get("page"),
+        header_breadcrumb=row.get("header_breadcrumb"),
+        tags=tuple(row.get("tags") or ()),
+        document_kind=DocumentKind(row["source_kind"]),
+        metadata=metadata,
+    )
 
 
 class PostgresVaultFS(VaultFS):
@@ -412,6 +452,90 @@ class PostgresVaultFS(VaultFS):
         )
 
 
+    async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
+        started_at = perf_counter()
+        params: list = [kb_id, query.text, self.user_id]
+
+        def bind(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        where = [
+            "dc.knowledge_base_id = $1",
+            "d.knowledge_base_id = $1",
+            "dc.user_id = $3",
+            "d.user_id = $3",
+            "dc.content &@~ $2",
+            "d.status != 'failed'",
+            "NOT d.archived",
+        ]
+        if query.annotated_only:
+            where.append("dc.has_highlight = true")
+        if query.area is SearchArea.WIKI:
+            where.append("d.source_kind = 'wiki'")
+        elif query.area is SearchArea.SOURCES:
+            where.append("d.source_kind != 'wiki'")
+        if query.document_kinds:
+            kinds = bind([kind.value for kind in query.document_kinds])
+            where.append(f"d.source_kind = ANY({kinds}::text[])")
+        if query.path_glob is not None:
+            path_pattern = bind(logical_glob_to_sql_like(query.path_glob))
+            where.append(f"(d.path || d.filename) LIKE {path_pattern} ESCAPE '\\'")
+        if query.tags:
+            tags = bind(list(query.tags))
+            where.append(
+                "ARRAY(SELECT lower(tag) FROM unnest("
+                "COALESCE(d.tags, ARRAY[]::text[])) tag) "
+                f"@> {tags}::text[]"
+            )
+
+        facet_conds, facet_params = postgres_facet_conditions(
+            validate_facets(dict(query.facets)),
+            start_index=len(params) + 1,
+            doc_alias="d",
+        )
+        where.extend(facet_conds)
+        params.extend(facet_params)
+
+        scope_where = ""
+        if query.scope is SearchScope.SOURCE:
+            scope_where = "WHERE source_hit"
+        elif query.scope is SearchScope.ANNOTATIONS:
+            scope_where = "WHERE annotation_hit"
+        limit_param = bind(query.candidate_limit)
+
+        rows = await scoped_query(
+            self.user_id,
+            "WITH labeled AS ("
+            "SELECT dc.document_id, dc.document_version, dc.content, "
+            "dc.source_content, dc.annotations_text, dc.has_highlight, "
+            "dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, d.metadata, "
+            "d.source_kind, pgroonga_score(dc.tableoid, dc.ctid) AS score, "
+            "(dc.source_content &@~ $2) AS source_hit, "
+            "(dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) "
+            "AS annotation_hit "
+            "FROM document_chunks dc JOIN documents d ON dc.document_id = d.id "
+            f"WHERE {' AND '.join(where)}"
+            "), filtered AS ("
+            f"SELECT * FROM labeled {scope_where}"
+            "), counted AS ("
+            "SELECT *, COUNT(*) OVER () AS candidate_count FROM filtered"
+            ") SELECT * FROM counted "
+            "ORDER BY score DESC, document_id, document_version, chunk_index "
+            f"LIMIT {limit_param}",
+            *params,
+        )
+        row_dicts = [dict(row) for row in rows]
+        hits = tuple(_postgres_search_hit(row) for row in row_dicts)
+        candidate_count = int(row_dicts[0]["candidate_count"]) if row_dicts else 0
+        return SearchResult(
+            hits=hits,
+            candidate_count=candidate_count,
+            latency_ms=(perf_counter() - started_at) * 1000,
+            profile="lexical",
+        )
+
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
         path_filter: str | None = None,
@@ -419,59 +543,15 @@ class PostgresVaultFS(VaultFS):
         scope: str = "all",
         facets: dict | None = None,
     ) -> list[dict]:
-        path_clause = ""
-        if path_filter == "wiki":
-            path_clause = " AND d.path LIKE '/wiki/%'"
-        elif path_filter == "sources":
-            path_clause = " AND d.path NOT LIKE '/wiki/%'"
-
-        # Always match against `content` — that's where the PGroonga index
-        # lives, and `content` already contains source + annotations
-        # materialized together. The per-side booleans below label *which
-        # side* matched so callers can post-filter by scope cheaply.
-        annotated_clause = " AND dc.has_highlight = true" if annotated_only else ""
-
-        # Push scope into SQL so the LIMIT counts only rows the user asked
-        # for. The earlier Python-side post-filter could return zero results
-        # for narrow scopes even when valid matches existed past the top-N.
-        if scope == "annotations":
-            scope_clause = (
-                " AND dc.annotations_text IS NOT NULL "
-                " AND dc.annotations_text &@~ $2"
-            )
-        elif scope == "source":
-            scope_clause = " AND dc.source_content &@~ $2"
-        else:
-            scope_clause = ""
-
-        facet_conds, facet_params = postgres_facet_conditions(
-            validate_facets(facets), start_index=5, doc_alias="d",
+        return await super().search_chunks(
+            kb_id,
+            query,
+            limit,
+            path_filter,
+            annotated_only,
+            scope,
+            facets,
         )
-        facet_sql = "".join(f"  AND {c}" for c in facet_conds)
-
-        rows = await scoped_query(
-            self.user_id,
-            f"SELECT dc.content, dc.source_content, dc.annotations_text, "
-            f"  dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            f"  (dc.source_content &@~ $2) AS source_hit, "
-            f"  (dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) AS annotation_hit, "
-            f"  d.filename, d.title, d.path, d.file_type, d.tags, "
-            f"  pgroonga_score(dc.tableoid, dc.ctid) AS score "
-            f"FROM document_chunks dc "
-            f"JOIN documents d ON dc.document_id = d.id "
-            f"WHERE dc.knowledge_base_id = $1 "
-            f"  AND dc.content &@~ $2 "
-            f"  AND NOT d.archived"
-            f"  AND d.user_id = $3"
-            f"{annotated_clause}"
-            f"{scope_clause}"
-            f"{path_clause}"
-            f"{facet_sql} "
-            f"ORDER BY score DESC, dc.chunk_index "
-            f"LIMIT $4",
-            kb_id, query, self.user_id, limit, *facet_params,
-        )
-        return rows
 
 
     async def load_source_bytes(self, doc: dict) -> bytes | None:

@@ -4,7 +4,11 @@ Tests the full flow through WriteHandler, ReadHandler, SearchHandler, DeleteHand
 Uses SqliteVaultFS with a temp workspace — no Postgres needed.
 """
 
+import uuid
+
 import pytest
+
+from llmwiki_core.search import SearchQuery
 
 
 def _make_kb(kb_id: str) -> dict:
@@ -749,6 +753,76 @@ class TestSearchDeleteLifecycle:
         result = await searcher.search_chunks("quantum", "*.pdf", None, 10)
         assert "paper.pdf" in result
         assert "notes.md" not in result
+
+    async def test_search_chunks_pushes_full_query_before_limit(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+        from vaultfs.sqlite import SqliteVaultFS
+
+        db = SqliteVaultFS._db_or_raise()
+        for index in range(4):
+            doc = await instance.create_document(
+                kb_id,
+                f"excluded-{index}.md",
+                "Excluded",
+                "/excluded/",
+                "md",
+                "",
+                ["other"],
+            )
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, chunk_index, content, source_content, token_count) "
+                "VALUES (?, ?, 0, ?, ?, 10)",
+                (str(uuid.uuid4()), str(doc["id"]), "quantum " * 30, "quantum"),
+            )
+        for index in range(2):
+            doc = await instance.create_document(
+                kb_id,
+                f"eligible-{index}.pdf",
+                "Eligible",
+                "/target/",
+                "pdf",
+                "",
+                ["Science", "Reviewed"],
+            )
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, chunk_index, content, source_content, token_count) "
+                "VALUES (?, ?, 0, ?, ?, 10)",
+                (str(uuid.uuid4()), str(doc["id"]), "quantum", "quantum"),
+            )
+        await db.commit()
+
+        captured: list[SearchQuery] = []
+        real_retrieve = instance.retrieve
+
+        async def capture(kb, request):
+            captured.append(request)
+            return await real_retrieve(kb, request)
+
+        instance.retrieve = capture
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        result = await searcher.search_chunks(
+            " quantum ",
+            "/target/*.pdf",
+            ["SCIENCE", "reviewed"],
+            2,
+            annotated_only=False,
+            scope="source",
+            facets={},
+        )
+
+        assert "**2 result(s)**" in result
+        assert "eligible-0.pdf" in result and "eligible-1.pdf" in result
+        assert "excluded" not in result
+        assert len(captured) == 1
+        request = captured[0]
+        assert request.text == "quantum"
+        assert request.limit == request.candidate_limit == 2
+        assert request.path_glob == "/target/*.pdf"
+        assert request.tags == ("reviewed", "science")
+        assert request.scope.value == "source"
 
     async def test_search_references_uncited(self, fs):
         instance, kb_id = fs

@@ -6,6 +6,8 @@ Tests every VaultFS method. Self-contained — no Postgres needed.
 import uuid
 
 import pytest
+
+from llmwiki_core.search import SearchQuery
 from tests.integration.mcp.conftest import TEST_USER_ID
 
 
@@ -162,7 +164,7 @@ class TestDocumentCRUD:
 
     async def test_create_wiki_document(self, fs):
         instance, kb_id = fs
-        doc = await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
+        await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
         fetched = await instance.get_document(kb_id, "scaling.md", "/wiki/concepts/")
         assert fetched is not None
         assert fetched["content"] == "# Scaling"
@@ -277,6 +279,256 @@ class TestPages:
 
 
 class TestSearch:
+
+    @staticmethod
+    async def _seed_ranked_rows(
+        instance,
+        kb_id: str,
+        *,
+        excluded: list[dict],
+        eligible: list[dict],
+    ) -> None:
+        """Insert excluded rows with stronger lexical scores before eligible rows."""
+        from vaultfs.sqlite import SqliteVaultFS
+
+        db = SqliteVaultFS._db_or_raise()
+        for index, row in enumerate([*excluded, *eligible]):
+            doc = await instance.create_document(
+                kb_id,
+                row.get("filename", f"ranked-{index}.md"),
+                f"Ranked {index}",
+                row.get("path", "/"),
+                "md",
+                "",
+                row.get("tags", ["reviewed", "asean"]),
+                metadata=row.get("metadata"),
+            )
+            if source_kind := row.get("source_kind"):
+                await db.execute(
+                    "UPDATE documents SET source_kind = ? WHERE id = ?",
+                    (source_kind, str(doc["id"])),
+                )
+            source_content = row.get("source_content", "permit source text")
+            annotations_text = row.get("annotations_text")
+            content = row.get("content") or "\n".join(
+                part for part in (source_content, annotations_text) if part
+            )
+            if row.get("excluded_score"):
+                content = "permit " * 30 + content
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, document_version, chunk_index, content, "
+                " source_content, annotations_text, has_highlight, token_count) "
+                "VALUES (?, ?, 1, 0, ?, ?, ?, ?, 10)",
+                (
+                    str(uuid.uuid4()),
+                    str(doc["id"]),
+                    content,
+                    source_content,
+                    annotations_text,
+                    int(row.get("has_highlight", False)),
+                ),
+            )
+        await db.commit()
+
+    @pytest.mark.parametrize(
+        ("query_kwargs", "excluded_override", "eligible_override"),
+        [
+            ({"path_glob": "/target/*.md"}, {"path": "/excluded/"}, {"path": "/target/"}),
+            ({"tags": ["REVIEWED", "asean"]}, {"tags": ["review"]}, {"tags": ["Reviewed", "ASEAN"]}),
+            ({"area": "sources"}, {"path": "/wiki/"}, {"path": "/sources/"}),
+            ({"document_kinds": ["source"]}, {"source_kind": "asset"}, {"source_kind": "source"}),
+            ({"document_kinds": ["asset"]}, {"source_kind": "source"}, {"source_kind": "asset"}),
+            ({"annotated_only": True}, {"has_highlight": False}, {"has_highlight": True}),
+            (
+                {"scope": "source"},
+                {"source_content": "other", "annotations_text": "permit annotation"},
+                {"source_content": "permit source", "annotations_text": "other"},
+            ),
+            (
+                {"scope": "annotations"},
+                {"source_content": "permit source", "annotations_text": "other"},
+                {"source_content": "other", "annotations_text": "permit annotation"},
+            ),
+            (
+                {"facets": {"country": "IDN"}},
+                {"metadata": {"geo_country": ["SGP"]}},
+                {"metadata": {"geo_country": ["IDN"]}},
+            ),
+        ],
+    )
+    async def test_retrieve_applies_each_filter_before_limit(
+        self,
+        fs,
+        query_kwargs,
+        excluded_override,
+        eligible_override,
+    ):
+        instance, kb_id = fs
+        excluded = [
+            {"filename": f"excluded-{i}.md", "excluded_score": True, **excluded_override}
+            for i in range(4)
+        ]
+        eligible = [
+            {"filename": f"eligible-{i}.md", **eligible_override}
+            for i in range(3)
+        ]
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=excluded,
+            eligible=eligible,
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                **query_kwargs,
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+        assert all(hit.path.endswith(("eligible-0.md", "eligible-1.md", "eligible-2.md")) for hit in result.hits)
+        if query_kwargs.get("scope") == "source":
+            assert all(hit.metadata["source_hit"] is True for hit in result.hits)
+            assert all(hit.metadata["annotation_hit"] is False for hit in result.hits)
+        if query_kwargs.get("scope") == "annotations":
+            assert all(hit.metadata["source_hit"] is False for hit in result.hits)
+            assert all(hit.metadata["annotation_hit"] is True for hit in result.hits)
+
+    async def test_retrieve_applies_combined_filters_before_limit(self, fs):
+        instance, kb_id = fs
+        good = {
+            "path": "/corpus/idn/",
+            "tags": ["Reviewed", "ASEAN"],
+            "source_kind": "source",
+            "source_content": "permit source",
+            "annotations_text": "permit annotation",
+            "has_highlight": True,
+            "metadata": {"geo_country": ["IDN"]},
+        }
+        excluded = []
+        for index, override in enumerate(
+            (
+                {"path": "/corpus/sgp/"},
+                {"tags": ["reviewed"]},
+                {"source_kind": "wiki"},
+                {"annotations_text": "other"},
+                {"has_highlight": False},
+                {"metadata": {"geo_country": ["SGP"]}},
+            )
+        ):
+            excluded.append(
+                {
+                    **good,
+                    **override,
+                    "filename": f"excluded-combined-{index}.md",
+                    "excluded_score": True,
+                }
+            )
+        eligible = [{**good, "filename": f"eligible-combined-{i}.md"} for i in range(3)]
+        await self._seed_ranked_rows(instance, kb_id, excluded=excluded, eligible=eligible)
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                path_glob="/corpus/idn/*.md",
+                tags=["reviewed", "ASEAN"],
+                area="sources",
+                document_kinds=["source"],
+                annotated_only=True,
+                scope="annotations",
+                facets={"country": "IDN"},
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+
+    async def test_retrieve_intersects_area_and_document_kind(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[{"filename": "wiki.md", "path": "/wiki/"}],
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                area="wiki",
+                document_kinds=["source"],
+            ),
+        )
+
+        assert result.hits == ()
+        assert result.candidate_count == 0
+
+    async def test_retrieve_glob_escapes_sql_metacharacters_and_literal_question_mark(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[
+                {"filename": "literal%_?.md", "path": "/target/"},
+                {"filename": "literalXXa.md", "path": "/target/"},
+            ],
+        )
+
+        exact = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                path_glob="/target/literal%_?.md",
+            ),
+        )
+        directory = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=2, path_glob="/target/"),
+        )
+
+        assert [hit.path for hit in exact.hits] == ["/target/literal%_?.md"]
+        assert exact.candidate_count == 1
+        assert directory.returned_count == directory.candidate_count == 2
+
+    async def test_retrieve_candidate_limit_is_distinct_from_result_limit(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[{"filename": f"candidate-{i}.md"} for i in range(5)],
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=2, candidate_limit=4),
+        )
+
+        assert result.returned_count == 4
+        assert result.candidate_count == 5
+
+    async def test_retrieve_reports_zero_candidates(self, fs):
+        instance, kb_id = fs
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="no-such-retrieval-token", limit=2),
+        )
+
+        assert result.hits == ()
+        assert result.candidate_count == 0
 
     async def test_search_chunks_finds_matching_content(self, fs, insert_chunk):
         instance, kb_id = fs

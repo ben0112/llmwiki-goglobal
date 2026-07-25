@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from llmwiki_core.search import SearchHit, SearchQuery, SearchResult
 from llmwiki_core.wiki import WikiWriteBundle
 
 # Content-derived edge types, rebuilt from wiki page text on every write.
@@ -75,13 +76,27 @@ class VaultFS(ABC):
     async def get_all_pages(self, doc_id: str) -> list[dict]: ...
 
     @abstractmethod
+    async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult: ...
+
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
         path_filter: str | None = None,
         annotated_only: bool = False,
         scope: str = "all",
         facets: dict | None = None,
-    ) -> list[dict]: ...
+    ) -> list[dict]:
+        """Compatibility facade over the typed lexical retrieval contract."""
+        request = SearchQuery.build(
+            text=query,
+            limit=limit,
+            candidate_limit=limit,
+            area=path_filter,
+            scope=scope,
+            facets=facets,
+            annotated_only=annotated_only,
+        )
+        result = await self.retrieve(kb_id, request)
+        return [search_hit_to_legacy_dict(hit) for hit in result.hits]
 
     async def corpus_search_context(self, kb_id: str, relpaths: list[str]) -> dict:
         """搜索结果的语料折叠/可信度标记上下文(默认无流水线,普通库零开销)。
@@ -146,3 +161,71 @@ class VaultFS(ABC):
 
     @abstractmethod
     async def find_stale_pages(self, kb_id: str) -> list[dict]: ...
+
+
+def logical_glob_to_sql_like(path_glob: str) -> str:
+    """Translate a normalized logical glob into an escaped SQL LIKE value.
+
+    SQL's own `%`, `_`, and escape character stay literal. `?` is also
+    literal; only `*` and `**` are wildcards. Both star forms retain the
+    historical `fnmatch` behavior where a wildcard may span `/`. A trailing
+    slash (or a bare extensionless path) denotes a directory prefix.
+    """
+    directory = path_glob.endswith("/") or (
+        "*" not in path_glob
+        and "." not in path_glob.rsplit("/", 1)[-1]
+        and path_glob != "/"
+    )
+    escaped: list[str] = []
+    index = 0
+    while index < len(path_glob):
+        char = path_glob[index]
+        if char == "*":
+            if index + 1 < len(path_glob) and path_glob[index + 1] == "*":
+                index += 1
+            escaped.append("%")
+        elif char in {"%", "_", "\\"}:
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+        index += 1
+    pattern = "".join(escaped)
+    if path_glob == "/":
+        return "/%"
+    if directory:
+        return pattern.rstrip("/") + "/%"
+    return pattern
+
+
+def search_hit_to_legacy_dict(hit: SearchHit) -> dict:
+    """Convert a typed hit back to the dictionary schema used by MCP tools."""
+    metadata = dict(hit.metadata)
+    filename = metadata.pop("_filename", hit.path.rsplit("/", 1)[-1])
+    directory = metadata.pop("_directory", hit.path.removesuffix(filename))
+    file_type = metadata.pop("_file_type", filename.rsplit(".", 1)[-1] if "." in filename else "")
+    source_content = metadata.pop("_source_content", "")
+    annotations_text = metadata.pop("_annotations_text", None)
+    has_highlight = bool(metadata.pop("_has_highlight", False))
+    source_hit = bool(metadata.pop("source_hit", False))
+    annotation_hit = bool(metadata.pop("annotation_hit", False))
+    return {
+        "document_id": hit.document_id,
+        "document_version": hit.document_version,
+        "content": hit.content,
+        "source_content": source_content,
+        "annotations_text": annotations_text,
+        "has_highlight": has_highlight,
+        "source_hit": source_hit,
+        "annotation_hit": annotation_hit,
+        "page": hit.page,
+        "header_breadcrumb": hit.header_breadcrumb,
+        "chunk_index": hit.chunk_index,
+        "filename": filename,
+        "title": hit.title,
+        "path": directory,
+        "file_type": file_type,
+        "tags": list(hit.tags),
+        "source_kind": hit.document_kind.value if hit.document_kind is not None else None,
+        "metadata": metadata,
+        "score": hit.score,
+    }

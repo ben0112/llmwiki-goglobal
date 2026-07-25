@@ -7,9 +7,10 @@ from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from vaultfs import VaultFS
-from vaultfs.base import RELATION_TYPES
+from vaultfs.base import RELATION_TYPES, search_hit_to_legacy_dict
 from vaultfs.facets import UnknownFacetError
 
+from llmwiki_core.documents import DocumentKind
 from llmwiki_core.search import SearchArea, SearchQuery
 
 from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
@@ -102,28 +103,30 @@ class SearchHandler:
         `facets` filters by the corpus 八维 classification metadata.
         """
         path_filter = self._path_filter_key(path)
+        area = SearchArea.ALL if path_filter is None else SearchArea(path_filter)
+        if area is SearchArea.WIKI:
+            document_kinds = (DocumentKind.WIKI,)
+        elif area is SearchArea.SOURCES:
+            document_kinds = (DocumentKind.SOURCE, DocumentKind.ASSET)
+        else:
+            document_kinds = ()
+        path_glob = None if path in ("*", "**", "**/*") else path
         request = SearchQuery.build(
             text=query,
             limit=limit,
-            area=path_filter,
+            candidate_limit=limit,
+            path_glob=path_glob,
+            tags=tags,
+            area=area,
+            document_kinds=document_kinds,
+            annotated_only=annotated_only,
             scope=scope,
             facets=facets,
         )
         query = request.text
-        limit = request.limit
         scope = request.scope.value
-        facets = dict(request.facets)
-        path_filter = None if request.area is SearchArea.ALL else request.area.value
-
-        matches = await self.fs.search_chunks(
-            self.kb_id, query, limit, path_filter,
-            annotated_only=annotated_only, scope=scope, facets=facets,
-        )
-        matches = self._apply_path_glob(matches, path)
-
-        if tags:
-            tag_set = {t.lower() for t in tags}
-            matches = [m for m in matches if tag_set.issubset({t.lower() for t in (m.get("tags") or [])})]
+        result = await self.fs.retrieve(self.kb_id, request)
+        matches = [search_hit_to_legacy_dict(hit) for hit in result.hits]
 
         matches = await self._fold_corpus(matches)
 
@@ -271,18 +274,6 @@ class SearchHandler:
         if path in ("/", "/*"):
             return "sources"
         return None
-
-    def _apply_path_glob(self, matches: list[dict], path: str) -> list[dict]:
-        """Narrow results by a file-level glob (e.g. `*.pdf`).
-
-        The coarse wiki/sources filter is pushed into SQL; finer globs the SQL
-        can't express are applied here, mirroring list/read/delete. Bare
-        directory scopes (no wildcard) are left to the coarse filter.
-        """
-        if path in ("*", "**", "**/*") or not ("*" in path or "?" in path):
-            return matches
-        glob_pat = path if path.startswith("/") else "/" + path.lstrip("/")
-        return [m for m in matches if glob_match(m["path"] + m["filename"], glob_pat)]
 
     def _format_source_line(self, doc: dict) -> str:
         """Format a single source document for list output."""

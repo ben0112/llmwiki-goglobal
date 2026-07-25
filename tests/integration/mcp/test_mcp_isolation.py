@@ -3,19 +3,21 @@
 Verifies that PostgresVaultFS operations for User A cannot reach User B's data,
 and vice versa, across reads, writes, graph queries, and S3 key derivation.
 
-search_chunks is excluded: it needs PGroonga's `&@~` operator, which the test
-Postgres lacks. Its tenancy guards (`d.user_id = $3` plus RLS on
-document_chunks) are the same ones every other query here exercises.
+The test database installs a tiny deterministic text-search operator shim so
+the real Postgres adapter query can exercise retrieval isolation without
+requiring the PGroonga extension in this integration environment.
 """
 
+import json
 import os
 import uuid
 
 import asyncpg
-import pytest
-
-from vaultfs.postgres import PostgresVaultFS
 import db as mcp_db
+import pytest
+from vaultfs.postgres import PostgresVaultFS
+
+from llmwiki_core.search import SearchQuery
 
 USER_A_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -50,6 +52,18 @@ async def pg_pool():
     await pool.execute("CREATE SCHEMA public")
     schema_sql = (Path(__file__).parent.parent.parent / "helpers" / "schema.sql").read_text()
     await pool.execute(schema_sql)
+    await pool.execute(
+        "CREATE FUNCTION test_text_search(text, text) RETURNS boolean "
+        "LANGUAGE sql IMMUTABLE STRICT AS "
+        "'SELECT strpos(lower($1), lower($2)) > 0'"
+    )
+    await pool.execute(
+        "CREATE OPERATOR &@~ (LEFTARG = text, RIGHTARG = text, FUNCTION = test_text_search)"
+    )
+    await pool.execute(
+        "CREATE FUNCTION pgroonga_score(oid, tid) RETURNS double precision "
+        "LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 0.0::double precision'"
+    )
 
     yield pool
     pool.terminate()
@@ -194,6 +208,97 @@ class TestReadIsolation:
     async def test_find_document_by_name_other_tenant_returns_none(self, fs_alice):
         doc = await fs_alice.find_document_by_name(str(KB_B_ID), "notes.md")
         assert doc is None
+
+    async def test_retrieve_filters_before_limit_and_isolates_tenant(
+        self,
+        fs_alice,
+        pg_pool,
+    ):
+        async def insert_ranked(
+            *,
+            user_id: str,
+            kb_id: str,
+            path: str,
+            filename: str,
+            tags: list[str],
+            country: str,
+            source_content: str,
+        ) -> None:
+            doc_id = str(uuid.uuid4())
+            await pg_pool.execute(
+                "INSERT INTO documents "
+                "(id, knowledge_base_id, user_id, filename, title, path, source_kind, "
+                " file_type, status, tags, metadata, version) "
+                "VALUES ($1, $2, $3, $4, $4, $5, 'source', 'md', 'ready', $6, $7, 1)",
+                doc_id,
+                kb_id,
+                user_id,
+                filename,
+                path,
+                tags,
+                json.dumps({"geo_country": [country]}),
+            )
+            await pg_pool.execute(
+                "INSERT INTO document_chunks "
+                "(document_id, document_version, user_id, knowledge_base_id, chunk_index, "
+                " content, source_content, annotations_text, has_highlight, token_count) "
+                "VALUES ($1, 1, $2, $3, 0, $4, $5, 'permit annotation', true, 10)",
+                doc_id,
+                user_id,
+                kb_id,
+                f"{source_content}\npermit annotation",
+                source_content,
+            )
+
+        for index in range(4):
+            await insert_ranked(
+                user_id=USER_A_ID,
+                kb_id=KB_A_ID,
+                path="/excluded/",
+                filename=f"excluded-{index}.md",
+                tags=["reviewed", "asean"],
+                country="IDN",
+                source_content="permit source",
+            )
+        for index in range(3):
+            await insert_ranked(
+                user_id=USER_A_ID,
+                kb_id=KB_A_ID,
+                path="/corpus/idn/",
+                filename=f"eligible-{index}.md",
+                tags=["Reviewed", "ASEAN"],
+                country="IDN",
+                source_content="permit source",
+            )
+        await insert_ranked(
+            user_id=USER_B_ID,
+            kb_id=KB_B_ID,
+            path="/corpus/idn/",
+            filename="bob-eligible.md",
+            tags=["reviewed", "asean"],
+            country="IDN",
+            source_content="permit source",
+        )
+
+        result = await fs_alice.retrieve(
+            KB_A_ID,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                path_glob="/corpus/idn/*.md",
+                tags=["REVIEWED", "asean"],
+                area="sources",
+                document_kinds=["source"],
+                annotated_only=True,
+                scope="source",
+                facets={"country": "IDN"},
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+        assert all(hit.path.startswith("/corpus/idn/eligible-") for hit in result.hits)
 
     async def test_load_asset_bytes_other_tenant_returns_none(self, fs_alice, monkeypatch):
         calls: list[str] = []
