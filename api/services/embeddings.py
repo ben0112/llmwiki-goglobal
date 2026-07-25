@@ -50,11 +50,10 @@ class OpenAIEmbeddingClient:
             label="maximum embedding input characters",
             maximum=10_000_000,
         )
-        if type(timeout_seconds) not in (int, float) or not isfinite(timeout_seconds) or timeout_seconds <= 0:
-            raise ValueError("embedding timeout must be a positive finite number")
+        normalized_timeout = _validated_timeout(timeout_seconds)
         self._client = httpx.AsyncClient(
             transport=transport,
-            timeout=httpx.Timeout(float(timeout_seconds)),
+            timeout=httpx.Timeout(normalized_timeout),
             follow_redirects=False,
             trust_env=False,
             headers={"Authorization": f"Bearer {validated_api_key}"} if validated_api_key else None,
@@ -146,6 +145,18 @@ def _bounded_integer(value: object, *, label: str, maximum: int) -> int:
     return value
 
 
+def _validated_timeout(value: object) -> float:
+    if type(value) not in (int, float):
+        raise ValueError("embedding timeout must be a positive finite number")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError("embedding timeout must be a positive finite number") from None
+    if not isfinite(normalized) or normalized <= 0:
+        raise ValueError("embedding timeout must be a positive finite number")
+    return normalized
+
+
 def _ordered_vectors(
     payload: Any,
     *,
@@ -169,9 +180,15 @@ def _ordered_vectors(
             raise InvalidEmbeddingResponse(_INVALID_RESPONSE)
         vector: list[float] = []
         for coordinate in embedding:
-            if type(coordinate) not in (int, float) or not isfinite(coordinate):
+            if type(coordinate) not in (int, float):
                 raise InvalidEmbeddingResponse(_INVALID_RESPONSE)
-            vector.append(float(coordinate))
+            try:
+                normalized = float(coordinate)
+            except (OverflowError, ValueError):
+                raise InvalidEmbeddingResponse(_INVALID_RESPONSE) from None
+            if not isfinite(normalized):
+                raise InvalidEmbeddingResponse(_INVALID_RESPONSE)
+            vector.append(normalized)
         ordered[index] = tuple(vector)
     if any(vector is None for vector in ordered):
         raise InvalidEmbeddingResponse(_INVALID_RESPONSE)

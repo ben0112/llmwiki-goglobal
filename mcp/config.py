@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from llmwiki_core.models import EmbeddingProfile
@@ -11,7 +11,11 @@ _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(_ENV_FILE),
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     MODE: Literal["local", "hosted"] = "local"
     WORKSPACE_PATH: str = "."
@@ -36,7 +40,7 @@ class Settings(BaseSettings):
     HYBRID_SEARCH_ENABLED: bool = False
     EMBEDDING_PROVIDER: Literal["openai_compatible"] = "openai_compatible"
     EMBEDDING_BASE_URL: str = ""
-    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_API_KEY: SecretStr = Field(default_factory=lambda: SecretStr(""), repr=False)
     EMBEDDING_MODEL: str = ""
     EMBEDDING_DIMENSIONS: int = Field(default=0, ge=0, le=4096)
     EMBEDDING_BATCH_SIZE: int = Field(default=32, ge=1, le=512)

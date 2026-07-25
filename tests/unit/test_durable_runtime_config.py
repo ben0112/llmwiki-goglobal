@@ -235,7 +235,7 @@ def test_lexical_defaults_do_not_require_embedding_endpoint(monkeypatch):
     assert runtime.HYBRID_SEARCH_ENABLED is False
     assert runtime.EMBEDDING_PROVIDER == "openai_compatible"
     assert runtime.EMBEDDING_BASE_URL == ""
-    assert runtime.EMBEDDING_API_KEY == ""
+    assert runtime.EMBEDDING_API_KEY.get_secret_value() == ""
     assert runtime.EMBEDDING_MODEL == ""
     assert runtime.EMBEDDING_DIMENSIONS == 0
     assert runtime.EMBEDDING_BATCH_SIZE == 32
@@ -361,6 +361,33 @@ def test_api_and_mcp_hybrid_preconditions_have_identical_semantics(settings_type
 def test_embedding_numeric_settings_reject_booleans(settings_type, field):
     with pytest.raises(ValueError, match=field):
         settings_type(MODE="local", _env_file=None, **{field: True})
+
+
+@pytest.mark.parametrize("settings_type", (Settings, McpSettings))
+def test_embedding_api_key_is_hidden_from_settings_repr(settings_type):
+    secret = "sk-private-settings-repr"
+
+    runtime = settings_type(MODE="local", EMBEDDING_API_KEY=secret, _env_file=None)
+
+    assert runtime.EMBEDDING_API_KEY.get_secret_value() == secret
+    assert secret not in repr(runtime)
+
+
+@pytest.mark.parametrize("settings_type", (Settings, McpSettings))
+def test_embedding_secrets_are_hidden_from_validation_errors_and_stderr(settings_type, capsys):
+    secret = "sk-private-validation-input"
+
+    with pytest.raises(ValueError) as caught:
+        settings_type(
+            MODE="local",
+            EMBEDDING_API_KEY=secret,
+            EMBEDDING_DIMENSIONS=secret,
+            _env_file=None,
+        )
+
+    print(caught.value, file=sys.stderr)
+    rendered = f"{caught.value!r}\n{caught.value}\n{capsys.readouterr().err}"
+    assert secret not in rendered
 
 
 def test_redis_module_does_not_create_client_on_import(monkeypatch):

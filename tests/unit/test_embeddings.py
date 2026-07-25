@@ -3,6 +3,7 @@ import math
 
 import httpx
 import pytest
+from config import Settings as ApiSettings
 from services.embeddings import OpenAIEmbeddingClient
 
 from llmwiki_core.models import (
@@ -62,6 +63,23 @@ async def test_openai_adapter_omits_authorization_when_key_is_empty():
     async with OpenAIEmbeddingClient(
         profile=_profile(),
         base_url="https://embedding.test/v1",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        await client.embed(["safe fixture"])
+
+
+async def test_openai_adapter_explicitly_unwraps_settings_secret_for_bearer_header():
+    secret = "sk-settings-private"
+    runtime = ApiSettings(MODE="local", EMBEDDING_API_KEY=secret, _env_file=None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == f"Bearer {secret}"
+        return _response(request, [[1.0, 2.0, 3.0]])
+
+    async with OpenAIEmbeddingClient(
+        profile=_profile(),
+        base_url="https://embedding.test/v1",
+        api_key=runtime.EMBEDDING_API_KEY.get_secret_value(),
         transport=httpx.MockTransport(handler),
     ) as client:
         await client.embed(["safe fixture"])
@@ -232,3 +250,35 @@ async def test_openai_adapter_rejects_unsafe_api_keys_with_sanitized_error(api_k
 
     assert str(caught.value) == "embedding API key contains invalid characters"
     assert api_key not in str(caught.value)
+
+
+async def test_openai_adapter_maps_huge_integer_coordinate_to_invalid_response():
+    huge_coordinate = 10**1000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _response(request, [[huge_coordinate, 2, 3]])
+
+    async with OpenAIEmbeddingClient(
+        profile=_profile(),
+        base_url="https://embedding.test/v1",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(InvalidEmbeddingResponse) as caught:
+            await client.embed(["safe fixture"])
+
+    assert str(caught.value) == "invalid embedding response"
+    assert str(huge_coordinate) not in str(caught.value)
+
+
+async def test_openai_adapter_rejects_huge_timeout_with_stable_error():
+    huge_timeout = 10**1000
+
+    with pytest.raises(ValueError) as caught:
+        OpenAIEmbeddingClient(
+            profile=_profile(),
+            base_url="https://embedding.test/v1",
+            timeout_seconds=huge_timeout,
+        )
+
+    assert str(caught.value) == "embedding timeout must be a positive finite number"
+    assert str(huge_timeout) not in str(caught.value)
