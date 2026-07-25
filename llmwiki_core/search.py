@@ -23,18 +23,51 @@ class SearchScope(StrEnum):
     SOURCE = "source"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class SearchQuery:
     text: str
     limit: int = 20
     area: SearchArea = SearchArea.ALL
     scope: SearchScope = SearchScope.ALL
     facets: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
-    candidate_limit: int | None = None
+    candidate_limit: int
     path_glob: str | None = None
     tags: tuple[str, ...] = ()
     document_kinds: tuple[DocumentKind, ...] = ()
     annotated_only: bool = False
+
+    def __init__(
+        self,
+        text: str,
+        limit: int = 20,
+        area: str | SearchArea | None = SearchArea.ALL,
+        scope: str | SearchScope = SearchScope.ALL,
+        facets: Mapping[str, Any] | None = None,
+        candidate_limit: int | None = None,
+        path_glob: str | None = None,
+        tags: Sequence[str] | None = None,
+        document_kinds: Sequence[str | DocumentKind] | None = None,
+        annotated_only: bool = False,
+    ) -> None:
+        object.__setattr__(self, "text", text)
+        object.__setattr__(self, "limit", limit)
+        object.__setattr__(self, "area", area)
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "facets", {} if facets is None else facets)
+        object.__setattr__(
+            self,
+            "candidate_limit",
+            limit if candidate_limit is None else candidate_limit,
+        )
+        object.__setattr__(self, "path_glob", path_glob)
+        object.__setattr__(self, "tags", () if tags is None else tags)
+        object.__setattr__(
+            self,
+            "document_kinds",
+            () if document_kinds is None else document_kinds,
+        )
+        object.__setattr__(self, "annotated_only", annotated_only)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not (normalized_text := self.text.strip()):
@@ -43,8 +76,7 @@ class SearchQuery:
         if not 1 <= normalized_limit <= 100:
             raise ValueError("search limit must be between 1 and 100")
 
-        candidate_limit = self.limit if self.candidate_limit is None else self.candidate_limit
-        normalized_candidate_limit = _validated_int("candidate limit", candidate_limit)
+        normalized_candidate_limit = _validated_int("candidate limit", self.candidate_limit)
         if normalized_candidate_limit < normalized_limit:
             raise ValueError("candidate limit must be at least the search limit")
         if normalized_candidate_limit > 500:
@@ -67,7 +99,7 @@ class SearchQuery:
         object.__setattr__(self, "limit", normalized_limit)
         object.__setattr__(self, "area", area)
         object.__setattr__(self, "scope", scope)
-        object.__setattr__(self, "facets", MappingProxyType(dict(self.facets)))
+        object.__setattr__(self, "facets", _freeze_json_like(self.facets, label="facets"))
         object.__setattr__(self, "candidate_limit", normalized_candidate_limit)
         object.__setattr__(self, "path_glob", _normalize_path_glob(self.path_glob))
         object.__setattr__(self, "tags", _normalize_tags(self.tags))
@@ -115,6 +147,8 @@ def _validated_int(name: str, value: object) -> int:
 def _normalize_path_glob(path_glob: str | None) -> str | None:
     if path_glob is None:
         return None
+    if not isinstance(path_glob, str):
+        raise ValueError("path_glob must be a string or None")
     if "\x00" in path_glob:
         raise ValueError("path glob contains NUL")
     normalized = path_glob.strip().replace("\\", "/")
@@ -170,6 +204,10 @@ class SearchHit:
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
+        if not isinstance(self.document_id, str) or not (
+            document_id := self.document_id.strip()
+        ):
+            raise ValueError("document_id must be a nonblank string")
         document_version = _validated_int("document_version", self.document_version)
         chunk_index = _validated_int("chunk_index", self.chunk_index)
         if document_version < 0:
@@ -191,12 +229,13 @@ class SearchHit:
             except (TypeError, ValueError) as exc:
                 raise ValueError("unsupported document kind") from exc
 
+        object.__setattr__(self, "document_id", document_id)
         object.__setattr__(self, "document_version", document_version)
         object.__setattr__(self, "chunk_index", chunk_index)
         object.__setattr__(self, "score", normalized_score)
         object.__setattr__(self, "tags", _normalize_tags(self.tags))
         object.__setattr__(self, "document_kind", document_kind)
-        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+        object.__setattr__(self, "metadata", _freeze_json_like(self.metadata, label="metadata"))
 
     @property
     def identity(self) -> tuple[str, int, int]:
@@ -221,8 +260,6 @@ class SearchResult:
         candidate_count = _validated_int("candidate_count", self.candidate_count)
         if candidate_count < 0:
             raise ValueError("candidate_count must not be negative")
-        if candidate_count < len(hits):
-            raise ValueError("candidate_count must be at least the returned hit count")
 
         if isinstance(self.latency_ms, bool) or not isinstance(self.latency_ms, Real):
             raise ValueError("latency_ms must be a real number")
@@ -262,24 +299,24 @@ class ContextExpander(Protocol):
     ) -> Sequence[SearchHit]: ...
 
 
-def _freeze_metadata(value: object) -> object:
-    """Recursively freeze JSON-like metadata into immutable equivalents."""
+def _freeze_json_like(value: object, *, label: str) -> object:
+    """Recursively freeze JSON-like values into immutable equivalents."""
     if value is None or isinstance(value, (str, int, float, bool)):
         if isinstance(value, float) and not isfinite(value):
-            raise TypeError("metadata numbers must be finite")
+            raise TypeError(f"{label} numbers must be finite")
         return value
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}
         for key, nested in value.items():
             if not isinstance(key, str):
-                raise TypeError("metadata mapping keys must be strings")
-            frozen[key] = _freeze_metadata(nested)
+                raise TypeError(f"{label} mapping keys must be strings")
+            frozen[key] = _freeze_json_like(nested, label=label)
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_metadata(item) for item in value)
+        return tuple(_freeze_json_like(item, label=label) for item in value)
     if isinstance(value, (set, frozenset)):
         try:
-            return frozenset(_freeze_metadata(item) for item in value)
+            return frozenset(_freeze_json_like(item, label=label) for item in value)
         except TypeError as exc:
-            raise TypeError("metadata set items must freeze to hashable values") from exc
-    raise TypeError(f"metadata contains unsupported value type: {type(value).__name__}")
+            raise TypeError(f"{label} set items must freeze to hashable values") from exc
+    raise TypeError(f"{label} contains unsupported value type: {type(value).__name__}")

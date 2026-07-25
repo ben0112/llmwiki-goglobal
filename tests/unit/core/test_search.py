@@ -1,4 +1,5 @@
 from inspect import iscoroutinefunction
+from typing import get_type_hints
 
 import pytest
 
@@ -107,6 +108,34 @@ def test_search_query_direct_constructor_normalizes_and_freezes_inputs():
         query.facets["country"] = "MYS"
 
 
+def test_search_query_deep_freezes_facets_and_isolates_source_mutation():
+    facets = {
+        "countries": ["IDN", {"code": "SGP"}],
+        "labels": {"policy", "reviewed"},
+    }
+    query = SearchQuery(text="query", facets=facets)
+    facets["countries"].append("MYS")
+    facets["countries"][1]["code"] = "MYS"
+    facets["labels"].add("new")
+
+    countries = query.facets["countries"]
+    assert countries == ("IDN", {"code": "SGP"})
+    assert query.facets["labels"] == frozenset({"policy", "reviewed"})
+    with pytest.raises(TypeError):
+        countries[1]["code"] = "MYS"
+
+
+def test_search_query_candidate_limit_has_non_optional_public_type():
+    assert get_type_hints(SearchQuery)["candidate_limit"] is int
+    assert SearchQuery("query", 40).candidate_limit == 40
+
+
+def test_search_query_preserves_positional_candidate_limit_input():
+    query = SearchQuery("query", 10, "all", "all", {}, 40)
+
+    assert query.candidate_limit == 40
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -140,6 +169,12 @@ def test_search_query_rejects_scalar_or_invalid_filter_sequences(kwargs):
 def test_search_query_rejects_non_boolean_annotated_only():
     with pytest.raises(ValueError, match="annotated_only must be a boolean"):
         SearchQuery(text="query", annotated_only=1)
+
+
+@pytest.mark.parametrize("path_glob", [7, b"corpus/*.md"])
+def test_search_query_rejects_non_string_path_glob(path_glob):
+    with pytest.raises(ValueError, match="path_glob must be a string or None"):
+        SearchQuery(text="query", path_glob=path_glob)
 
 
 @pytest.mark.parametrize(
@@ -253,6 +288,12 @@ def test_search_hit_rejects_invalid_identity_or_score_numbers(field, value):
         SearchHit(**values)
 
 
+@pytest.mark.parametrize("document_id", ["", "   ", 7])
+def test_search_hit_rejects_invalid_document_id(document_id):
+    with pytest.raises(ValueError, match="document_id must be a nonblank string"):
+        SearchHit(document_id, 1, 0, "text", 0.5, "/doc.md")
+
+
 def test_search_result_distinguishes_candidates_from_returned_hits():
     hit = SearchHit("doc", 1, 0, "text", 0.5, "/doc.md")
     result = SearchResult(hits=(hit,), candidate_count=17)
@@ -274,7 +315,18 @@ def test_search_result_copies_hit_sequence():
     assert result.hits == (hit,)
 
 
-@pytest.mark.parametrize("candidate_count", [True, -1, 0, 1.5])
+def test_search_result_allows_expansion_to_exceed_candidate_count():
+    hits = (
+        SearchHit("doc-1", 1, 0, "text", 0.5, "/one.md"),
+        SearchHit("doc-2", 1, 0, "context", 0.4, "/two.md"),
+    )
+    result = SearchResult(hits=hits, candidate_count=1)
+
+    assert result.returned_count == 2
+    assert result.candidate_count == 1
+
+
+@pytest.mark.parametrize("candidate_count", [True, -1, 1.5])
 def test_search_result_rejects_invalid_candidate_count(candidate_count):
     hit = SearchHit("doc", 1, 0, "text", 0.5, "/doc.md")
     with pytest.raises(ValueError, match="candidate_count"):
