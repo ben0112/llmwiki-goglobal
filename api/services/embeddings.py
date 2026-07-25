@@ -195,4 +195,4 @@ def _ordered_vectors(
     return tuple(vector for vector in ordered if vector is not None)
 
 
-__all__ = ["OpenAIEmbeddingClient"]
+__all__ = ["DEFAULT_MAX_INPUTS", "DEFAULT_MAX_TOTAL_CHARS", "OpenAIEmbeddingClient"]

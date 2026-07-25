@@ -6,6 +6,7 @@ import pytest
 from jobs.handlers import (
     TerminalJobError,
     WorkerContext,
+    _embedding_request_batches,
     _enqueue_embedding_after_extraction,
     _validate_embedding_job_shape,
     _validate_embedding_vectors,
@@ -151,6 +152,14 @@ def test_embedding_handler_preserves_ordered_chunk_indexes():
     ) == ((0, (1.0, 0.0, 0.0)), (1, (0.0, 1.0, 0.0)))
 
 
+def test_single_oversized_chunk_is_stable_terminal_input_error():
+    with pytest.raises(TerminalJobError) as raised:
+        _embedding_request_batches(("x" * 200_001,))
+
+    assert raised.value.error_code == "invalid_embedding_input"
+    assert "x" * 100 not in str(raised.value)
+
+
 @pytest.mark.asyncio
 async def test_successful_extraction_enqueues_exact_current_profile_job(monkeypatch):
     job = _record(job_type=JobType.DOCUMENT_EXTRACT, payload={"document_id": str(uuid4())})
@@ -216,7 +225,37 @@ def test_missing_reconciliation_cli_requires_explicit_mode(capsys):
     from scripts.enqueue_embeddings import main
 
     assert main([]) == 2
-    assert capsys.readouterr().out.startswith("usage:")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"error":"invalid_arguments"}\n'
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--missing", "--page-size", "postgres://private-token"],
+        ["--missing", "--page-size", "9" * 100_000],
+        ["--missing", "--page-size", "１２"],
+        ["--missing", "--private-path=/Users/private-token/repo"],
+    ],
+)
+def test_missing_reconciliation_cli_argument_errors_never_echo_private_argv(argv, capsys):
+    from scripts.enqueue_embeddings import main
+
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"error":"invalid_arguments"}\n'
+    assert "private-token" not in captured.err
+
+
+def test_missing_reconciliation_cli_help_remains_normal(capsys):
+    from scripts.enqueue_embeddings import main
+
+    assert main(["--help"]) == 0
+    captured = capsys.readouterr()
+    assert "--missing" in captured.out
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize(

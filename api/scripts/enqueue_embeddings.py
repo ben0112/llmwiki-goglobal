@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from collections.abc import Sequence
 
 import asyncpg
@@ -14,6 +15,31 @@ from llmwiki_core.models import EmbeddingProfile
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
+_INVALID_ARGUMENTS = '{"error":"invalid_arguments"}\n'
+
+
+def _emit_invalid_arguments() -> None:
+    sys.stderr.write(_INVALID_ARGUMENTS)
+
+
+class _ParserExit(Exception):
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__()
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if status:
+            _emit_invalid_arguments()
+        elif message:
+            self._print_message(message)
+        raise _ParserExit(status)
+
+    def error(self, message: str) -> None:
+        del message
+        _emit_invalid_arguments()
+        raise _ParserExit(2)
 
 
 async def reconcile_missing_embeddings(
@@ -64,6 +90,7 @@ async def reconcile_missing_embeddings(
                 user_id=row["user_id"],
                 knowledge_base_id=row["knowledge_base_id"],
                 profile=profile,
+                recover_terminal=True,
             )
             scanned += 1
             enqueued += int(created)
@@ -73,10 +100,22 @@ async def reconcile_missing_embeddings(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Enqueue missing durable document embeddings.")
+    parser = _SafeArgumentParser(
+        prog="enqueue_embeddings",
+        description="Enqueue missing durable document embeddings.",
+    )
     parser.add_argument("--missing", action="store_true", help="scan ready current document versions")
-    parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    parser.add_argument("--page-size", default=str(DEFAULT_PAGE_SIZE))
     return parser
+
+
+def _page_size(raw: object) -> int:
+    if not isinstance(raw, str) or not 1 <= len(raw) <= 3 or not raw.isascii() or not raw.isdecimal():
+        raise ValueError("invalid page size")
+    value = int(raw)
+    if not 1 <= value <= MAX_PAGE_SIZE:
+        raise ValueError("invalid page size")
+    return value
 
 
 async def _run(page_size: int) -> dict[str, int]:
@@ -93,12 +132,19 @@ async def _run(page_size: int) -> dict[str, int]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    if not args.missing:
-        _parser().print_usage()
-        return 2
+    parser = _parser()
     try:
-        result = asyncio.run(_run(args.page_size))
+        args = parser.parse_args(argv)
+        if not args.missing:
+            parser.error("missing reconciliation mode")
+        page_size = _page_size(args.page_size)
+    except ValueError:
+        _emit_invalid_arguments()
+        return 2
+    except _ParserExit as exc:
+        return exc.status
+    try:
+        result = asyncio.run(_run(page_size))
     except ValueError:
         print(json.dumps({"error": "invalid_configuration"}, sort_keys=True))
         return 3

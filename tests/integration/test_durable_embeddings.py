@@ -323,3 +323,201 @@ async def test_concurrent_duplicate_embedding_enqueues_have_one_durable_winner(p
         "SELECT count(*) FROM background_jobs WHERE document_id=$1 AND job_type='document.embed'",
         ids[2],
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_appends_one_successor_for_exhausted_terminal_job(pool, monkeypatch):
+    await pool.execute("UPDATE documents SET archived=true")
+    ids = await _seed_document(pool)
+    failed, _lease = await _claimed_job(pool, ids)
+    await pool.execute(
+        "UPDATE background_jobs SET state='failed',attempt_count=max_attempts,"
+        "lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,"
+        "error_code='attempts_exhausted',error_message='safe terminal audit' WHERE id=$1",
+        failed.id,
+    )
+    failed_before = await pool.fetchrow(
+        "SELECT state::text,attempt_count,max_attempts,error_code,error_message,idempotency_key "
+        "FROM background_jobs WHERE id=$1",
+        failed.id,
+    )
+
+    results = await asyncio.gather(
+        *(reconcile_missing_embeddings(pool, PROFILE, page_size=1) for _ in range(8))
+    )
+
+    assert sum(result["enqueued"] for result in results) == 1
+    rows = await pool.fetch(
+        "SELECT id,state::text,attempt_count,max_attempts,error_code,error_message,idempotency_key "
+        "FROM background_jobs WHERE document_id=$1 AND job_type='document.embed' "
+        "ORDER BY created_at,id",
+        ids[2],
+    )
+    assert len(rows) == 2
+    assert dict(rows[0]) == {"id": failed.id, **dict(failed_before)}
+    successor = rows[1]
+    logical_key = failed_before["idempotency_key"]
+    assert successor["state"] == "queued"
+    assert successor["attempt_count"] == 0
+    assert successor["error_code"] is None
+    assert successor["error_message"] is None
+    assert successor["idempotency_key"] == f"{logical_key}:reconcile:1"
+    assert await reconcile_missing_embeddings(pool, PROFILE, page_size=1) == {
+        "scanned": 1,
+        "enqueued": 0,
+    }
+
+    claimed = await repository.claim(pool, successor["id"], "recovery-worker", 120)
+    assert claimed is not None
+    lease = JobLease(pool, claimed.id, "recovery-worker", 120, 30)
+    _install_profile(monkeypatch)
+    monkeypatch.setattr(
+        "jobs.handlers._embed_texts",
+        lambda _profile, texts: asyncio.sleep(
+            0,
+            result=tuple((1.0, 0.0, 0.0) for _ in texts),
+        ),
+    )
+    result = await handle_document_embed(claimed, lease, _context(pool))
+    await repository.succeed(pool, claimed.id, "recovery-worker", result)
+
+    assert await pool.fetchval(
+        "SELECT count(*) FROM chunk_embeddings WHERE document_id=$1",
+        ids[2],
+    ) == 2
+    assert await reconcile_missing_embeddings(pool, PROFILE, page_size=1) == {
+        "scanned": 0,
+        "enqueued": 0,
+    }
+    assert dict(
+        await pool.fetchrow(
+            "SELECT state::text,attempt_count,max_attempts,error_code,error_message,idempotency_key "
+            "FROM background_jobs WHERE id=$1",
+            failed.id,
+        )
+    ) == dict(failed_before)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunks", "expected_sizes"),
+    [
+        (("x" * 1_000,) * 201, [200, 1]),
+        (("x",) * 513, [512, 1]),
+    ],
+)
+async def test_large_documents_use_bounded_ordered_provider_requests(
+    pool,
+    monkeypatch,
+    chunks,
+    expected_sizes,
+):
+    ids = await _seed_document(pool, chunks=chunks)
+    job, lease = await _claimed_job(pool, ids)
+    _install_profile(monkeypatch)
+    batches = []
+
+    async def embed(_profile, texts):
+        batches.append(tuple(texts))
+        return tuple((float(len(batches)), float(index + 1), 0.0) for index in range(len(texts)))
+
+    monkeypatch.setattr("jobs.handlers._embed_texts", embed)
+
+    result = await handle_document_embed(job, lease, _context(pool))
+
+    assert result["embedded_chunks"] == len(chunks)
+    assert [len(batch) for batch in batches] == expected_sizes
+    assert tuple(text for batch in batches for text in batch) == chunks
+    assert await pool.fetchval(
+        "SELECT count(*) FROM chunk_embeddings WHERE document_id=$1",
+        ids[2],
+    ) == len(chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "invalid"])
+async def test_second_provider_batch_failure_never_commits_partial_vectors(
+    pool,
+    monkeypatch,
+    failure,
+):
+    ids = await _seed_document(pool, chunks=("x",) * 513)
+    job, lease = await _claimed_job(pool, ids)
+    _install_profile(monkeypatch)
+    calls = 0
+
+    async def embed(_profile, texts):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if failure == "timeout":
+                raise EmbeddingUnavailable("private endpoint")
+            return ((1.0, 0.0),)
+        return tuple((1.0, float(index + 1), 0.0) for index in range(len(texts)))
+
+    monkeypatch.setattr("jobs.handlers._embed_texts", embed)
+
+    expected = RetryableJobError if failure == "timeout" else TerminalJobError
+    with pytest.raises(expected):
+        await handle_document_embed(job, lease, _context(pool))
+    assert calls == 2
+    assert await pool.fetchval(
+        "SELECT count(*) FROM chunk_embeddings WHERE document_id=$1",
+        ids[2],
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_between_provider_batches_stops_before_second_call(pool, monkeypatch):
+    ids = await _seed_document(pool, chunks=("x",) * 513)
+    job, lease = await _claimed_job(pool, ids)
+    _install_profile(monkeypatch)
+    sizes = []
+
+    async def embed(_profile, texts):
+        sizes.append(len(texts))
+        await pool.execute(
+            "UPDATE background_jobs SET lease_owner='takeover-worker' WHERE id=$1",
+            job.id,
+        )
+        return tuple((1.0, float(index + 1), 0.0) for index in range(len(texts)))
+
+    monkeypatch.setattr("jobs.handlers._embed_texts", embed)
+
+    with pytest.raises(LeaseLost):
+        await handle_document_embed(job, lease, _context(pool))
+    assert sizes == [512]
+    assert await pool.fetchval(
+        "SELECT count(*) FROM chunk_embeddings WHERE document_id=$1",
+        ids[2],
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_version_change_during_first_provider_batch_returns_stale_without_vectors(
+    pool,
+    monkeypatch,
+):
+    ids = await _seed_document(pool, chunks=("x",) * 513)
+    job, lease = await _claimed_job(pool, ids)
+    _install_profile(monkeypatch)
+    sizes = []
+
+    async def embed(_profile, texts):
+        sizes.append(len(texts))
+        if len(sizes) == 1:
+            await pool.execute("DELETE FROM document_chunks WHERE document_id=$1", ids[2])
+            await pool.execute("UPDATE documents SET version=2 WHERE id=$1", ids[2])
+        return tuple((1.0, float(index + 1), 0.0) for index in range(len(texts)))
+
+    monkeypatch.setattr("jobs.handlers._embed_texts", embed)
+
+    assert await handle_document_embed(job, lease, _context(pool)) == {
+        "document_id": str(ids[2]),
+        "stale": True,
+    }
+    assert sizes == [512, 1]
+    assert await pool.fetchval(
+        "SELECT count(*) FROM chunk_embeddings WHERE document_id=$1",
+        ids[2],
+    ) == 0

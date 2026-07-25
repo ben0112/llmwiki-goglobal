@@ -45,6 +45,7 @@ _VETTED_ERROR_MESSAGES = MappingProxyType(
         "invalid_document": "Document is invalid.",
         "invalid_document_job": "The document extraction job is invalid.",
         "invalid_embedding_job": "The document embedding job is invalid.",
+        "invalid_embedding_input": "Document content cannot be embedded.",
         "invalid_embedding_response": "The embedding provider returned an invalid response.",
         "invalid_job_result": "The job produced an invalid result.",
         "invalid_graph_job": "The graph rebuild job is invalid.",
@@ -354,7 +355,7 @@ async def handle_document_embed(
         return {"document_id": str(job.document_id), "stale": True}
 
     await lease.checkpoint()
-    indexed_vectors = await _request_embedding_vectors(profile, source)
+    indexed_vectors = await _request_embedding_vectors(profile, source, lease)
     count = await _commit_embedding_vectors(
         job,
         lease,
@@ -372,33 +373,75 @@ async def handle_document_embed(
 async def _request_embedding_vectors(
     profile: EmbeddingProfile,
     source: EmbeddingSource,
+    lease: JobLease,
 ) -> IndexedEmbeddings:
     texts = tuple(content for _index, content in source)
-    try:
-        raw_vectors = await _embed_texts(profile, texts) if texts else ()
-    except EmbeddingUnavailable:
-        raise RetryableJobError(
-            "embedding_unavailable",
-            "The embedding provider is temporarily unavailable.",
-        ) from None
-    except (EmbeddingInputError, InvalidEmbeddingResponse):
-        raise TerminalJobError(
-            "invalid_embedding_response",
-            "The embedding provider returned an invalid response.",
-        ) from None
-    except (JobCancelled, LeaseLost):
-        raise
-    except Exception:  # noqa: BLE001 - provider adapters share retry semantics.
-        raise RetryableJobError(
-            "embedding_unavailable",
-            "The embedding provider is temporarily unavailable.",
-        ) from None
-    vectors = _validate_embedding_vectors(
-        raw_vectors,
-        expected_count=len(source),
-        dimensions=profile.dimensions,
-    )
-    return tuple((source[index][0], vector) for index, (_ignored, vector) in enumerate(vectors))
+    indexed_vectors: list[tuple[int, tuple[float, ...]]] = []
+    offset = 0
+    for batch_number, batch in enumerate(_embedding_request_batches(texts)):
+        if batch_number:
+            await lease.checkpoint()
+        try:
+            raw_vectors = await _embed_texts(profile, batch)
+        except EmbeddingUnavailable:
+            raise RetryableJobError(
+                "embedding_unavailable",
+                "The embedding provider is temporarily unavailable.",
+            ) from None
+        except EmbeddingInputError:
+            raise TerminalJobError(
+                "invalid_embedding_input",
+                "Document content cannot be embedded.",
+            ) from None
+        except InvalidEmbeddingResponse:
+            raise TerminalJobError(
+                "invalid_embedding_response",
+                "The embedding provider returned an invalid response.",
+            ) from None
+        except (JobCancelled, LeaseLost):
+            raise
+        except Exception:  # noqa: BLE001 - provider adapters share retry semantics.
+            raise RetryableJobError(
+                "embedding_unavailable",
+                "The embedding provider is temporarily unavailable.",
+            ) from None
+        vectors = _validate_embedding_vectors(
+            raw_vectors,
+            expected_count=len(batch),
+            dimensions=profile.dimensions,
+        )
+        indexed_vectors.extend(
+            (source[offset + local_index][0], vector)
+            for local_index, (_ignored, vector) in enumerate(vectors)
+        )
+        offset += len(batch)
+    return tuple(indexed_vectors)
+
+
+def _embedding_request_batches(texts: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    from services.embeddings import DEFAULT_MAX_INPUTS, DEFAULT_MAX_TOTAL_CHARS
+
+    batches: list[tuple[str, ...]] = []
+    current: list[str] = []
+    current_chars = 0
+    for text in texts:
+        if not isinstance(text, str) or not text or len(text) > DEFAULT_MAX_TOTAL_CHARS:
+            raise TerminalJobError(
+                "invalid_embedding_input",
+                "Document content cannot be embedded.",
+            )
+        if current and (
+            len(current) >= DEFAULT_MAX_INPUTS
+            or current_chars + len(text) > DEFAULT_MAX_TOTAL_CHARS
+        ):
+            batches.append(tuple(current))
+            current = []
+            current_chars = 0
+        current.append(text)
+        current_chars += len(text)
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
 
 
 async def _commit_embedding_vectors(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import UUID
 
 import asyncpg
@@ -160,6 +161,7 @@ class JobService:
         user_id: UUID,
         knowledge_base_id: UUID,
         profile: EmbeddingProfile,
+        recover_terminal: bool = False,
     ) -> tuple[JobRecord, bool]:
         async with self._pool.acquire() as conn, conn.transaction():
             return await self._ensure_document_embedding_with_status_in_transaction(
@@ -169,6 +171,7 @@ class JobService:
                 user_id=user_id,
                 knowledge_base_id=knowledge_base_id,
                 profile=profile,
+                recover_terminal=recover_terminal,
             )
 
     async def ensure_document_embedding_in_transaction(
@@ -200,6 +203,7 @@ class JobService:
         user_id: UUID,
         knowledge_base_id: UUID,
         profile: EmbeddingProfile,
+        recover_terminal: bool = False,
     ) -> tuple[JobRecord, bool]:
         if not conn.is_in_transaction():
             raise RuntimeError("embedding job ensure requires an explicit transaction")
@@ -227,17 +231,59 @@ class JobService:
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             f"document.embed:{user_id}:{command.idempotency_key}",
         )
-        existing_id = await conn.fetchval(
-            "SELECT id FROM background_jobs "
-            "WHERE user_id=$1 AND job_type='document.embed' AND idempotency_key=$2",
+        # Keep the base key as the logical identity. Reconciliation appends a
+        # bounded physical generation only after every prior job is terminal,
+        # preserving the immutable failure ledger while allowing recovery.
+        key_prefix = f"{command.idempotency_key}:reconcile:"
+        active_id = await conn.fetchval(
+            "SELECT id FROM background_jobs WHERE user_id=$1 AND job_type='document.embed' "
+            "AND document_id=$2 AND knowledge_base_id=$3 "
+            "AND (idempotency_key=$4 OR (left(idempotency_key,length($5))=$5 "
+            "AND substring(idempotency_key from length($5)+1) ~ '^[1-9][0-9]{0,8}$')) "
+            "AND state IN ('queued','running','retry_wait') ORDER BY created_at DESC,id DESC LIMIT 1",
             user_id,
+            document_id,
+            knowledge_base_id,
             command.idempotency_key,
+            key_prefix,
         )
-        if existing_id is not None:
-            existing = await repository.get_for_user(conn, existing_id, user_id)
+        if active_id is not None:
+            existing = await repository.get_for_user(conn, active_id, user_id)
             if existing is None:
                 raise RuntimeError("authoritative document embedding job disappeared")
             return existing, False
+        latest_id = await conn.fetchval(
+            "SELECT id FROM background_jobs WHERE user_id=$1 AND job_type='document.embed' "
+            "AND document_id=$2 AND knowledge_base_id=$3 "
+            "AND (idempotency_key=$4 OR (left(idempotency_key,length($5))=$5 "
+            "AND substring(idempotency_key from length($5)+1) ~ '^[1-9][0-9]{0,8}$')) "
+            "ORDER BY created_at DESC,id DESC LIMIT 1",
+            user_id,
+            document_id,
+            knowledge_base_id,
+            command.idempotency_key,
+            key_prefix,
+        )
+        if latest_id is not None and not recover_terminal:
+            existing = await repository.get_for_user(conn, latest_id, user_id)
+            if existing is None:
+                raise RuntimeError("authoritative document embedding job disappeared")
+            return existing, False
+        if latest_id is not None:
+            generation = await conn.fetchval(
+                "SELECT COALESCE(max((substring(idempotency_key from length($2)+1))::integer),0) "
+                "FROM background_jobs WHERE user_id=$1 AND job_type='document.embed' "
+                "AND left(idempotency_key,length($2))=$2 "
+                "AND substring(idempotency_key from length($2)+1) ~ '^[1-9][0-9]{0,8}$'",
+                user_id,
+                key_prefix,
+            )
+            if type(generation) is not int or not 0 <= generation < 999_999_999:
+                raise RuntimeError("document embedding recovery generation is exhausted")
+            command = replace(
+                command,
+                idempotency_key=f"{command.idempotency_key}:reconcile:{generation + 1}",
+            )
         record = await self.create_in_transaction(
             conn,
             command,

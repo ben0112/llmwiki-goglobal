@@ -22,7 +22,8 @@
 - `api/services/vector_store.py`: tenant-scoped, document-version-fenced pgvector writes and candidate reads.
 - `api/jobs/handlers.py`: durable `document.embed` handler.
 - `api/scripts/retrieval_eval.py`: selected-retriever evaluation CLI and promotion-gate exit status.
-- `supabase/migrations/013_chunk_embeddings.sql`: additive pgvector table, indexes, RLS, and job-type constraint.
+- `supabase/migrations/013_chunk_embeddings.sql`: published Task 7 pgvector table, indexes, and RLS.
+- `supabase/migrations/014_document_embedding_jobs.sql`: additive embedding job type and reconciliation index.
 - `tests/fixtures/retrieval/v1/`: synthetic, non-user evaluation cases and fixture corpus.
 
 ### Task 1: Expand the shared search contract without breaking callers
@@ -494,7 +495,8 @@ git push origin feat/platform-architecture-evolution
 - Create: `api/scripts/enqueue_embeddings.py`
 - Create: `tests/unit/jobs/test_embedding_handler.py`
 - Create: `tests/integration/test_durable_embeddings.py`
-- Modify: `supabase/migrations/013_chunk_embeddings.sql`
+- Preserve: `supabase/migrations/013_chunk_embeddings.sql`
+- Create: `supabase/migrations/014_document_embedding_jobs.sql`
 - Modify: `tests/helpers/schema.sql`
 
 - [ ] **Step 1: Write RED job-contract tests**
@@ -527,7 +529,7 @@ PYTHONPATH=api MODE=hosted .venv/bin/pytest tests/unit/jobs/test_embedding_handl
 ```
 
 ```bash
-git add api/jobs api/services/ocr.py api/scripts/enqueue_embeddings.py supabase/migrations/013_chunk_embeddings.sql tests/helpers/schema.sql tests/unit/jobs/test_embedding_handler.py tests/integration/test_durable_embeddings.py
+git add api/jobs api/services/ocr.py api/scripts/enqueue_embeddings.py api/services/embeddings.py supabase/migrations/014_document_embedding_jobs.sql tests/helpers/schema.sql tests/unit/jobs/test_embedding_handler.py tests/integration/test_durable_embeddings.py tests/integration/test_document_embedding_jobs_migration.py
 git commit -m "feat: add durable document embedding jobs"
 git push origin feat/platform-architecture-evolution
 ```
