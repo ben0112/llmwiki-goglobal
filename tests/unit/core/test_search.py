@@ -76,6 +76,72 @@ def test_search_query_keeps_existing_builder_calls_compatible():
     assert query.annotated_only is False
 
 
+def test_search_query_direct_constructor_normalizes_and_freezes_inputs():
+    facets = {"country": "IDN"}
+    tags = ["Policy", " asean "]
+    document_kinds = ["wiki", DocumentKind.SOURCE]
+    query = SearchQuery(
+        "  query  ",
+        40,
+        "wiki",
+        "source",
+        facets,
+        tags=tags,
+        document_kinds=document_kinds,
+        path_glob="corpus/*.md",
+    )
+    facets["country"] = "SGP"
+    tags.append("new")
+    document_kinds.append("asset")
+
+    assert query.text == "query"
+    assert query.limit == 40
+    assert query.candidate_limit == 40
+    assert query.area is SearchArea.WIKI
+    assert query.scope is SearchScope.SOURCE
+    assert query.facets == {"country": "IDN"}
+    assert query.tags == ("asean", "policy")
+    assert query.document_kinds == (DocumentKind.SOURCE, DocumentKind.WIKI)
+    assert query.path_glob == "/corpus/*.md"
+    with pytest.raises(TypeError):
+        query.facets["country"] = "MYS"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"limit": True},
+        {"limit": 2.5},
+        {"candidate_limit": True},
+        {"candidate_limit": 20.0},
+    ],
+)
+def test_search_query_rejects_non_integer_counts(kwargs):
+    with pytest.raises(ValueError, match="must be an integer"):
+        SearchQuery(text="query", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tags": "policy"},
+        {"tags": b"policy"},
+        {"tags": ["policy", 7]},
+        {"document_kinds": "source"},
+        {"document_kinds": b"source"},
+        {"document_kinds": [7]},
+    ],
+)
+def test_search_query_rejects_scalar_or_invalid_filter_sequences(kwargs):
+    with pytest.raises(ValueError, match="must be a sequence"):
+        SearchQuery(text="query", **kwargs)
+
+
+def test_search_query_rejects_non_boolean_annotated_only():
+    with pytest.raises(ValueError, match="annotated_only must be a boolean"):
+        SearchQuery(text="query", annotated_only=1)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -136,6 +202,57 @@ def test_search_hit_copies_and_freezes_metadata():
         hit.metadata["country"] = "MYS"
 
 
+def test_search_hit_deep_freezes_metadata_and_isolates_source_mutation():
+    metadata = {
+        "classification": {"countries": ["IDN", {"code": "SGP"}]},
+        "labels": {"reviewed", "policy"},
+    }
+    hit = SearchHit("doc", 3, 2, "text", 0.75, "/doc.md", metadata=metadata)
+    metadata["classification"]["countries"].append("MYS")
+    metadata["classification"]["countries"][1]["code"] = "MYS"
+    metadata["labels"].add("new")
+
+    countries = hit.metadata["classification"]["countries"]
+    assert countries == ("IDN", {"code": "SGP"})
+    assert hit.metadata["labels"] == frozenset({"reviewed", "policy"})
+    with pytest.raises(TypeError):
+        countries[1]["code"] = "MYS"
+
+
+@pytest.mark.parametrize("metadata", [{1: "value"}, {"value": object()}])
+def test_search_hit_rejects_unsupported_metadata(metadata):
+    with pytest.raises(TypeError, match="metadata"):
+        SearchHit("doc", 1, 0, "text", 0.5, "/doc.md", metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("document_version", True),
+        ("document_version", -1),
+        ("document_version", 1.5),
+        ("chunk_index", False),
+        ("chunk_index", -1),
+        ("chunk_index", 1.5),
+        ("score", True),
+        ("score", float("nan")),
+        ("score", float("inf")),
+    ],
+)
+def test_search_hit_rejects_invalid_identity_or_score_numbers(field, value):
+    values = {
+        "document_id": "doc",
+        "document_version": 1,
+        "chunk_index": 0,
+        "content": "text",
+        "score": 0.5,
+        "path": "/doc.md",
+    }
+    values[field] = value
+    with pytest.raises(ValueError, match=field):
+        SearchHit(**values)
+
+
 def test_search_result_distinguishes_candidates_from_returned_hits():
     hit = SearchHit("doc", 1, 0, "text", 0.5, "/doc.md")
     result = SearchResult(hits=(hit,), candidate_count=17)
@@ -146,6 +263,39 @@ def test_search_result_distinguishes_candidates_from_returned_hits():
     assert result.profile == "lexical"
     with pytest.raises((AttributeError, TypeError)):
         result.hits = ()
+
+
+def test_search_result_copies_hit_sequence():
+    hit = SearchHit("doc", 1, 0, "text", 0.5, "/doc.md")
+    hits = [hit]
+    result = SearchResult(hits=hits, candidate_count=1)
+    hits.clear()
+
+    assert result.hits == (hit,)
+
+
+@pytest.mark.parametrize("candidate_count", [True, -1, 0, 1.5])
+def test_search_result_rejects_invalid_candidate_count(candidate_count):
+    hit = SearchHit("doc", 1, 0, "text", 0.5, "/doc.md")
+    with pytest.raises(ValueError, match="candidate_count"):
+        SearchResult(hits=(hit,), candidate_count=candidate_count)
+
+
+@pytest.mark.parametrize("latency_ms", [True, -0.1, float("nan"), float("inf")])
+def test_search_result_rejects_invalid_latency(latency_ms):
+    with pytest.raises(ValueError, match="latency_ms"):
+        SearchResult(hits=(), candidate_count=0, latency_ms=latency_ms)
+
+
+@pytest.mark.parametrize("profile", ["", "   ", 7])
+def test_search_result_rejects_invalid_profile(profile):
+    with pytest.raises(ValueError, match="profile"):
+        SearchResult(hits=(), candidate_count=0, profile=profile)
+
+
+def test_search_result_rejects_non_hit_members():
+    with pytest.raises(ValueError, match="SearchHit"):
+        SearchResult(hits=(object(),), candidate_count=1)
 
 
 def test_retrieval_ports_are_public_protocols():
