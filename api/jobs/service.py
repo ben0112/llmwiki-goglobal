@@ -8,6 +8,7 @@ import asyncpg
 
 from jobs import repository
 from jobs.models import JobCreate, JobRecord, JobState, JobType
+from llmwiki_core.models import EmbeddingProfile
 
 
 class JobResourceNotFound(LookupError):
@@ -129,6 +130,120 @@ class JobService:
                 if active is not None:
                     return active
         raise RuntimeError("active graph job changed too frequently")
+
+    async def ensure_document_embedding(
+        self,
+        *,
+        document_id: UUID,
+        document_version: int,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        profile: EmbeddingProfile,
+    ) -> JobRecord:
+        """Idempotently enqueue one immutable document-version/profile embedding."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            record, _created = await self._ensure_document_embedding_with_status_in_transaction(
+                conn,
+                document_id=document_id,
+                document_version=document_version,
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id,
+                profile=profile,
+            )
+            return record
+
+    async def ensure_document_embedding_with_status(
+        self,
+        *,
+        document_id: UUID,
+        document_version: int,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        profile: EmbeddingProfile,
+    ) -> tuple[JobRecord, bool]:
+        async with self._pool.acquire() as conn, conn.transaction():
+            return await self._ensure_document_embedding_with_status_in_transaction(
+                conn,
+                document_id=document_id,
+                document_version=document_version,
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id,
+                profile=profile,
+            )
+
+    async def ensure_document_embedding_in_transaction(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        document_id: UUID,
+        document_version: int,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        profile: EmbeddingProfile,
+    ) -> JobRecord:
+        record, _created = await self._ensure_document_embedding_with_status_in_transaction(
+            conn,
+            document_id=document_id,
+            document_version=document_version,
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            profile=profile,
+        )
+        return record
+
+    async def _ensure_document_embedding_with_status_in_transaction(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        document_id: UUID,
+        document_version: int,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        profile: EmbeddingProfile,
+    ) -> tuple[JobRecord, bool]:
+        if not conn.is_in_transaction():
+            raise RuntimeError("embedding job ensure requires an explicit transaction")
+        if not isinstance(profile, EmbeddingProfile):
+            raise TypeError("profile must be an EmbeddingProfile")
+        command = JobCreate(
+            job_type=JobType.DOCUMENT_EMBED,
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            document_id=document_id,
+            payload={
+                "document_id": str(document_id),
+                "document_version": document_version,
+                "provider": profile.provider,
+                "model": profile.model,
+                "dimensions": profile.dimensions,
+            },
+            idempotency_key=(
+                f"embed:{document_id}:{document_version}:"
+                f"{profile.provider}:{profile.model}:{profile.dimensions}"
+            ),
+        )
+        await self._validate_resources(conn, command, user_id)
+        await conn.fetchval(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"document.embed:{user_id}:{command.idempotency_key}",
+        )
+        existing_id = await conn.fetchval(
+            "SELECT id FROM background_jobs "
+            "WHERE user_id=$1 AND job_type='document.embed' AND idempotency_key=$2",
+            user_id,
+            command.idempotency_key,
+        )
+        if existing_id is not None:
+            existing = await repository.get_for_user(conn, existing_id, user_id)
+            if existing is None:
+                raise RuntimeError("authoritative document embedding job disappeared")
+            return existing, False
+        record = await self.create_in_transaction(
+            conn,
+            command,
+            authenticated_user_id=user_id,
+        )
+        return record, True
 
     async def ensure_document_extraction_in_transaction(
         self,

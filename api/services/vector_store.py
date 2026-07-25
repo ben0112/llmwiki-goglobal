@@ -95,92 +95,18 @@ class PostgresVectorStore:
             minimum=0,
             maximum=_POSTGRES_INTEGER_MAX,
         )
-        vectors = _document_vectors(embeddings, dimensions=self._profile.dimensions)
-
+        _document_vectors(embeddings, dimensions=self._profile.dimensions)
         failure = None
+        count = 0
         try:
             async with self._pool.acquire() as conn, conn.transaction():
-                current_version = await conn.fetchval(
-                    "SELECT version FROM documents "
-                    "WHERE id=$1 AND user_id=$2 AND knowledge_base_id=$3 "
-                    "AND NOT archived FOR UPDATE",
-                    document_uuid,
-                    user_uuid,
-                    kb_uuid,
-                )
-                if current_version is None:
-                    raise _VectorWriteRejected("document is not available in the requested tenant scope")
-                if current_version != version:
-                    raise _VectorWriteRejected("document_version must equal the current document version")
-
-                chunk_rows = await conn.fetch(
-                    "SELECT chunk_index FROM document_chunks "
-                    "WHERE document_id=$1 AND document_version=$2 "
-                    "AND user_id=$3 AND knowledge_base_id=$4 "
-                    "ORDER BY chunk_index FOR SHARE",
-                    document_uuid,
-                    version,
-                    user_uuid,
-                    kb_uuid,
-                )
-                expected = tuple(row["chunk_index"] for row in chunk_rows)
-                submitted = tuple(index for index, _vector in vectors)
-                if submitted != expected:
-                    raise _VectorWriteRejected("embeddings must match the complete current chunk set")
-
-                if vectors:
-                    await conn.executemany(
-                        "INSERT INTO chunk_embeddings "
-                        "(user_id, knowledge_base_id, document_id, document_version, "
-                        "chunk_index, provider, model, dimensions, embedding) "
-                        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector) "
-                        "ON CONFLICT (document_id, document_version, chunk_index, "
-                        "provider, model, dimensions) DO UPDATE SET "
-                        "embedding=EXCLUDED.embedding, updated_at=now()",
-                        [
-                            (
-                                user_uuid,
-                                kb_uuid,
-                                document_uuid,
-                                version,
-                                chunk_index,
-                                self._profile.provider,
-                                self._profile.model,
-                                self._profile.dimensions,
-                                vector,
-                            )
-                            for chunk_index, vector in vectors
-                        ],
-                    )
-
-                complete_count = await conn.fetchval(
-                    "SELECT count(*) FROM chunk_embeddings "
-                    "WHERE user_id=$1 AND knowledge_base_id=$2 AND document_id=$3 "
-                    "AND document_version=$4 AND provider=$5 AND model=$6 "
-                    "AND dimensions=$7",
-                    user_uuid,
-                    kb_uuid,
-                    document_uuid,
-                    version,
-                    self._profile.provider,
-                    self._profile.model,
-                    self._profile.dimensions,
-                )
-                if complete_count != len(expected):
-                    raise RetrieverUnavailable("vector store is unavailable")
-
-                await conn.execute(
-                    "DELETE FROM chunk_embeddings "
-                    "WHERE user_id=$1 AND knowledge_base_id=$2 AND document_id=$3 "
-                    "AND provider=$4 AND model=$5 AND dimensions=$6 "
-                    "AND document_version <> $7",
-                    user_uuid,
-                    kb_uuid,
-                    document_uuid,
-                    self._profile.provider,
-                    self._profile.model,
-                    self._profile.dimensions,
-                    version,
+                count = await self.replace_document_embeddings_in_transaction(
+                    conn,
+                    user_id=user_uuid,
+                    knowledge_base_id=kb_uuid,
+                    document_id=document_uuid,
+                    document_version=version,
+                    embeddings=embeddings,
                 )
         except (_VectorWriteRejected, RetrieverUnavailable):
             raise
@@ -194,6 +120,115 @@ class PostgresVectorStore:
             failure = caught
         if failure is not None:
             _raise_sanitized_boundary(failure, "vector store is unavailable")
+        return count
+
+    async def replace_document_embeddings_in_transaction(
+        self,
+        conn,
+        *,
+        user_id: str | UUID,
+        knowledge_base_id: str | UUID,
+        document_id: str | UUID,
+        document_version: int,
+        embeddings: Sequence[tuple[int, Sequence[Real]]],
+    ) -> int:
+        """Replace a complete set inside the caller's fenced transaction."""
+        is_in_transaction = getattr(conn, "is_in_transaction", None)
+        if callable(is_in_transaction) and not is_in_transaction():
+            raise RuntimeError("vector replacement requires an explicit transaction")
+        user_uuid = _uuid(user_id, label="user_id")
+        kb_uuid = _uuid(knowledge_base_id, label="knowledge_base_id")
+        document_uuid = _uuid(document_id, label="document_id")
+        version = _bounded_int(
+            document_version,
+            label="document_version",
+            minimum=0,
+            maximum=_POSTGRES_INTEGER_MAX,
+        )
+        vectors = _document_vectors(embeddings, dimensions=self._profile.dimensions)
+
+        current_version = await conn.fetchval(
+            "SELECT version FROM documents "
+            "WHERE id=$1 AND user_id=$2 AND knowledge_base_id=$3 "
+            "AND NOT archived FOR UPDATE",
+            document_uuid,
+            user_uuid,
+            kb_uuid,
+        )
+        if current_version is None:
+            raise _VectorWriteRejected("document is not available in the requested tenant scope")
+        if current_version != version:
+            raise _VectorWriteRejected("document_version must equal the current document version")
+
+        chunk_rows = await conn.fetch(
+            "SELECT chunk_index FROM document_chunks "
+            "WHERE document_id=$1 AND document_version=$2 "
+            "AND user_id=$3 AND knowledge_base_id=$4 "
+            "ORDER BY chunk_index FOR SHARE",
+            document_uuid,
+            version,
+            user_uuid,
+            kb_uuid,
+        )
+        expected = tuple(row["chunk_index"] for row in chunk_rows)
+        submitted = tuple(index for index, _vector in vectors)
+        if submitted != expected:
+            raise _VectorWriteRejected("embeddings must match the complete current chunk set")
+
+        if vectors:
+            await conn.executemany(
+                "INSERT INTO chunk_embeddings "
+                "(user_id, knowledge_base_id, document_id, document_version, "
+                "chunk_index, provider, model, dimensions, embedding) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector) "
+                "ON CONFLICT (document_id, document_version, chunk_index, "
+                "provider, model, dimensions) DO UPDATE SET "
+                "embedding=EXCLUDED.embedding, updated_at=now()",
+                [
+                    (
+                        user_uuid,
+                        kb_uuid,
+                        document_uuid,
+                        version,
+                        chunk_index,
+                        self._profile.provider,
+                        self._profile.model,
+                        self._profile.dimensions,
+                        vector,
+                    )
+                    for chunk_index, vector in vectors
+                ],
+            )
+
+        complete_count = await conn.fetchval(
+            "SELECT count(*) FROM chunk_embeddings "
+            "WHERE user_id=$1 AND knowledge_base_id=$2 AND document_id=$3 "
+            "AND document_version=$4 AND provider=$5 AND model=$6 "
+            "AND dimensions=$7",
+            user_uuid,
+            kb_uuid,
+            document_uuid,
+            version,
+            self._profile.provider,
+            self._profile.model,
+            self._profile.dimensions,
+        )
+        if complete_count != len(expected):
+            raise RetrieverUnavailable("vector store is unavailable")
+
+        await conn.execute(
+            "DELETE FROM chunk_embeddings "
+            "WHERE user_id=$1 AND knowledge_base_id=$2 AND document_id=$3 "
+            "AND provider=$4 AND model=$5 AND dimensions=$6 "
+            "AND document_version <> $7",
+            user_uuid,
+            kb_uuid,
+            document_uuid,
+            self._profile.provider,
+            self._profile.model,
+            self._profile.dimensions,
+            version,
+        )
         return len(vectors)
 
     async def search(

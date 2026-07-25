@@ -27,6 +27,7 @@ Jitter: TypeAlias = float | Callable[[float], float]
 
 class JobType(StrEnum):
     DOCUMENT_EXTRACT = "document.extract"
+    DOCUMENT_EMBED = "document.embed"
     GRAPH_REBUILD = "graph.rebuild"
     UPLOAD_CLEANUP = "upload.cleanup"
 
@@ -107,13 +108,15 @@ class JobCreate:
     user_id: UUID
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
-    payload: FrozenJSONMapping = field(default_factory=dict)
+    payload: FrozenJSONMapping = field(default_factory=dict, repr=False)
     idempotency_key: str | None = None
     max_attempts: int = 3
     run_after: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _freeze_mapping(self.payload))
+        if self.job_type is JobType.DOCUMENT_EMBED:
+            _validate_document_embed_command(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +129,7 @@ class JobRecord:
     state: JobState = JobState.QUEUED
     knowledge_base_id: UUID | None = None
     document_id: UUID | None = None
-    payload: FrozenJSONMapping = field(default_factory=dict)
+    payload: FrozenJSONMapping = field(default_factory=dict, repr=False)
     progress: FrozenJSONMapping | None = None
     result: FrozenJSONMapping | None = None
     idempotency_key: str | None = None
@@ -150,6 +153,37 @@ class JobRecord:
             object.__setattr__(self, "progress", _freeze_mapping(self.progress))
         if self.result is not None:
             object.__setattr__(self, "result", _freeze_mapping(self.result))
+
+
+_DOCUMENT_EMBED_PAYLOAD_KEYS = frozenset(
+    {"document_id", "document_version", "provider", "model", "dimensions"}
+)
+
+
+def _validate_document_embed_command(command: JobCreate) -> None:
+    if command.document_id is None or command.knowledge_base_id is None:
+        raise ValueError("document embedding command requires document tenant scope")
+    if set(command.payload) != _DOCUMENT_EMBED_PAYLOAD_KEYS:
+        raise ValueError("document embedding payload must contain exactly the public profile fields")
+    raw_document_id = command.payload.get("document_id")
+    try:
+        payload_document_id = UUID(raw_document_id) if isinstance(raw_document_id, str) else None
+    except ValueError:
+        payload_document_id = None
+    if payload_document_id != command.document_id or str(payload_document_id) != raw_document_id:
+        raise ValueError("document embedding payload contains an invalid document_id")
+    version = command.payload.get("document_version")
+    if type(version) is not int or not 1 <= version <= 2_147_483_647:
+        raise ValueError("document embedding version must be a positive PostgreSQL integer")
+    provider = command.payload.get("provider")
+    model = command.payload.get("model")
+    dimensions = command.payload.get("dimensions")
+    if not isinstance(provider, str) or not provider or provider.strip() != provider or len(provider) > 100:
+        raise ValueError("document embedding provider is invalid")
+    if not isinstance(model, str) or not model or model.strip() != model or len(model) > 200:
+        raise ValueError("document embedding model is invalid")
+    if type(dimensions) is not int or not 1 <= dimensions <= 4096:
+        raise ValueError("document embedding dimensions must be between 1 and 4096")
 
 
 def retry_delay_seconds(

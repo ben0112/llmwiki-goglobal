@@ -26,6 +26,7 @@ from jobs.models import (
 def test_job_type_values_are_stable():
     assert [item.value for item in JobType] == [
         "document.extract",
+        "document.embed",
         "graph.rebuild",
         "upload.cleanup",
     ]
