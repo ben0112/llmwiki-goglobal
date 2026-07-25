@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
-from math import ceil, isfinite, log2
+from math import ceil, isclose, isfinite, log2
 from numbers import Real
 from os import PathLike
 from pathlib import Path
@@ -20,6 +19,7 @@ MAX_LINE_BYTES = 256 * 1024
 MAX_CASES = 10_000
 MAX_RELEVANCE_PER_CASE = 10_000
 MAX_RANKING_LENGTH = 10_000
+PROMOTION_GATE_TOLERANCE = 1e-12
 
 _CASE_FIELDS = frozenset({"schema_version", "case_id", "query", "relevance"})
 _QUERY_FIELDS = frozenset(
@@ -489,16 +489,26 @@ def promotion_decision(
         raise ValueError("promotion inputs must be EvaluationReport values")
     if lexical.recall_at_10 <= 0:
         return PromotionDecision(False, "baseline_recall_zero")
-    recall_ratio_decimal = Decimal(str(hybrid.recall_at_10)) / Decimal(str(lexical.recall_at_10))
-    latency_ratio_decimal = Decimal(str(hybrid.latency_p95_ms)) / max(
-        Decimal(str(lexical.latency_p95_ms)), Decimal("0.001")
+    recall_ratio = hybrid.recall_at_10 / lexical.recall_at_10
+    latency_ratio = hybrid.latency_p95_ms / max(lexical.latency_p95_ms, 0.001)
+    quality_gate = recall_ratio >= 1.10 or isclose(
+        recall_ratio,
+        1.10,
+        rel_tol=PROMOTION_GATE_TOLERANCE,
+        abs_tol=PROMOTION_GATE_TOLERANCE,
     )
-    eligible = recall_ratio_decimal >= Decimal("1.10") and latency_ratio_decimal <= Decimal("2.0")
+    latency_gate = latency_ratio <= 2.0 or isclose(
+        latency_ratio,
+        2.0,
+        rel_tol=PROMOTION_GATE_TOLERANCE,
+        abs_tol=PROMOTION_GATE_TOLERANCE,
+    )
+    eligible = quality_gate and latency_gate
     return PromotionDecision(
         eligible=eligible,
         reason="eligible" if eligible else "gate_failed",
-        recall_ratio=float(recall_ratio_decimal),
-        latency_ratio=float(latency_ratio_decimal),
+        recall_ratio=recall_ratio,
+        latency_ratio=latency_ratio,
     )
 
 

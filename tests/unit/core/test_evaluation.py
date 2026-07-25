@@ -330,6 +330,20 @@ def test_promotion_gate_rejects_zero_baseline_recall():
     assert decision.latency_ratio is None
 
 
+def test_promotion_gate_accepts_exact_boundary_after_macro_average_rounding():
+    baseline = (1 + 3 / 7) / 2
+    hybrid = (1 + 4 / 7) / 2
+
+    decision = promotion_decision(
+        _report(recall_at_10=baseline, latency_p95_ms=1),
+        _report(recall_at_10=hybrid, latency_p95_ms=2),
+    )
+
+    assert hybrid / baseline == pytest.approx(1.10)
+    assert decision.eligible is True
+    assert decision.reason == "eligible"
+
+
 def test_public_evaluation_values_are_immutable():
     judgment = RelevanceJudgment("doc", 1)
     run = _run("case", ("doc", 0))
