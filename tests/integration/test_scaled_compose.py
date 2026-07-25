@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import time
+from io import BytesIO
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -22,6 +23,7 @@ import asyncpg
 import httpx
 import pytest
 import websockets
+from pypdf import PdfReader, PdfWriter
 
 ROOT = Path(__file__).parents[2]
 COMPOSE = ROOT / "deploy/docker-compose.selfhost.yml"
@@ -146,6 +148,15 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert 'recovered["attempt_count"] >= 2' in source
 
 
+def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
+    pdf = _mini_pdf()
+    assert len(pdf) > 5 * 1024 * 1024
+    assert pdf.rstrip().endswith(b"%%EOF")
+    reader = PdfReader(BytesIO(pdf))
+    assert len(reader.pages) == 1
+    assert "Scaled Compose Smoke" in reader.pages[0].extract_text()
+
+
 def _selfhost_env_value(name: str) -> str:
     try:
         lines = SELFHOST_ENV.read_text(encoding="utf-8").splitlines()
@@ -197,7 +208,14 @@ def _mini_pdf() -> bytes:
         len(objects) + 1,
         xref_at,
     )
-    return bytes(output)
+    # Put the multipart-sizing bytes inside a standards-compliant embedded
+    # stream. Appending bytes after %%EOF is tolerated by pypdf but rejected
+    # by the real OpenDataLoader/PDFBox converter exercised in scaled CI.
+    writer = PdfWriter(clone_from=BytesIO(bytes(output)))
+    writer.add_attachment("multipart-padding.bin", b"0" * (5 * 1024 * 1024))
+    padded = BytesIO()
+    writer.write(padded)
+    return padded.getvalue()
 
 
 def _metadata(**values: str) -> str:
@@ -340,7 +358,7 @@ async def test_two_api_two_worker_recovery_smoke():
                 return_exceptions=True,
             )
 
-        pdf = _mini_pdf() + b" " * (5 * 1024 * 1024)
+        pdf = _mini_pdf()
         tus_headers = {
             **auth_headers,
             "Tus-Resumable": "1.0.0",
