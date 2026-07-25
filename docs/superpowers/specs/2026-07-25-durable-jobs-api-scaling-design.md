@@ -127,9 +127,13 @@ are safe:
 
 1. A dispatcher selects due `queued` or `retry_wait` rows with
    `FOR UPDATE SKIP LOCKED`.
-2. It submits the database UUID as the ARQ `_job_id`, then records the dispatch
-   attempt. Rows remain eligible for periodic redelivery while they are not
-   terminal, so a crash between Redis and Postgres cannot strand work.
+2. It submits the database UUID as the `run_job` argument, while ARQ `_job_id`
+   combines that UUID with the canonical persisted `run_after` generation,
+   then records the dispatch attempt. Response loss within one generation is
+   deduplicated; a retry/reaper update creates a new transport ID that bypasses
+   any old ARQ in-progress key. Rows remain eligible for periodic redelivery
+   while they are not terminal, so a crash between Redis and Postgres cannot
+   strand work.
 3. ARQ workers receive only the UUID. They claim the row with a conditional
    update that checks state, `run_after`, cancellation, and lease expiry.
 4. Claiming sets `running`, increments `attempt_count`, and writes a finite
@@ -270,12 +274,12 @@ host port, removing the fixed-port conflict when `docker compose --scale
 api=N --scale worker=M` is used. API, MCP, worker, converter, and web replica
 counts remain independently configurable.
 
-Service readiness is role-specific: API requires Postgres, Redis, and the
-configured object store; worker requires Postgres, Redis, object store, and
-configured conversion dependencies. Liveness does not fail for a temporary
-downstream outage. Worker logs and metrics include job ID, attempt, lease
-owner, user ID, knowledge-base ID, and document ID without source content or
-credentials.
+Service readiness is role-specific and bounded: API requires Postgres, Redis,
+the configured object store, and a current Postgres LISTEN subscription;
+worker requires Postgres, Redis, object store, a non-empty converter secret,
+and converter reachability. Liveness does not fail for a temporary downstream
+outage. Worker logs and metrics include job ID, attempt, lease owner, user ID,
+knowledge-base ID, and document ID without source content or credentials.
 
 ## Security and tenancy
 
@@ -331,7 +335,8 @@ Postgres and Redis integration tests cover:
 
 - concurrent dispatchers using `SKIP LOCKED`;
 - duplicate delivery with a single successful database claim;
-- worker termination followed by lease expiry and recovery;
+- worker SIGKILL followed by lease expiry, a new delivery generation, and
+  recovery while the old ARQ in-progress key still exists;
 - Redis outage after the business transaction, followed by eventual dispatch;
 - tenant isolation for job reads, cancellation, and handler resources.
 
@@ -345,11 +350,12 @@ MinIO integration tests cover:
 - one pending document and one extraction job after repeated final PATCHes.
 
 Deployment verification builds all affected images and starts two API and two
-worker replicas behind Nginx. It exercises HTTP routing, WebSocket delivery,
-upload-to-ready processing, graph rebuild, worker crash recovery, and graceful
-shutdown. GitHub Actions adds Redis and MinIO services alongside the existing
-Postgres job, while keeping SQLite and Local suites independent of external
-services.
+worker replicas behind Nginx. It retains one WebSocket on each API and requires
+one NOTIFY to reach both, resumes TUS across identified API instances, and
+exercises upload-to-ready processing, graph rebuild, SIGKILL recovery, and
+graceful shutdown. GitHub Actions adds Redis and MinIO services alongside the
+existing Postgres job, while keeping SQLite and Local suites independent of
+external services.
 
 ## Acceptance criteria
 

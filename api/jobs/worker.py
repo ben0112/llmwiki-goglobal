@@ -48,6 +48,10 @@ _UNHANDLED_MESSAGE = "The job encountered an unexpected error."
 _INVALID_RESULT_CODE = "invalid_job_result"
 _INVALID_RESULT_MESSAGE = "The job produced an invalid result."
 _OWNED_RESOURCES_CTX_KEY = "_durable_worker_owned_resources"
+WORKER_STARTUP_TIMEOUT_SECONDS = 10.0
+WORKER_MAX_JOBS = 10
+WORKER_POOL_RESERVED_CONNECTIONS = 2
+WORKER_POOL_MAX_SIZE = WORKER_MAX_JOBS + WORKER_POOL_RESERVED_CONNECTIONS
 _WORKER_RUNTIME_CTX_KEYS = (
     "worker_context",
     "handlers",
@@ -61,7 +65,7 @@ _WORKER_RUNTIME_CTX_KEYS = (
 
 
 async def _create_pool(database_url: str) -> asyncpg.Pool:
-    return await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+    return await asyncpg.create_pool(database_url, min_size=2, max_size=WORKER_POOL_MAX_SIZE)
 
 
 def _create_s3_service() -> object:
@@ -115,6 +119,9 @@ def validate_worker_runtime(runtime_settings: object) -> None:
     database_url = getattr(runtime_settings, "DATABASE_URL", None)
     if not isinstance(database_url, str) or not database_url.strip():
         raise RuntimeError("ARQ durable worker requires DATABASE_URL")
+    converter_secret = getattr(runtime_settings, "CONVERTER_SECRET", None)
+    if not isinstance(converter_secret, str) or not converter_secret.strip():
+        raise RuntimeError("ARQ durable worker converter secret is required")
 
 
 async def startup(ctx: dict) -> None:
@@ -132,63 +139,66 @@ async def startup(ctx: dict) -> None:
 
     created_resources: dict[str, object | None] = {}
     try:
-        pool = await _create_pool(runtime_settings.DATABASE_URL)
-        created_resources["pool"] = pool
-        ctx["pool"] = pool
-        s3 = _create_s3_service() if _s3_is_configured(runtime_settings) else None
-        created_resources["s3"] = s3
-        ctx["s3"] = s3
-        tus_cleanup = None
-        if getattr(runtime_settings, "TUS_MULTIPART_ENABLED", False):
-            if s3 is None:
-                raise RuntimeError("multipart TUS cleanup worker requires S3")
-            from infra.quota import HostedQuotaService
-            from infra.tus import HostedTusCleanupService
-            from infra.tus_sessions import TusSessionStore
+        async with asyncio.timeout(WORKER_STARTUP_TIMEOUT_SECONDS):
+            pool = await _create_pool(runtime_settings.DATABASE_URL)
+            created_resources["pool"] = pool
+            ctx["pool"] = pool
+            s3 = _create_s3_service() if _s3_is_configured(runtime_settings) else None
+            created_resources["s3"] = s3
+            ctx["s3"] = s3
+            tus_cleanup = None
+            if getattr(runtime_settings, "TUS_MULTIPART_ENABLED", False):
+                if s3 is None:
+                    raise RuntimeError("multipart TUS cleanup worker requires S3")
+                from infra.quota import HostedQuotaService
+                from infra.tus import HostedTusCleanupService
+                from infra.tus_sessions import TusSessionStore
 
-            from jobs.service import JobService
+                from jobs.service import JobService
 
-            tus_cleanup = HostedTusCleanupService(
-                pool,
-                s3,
-                JobService(pool),
-                HostedQuotaService(pool, ctx["redis"]),
-                TusSessionStore(ctx["redis"]),
-                session_ttl_seconds=runtime_settings.TUS_SESSION_TTL_SECONDS,
-                stale_seconds=runtime_settings.TUS_STALE_SECONDS,
-                lock_seconds=runtime_settings.TUS_LOCK_SECONDS,
+                tus_cleanup = HostedTusCleanupService(
+                    pool,
+                    s3,
+                    JobService(pool),
+                    HostedQuotaService(pool, ctx["redis"]),
+                    TusSessionStore(ctx["redis"]),
+                    session_ttl_seconds=runtime_settings.TUS_SESSION_TTL_SECONDS,
+                    stale_seconds=runtime_settings.TUS_STALE_SECONDS,
+                    lock_seconds=runtime_settings.TUS_LOCK_SECONDS,
+                )
+            worker_context = WorkerContext(
+                pool=pool,
+                s3=s3,
+                converter_url=runtime_settings.CONVERTER_URL,
+                converter_secret=runtime_settings.CONVERTER_SECRET,
+                tus_cleanup=tus_cleanup,
             )
-        worker_context = WorkerContext(
-            pool=pool,
-            s3=s3,
-            converter_url=runtime_settings.CONVERTER_URL,
-            converter_secret=runtime_settings.CONVERTER_SECRET,
-            tus_cleanup=tus_cleanup,
-        )
-        ctx.update(
-            {
-                "worker_context": worker_context,
-                "handlers": HANDLERS,
-                "worker_id": _make_worker_id(),
-                "lease_seconds": runtime_settings.JOB_LEASE_SECONDS,
-                "heartbeat_seconds": runtime_settings.JOB_HEARTBEAT_SECONDS,
-                "dispatch_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
-                "reap_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
-                "redeliver_seconds": runtime_settings.JOB_REDELIVER_SECONDS,
-            }
-        )
-        await _check_worker_readiness(
-            pool=pool,
-            redis=ctx["redis"],
-            s3=s3,
-            converter_url=runtime_settings.CONVERTER_URL,
-        )
-        ctx[_OWNED_RESOURCES_CTX_KEY] = created_resources
-    except BaseException:
+            ctx.update(
+                {
+                    "worker_context": worker_context,
+                    "handlers": HANDLERS,
+                    "worker_id": _make_worker_id(),
+                    "lease_seconds": runtime_settings.JOB_LEASE_SECONDS,
+                    "heartbeat_seconds": runtime_settings.JOB_HEARTBEAT_SECONDS,
+                    "dispatch_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
+                    "reap_batch_size": runtime_settings.JOB_DISPATCH_BATCH_SIZE,
+                    "redeliver_seconds": runtime_settings.JOB_REDELIVER_SECONDS,
+                }
+            )
+            await _check_worker_readiness(
+                pool=pool,
+                redis=ctx["redis"],
+                s3=s3,
+                converter_url=runtime_settings.CONVERTER_URL,
+            )
+            ctx[_OWNED_RESOURCES_CTX_KEY] = created_resources
+    except BaseException as exc:
         try:
             await _close_worker_resources(ctx, owned_resources=created_resources)
         finally:
             _clear_worker_runtime_context(ctx)
+        if isinstance(exc, TimeoutError):
+            raise RuntimeError("worker dependency readiness timed out") from None
         raise
 
 
@@ -494,6 +504,7 @@ def build_worker_settings(runtime_settings: object) -> dict[str, object]:
         "retry_jobs": False,
         "keep_result": 0,
         "job_timeout": 3600,
+        "max_jobs": WORKER_MAX_JOBS,
         "on_startup": startup,
         "on_shutdown": shutdown,
         "redis_settings": RedisSettings.from_dsn(redis_url),
@@ -535,7 +546,7 @@ class WorkerSettings:
 
     functions = [run_job]
     cron_jobs = _build_cron_jobs()
-    max_jobs = 10
+    max_jobs = WORKER_MAX_JOBS
     max_tries = 1
     retry_jobs = False
     keep_result = 0

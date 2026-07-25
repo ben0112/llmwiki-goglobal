@@ -1,9 +1,11 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+READINESS_TIMEOUT_SECONDS = 5.0
 
 
 @router.get("/health")
@@ -20,26 +22,32 @@ async def ready(request: Request):
     """
     state = request.app.state
     try:
-        if getattr(state, "mode", None) == "local":
-            cursor = await state.sqlite_db.execute("SELECT 1")
-            await cursor.fetchone()
-        else:
-            pool = getattr(state, "pool", None)
-            if pool is None:
-                raise RuntimeError("postgres is not initialized")
-            await pool.fetchval("SELECT 1")
+        async with asyncio.timeout(READINESS_TIMEOUT_SECONDS):
+            if getattr(state, "mode", None) == "local":
+                cursor = await state.sqlite_db.execute("SELECT 1")
+                await cursor.fetchone()
+            else:
+                pool = getattr(state, "pool", None)
+                if pool is None:
+                    raise RuntimeError("postgres is not initialized")
+                await pool.fetchval("SELECT 1")
 
-            if getattr(state, "readiness_requires_redis", False):
-                redis = getattr(state, "redis", None)
-                if redis is None:
-                    raise RuntimeError("redis is not initialized")
-                await redis.ping()
+                if getattr(state, "readiness_requires_redis", False):
+                    redis = getattr(state, "redis", None)
+                    if redis is None:
+                        raise RuntimeError("redis is not initialized")
+                    await redis.ping()
 
-            if getattr(state, "readiness_requires_s3", False):
-                s3_service = getattr(state, "s3_service", None)
-                if s3_service is None:
-                    raise RuntimeError("s3 is not initialized")
-                await s3_service.head_bucket()
+                if getattr(state, "readiness_requires_s3", False):
+                    s3_service = getattr(state, "s3_service", None)
+                    if s3_service is None:
+                        raise RuntimeError("s3 is not initialized")
+                    await s3_service.head_bucket()
+
+                if getattr(state, "readiness_requires_listener", False):
+                    listener_ready = getattr(state, "listener_ready", None)
+                    if listener_ready is None or not listener_ready.is_set():
+                        raise RuntimeError("postgres listener is not ready")
     except Exception as exc:  # noqa: BLE001 - dependency clients expose unrelated error types.
         logger.warning("readiness check failed error_type=%s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="not ready") from None

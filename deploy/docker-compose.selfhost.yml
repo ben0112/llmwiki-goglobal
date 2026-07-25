@@ -16,7 +16,7 @@ name: llmwiki-selfhost
 
 services:
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4.2-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data

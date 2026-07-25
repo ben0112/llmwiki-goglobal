@@ -546,8 +546,16 @@ async def test_hosted_lifespan_closes_quota_redis_and_pool_when_app_body_fails(m
 
     pool = Pool()
     redis = Redis()
-    listener = asyncio.create_task(idle())
+    listener_task = asyncio.create_task(idle())
     cleanup = asyncio.create_task(idle())
+
+    class Listener:
+        async def close(self):
+            listener_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await listener_task
+
+    listener = Listener()
 
     async def no_op():
         return None
@@ -573,7 +581,7 @@ async def test_hosted_lifespan_closes_quota_redis_and_pool_when_app_body_fails(m
 
     assert redis.closes == 1
     assert pool.closes == 1
-    assert listener.cancelled()
+    assert listener_task.cancelled()
     assert cleanup.cancelled()
 
 

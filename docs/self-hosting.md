@@ -136,7 +136,9 @@ Restarting `gateway` after every replica-count change drops cached upstream
 connections and makes the new Docker DNS task set effective immediately.
 Each worker accepts up to 10 concurrent ARQ jobs; prefer adding worker
 replicas before increasing per-process concurrency because PDF and Office
-extraction can consume substantial memory.
+extraction can consume substantial memory. Its Postgres pool has 12
+connections, reserving two beyond handler concurrency for lease heartbeats
+and dispatcher/reaper cron scans.
 
 ## 5. Reverse proxy
 
@@ -191,7 +193,8 @@ term from the PDF (exercises PGroonga) → connect an MCP agent and run the
   (`mc mirror`), and preserve the `redis-data` volume. Postgres is the job and
   business source of truth; S3 holds source/derived objects; Redis AOF holds
   dispatch hints and active multipart coordination state.
-- **Redis AOF**: Compose pins `appendonly yes` and `appendfsync everysec`.
+- **Redis AOF**: Compose pins Redis 7.4.2 with `appendonly yes` and
+  `appendfsync everysec`.
   Before a backup, run `docker compose -f deploy/docker-compose.selfhost.yml
   --env-file deploy/.env.selfhost exec redis redis-cli BGREWRITEAOF`, wait for
   `aof_rewrite_in_progress:0`, then snapshot the `redis-data` volume together
@@ -201,11 +204,16 @@ term from the PDF (exercises PGroonga) → connect an MCP agent and run the
   absent; Postgres dispatch/reaper scans reconstruct durable work.
 - **Role readiness**: `/health` is process liveness and deliberately ignores
   temporary dependency failures. Hosted API `/ready` checks `SELECT 1`, Redis
-  `PING`, and S3 `head_bucket` without returning raw exception text. Local
-  `/ready` checks SQLite only. Workers have no HTTP port: startup performs the
-  same three checks plus converter `/health` and accepts no jobs until all
-  pass. A later dependency loss follows the normal Postgres retry/failure
-  classifier; the job is never acknowledged as a success.
+  `PING`, S3 `head_bucket`, and the current Postgres LISTEN subscription under
+  a bounded timeout without returning raw exception text. Local `/ready`
+  checks SQLite only. Workers have no HTTP port: startup requires a non-empty
+  `CONVERTER_SECRET`, then performs the same three dependency checks plus the
+  converter's anonymous `/health` under one bounded startup timeout and accepts
+  no jobs until all pass. The preflight does not send `CONVERTER_SECRET` and
+  cannot detect a converter-secret mismatch because the
+  converter exposes no separate auth-safe validation endpoint; authenticated
+  job calls still carry the secret and fail through the normal classifier. A
+  later dependency loss likewise never acknowledges the job as a success.
 - **Recovery behaviors**: every API replica has a supervised Postgres LISTEN
   task that reconnects with backoff. Workers reap expired leases so another
   replica safely retries interrupted work.

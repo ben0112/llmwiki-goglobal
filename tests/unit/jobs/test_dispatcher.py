@@ -132,9 +132,23 @@ async def test_select_due_jobs_returns_generation_tokens_with_ordered_skip_locke
     assert "limit $2" in normalized
 
 
+def test_delivery_transport_id_is_stable_within_generation_and_changes_for_retry():
+    from jobs.dispatcher import DispatchCandidate, delivery_transport_id
+
+    job_id = uuid4()
+    same_in_utc = DISPATCH_RUN_AFTER.astimezone(UTC)
+    retry_run_after = DISPATCH_RUN_AFTER + timedelta(seconds=1)
+
+    first = delivery_transport_id(DispatchCandidate(job_id, DISPATCH_RUN_AFTER))
+
+    assert first == delivery_transport_id(DispatchCandidate(job_id, same_in_utc))
+    assert first != delivery_transport_id(DispatchCandidate(job_id, retry_run_after))
+    assert first.startswith(f"{job_id}:")
+
+
 @pytest.mark.asyncio
 async def test_dispatch_sends_only_opaque_uuid_and_marks_new_and_duplicate_delivery():
-    from jobs.dispatcher import DispatchSummary, dispatch_due_jobs
+    from jobs.dispatcher import DispatchCandidate, DispatchSummary, delivery_transport_id, dispatch_due_jobs
 
     job_ids = [uuid4(), uuid4()]
     pool = FakePool(job_ids)
@@ -151,8 +165,14 @@ async def test_dispatch_sends_only_opaque_uuid_and_marks_new_and_duplicate_deliv
         mark_failed=0,
     )
     assert redis.calls == [
-        (("run_job", str(job_ids[0])), {"_job_id": str(job_ids[0])}),
-        (("run_job", str(job_ids[1])), {"_job_id": str(job_ids[1])}),
+        (
+            ("run_job", str(job_ids[0])),
+            {"_job_id": delivery_transport_id(DispatchCandidate(job_ids[0], DISPATCH_RUN_AFTER))},
+        ),
+        (
+            ("run_job", str(job_ids[1])),
+            {"_job_id": delivery_transport_id(DispatchCandidate(job_ids[1], DISPATCH_RUN_AFTER))},
+        ),
     ]
     assert [(call[1], call[2]) for call in pool.connection.fetchval_calls] == [
         (job_id, DISPATCH_RUN_AFTER) for job_id in job_ids
@@ -295,6 +315,8 @@ def test_worker_settings_disable_arq_retry_and_results_with_unique_safe_crons():
     assert built["retry_jobs"] is False
     assert built["keep_result"] == 0
     assert built["job_timeout"] == 3600
+    assert built["max_jobs"] == worker.WORKER_MAX_JOBS
+    assert worker.WorkerSettings.max_jobs == worker.WORKER_MAX_JOBS
     assert built["on_startup"] is worker.startup
     assert built["on_shutdown"] is worker.shutdown
     assert len(built["cron_jobs"]) == 3
@@ -319,6 +341,42 @@ def test_worker_settings_disable_arq_retry_and_results_with_unique_safe_crons():
         assert job.unique is True
         assert job.max_tries == 1
         assert job.keep_result_s == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_reserves_connections_beyond_handler_concurrency(monkeypatch):
+    from jobs import worker
+
+    captured = {}
+
+    async def create_pool(database_url, *, min_size, max_size):
+        captured.update(database_url=database_url, min_size=min_size, max_size=max_size)
+        return object()
+
+    monkeypatch.setattr(worker.asyncpg, "create_pool", create_pool)
+
+    await worker._create_pool("postgresql://worker.test/jobs")
+
+    assert captured == {
+        "database_url": "postgresql://worker.test/jobs",
+        "min_size": 2,
+        "max_size": worker.WORKER_MAX_JOBS + worker.WORKER_POOL_RESERVED_CONNECTIONS,
+    }
+    assert worker.WORKER_POOL_RESERVED_CONNECTIONS >= 2
+
+    capacity = asyncio.Semaphore(captured["max_size"])
+    handlers = []
+    for _ in range(worker.WORKER_MAX_JOBS):
+        await capacity.acquire()
+        handlers.append(object())
+    try:
+        async with asyncio.timeout(0.1):
+            await capacity.acquire()  # heartbeat
+            await capacity.acquire()  # dispatcher/reaper cron
+        assert capacity.locked()
+    finally:
+        for _ in range(len(handlers) + 2):
+            capacity.release()
 
 
 class CronRecordingRedis:

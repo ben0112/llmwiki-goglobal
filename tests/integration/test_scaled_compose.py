@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -38,7 +39,8 @@ def _service_block(text: str, service: str) -> str:
 
 def test_scaled_compose_declares_private_replicas_and_gateway():
     text = COMPOSE.read_text(encoding="utf-8")
-    assert "redis:7.4-alpine" in text
+    assert "redis:7.4.2-alpine" in text
+    assert "Redis 7.4.2" in DOCS.read_text(encoding="utf-8")
     assert '["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]' in text
     assert "redis-data:/data" in text
     assert 'command: ["arq", "jobs.worker.WorkerSettings"]' in text
@@ -90,6 +92,9 @@ def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
     assert "trap cleanup EXIT" in text
     assert "SCALED_COMPOSE_TEST=1" in text
     assert "safely reads `deploy/.env.selfhost`" in text
+    assert "does not send `CONVERTER_SECRET`" in text
+    assert "cannot detect a converter-secret mismatch" in text
+    assert "current Postgres LISTEN subscription" in text
     scaling = text.split("## Scaling verification", 1)[1]
     assert "```bash\n(\n  set -e" in scaling
     assert "trap cleanup EXIT" in scaling
@@ -123,6 +128,21 @@ def test_exported_rollback_flags_override_env_file_for_api_and_worker():
     for service in ("api", "worker"):
         assert rendered["services"][service]["environment"]["DURABLE_JOBS_ENABLED"] == "false"
         assert rendered["services"][service]["environment"]["TUS_MULTIPART_ENABLED"] == "false"
+
+
+def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
+    source = inspect.getsource(test_two_api_two_worker_recovery_smoke)
+    assert 'subprocess.run(["docker", "kill", "--signal", "KILL"' in source
+    assert "websocket.response.headers" in source
+    assert "len(websockets_by_instance) == 2" in source
+    assert "tus_instances" in source
+    assert "first_patch_instance" in source
+    assert "resume_instance != first_patch_instance" in source
+    assert "await asyncio.sleep(0.2)" not in source
+    assert "lock_connection = None" in source
+    assert '"--scale", "worker=2", "worker"' in source
+    assert "timeout=240" in source
+    assert 'recovered["attempt_count"] >= 2' in source
 
 
 def _selfhost_env_value(name: str) -> str:
@@ -243,6 +263,7 @@ async def test_two_api_two_worker_recovery_smoke():
     kb_id = uuid4()
     filename = f"scaled-{uuid4()}.pdf"
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=3)
+    killed_worker = False
 
     try:
         await pool.execute(
@@ -266,21 +287,57 @@ async def test_two_api_two_worker_recovery_smoke():
         assert len(instance_ids) == 2
 
         websocket_url = api_url.replace("http://", "ws://").replace("https://", "wss://")
-        async with websockets.connect(f"{websocket_url}/v1/ws/documents/{kb_id}") as websocket:
-            await websocket.send(token)
-            event_id = str(uuid4())
-            payload = json.dumps(
-                {
-                    "event": "scaled-smoke",
-                    "id": event_id,
-                    "user_id": str(user_id),
-                    "knowledge_base_id": str(kb_id),
-                }
+        websockets_by_instance = {}
+        try:
+            for _ in range(80):
+                websocket = await websockets.connect(f"{websocket_url}/v1/ws/documents/{kb_id}")
+                await websocket.send(token)
+                instance_id = websocket.response.headers.get("x-api-instance-id")
+                assert instance_id, "STAGE=test must identify each WebSocket handshake"
+                if instance_id in websockets_by_instance:
+                    await websocket.close()
+                    continue
+                websockets_by_instance[instance_id] = websocket
+                if len(websockets_by_instance) == 2:
+                    break
+            assert len(websockets_by_instance) == 2, (
+                "gateway did not route retained WebSockets to two API instances; "
+                f"observed={sorted(websockets_by_instance)}"
             )
-            await asyncio.sleep(0.2)
-            await pool.execute("SELECT pg_notify('document_changes', $1)", payload)
-            notification = json.loads(await asyncio.wait_for(websocket.recv(), timeout=15))
-            assert notification == {"event": "scaled-smoke", "id": event_id}
+
+            notifications = None
+            for _ in range(10):
+                event_id = str(uuid4())
+                payload = json.dumps(
+                    {
+                        "event": "scaled-smoke",
+                        "id": event_id,
+                        "user_id": str(user_id),
+                        "knowledge_base_id": str(kb_id),
+                    }
+                )
+                await pool.execute("SELECT pg_notify('document_changes', $1)", payload)
+                try:
+                    messages = await asyncio.wait_for(
+                        asyncio.gather(*(websocket.recv() for websocket in websockets_by_instance.values())),
+                        timeout=3,
+                    )
+                except TimeoutError:
+                    continue
+                decoded = [json.loads(message) for message in messages]
+                expected = {"event": "scaled-smoke", "id": event_id}
+                if all(notification == expected for notification in decoded):
+                    notifications = decoded
+                    break
+            assert notifications is not None, (
+                "two retained API WebSockets did not receive the same PostgreSQL NOTIFY; "
+                f"instances={sorted(websockets_by_instance)}"
+            )
+        finally:
+            await asyncio.gather(
+                *(websocket.close() for websocket in websockets_by_instance.values()),
+                return_exceptions=True,
+            )
 
         pdf = _mini_pdf() + b" " * (5 * 1024 * 1024)
         tus_headers = {
@@ -289,9 +346,13 @@ async def test_two_api_two_worker_recovery_smoke():
             "Upload-Length": str(len(pdf)),
             "Upload-Metadata": _metadata(filename=filename, knowledge_base_id=str(kb_id), path="/"),
         }
+        tus_instances = []
         async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=90) as client:
             created = await client.post("/v1/uploads", headers=tus_headers)
             created.raise_for_status()
+            created_instance = created.headers.get("x-api-instance-id")
+            assert created_instance, "TUS create response omitted API instance identity"
+            tus_instances.append(("create", created_instance))
             location = created.headers["location"]
             first = pdf[: 5 * 1024 * 1024]
             patched = await client.patch(
@@ -304,11 +365,30 @@ async def test_two_api_two_worker_recovery_smoke():
                 content=first,
             )
             patched.raise_for_status()
+            first_patch_instance = patched.headers.get("x-api-instance-id")
+            assert first_patch_instance, "first TUS PATCH response omitted API instance identity"
+            tus_instances.append(("patch-0", first_patch_instance))
+
+        resume_instance = None
+        for attempt in range(80):
+            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=90) as client:
+                resumed = await client.head(
+                    location,
+                    headers={"Tus-Resumable": "1.0.0", "Connection": "close"},
+                )
+            resumed.raise_for_status()
+            head_instance = resumed.headers.get("x-api-instance-id")
+            assert head_instance, f"TUS HEAD attempt {attempt} omitted API instance identity"
+            tus_instances.append((f"head-{attempt}", head_instance))
+            if head_instance != first_patch_instance:
+                resume_instance = head_instance
+                assert int(resumed.headers["upload-offset"]) == len(first)
+                break
+        assert resume_instance != first_patch_instance, (
+            f"gateway did not route TUS resume HEAD across API replicas; responses={tus_instances}"
+        )
 
         async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=90) as client:
-            resumed = await client.head(location, headers={"Tus-Resumable": "1.0.0"})
-            resumed.raise_for_status()
-            assert int(resumed.headers["upload-offset"]) == len(first)
             completed = await client.patch(
                 location,
                 headers={
@@ -319,6 +399,10 @@ async def test_two_api_two_worker_recovery_smoke():
                 content=pdf[len(first) :],
             )
             completed.raise_for_status()
+            completed_instance = completed.headers.get("x-api-instance-id")
+            assert completed_instance, "final TUS PATCH response omitted API instance identity"
+            tus_instances.append(("patch-final", completed_instance))
+            assert len({instance_id for _operation, instance_id in tus_instances}) >= 2
             document_id = completed.headers["x-document-id"]
             extraction_job_id = completed.headers["x-job-id"]
             await _wait_for_job(client, extraction_job_id)
@@ -327,11 +411,15 @@ async def test_two_api_two_worker_recovery_smoke():
             graph.raise_for_status()
             await _wait_for_job(client, graph.json()["job_id"])
 
-        lock_connection = await pool.acquire()
-        transaction = lock_connection.transaction()
-        await transaction.start()
-        await lock_connection.execute("LOCK TABLE document_references IN ACCESS EXCLUSIVE MODE")
+        lock_connection = None
+        transaction = None
+        transaction_started = False
         try:
+            lock_connection = await pool.acquire()
+            transaction = lock_connection.transaction()
+            await transaction.start()
+            transaction_started = True
+            await lock_connection.execute("LOCK TABLE document_references IN ACCESS EXCLUSIVE MODE")
             async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
                 leased = await client.post(f"/v1/knowledge-bases/{kb_id}/graph/rebuild")
                 leased.raise_for_status()
@@ -349,14 +437,23 @@ async def test_two_api_two_worker_recovery_smoke():
                     await asyncio.sleep(0.5)
                 assert owner, "test graph job was not leased by either worker"
                 container_id = _worker_container_for_owner(owner)
-                subprocess.run(["docker", "stop", "--time", "1", container_id], check=True)
+                kill_started = time.monotonic()
+                subprocess.run(["docker", "kill", "--signal", "KILL", container_id], check=True)
+                killed_worker = True
         finally:
-            await transaction.rollback()
-            await pool.release(lock_connection)
+            try:
+                if transaction_started:
+                    await transaction.rollback()
+            finally:
+                if lock_connection is not None:
+                    await pool.release(lock_connection)
+
+        _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker")
 
         async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
-            recovered = await _wait_for_job(client, str(leased_job_id), timeout=300)
+            recovered = await _wait_for_job(client, str(leased_job_id), timeout=240)
             assert recovered["attempt_count"] >= 2
+            assert time.monotonic() - kill_started < 240
 
         duplicate_counts = await pool.fetchrow(
             "SELECT "
@@ -375,5 +472,9 @@ async def test_two_api_two_worker_recovery_smoke():
         assert duplicate_counts["chunks"] == duplicate_counts["unique_chunks"]
         assert duplicate_counts["refs"] == duplicate_counts["unique_refs"]
     finally:
-        await pool.execute("DELETE FROM knowledge_bases WHERE id = $1", kb_id)
-        await pool.close()
+        try:
+            if killed_worker:
+                _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker", check=False)
+        finally:
+            await pool.execute("DELETE FROM knowledge_bases WHERE id = $1", kb_id)
+            await pool.close()

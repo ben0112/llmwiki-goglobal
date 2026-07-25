@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 import asyncpg
@@ -24,6 +24,14 @@ class DispatchCandidate:
 
     job_id: UUID
     run_after: datetime
+
+
+def delivery_transport_id(candidate: DispatchCandidate) -> str:
+    """Return the stable ARQ dedupe key for one persisted delivery generation."""
+    if candidate.run_after.tzinfo is None or candidate.run_after.utcoffset() is None:
+        raise ValueError("run_after must be timezone-aware")
+    generation = candidate.run_after.astimezone(UTC).isoformat(timespec="microseconds")
+    return f"{candidate.job_id}:{generation}"
 
 
 _SELECT_DUE_JOB_IDS = """
@@ -133,7 +141,7 @@ async def dispatch_due_jobs(
             arq_job = await arq_redis.enqueue_job(
                 "run_job",
                 str(job_id),
-                _job_id=str(job_id),
+                _job_id=delivery_transport_id(candidate),
             )
         except Exception as exc:  # noqa: BLE001 - one transport failure must not abort the batch.
             enqueue_failed += 1

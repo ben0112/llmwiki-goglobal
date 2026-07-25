@@ -31,7 +31,10 @@ class ReplicaIdentityMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         async def send_with_identity(message):
-            if self.instance_id is not None and message["type"] == "http.response.start":
+            if self.instance_id is not None and message["type"] in {
+                "http.response.start",
+                "websocket.accept",
+            }:
                 headers = list(message.get("headers", []))
                 headers.append((b"x-api-instance-id", self.instance_id.encode("ascii")))
                 message = {**message, "headers": headers}
@@ -44,6 +47,8 @@ from config import settings  # noqa: E402 - middleware must be defined before ap
 from infra.tasks import spawn_logged  # noqa: E402 - middleware must be defined before app imports.
 
 logger = logging.getLogger(__name__)
+
+HOSTED_LISTENER_STARTUP_TIMEOUT_SECONDS = 10.0
 
 if settings.SENTRY_DSN:
     import sentry_sdk
@@ -153,6 +158,23 @@ async def _start_hosted_quota_runtime(pool, redis_url: str):
     return redis, HostedQuotaService(pool, redis)
 
 
+async def _start_hosted_listener(app: FastAPI):
+    """Start LISTEN supervision and wait for the first active subscription."""
+    from routes.ws import setup_listener
+
+    listener = await setup_listener(settings.listen_database_url)
+    app.state.listener_ready = listener.ready
+    try:
+        await listener.wait_ready(timeout_seconds=HOSTED_LISTENER_STARTUP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        await listener.close()
+        raise RuntimeError("listener subscription timed out") from None
+    except BaseException:
+        await listener.close()
+        raise
+    return listener
+
+
 async def _finish_hosted_startup(app: FastAPI, pool):
     """Build Hosted services and background tasks after core infra is ready."""
     await _repair_hosted_derived_drift(pool)
@@ -204,9 +226,7 @@ async def _finish_hosted_startup(app: FastAPI, pool):
             max_patch_bytes=settings.TUS_MAX_PATCH_BYTES,
         )
 
-    from routes.ws import setup_listener
-
-    listener_task = await setup_listener(settings.listen_database_url)
+    listener = await _start_hosted_listener(app)
     cleanup_task = None
     try:
         if not settings.TUS_MULTIPART_ENABLED:
@@ -214,11 +234,9 @@ async def _finish_hosted_startup(app: FastAPI, pool):
 
             cleanup_task = asyncio.create_task(cleanup_stale_uploads())
     except BaseException:
-        listener_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await listener_task
+        await listener.close()
         raise
-    return listener_task, cleanup_task
+    return listener, cleanup_task
 
 
 @asynccontextmanager
@@ -245,6 +263,7 @@ async def lifespan(app: FastAPI):
     app.state.readiness_requires_s3 = bool(
         settings.TUS_MULTIPART_ENABLED or (settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET)
     )
+    app.state.readiness_requires_listener = True
 
     app.state.job_service = None
     app.state.quota_service = None
@@ -265,7 +284,7 @@ async def lifespan(app: FastAPI):
             raise
 
     try:
-        listener_task, cleanup_task = await _finish_hosted_startup(app, pool)
+        listener, cleanup_task = await _finish_hosted_startup(app, pool)
     except BaseException:
         try:
             if quota_redis is not None:
@@ -280,8 +299,7 @@ async def lifespan(app: FastAPI):
         # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
         if cleanup_task is not None:
             cleanup_task.cancel()
-        listener_task.cancel()
-        for task in (cleanup_task, listener_task):
+        for task in (cleanup_task,):
             if task is None:
                 continue
             try:
@@ -290,6 +308,7 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception as exc:  # noqa: BLE001 - continue closing shared infrastructure.
                 logger.error("Hosted shutdown task failed error_type=%s", type(exc).__name__)
+        await listener.close()
         try:
             if quota_redis is not None:
                 await quota_redis.aclose()
@@ -341,6 +360,8 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.redis = None
     app.state.readiness_requires_redis = False
     app.state.readiness_requires_s3 = False
+    app.state.readiness_requires_listener = False
+    app.state.listener_ready = None
     app.state.tus_service = None
     app.state.tus_session_store = None
     app.state.auth_provider = auth_provider

@@ -8,7 +8,13 @@ from uuid import UUID, uuid4
 
 import pytest
 from jobs import repository
-from jobs.dispatcher import dispatch_due_jobs, mark_dispatched, select_due_jobs
+from jobs.dispatcher import (
+    DispatchCandidate,
+    delivery_transport_id,
+    dispatch_due_jobs,
+    mark_dispatched,
+    select_due_jobs,
+)
 from jobs.handlers import TerminalJobError, WorkerContext
 from jobs.models import JobState, JobType
 
@@ -265,7 +271,10 @@ async def test_concurrent_dispatchers_release_database_then_arq_collapses_duplic
     assert sum(summary.enqueued for summary in summaries) == 1
     assert sum(summary.already_present for summary in summaries) == 1
     assert sum(summary.marked for summary in summaries) == 2
-    expected = (("run_job", str(job["id"])), {"_job_id": str(job["id"])})
+    expected = (
+        ("run_job", str(job["id"])),
+        {"_job_id": delivery_transport_id(DispatchCandidate(job["id"], job["run_after"]))},
+    )
     assert redis.calls == [expected, expected]
     assert len(redis._seen) == 1
     assert await pool.fetchval("SELECT dispatch_attempts FROM background_jobs WHERE id = $1", job["id"]) == 2
@@ -284,7 +293,7 @@ async def test_stale_delivery_mark_cannot_throttle_a_due_retry_generation(pool):
 
         async def enqueue_job(self, function, job_id_text, **kwargs):
             assert (function, job_id_text) == ("run_job", str(job["id"]))
-            assert kwargs == {"_job_id": str(job["id"])}
+            assert kwargs == {"_job_id": delivery_transport_id(DispatchCandidate(job["id"], job["run_after"]))}
             async with pool.acquire() as conn, conn.transaction():
                 claimed = await repository.claim(conn, job["id"], "race-worker", 30)
                 assert claimed is not None
@@ -330,6 +339,80 @@ async def test_stale_delivery_mark_cannot_throttle_a_due_retry_generation(pool):
     assert row["last_dispatched_at"] is None
     assert row["dispatch_attempts"] == 0
     assert job["id"] in await _select(pool, redeliver_seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_reaper_generation_bypasses_old_arq_in_progress_key_without_double_execution(pool):
+    from jobs import worker
+
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(pool, user_id, run_after=OLD)
+
+    class PersistentInProgressRedis:
+        def __init__(self):
+            self.calls = []
+            self.seen = set()
+
+        async def enqueue_job(self, function, job_id_text, **kwargs):
+            transport_id = kwargs["_job_id"]
+            self.calls.append((function, job_id_text, transport_id))
+            if transport_id in self.seen:
+                return None
+            self.seen.add(transport_id)
+            return object()
+
+    redis = PersistentInProgressRedis()
+    first_summary = await dispatch_due_jobs(pool, redis, batch_size=1, redeliver_seconds=30)
+    duplicate_summary = await dispatch_due_jobs(pool, redis, batch_size=1, redeliver_seconds=0 + 1)
+    first_transport_id = redis.calls[0][2]
+
+    assert first_summary.enqueued == 1
+    assert duplicate_summary.selected == 0
+
+    async with pool.acquire() as conn, conn.transaction():
+        claimed = await repository.claim(conn, job["id"], "killed-worker", 30)
+        assert claimed is not None
+        await conn.execute(
+            "UPDATE background_jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+            job["id"],
+        )
+        assert await repository.reap_expired(conn, limit=1) == [job["id"]]
+
+    retry_row = await pool.fetchrow(
+        "SELECT state, run_after, attempt_count FROM background_jobs WHERE id = $1",
+        job["id"],
+    )
+    retry_summary = await dispatch_due_jobs(pool, redis, batch_size=1, redeliver_seconds=30)
+    retry_transport_id = redis.calls[-1][2]
+
+    assert retry_row["state"] == "retry_wait"
+    assert retry_row["attempt_count"] == 1
+    assert retry_transport_id != first_transport_id
+    assert first_transport_id in redis.seen
+    assert retry_summary.enqueued == 1
+
+    handled = []
+
+    async def handler(record, lease, context):
+        handled.append(record.attempt_count)
+        return {"completed": True}
+
+    ctx = {
+        "pool": pool,
+        "worker_id": "replacement-worker",
+        "lease_seconds": 30,
+        "heartbeat_seconds": 10,
+        "worker_context": WorkerContext(pool=pool, s3=None, converter_url="", converter_secret=""),
+        "handlers": {JobType.DOCUMENT_EXTRACT: handler},
+    }
+    recovered = await worker.run_job(ctx, str(job["id"]))
+    duplicate = await worker.run_job(ctx, str(job["id"]))
+
+    assert recovered == {"status": "succeeded", "job_id": str(job["id"])}
+    assert duplicate == {"status": "duplicate", "job_id": str(job["id"])}
+    assert handled == [2]
+    assert await pool.fetchval("SELECT attempt_count FROM background_jobs WHERE id = $1", job["id"]) == 2
 
 
 @pytest.mark.asyncio
