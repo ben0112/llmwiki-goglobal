@@ -647,7 +647,7 @@ async def test_url_ingest_commit_failure_with_release_failure_still_resolves_ori
     async def fail_commit(transaction):
         if commit_outcome == "committed":
             await transaction.commit()
-        raise RuntimeError("commit result lost")
+        raise TimeoutError("commit result lost")
 
     monkeypatch.setattr(service, "_commit_transaction", fail_commit)
     if commit_outcome == "unknown":
@@ -657,7 +657,7 @@ async def test_url_ingest_commit_failure_with_release_failure_still_resolves_ori
 
         monkeypatch.setattr(service, "_confirm_document_job_committed", unknown_result)
 
-    with pytest.raises(RuntimeError, match="commit result lost"):
+    with pytest.raises(TimeoutError, match="commit result lost"):
         await service.ingest_pdf(
             str(user_id),
             str(kb_id),

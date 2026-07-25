@@ -382,6 +382,39 @@ class _BlockingAdmissionRedis(_AdmissionOutcomeRedis):
         return await super().eval(script, numkeys, *args)
 
 
+class _NeverRespondingAdmissionRedis(_AdmissionOutcomeRedis):
+    def __init__(self):
+        super().__init__()
+        self.written_owner = None
+
+    async def eval(self, script, numkeys, *args):
+        if numkeys == 4:
+            self.eval_calls.append((script, numkeys, args))
+            self.owner = args[-5]
+            self.written_owner = self.owner
+            self.byte_count = args[-2]
+            await asyncio.Event().wait()
+        return await super().eval(script, numkeys, *args)
+
+
+async def test_admission_timeout_cancels_command_cas_releases_and_never_logs_owner_token(caplog):
+    quota = _module()
+    redis = _NeverRespondingAdmissionRedis()
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 0}),
+        redis,
+    )
+    service._redis_command_timeout_seconds = 0.01
+
+    with pytest.raises(quota.QuotaUnavailable) as raised:
+        await service.reserve(uuid4(), uuid4(), 10, ttl_seconds=60)
+
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert redis.owner is None
+    assert redis.written_owner not in caplog.text
+    assert redis.written_owner not in str(raised.value)
+
+
 async def test_outer_cancellation_waits_for_admission_response_then_cas_releases():
     quota = _module()
     redis = _BlockingAdmissionRedis()
