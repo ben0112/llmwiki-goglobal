@@ -7,6 +7,8 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
+from hashlib import sha256
+from itertools import islice
 from math import ceil, isfinite, log2
 from numbers import Real
 from os import PathLike
@@ -68,6 +70,16 @@ def _finite_non_negative(name: str, value: object) -> float:
     if not isfinite(normalized) or normalized < 0:
         raise ValueError(f"{name} must be finite and non-negative")
     return normalized
+
+
+def _bounded_tuple(value: object, *, limit: int, too_large: str) -> tuple[Any, ...]:
+    try:
+        items = tuple(islice(iter(value), limit + 1))
+    except TypeError as exc:
+        raise ValueError("value must be iterable") from exc
+    if len(items) > limit:
+        raise ValueError(too_large)
+    return items
 
 
 def _strict_fields(
@@ -140,14 +152,13 @@ class EvalCase:
         object.__setattr__(self, "case_id", _nonblank_string("case_id", self.case_id))
         if not isinstance(self.query, SearchQuery):
             raise ValueError("query must be a SearchQuery")
-        try:
-            relevance = tuple(self.relevance)
-        except TypeError as exc:
-            raise ValueError("relevance must be a sequence") from exc
+        relevance = _bounded_tuple(
+            self.relevance,
+            limit=MAX_RELEVANCE_PER_CASE,
+            too_large="too many relevance judgments",
+        )
         if not relevance:
             raise ValueError("relevance must not be empty")
-        if len(relevance) > MAX_RELEVANCE_PER_CASE:
-            raise ValueError("too many relevance judgments")
         if any(not isinstance(item, RelevanceJudgment) for item in relevance):
             raise ValueError("relevance must contain RelevanceJudgment values")
         _validate_relevance_overlap(relevance)
@@ -172,7 +183,7 @@ class EvalCase:
             search_query = SearchQuery.build(**query_fields)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid query: {exc}") from exc
-        return cls(schema_version, case_id, search_query, tuple(relevance))
+        return cls(schema_version, case_id, search_query, relevance)
 
 
 def _validate_relevance_overlap(relevance: Sequence[RelevanceJudgment]) -> None:
@@ -203,12 +214,11 @@ class EvaluationRun:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", _nonblank_string("case_id", self.case_id))
-        try:
-            ranking = tuple(self.ranking)
-        except TypeError as exc:
-            raise ValueError("ranking must be a sequence") from exc
-        if len(ranking) > MAX_RANKING_LENGTH:
-            raise ValueError("ranking is too large")
+        ranking = _bounded_tuple(
+            self.ranking,
+            limit=MAX_RANKING_LENGTH,
+            too_large="ranking is too large",
+        )
         if any(not isinstance(result, RankedResult) for result in ranking):
             raise ValueError("ranking must contain RankedResult values")
         seen: set[tuple[str, int | None]] = set()
@@ -237,7 +247,8 @@ class EvaluationReport:
     filtered_result_count: int
     latency_p50_ms: float
     latency_p95_ms: float
-    recall_at_10_exact: Fraction | None = field(default=None, repr=False)
+    dataset_digest: str | None = None
+    _recall_at_10_exact: Fraction = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.case_count, bool) or not isinstance(self.case_count, int) or self.case_count <= 0:
@@ -247,6 +258,8 @@ class EvaluationReport:
             if normalized > 1:
                 raise ValueError(f"{name} must not exceed 1")
             object.__setattr__(self, name, normalized)
+        if not self.recall_at_5 <= self.recall_at_10 <= self.recall_at_20:
+            raise ValueError("recall metrics must be monotonic")
         if (
             isinstance(self.filtered_result_count, bool)
             or not isinstance(self.filtered_result_count, int)
@@ -263,14 +276,19 @@ class EvaluationReport:
             "latency_p95_ms",
             _finite_non_negative("latency_p95_ms", self.latency_p95_ms),
         )
-        exact_recall = self.recall_at_10_exact
-        if exact_recall is None:
-            exact_recall = Fraction(*self.recall_at_10.as_integer_ratio())
-        if not isinstance(exact_recall, Fraction) or not 0 <= exact_recall <= 1:
-            raise ValueError("recall_at_10_exact must be a Fraction between 0 and 1")
-        if float(exact_recall) != self.recall_at_10:
-            raise ValueError("recall_at_10_exact must round to recall_at_10")
-        object.__setattr__(self, "recall_at_10_exact", exact_recall)
+        if self.latency_p50_ms > self.latency_p95_ms:
+            raise ValueError("latency p50 must not exceed p95")
+        if self.dataset_digest is not None and not _is_sha256_digest(self.dataset_digest):
+            raise ValueError("dataset_digest must be a lowercase SHA-256 digest or None")
+        object.__setattr__(
+            self,
+            "_recall_at_10_exact",
+            Fraction(*self.recall_at_10.as_integer_ratio()),
+        )
+
+    @property
+    def recall_at_10_exact(self) -> Fraction:
+        return self._recall_at_10_exact
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +308,24 @@ class PromotionDecision:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _finite_non_negative(name, value))
+        has_ratios = self.recall_ratio is not None and self.latency_ratio is not None
+        gates_pass = bool(has_ratios and self.recall_ratio >= 1.10 and self.latency_ratio <= 2.0)
+        consistent = (
+            (self.eligible and self.reason == "eligible" and gates_pass)
+            or (not self.eligible and self.reason == "gate_failed" and has_ratios and not gates_pass)
+            or (
+                not self.eligible
+                and self.reason == "baseline_recall_zero"
+                and self.recall_ratio is None
+                and self.latency_ratio is None
+            )
+        )
+        if not consistent:
+            raise ValueError("promotion decision fields are inconsistent")
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -415,6 +451,79 @@ def _is_filtered(query: SearchQuery) -> bool:
     )
 
 
+def _canonical_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _canonical_json_value(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(item) for item in value]
+    if isinstance(value, frozenset):
+        values = [_canonical_json_value(item) for item in value]
+        return sorted(values, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError(f"unsupported canonical evaluation value: {type(value).__name__}")
+
+
+def evaluation_dataset_digest(cases: Sequence[EvalCase]) -> str:
+    """Return an order-independent SHA-256 identity for complete case definitions."""
+
+    case_values = _bounded_tuple(
+        cases,
+        limit=MAX_CASES,
+        too_large="evaluation dataset has too many cases",
+    )
+    if not case_values:
+        raise ValueError("evaluation dataset must contain at least one case")
+    if any(not isinstance(case, EvalCase) for case in case_values):
+        raise ValueError("cases must contain EvalCase values")
+    if len({case.case_id for case in case_values}) != len(case_values):
+        raise ValueError("evaluation dataset has duplicate case ids")
+
+    payload = []
+    for case in sorted(case_values, key=lambda item: item.case_id):
+        query = case.query
+        payload.append(
+            {
+                "schema_version": case.schema_version,
+                "case_id": case.case_id,
+                "query": {
+                    "text": query.text,
+                    "limit": query.limit,
+                    "candidate_limit": query.candidate_limit,
+                    "area": query.area.value,
+                    "scope": query.scope.value,
+                    "facets": _canonical_json_value(query.facets),
+                    "path_glob": query.path_glob,
+                    "tags": list(query.tags),
+                    "document_kinds": [kind.value for kind in query.document_kinds],
+                    "annotated_only": query.annotated_only,
+                },
+                "relevance": [
+                    {
+                        "document_id": judgment.document_id,
+                        "chunk_index": judgment.chunk_index,
+                        "grade": judgment.grade,
+                    }
+                    for judgment in sorted(
+                        case.relevance,
+                        key=lambda item: (
+                            item.document_id,
+                            -1 if item.chunk_index is None else item.chunk_index,
+                        ),
+                    )
+                ],
+            }
+        )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
 def _case_metrics(
     case: EvalCase,
     run: EvaluationRun,
@@ -479,6 +588,13 @@ def _index_cases_and_runs(
     return cases_by_id, runs_by_id
 
 
+def _with_exact_recall(report: EvaluationReport, exact_recall: Fraction) -> EvaluationReport:
+    if float(exact_recall) != report.recall_at_10:
+        raise RuntimeError("exact recall must round to the public recall_at_10")
+    object.__setattr__(report, "_recall_at_10_exact", exact_recall)
+    return report
+
+
 def evaluate_rankings(
     cases: Sequence[EvalCase],
     runs: Sequence[EvaluationRun],
@@ -510,19 +626,22 @@ def evaluate_rankings(
         *(sum(metrics[index] for metrics in per_case) / count for index in range(3, 5)),
     ]
     latencies = [runs_by_id[case.case_id].latency_ms for case in case_values]
-    return EvaluationReport(
-        case_count=count,
-        recall_at_5=averages[0],
-        recall_at_10=averages[1],
-        recall_at_20=averages[2],
-        mrr=averages[3],
-        ndcg_at_10=averages[4],
-        filtered_result_count=sum(
-            len(runs_by_id[case.case_id].ranking) for case in case_values if _is_filtered(case.query)
+    return _with_exact_recall(
+        EvaluationReport(
+            case_count=count,
+            recall_at_5=averages[0],
+            recall_at_10=averages[1],
+            recall_at_20=averages[2],
+            mrr=averages[3],
+            ndcg_at_10=averages[4],
+            filtered_result_count=sum(
+                len(runs_by_id[case.case_id].ranking) for case in case_values if _is_filtered(case.query)
+            ),
+            latency_p50_ms=_nearest_rank(latencies, 0.50),
+            latency_p95_ms=_nearest_rank(latencies, 0.95),
+            dataset_digest=evaluation_dataset_digest(case_values),
         ),
-        latency_p50_ms=_nearest_rank(latencies, 0.50),
-        latency_p95_ms=_nearest_rank(latencies, 0.95),
-        recall_at_10_exact=exact_recalls[1],
+        exact_recalls[1],
     )
 
 
@@ -534,10 +653,14 @@ def promotion_decision(
 
     if not isinstance(lexical, EvaluationReport) or not isinstance(hybrid, EvaluationReport):
         raise ValueError("promotion inputs must be EvaluationReport values")
+    if lexical.dataset_digest is None or hybrid.dataset_digest is None:
+        raise ValueError("promotion requires an identified evaluation cohort")
+    if lexical.case_count != hybrid.case_count or lexical.dataset_digest != hybrid.dataset_digest:
+        raise ValueError("promotion requires the same evaluation cohort")
     if lexical.recall_at_10 <= 0:
         return PromotionDecision(False, "baseline_recall_zero")
     latency_baseline = max(lexical.latency_p95_ms, 0.001)
-    recall_ratio = _bounded_ratio(hybrid.recall_at_10, lexical.recall_at_10)
+    recall_ratio = _bounded_fraction_ratio(hybrid.recall_at_10_exact / lexical.recall_at_10_exact)
     latency_ratio = _bounded_ratio(hybrid.latency_p95_ms, latency_baseline)
     lexical_recall = lexical.recall_at_10_exact
     hybrid_recall = hybrid.recall_at_10_exact
@@ -561,6 +684,14 @@ def _bounded_ratio(numerator: float, denominator: float) -> float:
     return ratio if isfinite(ratio) else float_info.max
 
 
+def _bounded_fraction_ratio(ratio: Fraction) -> float:
+    try:
+        value = float(ratio)
+    except OverflowError:
+        return float_info.max
+    return value if isfinite(value) else float_info.max
+
+
 __all__ = [
     "EVALUATION_SCHEMA_VERSION",
     "EvalCase",
@@ -569,6 +700,7 @@ __all__ = [
     "PromotionDecision",
     "RankedResult",
     "RelevanceJudgment",
+    "evaluation_dataset_digest",
     "evaluate_rankings",
     "load_cases",
     "promotion_decision",

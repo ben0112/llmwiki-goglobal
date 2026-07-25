@@ -19,6 +19,7 @@ from .evaluation import (
     RankedResult,
     RelevanceJudgment,
     evaluate_rankings,
+    evaluation_dataset_digest,
     load_cases,
     promotion_decision,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "apply_rollup",
     "build_lookup_maps",
     "extract_references",
+    "evaluation_dataset_digest",
     "evaluate_rankings",
     "load_cases",
     "parse_citation_filename",

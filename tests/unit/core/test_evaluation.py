@@ -11,13 +11,14 @@ from llmwiki_core.evaluation import (
     EvalCase,
     EvaluationReport,
     EvaluationRun,
+    PromotionDecision,
     RankedResult,
     RelevanceJudgment,
     evaluate_rankings,
     load_cases,
     promotion_decision,
 )
-from llmwiki_core.search import SearchArea, SearchScope
+from llmwiki_core.search import SearchArea, SearchQuery, SearchScope
 
 FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "retrieval" / "v1"
 
@@ -69,11 +70,11 @@ def _report(
     *,
     recall_at_10: float,
     latency_p95_ms: float,
-    exact_recall_at_10: Fraction | None = None,
+    case_count: int = 1,
+    dataset_digest: str = "0" * 64,
 ) -> EvaluationReport:
-    exact = {} if exact_recall_at_10 is None else {"recall_at_10_exact": exact_recall_at_10}
     return EvaluationReport(
-        case_count=1,
+        case_count=case_count,
         recall_at_5=recall_at_10,
         recall_at_10=recall_at_10,
         recall_at_20=recall_at_10,
@@ -82,7 +83,7 @@ def _report(
         filtered_result_count=0,
         latency_p50_ms=latency_p95_ms,
         latency_p95_ms=latency_p95_ms,
-        **exact,
+        dataset_digest=dataset_digest,
     )
 
 
@@ -361,20 +362,11 @@ def test_value_types_reject_invalid_rankings_latencies_and_duplicate_cases():
 
 
 @pytest.mark.parametrize(
-    (
-        "baseline_recall",
-        "hybrid_recall",
-        "baseline_latency",
-        "hybrid_latency",
-        "exact_baseline",
-        "exact_hybrid",
-        "eligible",
-    ),
+    ("baseline_recall", "hybrid_recall", "baseline_latency", "hybrid_latency", "eligible"),
     [
-        (0.50, 0.55, 10.0, 20.0, Fraction(1, 2), Fraction(11, 20), True),
-        (0.75, 0.825, 0.3, 0.6, Fraction(3, 4), Fraction(33, 40), True),
-        (0.50, 0.549999, 10.0, 20.0, None, None, False),
-        (0.50, 0.55, 10.0, 20.000001, Fraction(1, 2), Fraction(11, 20), False),
+        (0.50, 0.55, 10.0, 20.0, True),
+        (0.50, 0.549999, 10.0, 20.0, False),
+        (0.50, 0.55, 10.0, 20.000001, False),
     ],
 )
 def test_promotion_gate_has_stable_inclusive_boundaries(
@@ -382,21 +374,11 @@ def test_promotion_gate_has_stable_inclusive_boundaries(
     hybrid_recall,
     baseline_latency,
     hybrid_latency,
-    exact_baseline,
-    exact_hybrid,
     eligible,
 ):
     decision = promotion_decision(
-        _report(
-            recall_at_10=baseline_recall,
-            latency_p95_ms=baseline_latency,
-            exact_recall_at_10=exact_baseline,
-        ),
-        _report(
-            recall_at_10=hybrid_recall,
-            latency_p95_ms=hybrid_latency,
-            exact_recall_at_10=exact_hybrid,
-        ),
+        _report(recall_at_10=baseline_recall, latency_p95_ms=baseline_latency),
+        _report(recall_at_10=hybrid_recall, latency_p95_ms=hybrid_latency),
     )
 
     assert decision.eligible is eligible
@@ -416,23 +398,39 @@ def test_promotion_gate_rejects_zero_baseline_recall():
 
 
 def test_promotion_gate_accepts_exact_boundary_after_macro_average_rounding():
-    baseline = (1 + 3 / 7) / 2
-    hybrid = (1 + 4 / 7) / 2
-
-    decision = promotion_decision(
-        _report(
-            recall_at_10=baseline,
-            latency_p95_ms=1,
-            exact_recall_at_10=Fraction(5, 7),
-        ),
-        _report(
-            recall_at_10=hybrid,
-            latency_p95_ms=2,
-            exact_recall_at_10=Fraction(11, 14),
+    one = _case("one", (RelevanceJudgment("one", 1),))
+    seven = _case(
+        "seven",
+        tuple(RelevanceJudgment(f"seven-{index}", 1) for index in range(7)),
+    )
+    cases = (one, seven)
+    lexical = evaluate_rankings(
+        cases,
+        (
+            _run("one", ("one", 0), latency_ms=1),
+            _run(
+                "seven",
+                *((f"seven-{index}", 0) for index in range(3)),
+                latency_ms=1,
+            ),
         ),
     )
+    hybrid = evaluate_rankings(
+        cases,
+        (
+            _run("one", ("one", 0), latency_ms=2),
+            _run(
+                "seven",
+                *((f"seven-{index}", 0) for index in range(4)),
+                latency_ms=2,
+            ),
+        ),
+    )
+    decision = promotion_decision(lexical, hybrid)
 
-    assert hybrid / baseline == pytest.approx(1.10)
+    assert lexical.recall_at_10_exact == Fraction(5, 7)
+    assert hybrid.recall_at_10_exact == Fraction(11, 14)
+    assert decision.recall_ratio == 1.1
     assert decision.eligible is True
     assert decision.reason == "eligible"
 
@@ -571,6 +569,147 @@ def test_promotion_gate_rejects_no_improvement_at_minimum_positive_recall():
     assert decision.recall_ratio == 1
     assert decision.eligible is False
     assert decision.reason == "gate_failed"
+
+
+def test_dataset_digest_is_order_independent_and_definition_sensitive():
+    first = _case(
+        "first",
+        (RelevanceJudgment("doc-first", 2, 0),),
+        facets={"country": "IDN"},
+        tags=["reviewed"],
+    )
+    second = _case("second", (RelevanceJudgment("doc-second", 1),))
+    changed_query = EvalCase.build(
+        schema_version=1,
+        case_id="first",
+        query={"text": "changed query", "facets": {"country": "IDN"}, "tags": ["reviewed"]},
+        relevance=(RelevanceJudgment("doc-first", 2, 0),),
+    )
+    changed_relevance = _case(
+        "first",
+        (RelevanceJudgment("doc-first", 3, 0),),
+        facets={"country": "IDN"},
+        tags=["reviewed"],
+    )
+
+    digest = evaluation_module.evaluation_dataset_digest((first, second))
+
+    assert digest == evaluation_module.evaluation_dataset_digest((second, first))
+    assert digest != evaluation_module.evaluation_dataset_digest((changed_query, second))
+    assert digest != evaluation_module.evaluation_dataset_digest((changed_relevance, second))
+    assert len(digest) == 64
+    assert "query first" not in digest
+
+
+def test_promotion_rejects_unknown_or_different_cohorts():
+    baseline = _report(recall_at_10=0.5, latency_p95_ms=1)
+
+    with pytest.raises(ValueError, match="same evaluation cohort"):
+        promotion_decision(
+            baseline,
+            _report(recall_at_10=0.55, latency_p95_ms=1, case_count=2),
+        )
+    with pytest.raises(ValueError, match="same evaluation cohort"):
+        promotion_decision(
+            baseline,
+            _report(recall_at_10=0.55, latency_p95_ms=1, dataset_digest="1" * 64),
+        )
+    with pytest.raises(ValueError, match="identified evaluation cohort"):
+        promotion_decision(
+            _report(recall_at_10=0.5, latency_p95_ms=1, dataset_digest=None),
+            _report(recall_at_10=0.55, latency_p95_ms=1, dataset_digest=None),
+        )
+
+
+def test_report_and_decision_constructors_reject_contradictions():
+    with pytest.raises(ValueError, match="recall metrics must be monotonic"):
+        EvaluationReport(
+            case_count=1,
+            recall_at_5=0.6,
+            recall_at_10=0.5,
+            recall_at_20=0.7,
+            mrr=0.5,
+            ndcg_at_10=0.5,
+            filtered_result_count=0,
+            latency_p50_ms=1,
+            latency_p95_ms=2,
+            dataset_digest="0" * 64,
+        )
+    with pytest.raises(ValueError, match="p50 must not exceed p95"):
+        EvaluationReport(
+            case_count=1,
+            recall_at_5=0.5,
+            recall_at_10=0.5,
+            recall_at_20=0.5,
+            mrr=0.5,
+            ndcg_at_10=0.5,
+            filtered_result_count=0,
+            latency_p50_ms=2,
+            latency_p95_ms=1,
+            dataset_digest="0" * 64,
+        )
+    with pytest.raises(TypeError):
+        EvaluationReport(
+            case_count=1,
+            recall_at_5=0.5,
+            recall_at_10=0.5,
+            recall_at_20=0.5,
+            mrr=0.5,
+            ndcg_at_10=0.5,
+            filtered_result_count=0,
+            latency_p50_ms=1,
+            latency_p95_ms=1,
+            dataset_digest="0" * 64,
+            recall_at_10_exact=Fraction(1, 2),
+        )
+
+    inconsistent = (
+        (True, "gate_failed", 1.1, 1.0),
+        (False, "eligible", 1.1, 1.0),
+        (True, "eligible", 1.0, 1.0),
+        (False, "gate_failed", 1.1, 2.0),
+        (False, "baseline_recall_zero", 1.1, 1.0),
+        (False, "gate_failed", None, None),
+        (False, "unknown", 1.0, 1.0),
+    )
+    for args in inconsistent:
+        with pytest.raises(ValueError, match="promotion decision fields are inconsistent"):
+            PromotionDecision(*args)
+
+
+class _GuardedIterable:
+    def __init__(self, factory, *, allowed: int):
+        self.factory = factory
+        self.allowed = allowed
+        self.consumed = 0
+
+    def __iter__(self):
+        while True:
+            self.consumed += 1
+            if self.consumed > self.allowed:
+                raise AssertionError("iterable consumed beyond the bounded probe")
+            yield self.factory(self.consumed)
+
+
+def test_case_and_run_materialize_iterables_with_a_hard_bound(monkeypatch):
+    monkeypatch.setattr(evaluation_module, "MAX_RELEVANCE_PER_CASE", 3)
+    monkeypatch.setattr(evaluation_module, "MAX_RANKING_LENGTH", 3)
+    relevance = _GuardedIterable(
+        lambda index: RelevanceJudgment(f"doc-{index}", 1),
+        allowed=4,
+    )
+    ranking = _GuardedIterable(
+        lambda index: RankedResult(f"doc-{index}", 0),
+        allowed=4,
+    )
+
+    with pytest.raises(ValueError, match="too many relevance judgments"):
+        EvalCase(1, "bounded", SearchQuery.build(text="query"), relevance)
+    with pytest.raises(ValueError, match="ranking is too large"):
+        EvaluationRun("bounded", ranking, 1)
+
+    assert relevance.consumed == 4
+    assert ranking.consumed == 4
 
 
 def test_public_evaluation_values_are_immutable():
