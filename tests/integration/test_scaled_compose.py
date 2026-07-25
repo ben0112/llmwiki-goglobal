@@ -76,8 +76,8 @@ def test_gateway_configuration_supports_dynamic_http_and_websocket_proxying():
 
 def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
     text = DOCS.read_text(encoding="utf-8")
-    assert "DURABLE_JOBS_ENABLED=false" in text
-    assert "TUS_MULTIPART_ENABLED=false" in text
+    assert "export DURABLE_JOBS_ENABLED=false" in text
+    assert "export TUS_MULTIPART_ENABLED=false" in text
     assert "stop worker" in text
     assert "--scale worker=0" in text
     assert "--scale api=1" in text
@@ -86,6 +86,39 @@ def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
     assert "trap cleanup EXIT" in text
     assert "SCALED_COMPOSE_TEST=1" in text
     assert "safely reads `deploy/.env.selfhost`" in text
+    scaling = text.split("## Scaling verification", 1)[1]
+    assert "```bash\n(\n  set -e" in scaling
+    assert "trap cleanup EXIT" in scaling
+    assert "\n)\n```" in scaling
+
+
+def test_exported_rollback_flags_override_env_file_for_api_and_worker():
+    environment = {
+        **os.environ,
+        "DURABLE_JOBS_ENABLED": "false",
+        "TUS_MULTIPART_ENABLED": "false",
+    }
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE),
+            "--env-file",
+            str(ROOT / "deploy/.env.selfhost.example"),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    rendered = json.loads(result.stdout)
+    for service in ("api", "worker"):
+        assert rendered["services"][service]["environment"]["DURABLE_JOBS_ENABLED"] == "false"
+        assert rendered["services"][service]["environment"]["TUS_MULTIPART_ENABLED"] == "false"
 
 
 def _selfhost_env_value(name: str) -> str:

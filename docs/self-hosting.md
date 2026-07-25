@@ -236,9 +236,9 @@ Copyable incident rollback (the worker intentionally refuses to start when
 durable jobs are disabled):
 
 ```bash
-# Set these two lines in deploy/.env.selfhost first:
-DURABLE_JOBS_ENABLED=false
-TUS_MULTIPART_ENABLED=false
+# Exported values override the true defaults in deploy/.env.selfhost:
+export DURABLE_JOBS_ENABLED=false
+export TUS_MULTIPART_ENABLED=false
 
 docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
   stop worker
@@ -326,18 +326,22 @@ With `STAGE=test` and the opt-in `SCALED_TEST_*` variables in
 safely reads `deploy/.env.selfhost` without sourcing or printing its secrets:
 
 ```bash
-compose() {
-  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost "$@"
-}
-cleanup() {
-  compose down -v
-}
-trap cleanup EXIT
+(
+  set -e
 
-compose up -d --build --scale api=2 --scale worker=2
-compose restart gateway
-SCALED_COMPOSE_TEST=1 PYTHONPATH=api .venv/bin/pytest \
-  tests/integration/test_scaled_compose.py -q
+  compose() {
+    docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost "$@"
+  }
+  cleanup() {
+    compose down -v
+  }
+  trap cleanup EXIT
+
+  compose up -d --build --scale api=2 --scale worker=2
+  compose restart gateway
+  SCALED_COMPOSE_TEST=1 PYTHONPATH=api .venv/bin/pytest \
+    tests/integration/test_scaled_compose.py -q
+)
 ```
 
 The live test requires a reachable self-hosted Supabase database and a valid
