@@ -14,8 +14,10 @@ from .facets import FACET_KEYS, UnknownFacetError, apply_rollup, rollup_from_met
 from .references import build_lookup_maps, extract_references, parse_citation_filename, parse_wiki_links
 from .search import (
     ContextExpander,
+    HybridRetrievalService,
     Reranker,
     Retriever,
+    RetrieverUnavailable,
     SearchArea,
     SearchHit,
     SearchQuery,
@@ -32,6 +34,7 @@ __all__ = [
     "DocumentKind",
     "DocumentStatus",
     "FACET_KEYS",
+    "HybridRetrievalService",
     "InvalidStatusTransition",
     "assert_status_transition",
     "chunk_pages",
@@ -40,6 +43,7 @@ __all__ = [
     "normalize_directory_path",
     "Reranker",
     "Retriever",
+    "RetrieverUnavailable",
     "SearchArea",
     "SearchHit",
     "SearchQuery",

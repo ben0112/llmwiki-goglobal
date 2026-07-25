@@ -1,7 +1,7 @@
 """Backend-neutral search request, result, and retrieval port contracts."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
 from numbers import Real
@@ -328,6 +328,150 @@ class ContextExpander(Protocol):
         query: SearchQuery,
         hits: Sequence[SearchHit],
     ) -> Sequence[SearchHit]: ...
+
+
+class RetrieverUnavailable(RuntimeError):
+    """A retriever cannot currently serve the request."""
+
+
+class HybridRetrievalService:
+    """Compose lexical and optional vector retrieval with bounded post-processing."""
+
+    def __init__(
+        self,
+        *,
+        lexical: Retriever,
+        vector: Retriever | None = None,
+        reranker: Reranker | None = None,
+        expander: ContextExpander | None = None,
+        rrf_k: int = 60,
+    ) -> None:
+        if isinstance(rrf_k, bool) or not isinstance(rrf_k, int) or rrf_k <= 0:
+            raise ValueError("rrf_k must be a positive integer")
+        self._lexical = lexical
+        self._vector = vector
+        self._reranker = reranker
+        self._expander = expander
+        self._rrf_k = rrf_k
+
+    async def retrieve(self, query: SearchQuery) -> SearchResult:
+        lexical = await self._lexical.retrieve(query)
+        if self._vector is None:
+            return await self._finish(
+                query,
+                lexical.hits,
+                candidate_count=lexical.candidate_count,
+                latency_ms=lexical.latency_ms,
+                profile="lexical",
+            )
+
+        try:
+            vector = await self._vector.retrieve(query)
+        except RetrieverUnavailable:
+            return await self._finish(
+                query,
+                lexical.hits,
+                candidate_count=lexical.candidate_count,
+                latency_ms=lexical.latency_ms,
+                profile="lexical_fallback",
+            )
+
+        fused = _reciprocal_rank_fusion(lexical.hits, vector.hits, rrf_k=self._rrf_k)
+        return await self._finish(
+            query,
+            fused,
+            candidate_count=lexical.candidate_count + vector.candidate_count,
+            latency_ms=max(lexical.latency_ms, vector.latency_ms),
+            profile="hybrid",
+        )
+
+    async def _finish(
+        self,
+        query: SearchQuery,
+        hits: Sequence[SearchHit],
+        *,
+        candidate_count: int,
+        latency_ms: float,
+        profile: str,
+    ) -> SearchResult:
+        direct = list(_unique_hits(hits))[: query.limit]
+        if self._reranker is not None and direct:
+            reranked = await self._reranker.rerank(query, tuple(direct))
+            direct = _sanitize_reranked(direct, reranked)
+
+        final = direct
+        if self._expander is not None and final and len(final) < query.limit:
+            expanded = await self._expander.expand(query, tuple(final))
+            final = _append_expanded(final, expanded, limit=query.limit)
+
+        return SearchResult(
+            hits=tuple(final),
+            candidate_count=candidate_count,
+            latency_ms=latency_ms,
+            profile=profile,
+        )
+
+
+def _unique_hits(hits: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
+    unique: dict[tuple[str, int, int], SearchHit] = {}
+    for hit in hits:
+        if not isinstance(hit, SearchHit):
+            raise TypeError("retriever hits must contain only SearchHit values")
+        unique.setdefault(hit.identity, hit)
+    return tuple(unique.values())
+
+
+def _reciprocal_rank_fusion(
+    lexical_hits: Sequence[SearchHit],
+    vector_hits: Sequence[SearchHit],
+    *,
+    rrf_k: int,
+) -> tuple[SearchHit, ...]:
+    representatives: dict[tuple[str, int, int], SearchHit] = {}
+    scores: dict[tuple[str, int, int], float] = {}
+    for ranked_hits in (_unique_hits(lexical_hits), _unique_hits(vector_hits)):
+        for rank, hit in enumerate(ranked_hits, start=1):
+            representatives.setdefault(hit.identity, hit)
+            scores[hit.identity] = scores.get(hit.identity, 0.0) + 1 / (rrf_k + rank)
+
+    identities = sorted(scores, key=lambda identity: (-scores[identity], identity))
+    return tuple(
+        replace(representatives[identity], score=scores[identity]) for identity in identities
+    )
+
+
+def _sanitize_reranked(
+    direct: Sequence[SearchHit],
+    reranked: Sequence[SearchHit],
+) -> list[SearchHit]:
+    known = {hit.identity: hit for hit in direct}
+    ordered: list[SearchHit] = []
+    seen: set[tuple[str, int, int]] = set()
+    for hit in reranked:
+        if not isinstance(hit, SearchHit) or hit.identity not in known or hit.identity in seen:
+            continue
+        ordered.append(known[hit.identity])
+        seen.add(hit.identity)
+    ordered.extend(hit for hit in direct if hit.identity not in seen)
+    return ordered
+
+
+def _append_expanded(
+    direct: Sequence[SearchHit],
+    expanded: Sequence[SearchHit],
+    *,
+    limit: int,
+) -> list[SearchHit]:
+    result = list(direct)
+    seen = {hit.identity for hit in result}
+    for hit in expanded:
+        if not isinstance(hit, SearchHit) or hit.identity in seen:
+            continue
+        result.append(hit)
+        seen.add(hit.identity)
+        if len(result) == limit:
+            break
+    return result
 
 
 def _freeze_json_like(value: object, *, label: str) -> object:
