@@ -243,21 +243,11 @@ def test_handler_registry_is_complete_read_only_and_transport_neutral():
     assert "redis" not in source.lower()
 
 
-@pytest.mark.asyncio
-async def test_remaining_placeholder_handler_explicitly_rejects_unsupported_business_work():
-    from jobs.handlers import HANDLERS, UnsupportedJobHandler, WorkerContext
-    from jobs.models import JobRecord, JobType
+def test_upload_cleanup_handler_is_registered_as_concrete_business_work():
+    from jobs.handlers import HANDLERS, handle_upload_cleanup
+    from jobs.models import JobType
 
-    context = WorkerContext(pool=object(), s3=None, converter_url="", converter_secret="")
-    lease = object()
-    unsupported_types = (JobType.UPLOAD_CLEANUP,)
-    for job_type in unsupported_types:
-        handler = HANDLERS[job_type]
-        record = JobRecord(id=uuid4(), job_type=job_type, user_id=uuid4())
-        with pytest.raises(UnsupportedJobHandler) as raised:
-            await handler(record, lease, context)
-        assert raised.value.error_code == "unsupported_job_type"
-        assert "not supported" in raised.value.error_message.lower()
+    assert HANDLERS[JobType.UPLOAD_CLEANUP] is handle_upload_cleanup
 
 
 def test_handler_errors_persist_only_vetted_utf8_postgres_safe_messages():
@@ -307,16 +297,23 @@ def test_worker_settings_disable_arq_retry_and_results_with_unique_safe_crons():
     assert built["job_timeout"] == 3600
     assert built["on_startup"] is worker.startup
     assert built["on_shutdown"] is worker.shutdown
-    assert len(built["cron_jobs"]) == 2
+    assert len(built["cron_jobs"]) == 3
 
-    dispatch, reap = built["cron_jobs"]
+    dispatch, reap, cleanup = built["cron_jobs"]
     assert dispatch.coroutine is worker.dispatch_cron
     assert dispatch.second == {0, 10, 20, 30, 40, 50}
     assert reap.coroutine is worker.reap_cron
     assert reap.second == {5, 35}
-    assert {dispatch.name, reap.name} == {"durable_job_dispatch", "durable_job_reaper"}
+    assert cleanup.coroutine is worker.upload_cleanup_cron
+    assert cleanup.second == {15}
+    assert {dispatch.name, reap.name, cleanup.name} == {
+        "durable_job_dispatch",
+        "durable_job_reaper",
+        "durable_upload_cleanup_scan",
+    }
     assert dispatch.job_id is None
     assert reap.job_id is None
+    assert cleanup.job_id is None
     for job in built["cron_jobs"]:
         assert job.run_at_startup is True
         assert job.unique is True
@@ -360,8 +357,8 @@ async def test_real_arq_cron_ids_change_by_schedule_and_dedupe_across_replicas()
     )
 
     assert sorted(first_redis.attempts) == sorted(second_redis.attempts)
-    assert len(first_redis.attempts) == 2
-    assert len(first_redis.enqueued) + len(second_redis.enqueued) == 2
+    assert len(first_redis.attempts) == 3
+    assert len(first_redis.enqueued) + len(second_redis.enqueued) == 3
 
     first_dispatch_id = next(job_id for function, job_id in first_redis.attempts if function == "durable_job_dispatch")
     await first.run_cron(scheduled + timedelta(seconds=10), delay=0.1)
@@ -423,7 +420,7 @@ def test_build_worker_settings_preserves_safety_and_parses_validated_redis_url()
     built = worker.build_worker_settings(runtime_settings)
 
     assert built["functions"] == [worker.run_job]
-    assert len(built["cron_jobs"]) == 2
+    assert len(built["cron_jobs"]) == 3
     assert built["max_tries"] == 1
     assert built["retry_jobs"] is False
     assert built["keep_result"] == 0

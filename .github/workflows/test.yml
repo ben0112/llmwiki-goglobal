@@ -34,7 +34,7 @@ jobs:
         run: pytest tests/unit/core/ -v
 
       - name: Run API unit tests
-        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_tus_sessions.py tests/unit/test_hosted_quota.py tests/unit/test_url_ingest.py tests/unit/test_facet_rollup.py tests/unit/test_graph_local.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py -v
+        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_tus_sessions.py tests/unit/test_hosted_tus_multipart.py tests/unit/test_hosted_quota.py tests/unit/test_url_ingest.py tests/unit/test_facet_rollup.py tests/unit/test_graph_local.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py tests/unit/jobs/ -v
 
       - name: Run MCP unit tests
         working-directory: mcp
@@ -197,6 +197,33 @@ jobs:
         env:
           QUOTA_REDIS_TEST_URL: redis://127.0.0.1:6379/0
         run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_hosted_quota.py -v
+
+      - name: Start fixed-version MinIO for Hosted TUS
+        run: |
+          docker run --detach --name llmwiki-tus-minio \
+            --publish 127.0.0.1:9000:9000 \
+            --env MINIO_ROOT_USER=test-access \
+            --env MINIO_ROOT_PASSWORD=test-secret-key \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              docker logs llmwiki-tus-minio
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+      - name: Run cross-replica Hosted TUS tests
+        env:
+          TUS_MULTIPART_REDIS_URL: redis://127.0.0.1:6379/0
+          TUS_MULTIPART_S3_ENDPOINT: http://127.0.0.1:9000
+          TUS_MULTIPART_S3_ACCESS_KEY: test-access
+          TUS_MULTIPART_S3_SECRET_KEY: test-secret-key
+          TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
+        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_tus_multipart.py -v
 
       - name: Run API-key auth + hosted corpus import tests
         run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_api_key_auth.py tests/integration/test_corpus_hosted_import.py tests/integration/test_corpus_hosted_pipeline.py -v

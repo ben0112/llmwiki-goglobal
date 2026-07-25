@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ _SESSION_FIELDS = frozenset(
         "user_id",
         "knowledge_base_id",
         "filename",
+        "path",
         "content_type",
         "total_length",
         "offset",
@@ -35,9 +37,11 @@ _SESSION_FIELDS = frozenset(
         "document_id",
         "job_id",
         "reservation_bytes",
+        "object_completed",
     }
 )
 _PART_FIELDS = frozenset({"part_number", "etag"})
+_SESSION_KEY_PATTERN = re.compile(r"tus:session:\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\}\Z")
 
 
 class RedisClient(Protocol):
@@ -58,6 +62,7 @@ class TusSessionProtocolError(RuntimeError):
 
 class TusSessionState(StrEnum):
     UPLOADING = "uploading"
+    CLEANUP_REQUIRED = "cleanup_required"
     COMPLETED = "completed"
 
 
@@ -112,6 +117,12 @@ class ReservationReleaseStatus(StrEnum):
     RELEASED = "released"
     ALREADY_RELEASED = "already_released"
     MALFORMED = "malformed"
+    NOT_OWNER = "not_owner"
+
+
+class TusReservationState(StrEnum):
+    RESERVED = "reserved"
+    RELEASED = "released"
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +143,52 @@ class CompleteResult:
 class LockAcquireResult:
     status: LockAcquireStatus
     token: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TusQuotaReservation:
+    bytes: int
+    owner_token: str
+    state: TusReservationState
+
+    def __post_init__(self) -> None:
+        _require_safe_integer(self.bytes, "bytes", minimum=1, maximum=MAX_UPLOAD_BYTES)
+        _validate_owner_token(self.owner_token)
+        if not isinstance(self.state, TusReservationState):
+            raise ValueError("state must be a TusReservationState")
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"bytes": self.bytes, "owner": self.owner_token, "state": self.state.value},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, raw: bytes | str) -> TusQuotaReservation:
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise InvalidTusSessionError("reservation marker must be UTF-8") from exc
+        if not isinstance(raw, str):
+            raise InvalidTusSessionError("reservation marker must be bytes or text")
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) != {"bytes", "owner", "state"}:
+                raise InvalidTusSessionError("reservation marker fields do not match the closed schema")
+            marker = cls(
+                _parse_safe_integer(payload["bytes"], "bytes", minimum=1, maximum=MAX_UPLOAD_BYTES),
+                _validate_owner_token(payload["owner"]),
+                TusReservationState(payload["state"]),
+            )
+        except InvalidTusSessionError:
+            raise
+        except (TypeError, ValueError, KeyError) as exc:
+            raise InvalidTusSessionError(str(exc)) from exc
+        if marker.to_json() != raw:
+            raise InvalidTusSessionError("reservation marker must use canonical wire encoding")
+        return marker
 
 
 def _require_uuid(value: object, name: str) -> UUID:
@@ -207,6 +264,30 @@ def _validate_etag(value: object) -> str:
     return _validate_ascii_opaque(value, "etag", max_bytes=512)
 
 
+def _validate_owner_token(value: object) -> str:
+    token = _validate_ascii_opaque(value, "owner token", max_bytes=32)
+    if len(token) != 32 or any(not (character.isascii() and (character.isalnum() or character in "_-")) for character in token):
+        raise ValueError("owner token must use the generated URL-safe format")
+    return token
+
+
+def _validate_path(value: object) -> str:
+    path = _validate_text(value, "path", max_bytes=1_024, allow_quote=False)
+    if not path.startswith("/") or not path.endswith("/") or "//" in path:
+        raise ValueError("path must use normalized absolute directory form")
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        raise ValueError("path must not contain traversal segments")
+    return path
+
+
+def validate_tus_upload_metadata(filename: object, path: object) -> tuple[str, str]:
+    """Validate the client-derived metadata stored in the closed session schema."""
+    return (
+        _validate_text(filename, "filename", max_bytes=255, forbid_path=True, allow_quote=True),
+        _validate_path(path),
+    )
+
+
 def _require_utc(value: object, name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError(f"{name} must be an aware UTC datetime")
@@ -247,6 +328,7 @@ class TusSession:
     user_id: UUID
     knowledge_base_id: UUID
     filename: str
+    path: str
     content_type: str
     total_length: int
     offset: int
@@ -259,12 +341,13 @@ class TusSession:
     document_id: UUID | None
     job_id: UUID | None
     reservation_bytes: int
+    object_completed: bool
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 -- this is the closed-schema invariant boundary
         _require_uuid(self.upload_id, "upload_id")
         _require_uuid(self.user_id, "user_id")
         _require_uuid(self.knowledge_base_id, "knowledge_base_id")
-        _validate_text(self.filename, "filename", max_bytes=255, forbid_path=True, allow_quote=True)
+        validate_tus_upload_metadata(self.filename, self.path)
         _validate_ascii_opaque(self.content_type, "content_type", max_bytes=255)
         total_length = _require_safe_integer(self.total_length, "total_length", maximum=MAX_UPLOAD_BYTES)
         offset = _require_safe_integer(self.offset, "offset", maximum=MAX_UPLOAD_BYTES)
@@ -288,11 +371,19 @@ class TusSession:
         _require_safe_integer(self.reservation_bytes, "reservation_bytes", maximum=MAX_UPLOAD_BYTES)
         if self.reservation_bytes != self.total_length:
             raise ValueError("reservation_bytes must equal total_length")
+        if not isinstance(self.object_completed, bool):
+            raise ValueError("object_completed must be a boolean")
+        if self.object_completed and self.offset != self.total_length:
+            raise ValueError("object_completed requires the full offset")
         if self.state is TusSessionState.UPLOADING:
             if self.document_id is not None or self.job_id is not None:
                 raise ValueError("uploading sessions cannot contain document or job IDs")
+        elif self.state is TusSessionState.CLEANUP_REQUIRED:
+            if self.document_id is not None or self.job_id is not None:
+                raise ValueError("cleanup-required sessions cannot contain document or job IDs")
         elif (
             self.offset != self.total_length
+            or not self.object_completed
             or not isinstance(self.document_id, UUID)
             or not isinstance(self.job_id, UUID)
         ):
@@ -304,6 +395,7 @@ class TusSession:
             "user_id": str(self.user_id),
             "knowledge_base_id": str(self.knowledge_base_id),
             "filename": self.filename,
+            "path": self.path,
             "content_type": self.content_type,
             "total_length": self.total_length,
             "offset": self.offset,
@@ -316,6 +408,7 @@ class TusSession:
             "document_id": str(self.document_id) if self.document_id is not None else None,
             "job_id": str(self.job_id) if self.job_id is not None else None,
             "reservation_bytes": self.reservation_bytes,
+            "object_completed": self.object_completed,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -365,6 +458,7 @@ class TusSession:
                     forbid_path=True,
                     allow_quote=True,
                 ),
+                path=_validate_path(payload["path"]),
                 content_type=_validate_ascii_opaque(payload["content_type"], "content_type", max_bytes=255),
                 total_length=_parse_safe_integer(payload["total_length"], "total_length", maximum=MAX_UPLOAD_BYTES),
                 offset=_parse_safe_integer(payload["offset"], "offset", maximum=MAX_UPLOAD_BYTES),
@@ -381,6 +475,7 @@ class TusSession:
                 reservation_bytes=_parse_safe_integer(
                     payload["reservation_bytes"], "reservation_bytes", maximum=MAX_UPLOAD_BYTES
                 ),
+                object_completed=payload["object_completed"],
             )
             if raw != session.to_json():
                 raise InvalidTusSessionError("session JSON must use the canonical wire encoding")
@@ -485,6 +580,19 @@ local function escape_filename(value)
   return '"' .. table.concat(encoded) .. '"'
 end
 
+local function valid_path(value)
+  if not valid_utf8(value, 1024) or string.sub(value, 1, 1) ~= '/'
+    or string.sub(value, -1) ~= '/' or string.find(value, '//', 1, true) then return false end
+  for index = 1, #value do
+    local byte = string.byte(value, index)
+    if byte < 32 or byte == 34 or byte == 92 or byte == 127 then return false end
+  end
+  for segment in string.gmatch(value, '[^/]+') do
+    if segment == '.' or segment == '..' then return false end
+  end
+  return true
+end
+
 local function ascii_opaque(value, maximum_bytes)
   if type(value) ~= 'string' or #value == 0 or #value > maximum_bytes then return false end
   for index = 1, #value do
@@ -518,15 +626,16 @@ local function parts_json(parts)
 end
 
 local function canonical_record(session)
-  if type(session) ~= 'table' or count(session) ~= 16 then return nil end
+  if type(session) ~= 'table' or count(session) ~= 18 then return nil end
   local encoded_filename = escape_filename(session.filename)
   if not uuid(session.upload_id) or not uuid(session.user_id) or not uuid(session.knowledge_base_id)
-    or not encoded_filename or not ascii_opaque(session.content_type, 255)
+    or not encoded_filename or not valid_path(session.path) or not ascii_opaque(session.content_type, 255)
     or not ascii_opaque(session.s3_key, 1024) or not ascii_opaque(session.multipart_upload_id, 1024)
     or not safe_integer(session.total_length, 0, MAX_UPLOAD)
     or not safe_integer(session.offset, 0, MAX_UPLOAD) or session.offset > session.total_length
     or not safe_integer(session.reservation_bytes, 0, MAX_UPLOAD)
-    or session.reservation_bytes ~= session.total_length then return nil end
+    or session.reservation_bytes ~= session.total_length or type(session.object_completed) ~= 'boolean'
+    or (session.object_completed and session.offset ~= session.total_length) then return nil end
   local created_at = canonical_decimal(session.created_at, 0, MAX_SAFE)
   local updated_at = canonical_decimal(session.updated_at, 0, MAX_SAFE)
   if not created_at or not updated_at or updated_at < created_at then return nil end
@@ -534,12 +643,13 @@ local function canonical_record(session)
   if not encoded_parts then return nil end
   local document_json
   local job_json
-  if session.state == 'uploading' then
+  if session.state == 'uploading' or session.state == 'cleanup_required' then
     if session.document_id ~= cjson.null or session.job_id ~= cjson.null then return nil end
     document_json = 'null'
     job_json = 'null'
   elseif session.state == 'completed' then
-    if session.offset ~= session.total_length or not uuid(session.document_id) or not uuid(session.job_id) then return nil end
+    if session.offset ~= session.total_length or not session.object_completed
+      or not uuid(session.document_id) or not uuid(session.job_id) then return nil end
     document_json = '"' .. session.document_id .. '"'
     job_json = '"' .. session.job_id .. '"'
   else
@@ -552,9 +662,11 @@ local function canonical_record(session)
     .. ',"job_id":' .. job_json
     .. ',"knowledge_base_id":"' .. session.knowledge_base_id
     .. '","multipart_upload_id":"' .. session.multipart_upload_id
-    .. '","offset":' .. string.format('%.0f', session.offset)
+    .. '","object_completed":' .. (session.object_completed and 'true' or 'false')
+    .. ',"offset":' .. string.format('%.0f', session.offset)
     .. ',"parts":' .. encoded_parts
-    .. ',"reservation_bytes":' .. string.format('%.0f', session.reservation_bytes)
+    .. ',"path":"' .. session.path
+    .. '","reservation_bytes":' .. string.format('%.0f', session.reservation_bytes)
     .. ',"s3_key":"' .. session.s3_key
     .. '","state":"' .. session.state
     .. '","total_length":' .. string.format('%.0f', session.total_length)
@@ -678,6 +790,7 @@ if session.offset ~= session.total_length then return {6, session.offset, '', ''
 local timestamp = next_timestamp(session.updated_at)
 if not timestamp then return {7, session.offset, '', ''} end
 session.state = 'completed'
+session.object_completed = true
 session.document_id = document_id
 session.job_id = job_id
 session.updated_at = timestamp
@@ -687,6 +800,65 @@ redis.call('SET', KEYS[1], encoded, 'EX', ttl)
 return {0, session.offset, session.document_id, session.job_id}
 """
 )
+
+
+_MARK_OBJECT_COMPLETED_LUA = (
+    _LUA_RECORD_CODEC
+    + r"""
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local session = decode_canonical(raw)
+if not session then return 4 end
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then return 5 end
+local expected = canonical_argument(ARGV[1], 0, MAX_UPLOAD)
+local ttl = canonical_argument(ARGV[2], 1, MAX_TTL)
+if not expected or not ttl then return 4 end
+if session.offset ~= expected then return 6 end
+if session.state ~= 'uploading' or session.offset ~= session.total_length then return 3 end
+if session.object_completed then return 2 end
+local timestamp = next_timestamp(session.updated_at)
+if not timestamp then return 4 end
+session.object_completed = true
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return 4 end
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+return 1
+"""
+)
+
+
+_MARK_CLEANUP_REQUIRED_LUA = (
+    _LUA_RECORD_CODEC
+    + r"""
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local session = decode_canonical(raw)
+if not session then return 4 end
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then return 5 end
+local expected = canonical_argument(ARGV[1], 0, MAX_UPLOAD)
+local ttl = canonical_argument(ARGV[2], 1, MAX_TTL)
+if not expected or not ttl then return 4 end
+if session.offset ~= expected then return 6 end
+if session.state == 'completed' then return 3 end
+if session.state == 'cleanup_required' then return 2 end
+if session.state ~= 'uploading' then return 3 end
+local timestamp = next_timestamp(session.updated_at)
+if not timestamp then return 4 end
+session.state = 'cleanup_required'
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return 4 end
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+return 1
+"""
+)
+
+
+_DELETE_LOCKED_LUA = r"""
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+"""
 
 
 _RENEW_LOCK_LUA = r"""
@@ -711,15 +883,41 @@ local decoded, reservation = pcall(cjson.decode, raw)
 if not decoded or type(reservation) ~= 'table' then return 3 end
 local count = 0
 for _ in pairs(reservation) do count = count + 1 end
-if count ~= 2 or type(reservation.bytes) ~= 'number' or reservation.bytes ~= math.floor(reservation.bytes)
-  or reservation.bytes < 0 or reservation.bytes > 9999999999999 then return 3 end
+if count ~= 3 or type(reservation.bytes) ~= 'number' or reservation.bytes ~= math.floor(reservation.bytes)
+  or reservation.bytes < 1 or reservation.bytes > 9999999999999 then return 3 end
+if type(reservation.owner) ~= 'string' or #reservation.owner ~= 32
+  or string.find(reservation.owner, '[^A-Za-z0-9_%-]') then return 3 end
 if reservation.state ~= 'reserved' and reservation.state ~= 'released' then return 3 end
 local canonical = '{"bytes":' .. string.format('%.0f', reservation.bytes)
-  .. ',"state":"' .. reservation.state .. '"}'
+  .. ',"owner":"' .. reservation.owner .. '","state":"' .. reservation.state .. '"}'
 if canonical ~= raw then return 3 end
+if reservation.owner ~= ARGV[1] then return 4 end
 if reservation.state == 'released' then return 2 end
-local released = '{"bytes":' .. string.format('%.0f', reservation.bytes) .. ',"state":"released"}'
+local released = '{"bytes":' .. string.format('%.0f', reservation.bytes)
+  .. ',"owner":"' .. reservation.owner .. '","state":"released"}'
 redis.call('SET', KEYS[1], released, 'KEEPTTL')
+return 1
+"""
+
+
+_RENEW_RESERVATION_LUA = r"""
+local raw = redis.call('GET', KEYS[1])
+if not raw or redis.call('PTTL', KEYS[1]) <= 0 then return 0 end
+local decoded, reservation = pcall(cjson.decode, raw)
+if not decoded or type(reservation) ~= 'table' then return 0 end
+local count = 0
+for _ in pairs(reservation) do count = count + 1 end
+if count ~= 3 or type(reservation.bytes) ~= 'number' or reservation.bytes ~= math.floor(reservation.bytes)
+  or reservation.bytes < 1 or reservation.bytes > 9999999999999
+  or type(reservation.owner) ~= 'string' or #reservation.owner ~= 32
+  or string.find(reservation.owner, '[^A-Za-z0-9_%-]')
+  or reservation.state ~= 'reserved' then return 0 end
+local canonical = '{"bytes":' .. string.format('%.0f', reservation.bytes)
+  .. ',"owner":"' .. reservation.owner .. '","state":"reserved"}'
+if canonical ~= raw or reservation.owner ~= ARGV[1] then return 0 end
+local ttl = tonumber(ARGV[2])
+if not ttl or ttl < 1 or ttl > 2147483647 or ttl ~= math.floor(ttl) then return 0 end
+redis.call('EXPIRE', KEYS[1], ttl)
 return 1
 """
 
@@ -752,6 +950,7 @@ _RESERVATION_RELEASE_CODES = {
     1: ReservationReleaseStatus.RELEASED,
     2: ReservationReleaseStatus.ALREADY_RELEASED,
     3: ReservationReleaseStatus.MALFORMED,
+    4: ReservationReleaseStatus.NOT_OWNER,
 }
 
 
@@ -803,6 +1002,21 @@ class TusSessionStore:
     async def get(self, upload_id: UUID) -> TusSession | None:
         raw = await self._redis.get(session_key(upload_id))
         return None if raw is None else TusSession.from_json(raw)
+
+    async def iter_sessions(self):
+        """Scan canonical session keys without a cross-slot Lua operation."""
+        scan_iter = getattr(self._redis, "scan_iter", None)
+        if not callable(scan_iter):
+            raise TusSessionProtocolError("Redis client does not support bounded session scans")
+        async for raw_key in scan_iter(match="tus:session:{*}", count=100):
+            key = _decode_protocol_text(raw_key, "session key")
+            match = _SESSION_KEY_PATTERN.fullmatch(key)
+            if match is None:
+                continue
+            upload_id = UUID(match.group(1))
+            session = await self.get(upload_id)
+            if session is not None:
+                yield session
 
     async def append_part(
         self,
@@ -894,6 +1108,76 @@ class TusSessionStore:
             committed_job = None
         return CompleteResult(status, offset, committed_document, committed_job)
 
+    async def mark_object_completed(
+        self,
+        upload_id: UUID,
+        expected_offset: int,
+        ttl_seconds: int,
+        *,
+        lock_token: str,
+    ) -> bool:
+        return await self._phase_mutation(
+            _MARK_OBJECT_COMPLETED_LUA,
+            upload_id,
+            expected_offset,
+            ttl_seconds,
+            lock_token,
+        )
+
+    async def mark_cleanup_required(
+        self,
+        upload_id: UUID,
+        expected_offset: int,
+        ttl_seconds: int,
+        *,
+        lock_token: str,
+    ) -> bool:
+        return await self._phase_mutation(
+            _MARK_CLEANUP_REQUIRED_LUA,
+            upload_id,
+            expected_offset,
+            ttl_seconds,
+            lock_token,
+        )
+
+    async def _phase_mutation(
+        self,
+        script: str,
+        upload_id: UUID,
+        expected_offset: int,
+        ttl_seconds: int,
+        lock_token: str,
+    ) -> bool:
+        expected = _require_safe_integer(expected_offset, "expected_offset", maximum=MAX_UPLOAD_BYTES)
+        ttl = _require_ttl(ttl_seconds)
+        token = _validate_ascii_opaque(lock_token, "lock token", max_bytes=512)
+        raw = await self._redis.eval(
+            script,
+            2,
+            session_key(upload_id),
+            lock_key(upload_id),
+            str(expected),
+            str(ttl),
+            token,
+        )
+        code = _protocol_integer(raw, "session phase status", maximum=6)
+        if code in {1, 2}:
+            return True
+        if code in {0, 3, 5, 6}:
+            return False
+        raise TusSessionProtocolError("Redis rejected a session phase mutation")
+
+    async def delete_locked(self, upload_id: UUID, *, lock_token: str) -> bool:
+        token = _validate_ascii_opaque(lock_token, "lock token", max_bytes=512)
+        raw = await self._redis.eval(
+            _DELETE_LOCKED_LUA,
+            2,
+            session_key(upload_id),
+            lock_key(upload_id),
+            token,
+        )
+        return _protocol_integer(raw, "session delete status", maximum=1) == 1
+
     async def acquire_lock(self, upload_id: UUID, ttl_seconds: int) -> LockAcquireResult:
         ttl = _require_ttl(ttl_seconds)
         token = secrets.token_urlsafe(32)
@@ -920,12 +1204,15 @@ class TusSessionStore:
         user_id: UUID,
         upload_id: UUID,
         bytes_reserved: int,
+        *,
+        owner_token: str,
         ttl_seconds: int,
     ) -> ReservationCreateStatus:
         """Create the reservation marker separately from the session key."""
-        reserved = _require_safe_integer(bytes_reserved, "bytes_reserved", maximum=MAX_UPLOAD_BYTES)
+        reserved = _require_safe_integer(bytes_reserved, "bytes_reserved", minimum=1, maximum=MAX_UPLOAD_BYTES)
+        owner = _validate_owner_token(owner_token)
         ttl = _require_ttl(ttl_seconds)
-        payload = json.dumps({"bytes": reserved, "state": "reserved"}, sort_keys=True, separators=(",", ":"))
+        payload = TusQuotaReservation(reserved, owner, TusReservationState.RESERVED).to_json()
         created = await self._redis.set(
             reservation_key(user_id, upload_id),
             payload,
@@ -934,11 +1221,41 @@ class TusSessionStore:
         )
         return ReservationCreateStatus.CREATED if created else ReservationCreateStatus.ALREADY_EXISTS
 
-    async def release_reservation_once(self, user_id: UUID, upload_id: UUID) -> ReservationReleaseStatus:
+    async def get_reservation(self, user_id: UUID, upload_id: UUID) -> TusQuotaReservation | None:
+        raw = await self._redis.get(reservation_key(user_id, upload_id))
+        return None if raw is None else TusQuotaReservation.from_json(raw)
+
+    async def renew_reservation(
+        self,
+        user_id: UUID,
+        upload_id: UUID,
+        owner_token: str,
+        *,
+        ttl_seconds: int,
+    ) -> LockMutationStatus:
+        owner = _validate_owner_token(owner_token)
+        ttl = _require_ttl(ttl_seconds)
+        raw = await self._redis.eval(
+            _RENEW_RESERVATION_LUA,
+            1,
+            reservation_key(user_id, upload_id),
+            owner,
+            str(ttl),
+        )
+        return LockMutationStatus.RENEWED if _protocol_integer(raw, "reservation renewal status", maximum=1) else LockMutationStatus.NOT_OWNER
+
+    async def release_reservation_once(
+        self,
+        user_id: UUID,
+        upload_id: UUID,
+        owner_token: str,
+    ) -> ReservationReleaseStatus:
+        owner = _validate_owner_token(owner_token)
         raw = await self._redis.eval(
             _RELEASE_RESERVATION_LUA,
             1,
             reservation_key(user_id, upload_id),
+            owner,
         )
         code = _protocol_integer(raw, "reservation release status", maximum=max(_RESERVATION_RELEASE_CODES))
         status = _RESERVATION_RELEASE_CODES.get(code)

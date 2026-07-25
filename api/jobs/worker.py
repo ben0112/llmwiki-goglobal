@@ -107,11 +107,31 @@ async def startup(ctx: dict) -> None:
         s3 = _create_s3_service() if _s3_is_configured(runtime_settings) else None
         created_resources["s3"] = s3
         ctx["s3"] = s3
+        tus_cleanup = None
+        if getattr(runtime_settings, "TUS_MULTIPART_ENABLED", False):
+            if s3 is None:
+                raise RuntimeError("multipart TUS cleanup worker requires S3")
+            from infra.quota import HostedQuotaService
+            from infra.tus import HostedTusCleanupService
+            from infra.tus_sessions import TusSessionStore
+
+            from jobs.service import JobService
+
+            tus_cleanup = HostedTusCleanupService(
+                pool,
+                s3,
+                JobService(pool),
+                HostedQuotaService(pool, ctx["redis"]),
+                TusSessionStore(ctx["redis"]),
+                stale_seconds=runtime_settings.TUS_STALE_SECONDS,
+                lock_seconds=runtime_settings.TUS_LOCK_SECONDS,
+            )
         worker_context = WorkerContext(
             pool=pool,
             s3=s3,
             converter_url=runtime_settings.CONVERTER_URL,
             converter_secret=runtime_settings.CONVERTER_SECRET,
+            tus_cleanup=tus_cleanup,
         )
         ctx.update(
             {
@@ -381,6 +401,15 @@ async def reap_cron(ctx: dict) -> None:
     logger.info("reaped expired durable jobs count=%d", len(reaped))
 
 
+async def upload_cleanup_cron(ctx: dict) -> None:
+    """Discover stale upload sessions and append idempotent durable cleanup jobs."""
+    cleanup = ctx["worker_context"].tus_cleanup
+    if cleanup is None:
+        return
+    count = await cleanup.enqueue_stale_jobs()
+    logger.info("enqueued stale upload cleanup jobs count=%d", count)
+
+
 def _build_cron_jobs() -> list:
     """Build fresh CronJob instances because ARQ mutates their next_run state."""
     return [
@@ -397,6 +426,16 @@ def _build_cron_jobs() -> list:
             reap_cron,
             name="durable_job_reaper",
             second={5, 35},
+            run_at_startup=True,
+            unique=True,
+            max_tries=1,
+            keep_result=0,
+        ),
+        cron(
+            upload_cleanup_cron,
+            name="durable_upload_cleanup_scan",
+            minute=None,
+            second={15},
             run_at_startup=True,
             unique=True,
             max_tries=1,

@@ -19,6 +19,7 @@ def _valid_session(module, **overrides):
         "user_id": uuid4(),
         "knowledge_base_id": uuid4(),
         "filename": "quarterly-report.pdf",
+        "path": "/reports/2026/",
         "content_type": "application/pdf",
         "total_length": 12,
         "offset": 5,
@@ -31,6 +32,7 @@ def _valid_session(module, **overrides):
         "document_id": None,
         "job_id": None,
         "reservation_bytes": 12,
+        "object_completed": False,
     }
     values.update(overrides)
     return module.TusSession(**values)
@@ -73,6 +75,7 @@ def test_session_round_trip_is_explicit_and_contains_no_auth_material():
         "user_id",
         "knowledge_base_id",
         "filename",
+        "path",
         "content_type",
         "total_length",
         "offset",
@@ -85,6 +88,7 @@ def test_session_round_trip_is_explicit_and_contains_no_auth_material():
         "document_id",
         "job_id",
         "reservation_bytes",
+        "object_completed",
     }
     lowered = encoded.lower()
     assert "token" not in lowered
@@ -139,6 +143,30 @@ def test_session_reservation_bytes_must_equal_declared_length():
     module = _module()
     with pytest.raises(ValueError, match="reservation_bytes"):
         _valid_session(module, reservation_bytes=11)
+
+
+def test_cleanup_required_session_preserves_offset_and_multipart_identity():
+    module = _module()
+    session = _valid_session(
+        module,
+        state=module.TusSessionState.CLEANUP_REQUIRED,
+    )
+
+    decoded = module.TusSession.from_json(session.to_json())
+
+    assert decoded.offset == 5
+    assert decoded.parts == (module.TusPart(1, "etag-1"),)
+    assert decoded.multipart_upload_id == "multipart-opaque-id"
+
+
+def test_object_completed_phase_requires_full_offset():
+    module = _module()
+
+    completed_object = _valid_session(module, offset=12, object_completed=True)
+    assert module.TusSession.from_json(completed_object.to_json()) == completed_object
+
+    with pytest.raises(ValueError, match="object_completed"):
+        _valid_session(module, object_completed=True)
 
 
 def test_hash_tagged_keys_are_exact_and_mutation_keys_share_cluster_slot():
@@ -199,6 +227,7 @@ def test_completed_state_requires_full_offset_and_stable_document_and_job_ids():
         state=module.TusSessionState.COMPLETED,
         document_id=document_id,
         job_id=job_id,
+        object_completed=True,
     )
     assert module.TusSession.from_json(session.to_json()) == session
 
@@ -416,26 +445,81 @@ def test_lock_tokens_are_opaque_and_owner_checked_with_single_key_scripts():
     assert all(call[2][0] == f"tus:lock:{{{upload_id}}}" for call in redis.eval_calls)
 
 
-def test_reservation_uses_exact_key_and_release_is_typed_and_single_key():
+def test_stale_owner_cannot_mark_cleanup_or_delete_a_new_owners_session():
+    module = _module()
+    upload_id = uuid4()
+    redis = FakeRedis(eval_results=[5, 0])
+    store = module.TusSessionStore(redis)
+
+    marked = asyncio.run(
+        store.mark_cleanup_required(
+            upload_id,
+            expected_offset=5,
+            ttl_seconds=60,
+            lock_token="stale-owner",
+        )
+    )
+    deleted = asyncio.run(store.delete_locked(upload_id, lock_token="stale-owner"))
+
+    assert marked is False
+    assert deleted is False
+    assert redis.eval_calls[0][1] == 2
+    assert redis.eval_calls[1][1] == 2
+
+
+def test_reservation_marker_persists_quota_owner_and_release_is_token_fenced():
     module = _module()
     user_id = uuid4()
     upload_id = uuid4()
-    redis = FakeRedis(set_results=[True, None], eval_results=[1, 2, 0])
+    owner_token = "B" * 32
+    payload = json.dumps(
+        {"bytes": 12, "owner": owner_token, "state": "reserved"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    redis = FakeRedis(set_results=[True, None], get_result=payload, eval_results=[4, 1, 2])
     store = module.TusSessionStore(redis)
 
-    created = asyncio.run(store.create_reservation(user_id, upload_id, bytes_reserved=12, ttl_seconds=90))
-    duplicate = asyncio.run(store.create_reservation(user_id, upload_id, bytes_reserved=12, ttl_seconds=90))
-    results = [asyncio.run(store.release_reservation_once(user_id, upload_id)) for _ in range(3)]
+    created = asyncio.run(
+        store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90)
+    )
+    duplicate = asyncio.run(
+        store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90)
+    )
+    marker = asyncio.run(store.get_reservation(user_id, upload_id))
+    wrong_owner = asyncio.run(store.release_reservation_once(user_id, upload_id, "C" * 32))
+    released = asyncio.run(store.release_reservation_once(user_id, upload_id, owner_token))
+    repeated = asyncio.run(store.release_reservation_once(user_id, upload_id, owner_token))
 
     assert created is module.ReservationCreateStatus.CREATED
     assert duplicate is module.ReservationCreateStatus.ALREADY_EXISTS
-    assert results == [
-        module.ReservationReleaseStatus.RELEASED,
-        module.ReservationReleaseStatus.ALREADY_RELEASED,
-        module.ReservationReleaseStatus.NOT_FOUND,
-    ]
+    assert marker == module.TusQuotaReservation(12, owner_token, module.TusReservationState.RESERVED)
+    assert wrong_owner is module.ReservationReleaseStatus.NOT_OWNER
+    assert released is module.ReservationReleaseStatus.RELEASED
+    assert repeated is module.ReservationReleaseStatus.ALREADY_RELEASED
     key = f"tus:reservation:{{{user_id}}}:{{{upload_id}}}"
     assert redis.set_calls[0][0] == key
     reservation_payload = json.loads(redis.set_calls[0][1])
-    assert reservation_payload == {"bytes": 12, "state": "reserved"}
-    assert all(call[1] == 1 and call[2] == (key,) for call in redis.eval_calls)
+    assert reservation_payload == {"bytes": 12, "owner": owner_token, "state": "reserved"}
+    assert all(call[1] == 1 and call[2][0] == key for call in redis.eval_calls)
+    assert [call[2][1] for call in redis.eval_calls] == ["C" * 32, owner_token, owner_token]
+
+
+def test_reservation_marker_ttl_renewal_requires_the_quota_owner():
+    module = _module()
+    user_id = uuid4()
+    upload_id = uuid4()
+    owner_token = "D" * 32
+    redis = FakeRedis(eval_results=[1, 0])
+    store = module.TusSessionStore(redis)
+
+    renewed = asyncio.run(store.renew_reservation(user_id, upload_id, owner_token, ttl_seconds=120))
+    rejected = asyncio.run(store.renew_reservation(user_id, upload_id, "E" * 32, ttl_seconds=120))
+
+    assert renewed is module.LockMutationStatus.RENEWED
+    assert rejected is module.LockMutationStatus.NOT_OWNER
+    key = f"tus:reservation:{{{user_id}}}:{{{upload_id}}}"
+    assert [call[1:] for call in redis.eval_calls] == [
+        (1, (key, owner_token, "120")),
+        (1, (key, "E" * 32, "120")),
+    ]

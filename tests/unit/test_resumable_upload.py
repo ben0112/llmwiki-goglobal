@@ -10,11 +10,11 @@ import hashlib
 import os
 import time
 
+import httpx
 import pytest
-from fastapi import HTTPException
-
 import routes.local_upload as lu
 from config import settings
+from fastapi import FastAPI, HTTPException, Response
 
 
 @pytest.fixture
@@ -97,3 +97,45 @@ async def test_offset_unknown_id_404(ws):
     with pytest.raises(HTTPException) as exc:
         await lu.resumable_offset("c" * 32, user_id="u")
     assert exc.value.status_code == 404
+
+
+async def test_hosted_tus_flag_delegates_to_application_scoped_service(monkeypatch):
+    from infra import tus
+
+    calls = []
+
+    class HostedService:
+        async def create(self, request, user_id):
+            calls.append(("create", user_id))
+            return Response(status_code=201, headers={"Location": "/v1/uploads/shared"})
+
+        async def head(self, upload_id, request, user_id):
+            calls.append(("head", upload_id, user_id))
+            return Response(status_code=200, headers={"Upload-Offset": "7"})
+
+        async def patch(self, upload_id, request, user_id):
+            calls.append(("patch", upload_id, user_id))
+            return Response(status_code=204, headers={"Upload-Offset": "9"})
+
+    async def authenticated(_request):
+        return "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    monkeypatch.setattr(tus, "_get_user_id", authenticated)
+    monkeypatch.setattr(tus.settings, "TUS_MULTIPART_ENABLED", True)
+    app = FastAPI()
+    app.state.tus_service = HostedService()
+    app.include_router(tus.router)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/v1/uploads")
+        headed = await client.head("/v1/uploads/shared")
+        patched = await client.patch("/v1/uploads/shared")
+
+    assert created.status_code == 201
+    assert headed.headers["upload-offset"] == "7"
+    assert patched.headers["upload-offset"] == "9"
+    assert calls == [
+        ("create", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        ("head", "shared", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        ("patch", "shared", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+    ]

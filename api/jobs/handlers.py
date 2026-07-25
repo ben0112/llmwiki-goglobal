@@ -32,8 +32,10 @@ _VETTED_ERROR_MESSAGES = MappingProxyType(
         "invalid_document_job": "The document extraction job is invalid.",
         "invalid_job_result": "The job produced an invalid result.",
         "invalid_graph_job": "The graph rebuild job is invalid.",
+        "invalid_upload_job": "The upload cleanup job is invalid.",
         "knowledge_base_not_found": "The requested knowledge base was not found.",
         "quota_exceeded": "The account quota was exceeded.",
+        "upload_cleanup_transient": "Upload cleanup will be retried.",
         "unsupported_document_type": "This document type is not supported.",
         "unsupported_job_type": "This job type is not supported.",
     }
@@ -46,6 +48,7 @@ class WorkerContext:
     s3: object | None
     converter_url: str
     converter_secret: str
+    tus_cleanup: object | None = None
 
 
 Handler = Callable[
@@ -307,8 +310,35 @@ async def handle_upload_cleanup(
     lease: JobLease,
     context: WorkerContext,
 ) -> Mapping[str, JSONValue]:
-    del job, lease, context
-    raise UnsupportedJobHandler
+    await lease.checkpoint()
+    if (
+        job.job_type is not JobType.UPLOAD_CLEANUP
+        or job.document_id is not None
+        or job.knowledge_base_id is not None
+        or set(job.payload) != {"upload_id"}
+    ):
+        raise TerminalJobError("invalid_upload_job", "The upload cleanup job is invalid.")
+    raw_upload_id = job.payload.get("upload_id")
+    try:
+        upload_id = UUID(raw_upload_id) if isinstance(raw_upload_id, str) else None
+    except ValueError:
+        upload_id = None
+    if upload_id is None or str(upload_id) != raw_upload_id:
+        raise TerminalJobError("invalid_upload_job", "The upload cleanup job is invalid.")
+    if context.tus_cleanup is None:
+        raise RetryableJobError("upload_cleanup_transient", "Upload cleanup will be retried.")
+    try:
+        result = await context.tus_cleanup.cleanup(upload_id, job.user_id)
+    except Exception:  # noqa: BLE001 -- cleanup adapters use retryable job semantics
+        raise RetryableJobError("upload_cleanup_transient", "Upload cleanup will be retried.") from None
+    status = result.get("status") if isinstance(result, Mapping) else None
+    if status in {"contended", "retry", "lock_lost"}:
+        raise RetryableJobError("upload_cleanup_transient", "Upload cleanup will be retried.")
+    if status == "owner_mismatch":
+        raise TerminalJobError("invalid_upload_job", "The upload cleanup job is invalid.")
+    if status not in {"cleaned", "already_clean", "committed", "active"}:
+        raise RetryableJobError("upload_cleanup_transient", "Upload cleanup will be retried.")
+    return {"upload_id": str(upload_id), "status": status}
 
 
 HANDLERS: Mapping[JobType, Handler] = MappingProxyType(

@@ -37,6 +37,7 @@ def _session(module, upload_id, user_id, kb_id, *, total=10):
         user_id=user_id,
         knowledge_base_id=kb_id,
         filename="safe.pdf",
+        path="/",
         content_type="application/pdf",
         total_length=total,
         offset=0,
@@ -49,6 +50,7 @@ def _session(module, upload_id, user_id, kb_id, *, total=10):
         document_id=None,
         job_id=None,
         reservation_bytes=total,
+        object_completed=False,
     )
 
 
@@ -149,6 +151,20 @@ async def test_real_redis_stale_lock_owner_cannot_append_or_complete(namespace, 
     assert stale_duplicate.status is module.CompleteStatus.LOCK_LOST
     assert await redis_client.get(key) == completed_record
     assert 0 <= completed_ttl - await redis_client.pttl(key) < 1_000
+
+
+async def test_real_redis_stale_owner_cannot_mark_cleanup_or_delete_new_progress(namespace, redis_client):
+    module, store, upload_id, user_id, kb_id = namespace
+    await store.create(_session(module, upload_id, user_id, kb_id, total=5), ttl_seconds=60)
+    stale = await _lock_token(module, store, upload_id)
+    await redis_client.delete(module.lock_key(upload_id))
+    owner = await _lock_token(module, store, upload_id)
+    await store.append_part(upload_id, 0, 5, 1, "etag-owner", 60, lock_token=owner)
+    before = await redis_client.get(module.session_key(upload_id))
+
+    assert not await store.mark_cleanup_required(upload_id, 0, 60, lock_token=stale)
+    assert not await store.delete_locked(upload_id, lock_token=stale)
+    assert await redis_client.get(module.session_key(upload_id)) == before
 
 
 async def test_real_redis_chinese_filename_round_trips_and_mutates(namespace):
@@ -379,8 +395,15 @@ async def test_real_redis_lock_is_token_owned_and_renewable(namespace, redis_cli
 
 async def test_real_redis_reservation_release_is_once_and_marker_has_no_credentials(namespace, redis_client):
     module, store, upload_id, user_id, _ = namespace
+    owner = "R" * 32
     assert (
-        await store.create_reservation(user_id, upload_id, bytes_reserved=10, ttl_seconds=60)
+        await store.create_reservation(
+            user_id,
+            upload_id,
+            bytes_reserved=10,
+            owner_token=owner,
+            ttl_seconds=60,
+        )
         is module.ReservationCreateStatus.CREATED
     )
     key = module.reservation_key(user_id, upload_id)
@@ -388,8 +411,9 @@ async def test_real_redis_reservation_release_is_once_and_marker_has_no_credenti
     lowered = raw.lower()
     assert b"token" not in lowered and b"secret" not in lowered and b"credential" not in lowered
 
-    assert await store.release_reservation_once(user_id, upload_id) is module.ReservationReleaseStatus.RELEASED
-    assert await store.release_reservation_once(user_id, upload_id) is module.ReservationReleaseStatus.ALREADY_RELEASED
+    assert await store.release_reservation_once(user_id, upload_id, "S" * 32) is module.ReservationReleaseStatus.NOT_OWNER
+    assert await store.release_reservation_once(user_id, upload_id, owner) is module.ReservationReleaseStatus.RELEASED
+    assert await store.release_reservation_once(user_id, upload_id, owner) is module.ReservationReleaseStatus.ALREADY_RELEASED
 
 
 async def test_real_redis_expired_session_returns_none_with_bounded_poll(namespace, redis_client):
@@ -529,9 +553,30 @@ async def test_real_redis_max_timestamp_cannot_overflow_on_append_or_complete(na
 async def test_real_redis_released_reservation_without_ttl_is_malformed(namespace, redis_client):
     module, store, upload_id, user_id, _ = namespace
     key = module.reservation_key(user_id, upload_id)
-    await redis_client.set(key, '{"bytes":10,"state":"released"}')
+    owner = "T" * 32
+    await redis_client.set(key, f'{{"bytes":10,"owner":"{owner}","state":"released"}}')
 
-    result = await store.release_reservation_once(user_id, upload_id)
+    result = await store.release_reservation_once(user_id, upload_id, owner)
 
     assert result is module.ReservationReleaseStatus.MALFORMED
     assert await redis_client.pttl(key) == -1
+
+
+async def test_real_redis_zero_byte_reservation_is_malformed_and_never_renewed(namespace, redis_client):
+    module, store, upload_id, user_id, _ = namespace
+    key = module.reservation_key(user_id, upload_id)
+    owner = "T" * 32
+    raw = f'{{"bytes":0,"owner":"{owner}","state":"reserved"}}'
+    await redis_client.set(key, raw, ex=60)
+
+    with pytest.raises(module.InvalidTusSessionError):
+        await store.get_reservation(user_id, upload_id)
+    assert (
+        await store.release_reservation_once(user_id, upload_id, owner)
+        is module.ReservationReleaseStatus.MALFORMED
+    )
+    assert (
+        await store.renew_reservation(user_id, upload_id, owner, ttl_seconds=60)
+        is module.LockMutationStatus.NOT_OWNER
+    )
+    assert await redis_client.get(key) == raw.encode()

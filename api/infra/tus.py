@@ -1,17 +1,18 @@
-import time
 import asyncio
 import logging
-from uuid import uuid4
+import time
+from base64 import b64decode, b64encode
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from base64 import b64decode
-from dataclasses import dataclass, field
-
-from fastapi import APIRouter, Request, HTTPException, Response
-from starlette.requests import ClientDisconnect
+from uuid import UUID, uuid4
 
 from auth import get_current_user
 from config import settings
+from fastapi import APIRouter, HTTPException, Request, Response
 from infra.tasks import spawn_logged
+from starlette.requests import ClientDisconnect
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,8 @@ TUS_VERSION = "1.0.0"
 MAX_SIZE = 1_073_741_824  # 1 GiB(前端 tus-js 以 50MB 分块 PATCH,反向代理 body 上限无需同步放大)
 UPLOAD_DIR = Path("/tmp/supavault_tus_uploads")
 STALE_SECONDS = 3600
+MIN_MULTIPART_PART_SIZE = 5 * 1024 * 1024
+FINALIZATION_TIMEOUT_SECONDS = 20
 
 ALLOWED_EXTENSIONS = {
     ".pdf": "pdf",
@@ -160,7 +163,16 @@ class TusUpload:
     last_activity: float = field(default_factory=time.time)
 
 
-_uploads: dict[str, TusUpload] = {}
+class _LegacyTusCompatibility:
+    """Rollback-only process-local Hosted TUS state."""
+
+    def __init__(self) -> None:
+        self.uploads: dict[str, TusUpload] = {}
+
+
+_legacy_tus_compatibility = _LegacyTusCompatibility()
+# Compatibility aliases remain for old tests/imports until the rollout flag is removed.
+_uploads = _legacy_tus_compatibility.uploads
 
 
 def _check_tus_version(request: Request):
@@ -275,6 +287,901 @@ async def _get_user_id(request: Request) -> str:
     return await get_current_user(request)
 
 
+def _hosted_tus_service(request: Request):
+    service = getattr(request.app.state, "tus_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Resumable upload coordination is unavailable")
+    return service
+
+
+def _canonical_upload_id(raw: str) -> UUID:
+    try:
+        upload_id = UUID(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="Upload not found") from None
+    if str(upload_id) != raw:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return upload_id
+
+
+def _validate_signature_bytes(head: bytes, ext: str) -> None:
+    signatures = _FILE_SIGNATURES.get(ext)
+    if not signatures:
+        return
+    valid = head[:4] == b"RIFF" and head[8:12] == b"WEBP" if ext == "webp" else any(
+        head.startswith(prefix) for group in signatures for prefix in group
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail=f"File content does not match declared type .{ext}")
+
+
+def _reservation_marker_settled(status) -> bool:
+    from infra.tus_sessions import ReservationReleaseStatus
+
+    return status in {
+        ReservationReleaseStatus.RELEASED,
+        ReservationReleaseStatus.ALREADY_RELEASED,
+        ReservationReleaseStatus.NOT_FOUND,
+    }
+
+
+async def _shielded(operation) -> None:
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        try:
+            await task
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 -- preserve outer cancellation
+            logger.error("Shielded TUS compensation failed error_type=%s", type(exc).__name__)
+        raise cancelled
+
+
+class HostedTusMultipartService:
+    """Replica-safe Hosted TUS protocol over Redis sessions and S3 multipart."""
+
+    def __init__(
+        self,
+        pool,
+        s3_service,
+        job_service,
+        quota_service,
+        session_store,
+        *,
+        session_ttl_seconds: int,
+        stale_seconds: int,
+        lock_seconds: int,
+        max_patch_bytes: int,
+    ) -> None:
+        self.pool = pool
+        self.s3 = s3_service
+        self.jobs = job_service
+        self.quota = quota_service
+        self.sessions = session_store
+        self.session_ttl_seconds = session_ttl_seconds
+        self.stale_seconds = stale_seconds
+        self.lock_seconds = lock_seconds
+        self.max_patch_bytes = max_patch_bytes
+
+    async def create(self, request: Request, user_id: str) -> Response:
+        from infra.quota import QuotaExceeded, QuotaUnavailable
+        from infra.tus_sessions import (
+            ReservationCreateStatus,
+            SessionCreateStatus,
+            TusSession,
+            TusSessionState,
+            validate_tus_upload_metadata,
+        )
+
+        _check_tus_version(request)
+        try:
+            user_uuid = UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid authenticated user") from None
+        upload_length = self._upload_length(request)
+        metadata = _parse_metadata(request.headers.get("Upload-Metadata", ""))
+        filename, ext = self._filename(metadata)
+        path = sanitize_upload_path(metadata.get("path", "/"))
+        try:
+            validate_tus_upload_metadata(filename, path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid Upload-Metadata: {exc}") from None
+        try:
+            kb_id = UUID(metadata.get("knowledge_base_id", "").strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid knowledge_base_id format") from None
+        if not metadata.get("knowledge_base_id", "").strip():
+            raise HTTPException(status_code=400, detail="Missing knowledge_base_id in Upload-Metadata")
+        owned = await self.pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id = $1 AND user_id = $2)",
+            kb_id,
+            user_uuid,
+        )
+        if not owned:
+            raise HTTPException(status_code=403, detail="Knowledge base not found or not owned by you")
+
+        upload_id = uuid4()
+        try:
+            reservation = await self.quota.reserve(
+                user_uuid,
+                upload_id,
+                upload_length,
+                ttl_seconds=self.session_ttl_seconds,
+            )
+        except QuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=f"Storage quota exceeded ({exc.used_bytes}/{exc.limit_bytes} bytes)") from None
+        except QuotaUnavailable:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable") from None
+
+        key = f"{user_uuid}/{upload_id}/source.{ext}"
+        multipart_id = None
+        marker_created = False
+        session = None
+        try:
+            multipart_id = await self.s3.create_multipart(key, CONTENT_TYPES.get(ext, "application/octet-stream"))
+            now = datetime.now(UTC)
+            session = TusSession(
+                upload_id=upload_id,
+                user_id=user_uuid,
+                knowledge_base_id=kb_id,
+                filename=filename,
+                path=path,
+                content_type=CONTENT_TYPES.get(ext, "application/octet-stream"),
+                total_length=upload_length,
+                offset=0,
+                s3_key=key,
+                multipart_upload_id=multipart_id,
+                parts=(),
+                created_at=now,
+                updated_at=now,
+                state=TusSessionState.UPLOADING,
+                document_id=None,
+                job_id=None,
+                reservation_bytes=upload_length,
+                object_completed=False,
+            )
+            marker = await self.sessions.create_reservation(
+                user_uuid,
+                upload_id,
+                upload_length,
+                owner_token=reservation.owner_token,
+                ttl_seconds=self.session_ttl_seconds,
+            )
+            if marker is not ReservationCreateStatus.CREATED:
+                raise RuntimeError("reservation marker collision")
+            marker_created = True
+            created = await self.sessions.create(session, self.session_ttl_seconds)
+            if created is not SessionCreateStatus.CREATED:
+                raise RuntimeError("upload session collision")
+        except asyncio.CancelledError:
+            await _shielded(self._compensate_create(reservation, key, multipart_id, marker_created, session))
+            raise
+        except Exception:  # noqa: BLE001 -- all adapter failures require the same compensation
+            await _shielded(self._compensate_create(reservation, key, multipart_id, marker_created, session))
+            raise HTTPException(status_code=503, detail="Could not initialize resumable upload") from None
+        return Response(status_code=201, headers=_tus_headers({"Location": f"/v1/uploads/{upload_id}"}))
+
+    async def _compensate_create(
+        self,
+        reservation,
+        key: str,
+        multipart_id: str | None,
+        marker_created: bool,
+        session,
+    ) -> None:
+        abort_ok = True
+        if multipart_id is not None:
+            try:
+                await self._abort_ignoring_missing(key, multipart_id)
+            except Exception as exc:  # noqa: BLE001 -- S3 SDK error types are adapter-specific
+                abort_ok = False
+                logger.error("TUS create abort failed upload_id=%s error_type=%s", reservation.upload_id, type(exc).__name__)
+        if not abort_ok and session is not None:
+            try:
+                if not marker_created:
+                    from infra.tus_sessions import ReservationCreateStatus
+
+                    marker_created = await self.sessions.create_reservation(
+                        reservation.user_id,
+                        reservation.upload_id,
+                        reservation.bytes,
+                        owner_token=reservation.owner_token,
+                        ttl_seconds=self.session_ttl_seconds,
+                    ) is ReservationCreateStatus.CREATED
+                from infra.tus_sessions import SessionCreateStatus, TusSessionState
+
+                cleanup_session = replace(session, state=TusSessionState.CLEANUP_REQUIRED)
+                created = await self.sessions.create(cleanup_session, self.session_ttl_seconds)
+                if created is SessionCreateStatus.ALREADY_EXISTS:
+                    acquired = await self.sessions.acquire_lock(session.upload_id, self.lock_seconds)
+                    if acquired.token is not None:
+                        try:
+                            await self.sessions.mark_cleanup_required(
+                                session.upload_id,
+                                session.offset,
+                                self.session_ttl_seconds,
+                                lock_token=acquired.token,
+                            )
+                        finally:
+                            await self.sessions.release_lock(session.upload_id, acquired.token)
+            except Exception as exc:  # noqa: BLE001 -- recovery is best effort and must retain ownership
+                logger.error(
+                    "TUS create recovery marker failed upload_id=%s error_type=%s",
+                    reservation.upload_id,
+                    type(exc).__name__,
+                )
+            return
+        quota_ok = False
+        try:
+            quota_ok = await self.quota.release(reservation) is True
+        except Exception as exc:  # noqa: BLE001 -- quota backends expose adapter-specific failures
+            logger.error("TUS create quota release failed upload_id=%s error_type=%s", reservation.upload_id, type(exc).__name__)
+        if marker_created and quota_ok:
+            with suppress(Exception):
+                await self.sessions.release_reservation_once(
+                    reservation.user_id,
+                    reservation.upload_id,
+                    reservation.owner_token,
+                )
+
+    async def head(self, raw_upload_id: str, request: Request, user_id: str) -> Response:
+        del request
+        session = await self._owned_session(_canonical_upload_id(raw_upload_id), user_id)
+        metadata = {
+            "filename": session.filename,
+            "knowledge_base_id": str(session.knowledge_base_id),
+            "path": session.path,
+        }
+        encoded_metadata = ",".join(
+            f"{key} {b64encode(value.encode('utf-8')).decode('ascii')}" for key, value in metadata.items()
+        )
+        headers = _tus_headers(
+            {
+                "Upload-Offset": str(session.offset),
+                "Upload-Length": str(session.total_length),
+                "Upload-Metadata": encoded_metadata,
+                "Cache-Control": "no-store",
+            }
+        )
+        if session.document_id is not None and session.job_id is not None:
+            headers.update({"X-Document-Id": str(session.document_id), "X-Job-Id": str(session.job_id)})
+        return Response(status_code=200, headers=headers)
+
+    async def patch(self, raw_upload_id: str, request: Request, user_id: str) -> Response:  # noqa: C901
+        from infra.tus_sessions import AppendPartStatus, LockAcquireStatus, TusSessionState
+
+        _check_tus_version(request)
+        if request.headers.get("Content-Type", "") != "application/offset+octet-stream":
+            raise HTTPException(status_code=415, detail="Content-Type must be application/offset+octet-stream")
+        upload_id = _canonical_upload_id(raw_upload_id)
+        session = await self._owned_session(upload_id, user_id)
+        client_offset = self._client_offset(request)
+        if session.state is TusSessionState.COMPLETED:
+            await self._retry_completed_settlement(session)
+            return self._completed_response(session, client_offset)
+        if session.state is TusSessionState.CLEANUP_REQUIRED:
+            raise HTTPException(status_code=409, detail="Upload requires cleanup", headers={"Retry-After": "1"})
+
+        acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
+        if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
+            raise HTTPException(status_code=423, detail="Upload is busy", headers={"Retry-After": "1"})
+        token = acquired.token
+        lost = asyncio.Event()
+        renewal = asyncio.create_task(self._renew_upload_lock(upload_id, token, lost))
+        try:
+            session = await self._owned_session(upload_id, user_id)
+            if session.state is TusSessionState.COMPLETED:
+                await self._retry_completed_settlement(session)
+                return self._completed_response(session, client_offset)
+            if session.state is TusSessionState.CLEANUP_REQUIRED:
+                raise HTTPException(status_code=409, detail="Upload requires cleanup", headers={"Retry-After": "1"})
+            if client_offset != session.offset:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Offset mismatch",
+                    headers=_tus_headers({"Upload-Offset": str(session.offset)}),
+                )
+            await self._renew_session_reservation(session)
+
+            body, too_large = await self._read_patch_body(request, session.total_length - session.offset)
+            if too_large:
+                raise HTTPException(
+                    status_code=413,
+                    detail="PATCH body exceeds the configured limit",
+                    headers=_tus_headers({"Upload-Offset": str(session.offset)}),
+                )
+            if lost.is_set():
+                raise HTTPException(status_code=423, detail="Upload lock was lost", headers={"Retry-After": "1"})
+            if not body and session.offset != session.total_length:
+                raise HTTPException(status_code=400, detail="PATCH body must not be empty")
+
+            if body:
+                next_offset = session.offset + len(body)
+                if next_offset > session.total_length:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Body exceeds declared Upload-Length",
+                        headers=_tus_headers({"Upload-Offset": str(session.offset)}),
+                    )
+                if next_offset < session.total_length and len(body) < MIN_MULTIPART_PART_SIZE:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Non-final multipart chunks must be at least 5 MiB",
+                        headers=_tus_headers({"Upload-Offset": str(session.offset)}),
+                    )
+                part_number = len(session.parts) + 1
+                etag = await self.s3.upload_part(
+                    session.s3_key,
+                    session.multipart_upload_id,
+                    part_number,
+                    body,
+                )
+                if lost.is_set():
+                    raise HTTPException(status_code=423, detail="Upload lock was lost", headers={"Retry-After": "1"})
+                appended = await self.sessions.append_part(
+                    upload_id,
+                    session.offset,
+                    len(body),
+                    part_number,
+                    etag,
+                    self.session_ttl_seconds,
+                    lock_token=token,
+                )
+                if appended.status is not AppendPartStatus.APPENDED:
+                    if appended.status is not AppendPartStatus.LOCK_LOST and not lost.is_set():
+                        await self.sessions.mark_cleanup_required(
+                            upload_id,
+                            session.offset,
+                            self.session_ttl_seconds,
+                            lock_token=token,
+                        )
+                    raise HTTPException(
+                        status_code=423 if appended.status is AppendPartStatus.LOCK_LOST else 409,
+                        detail="Upload offset could not be committed",
+                        headers=_tus_headers({"Upload-Offset": str(appended.offset), "Retry-After": "1"}),
+                    )
+                session = await self.sessions.get(upload_id)
+                if session is None:
+                    raise HTTPException(status_code=503, detail="Upload session disappeared")
+
+            if session.offset == session.total_length:
+                return await self._finalize(session, token)
+            return Response(status_code=204, headers=_tus_headers({"Upload-Offset": str(session.offset)}))
+        finally:
+            renewal.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal
+            with suppress(Exception):
+                await asyncio.shield(self.sessions.release_lock(upload_id, token))
+
+    async def _renew_upload_lock(self, upload_id: UUID, token: str, lost: asyncio.Event) -> None:
+        from infra.tus_sessions import LockMutationStatus
+
+        interval = max(self.lock_seconds / 3, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = await self.sessions.renew_lock(upload_id, token, self.lock_seconds)
+            except Exception:  # noqa: BLE001 -- any coordination failure loses the renewable lock
+                lost.set()
+                return
+            if renewed is not LockMutationStatus.RENEWED:
+                lost.set()
+                return
+
+    async def _read_patch_body(self, request: Request, remaining: int) -> tuple[bytes, bool]:
+        content_length = request.headers.get("Content-Length")
+        if content_length:
+            with suppress(ValueError):
+                if int(content_length) > self.max_patch_bytes or int(content_length) > remaining:
+                    return b"", True
+        body = bytearray()
+        try:
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > self.max_patch_bytes or len(body) > remaining:
+                    return bytes(body), True
+        except ClientDisconnect:
+            raise HTTPException(status_code=400, detail="PATCH body was interrupted") from None
+        return bytes(body), False
+
+    async def _finalize(self, session, token: str) -> Response:  # noqa: C901
+        from infra.quota import QuotaReservation, QuotaUnavailable
+        from services.s3 import MultipartPart
+
+        marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+        if marker is None or marker.state.value != "reserved" or marker.bytes != session.reservation_bytes:
+            await self.sessions.mark_cleanup_required(
+                session.upload_id,
+                session.offset,
+                self.session_ttl_seconds,
+                lock_token=token,
+            )
+            raise HTTPException(status_code=503, detail="Upload reservation is unavailable")
+        reservation = QuotaReservation(session.user_id, session.upload_id, marker.bytes, marker.owner_token)
+        if not session.object_completed:
+            try:
+                await self.s3.complete_multipart(
+                    session.s3_key,
+                    session.multipart_upload_id,
+                    [MultipartPart(part.part_number, part.etag) for part in session.parts],
+                )
+            except Exception as exc:  # noqa: BLE001 -- normalize S3 adapter-specific missing errors
+                if not self._is_missing(exc) or await self.s3.head_object(session.s3_key) is None:
+                    raise HTTPException(status_code=502, detail="Could not complete multipart upload") from None
+            metadata = await self.s3.head_object(session.s3_key)
+            if metadata is None or metadata.size != session.total_length:
+                await _shielded(self._discard(session, reservation, token))
+                raise HTTPException(status_code=400, detail="Upload size mismatch")
+            head = await self.s3.read_range(session.s3_key, 0, min(15, session.total_length - 1))
+            ext = session.filename.rsplit(".", 1)[-1].lower()
+            try:
+                _validate_signature_bytes(head, ext)
+            except HTTPException:
+                await _shielded(self._discard(session, reservation, token))
+                raise
+            if not await self.sessions.mark_object_completed(
+                session.upload_id,
+                session.offset,
+                self.session_ttl_seconds,
+                lock_token=token,
+            ):
+                await self.sessions.mark_cleanup_required(
+                    session.upload_id,
+                    session.offset,
+                    self.session_ttl_seconds,
+                    lock_token=token,
+                )
+                raise HTTPException(status_code=503, detail="Upload completion state is unavailable")
+            session = await self.sessions.get(session.upload_id)
+            if session is None:
+                raise HTTPException(status_code=503, detail="Upload session disappeared")
+
+        try:
+            renewed = await self.quota.renew(reservation, self.session_ttl_seconds)
+            marker_renewed = await self.sessions.renew_reservation(
+                session.user_id,
+                session.upload_id,
+                marker.owner_token,
+                ttl_seconds=self.session_ttl_seconds,
+            )
+        except QuotaUnavailable:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable") from None
+        if not renewed or marker_renewed.value != "renewed":
+            await _shielded(self._discard(session, reservation, token))
+            raise HTTPException(status_code=503, detail="Storage quota reservation expired before persistence")
+
+        try:
+            document_id, job_id = await self._persist_document_job(session)
+        except _CommitOutcomeError as exc:
+            cancelled = exc.__cause__ if isinstance(exc.__cause__, asyncio.CancelledError) else None
+            try:
+                if exc.committed is False:
+                    await _shielded(self._discard(session, reservation, token))
+                elif exc.committed is True and exc.job_id is not None:
+                    await _shielded(
+                        self._settle_committed(session, reservation, token, exc.document_id, exc.job_id)
+                    )
+            except (Exception, asyncio.CancelledError) as compensation_error:  # noqa: BLE001
+                if cancelled is None:
+                    raise
+                logger.error(
+                    "TUS cancellation compensation failed upload_id=%s error_type=%s",
+                    session.upload_id,
+                    type(compensation_error).__name__,
+                )
+            if cancelled is not None:
+                raise cancelled from None
+            raise HTTPException(status_code=503, detail="Upload persistence outcome is unavailable") from None
+        await self._settle_committed(session, reservation, token, document_id, job_id)
+        completed = await self.sessions.get(session.upload_id)
+        if completed is None:
+            raise HTTPException(status_code=503, detail="Upload completion state is unavailable")
+        return self._completed_response(completed, completed.offset)
+
+    async def _renew_session_reservation(self, session):
+        from infra.quota import QuotaReservation, QuotaUnavailable
+        from infra.tus_sessions import LockMutationStatus, TusReservationState
+
+        marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+        if marker is None or marker.state is not TusReservationState.RESERVED or marker.bytes != session.reservation_bytes:
+            raise HTTPException(status_code=503, detail="Upload reservation is unavailable")
+        reservation = QuotaReservation(session.user_id, session.upload_id, marker.bytes, marker.owner_token)
+        try:
+            renewed = await self.quota.renew(reservation, self.session_ttl_seconds)
+            marker_renewed = await self.sessions.renew_reservation(
+                session.user_id,
+                session.upload_id,
+                marker.owner_token,
+                ttl_seconds=self.session_ttl_seconds,
+            )
+        except QuotaUnavailable:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable") from None
+        if renewed is not True or marker_renewed is not LockMutationStatus.RENEWED:
+            raise HTTPException(status_code=503, detail="Storage quota reservation expired")
+        return reservation
+
+    async def _persist_document_job(self, session) -> tuple[UUID, UUID]:
+        document_id = session.upload_id
+        title = session.filename.rsplit(".", 1)[0]
+        ext = session.filename.rsplit(".", 1)[-1].lower()
+        conn = None
+        transaction = None
+        commit_attempted = False
+        job = None
+        try:
+            conn = await self.pool.acquire()
+            async with asyncio.timeout(FINALIZATION_TIMEOUT_SECONDS):
+                transaction = conn.transaction()
+                await transaction.start()
+                await conn.execute(
+                    "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                    "source_kind, file_type, file_size, status) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, 'source', $7, $8, 'pending') "
+                    "ON CONFLICT (id) DO NOTHING",
+                    document_id,
+                    session.knowledge_base_id,
+                    session.user_id,
+                    session.filename,
+                    session.path,
+                    title,
+                    ALLOWED_EXTENSIONS.get(f".{ext}", ext),
+                    session.total_length,
+                )
+                owned = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1 AND user_id = $2 "
+                    "AND knowledge_base_id = $3 AND filename = $4 AND file_size = $5)",
+                    document_id,
+                    session.user_id,
+                    session.knowledge_base_id,
+                    session.filename,
+                    session.total_length,
+                )
+                if not owned:
+                    raise RuntimeError("document id conflicts with another resource")
+                job, _ = await self.jobs.ensure_document_extraction_in_transaction(
+                    conn,
+                    document_id=document_id,
+                    user_id=session.user_id,
+                    knowledge_base_id=session.knowledge_base_id,
+                    restart_terminal=False,
+                )
+                commit_attempted = True
+                await self._commit_transaction(transaction)
+        except (Exception, asyncio.CancelledError) as exc:
+            committed: bool | None = False
+            if commit_attempted and job is not None:
+                committed = await asyncio.shield(
+                    self._confirm_document_job_committed(session, document_id, job.id)
+                )
+            elif transaction is not None:
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(transaction.rollback())
+            raise _CommitOutcomeError(committed, document_id, None if job is None else job.id) from exc
+        finally:
+            if conn is not None:
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(self.pool.release(conn))
+        return document_id, job.id
+
+    async def _commit_transaction(self, transaction) -> None:
+        await transaction.commit()
+
+    async def _confirm_document_job_committed(self, session, document_id: UUID, job_id: UUID) -> bool | None:
+        try:
+            return bool(
+                await self.pool.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM documents d JOIN background_jobs j ON j.document_id = d.id "
+                    "WHERE d.id = $1 AND d.user_id = $2 AND d.knowledge_base_id = $3 "
+                    "AND j.id = $4 AND j.user_id = d.user_id)",
+                    document_id,
+                    session.user_id,
+                    session.knowledge_base_id,
+                    job_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 -- read-after-write failures make the outcome unknown
+            return None
+
+    async def _settle_committed(self, session, reservation, token: str, document_id: UUID, job_id: UUID) -> None:
+        from infra.tus_sessions import CompleteStatus
+
+        result = await self.sessions.mark_complete(
+            session.upload_id,
+            session.offset,
+            document_id,
+            job_id,
+            self.session_ttl_seconds,
+            lock_token=token,
+        )
+        if result.status not in {CompleteStatus.COMPLETED, CompleteStatus.ALREADY_COMPLETED}:
+            raise HTTPException(status_code=503, detail="Upload completion state is unavailable")
+        finalized = await self.quota.finalize(reservation)
+        if finalized is not True:
+            raise RuntimeError("quota reservation generation was not finalized")
+        marker_status = await self.sessions.release_reservation_once(
+            session.user_id,
+            session.upload_id,
+            reservation.owner_token,
+        )
+        if not _reservation_marker_settled(marker_status):
+            raise RuntimeError("upload reservation marker was not owner-settled")
+
+    async def _retry_completed_settlement(self, session) -> None:
+        from infra.quota import QuotaReservation
+        from infra.tus_sessions import TusReservationState
+
+        try:
+            marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+            if marker is None or marker.state is TusReservationState.RELEASED:
+                return
+            reservation = QuotaReservation(session.user_id, session.upload_id, marker.bytes, marker.owner_token)
+            finalized = await self.quota.finalize(reservation)
+            if finalized is not True:
+                return
+            marker_status = await self.sessions.release_reservation_once(
+                session.user_id,
+                session.upload_id,
+                marker.owner_token,
+            )
+            if not _reservation_marker_settled(marker_status):
+                return
+        except Exception as exc:  # noqa: BLE001 -- settlement is intentionally retried on duplicate PATCH
+            logger.error(
+                "TUS completed quota settlement deferred upload_id=%s error_type=%s",
+                session.upload_id,
+                type(exc).__name__,
+            )
+
+    async def _discard(self, session, reservation, token: str) -> None:
+        with suppress(Exception):
+            await self.sessions.mark_cleanup_required(
+                session.upload_id,
+                session.offset,
+                self.session_ttl_seconds,
+                lock_token=token,
+            )
+        objects_clean = True
+        try:
+            await self.s3.delete_object(session.s3_key)
+        except Exception as exc:  # noqa: BLE001 -- normalize S3 adapter-specific missing errors
+            objects_clean = self._is_missing(exc)
+        try:
+            await self._abort_ignoring_missing(session.s3_key, session.multipart_upload_id)
+        except Exception:  # noqa: BLE001 -- incomplete object cleanup retains all ownership state
+            objects_clean = False
+        if not objects_clean:
+            return
+        try:
+            released = await self.quota.release(reservation)
+        except Exception:  # noqa: BLE001 -- quota release failure retains marker and session
+            return
+        if released is not True:
+            return
+        try:
+            marker_status = await self.sessions.release_reservation_once(
+                session.user_id,
+                session.upload_id,
+                reservation.owner_token,
+            )
+        except Exception:  # noqa: BLE001 -- marker failure retains the cleanup session
+            return
+        if not _reservation_marker_settled(marker_status):
+            return
+        with suppress(Exception):
+            await self.sessions.delete_locked(session.upload_id, lock_token=token)
+
+    async def _abort_ignoring_missing(self, key: str, multipart_id: str) -> None:
+        try:
+            await self.s3.abort_multipart(key, multipart_id)
+        except Exception as exc:
+            if not self._is_missing(exc):
+                raise
+
+    @staticmethod
+    def _is_missing(exc: Exception) -> bool:
+        response = getattr(exc, "response", {})
+        code = str(response.get("Error", {}).get("Code", "")) if isinstance(response, dict) else ""
+        return code in {"404", "NoSuchKey", "NoSuchUpload", "NotFound"}
+
+    async def _owned_session(self, upload_id: UUID, user_id: str):
+        try:
+            user_uuid = UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Upload not found") from None
+        try:
+            session = await self.sessions.get(upload_id)
+        except Exception:  # noqa: BLE001 -- coordination backends map uniformly to service unavailable
+            raise HTTPException(status_code=503, detail="Upload coordination is unavailable") from None
+        if session is None or session.user_id != user_uuid:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        return session
+
+    @staticmethod
+    def _client_offset(request: Request) -> int:
+        raw = request.headers.get("Upload-Offset")
+        if raw is None:
+            raise HTTPException(status_code=400, detail="Missing Upload-Offset header")
+        try:
+            offset = int(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Upload-Offset") from None
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="Invalid Upload-Offset")
+        return offset
+
+    @staticmethod
+    def _upload_length(request: Request) -> int:
+        raw = request.headers.get("Upload-Length")
+        if raw is None:
+            raise HTTPException(status_code=400, detail="Missing Upload-Length header")
+        try:
+            length = int(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Upload-Length") from None
+        if length < 1:
+            raise HTTPException(status_code=400, detail="Upload-Length must be positive")
+        if length > MAX_SIZE:
+            raise HTTPException(status_code=413, detail=f"Upload-Length exceeds maximum of {MAX_SIZE} bytes")
+        return length
+
+    @staticmethod
+    def _filename(metadata: dict[str, str]) -> tuple[str, str]:
+        raw = metadata.get("filename", "").strip()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Missing filename in Upload-Metadata")
+        filename = raw.replace("\\", "/").rsplit("/", 1)[-1]
+        if not filename or filename in {".", ".."}:
+            raise HTTPException(status_code=400, detail="Invalid filename in Upload-Metadata")
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if f".{ext}" not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+        return filename, ext
+
+    @staticmethod
+    def _completed_response(session, client_offset: int) -> Response:
+        if client_offset != session.offset:
+            raise HTTPException(
+                status_code=409,
+                detail="Offset mismatch",
+                headers=_tus_headers({"Upload-Offset": str(session.offset)}),
+            )
+        return Response(
+            status_code=204,
+            headers=_tus_headers(
+                {
+                    "Upload-Offset": str(session.offset),
+                    "X-Document-Id": str(session.document_id),
+                    "X-Job-Id": str(session.job_id),
+                }
+            ),
+        )
+
+
+class _CommitOutcomeError(RuntimeError):
+    def __init__(self, committed: bool | None, document_id: UUID, job_id: UUID | None) -> None:
+        self.committed = committed
+        self.document_id = document_id
+        self.job_id = job_id
+        super().__init__("upload database commit outcome was not confirmed")
+
+
+class HostedTusCleanupService:
+    """Worker-only stale multipart discovery and token-fenced reclamation."""
+
+    def __init__(
+        self,
+        pool,
+        s3_service,
+        job_service,
+        quota_service,
+        session_store,
+        *,
+        stale_seconds: int,
+        lock_seconds: int,
+    ) -> None:
+        self.pool = pool
+        self.s3 = s3_service
+        self.jobs = job_service
+        self.quota = quota_service
+        self.sessions = session_store
+        self.stale_seconds = stale_seconds
+        self.lock_seconds = lock_seconds
+
+    async def enqueue_stale_jobs(self) -> int:
+        from infra.tus_sessions import TusSessionState
+        from jobs.models import JobCreate, JobType
+
+        stale_before = datetime.now(UTC).timestamp() - self.stale_seconds
+        created = 0
+        async for session in self.sessions.iter_sessions():
+            if session.state is TusSessionState.COMPLETED:
+                continue
+            if session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
+                continue
+            await self.jobs.create(
+                JobCreate(
+                    job_type=JobType.UPLOAD_CLEANUP,
+                    user_id=session.user_id,
+                    payload={"upload_id": str(session.upload_id)},
+                    idempotency_key=f"upload.cleanup:{session.upload_id}:{int(session.updated_at.timestamp() * 1_000_000)}",
+                ),
+                authenticated_user_id=session.user_id,
+            )
+            created += 1
+        return created
+
+    async def cleanup(self, upload_id: UUID, expected_user_id: UUID) -> dict[str, object]:
+        from infra.quota import QuotaReservation
+        from infra.tus_sessions import (
+            LockAcquireStatus,
+            LockMutationStatus,
+            TusReservationState,
+            TusSessionState,
+        )
+
+        acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
+        if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
+            return {"upload_id": str(upload_id), "status": "contended"}
+        token = acquired.token
+        try:
+            session = await self.sessions.get(upload_id)
+            if session is None:
+                return {"upload_id": str(upload_id), "status": "already_clean"}
+            if session.user_id != expected_user_id:
+                return {"upload_id": str(upload_id), "status": "owner_mismatch"}
+            if session.state is TusSessionState.COMPLETED:
+                return {"upload_id": str(upload_id), "status": "committed"}
+            stale_before = datetime.now(UTC).timestamp() - self.stale_seconds
+            if session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
+                return {"upload_id": str(upload_id), "status": "active"}
+
+            if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
+                return {"upload_id": str(upload_id), "status": "lock_lost"}
+            objects_clean = await self._cleanup_objects(session)
+            if not objects_clean:
+                return {"upload_id": str(upload_id), "status": "retry"}
+            if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
+                return {"upload_id": str(upload_id), "status": "lock_lost"}
+
+            marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+            if marker is not None and marker.state is TusReservationState.RESERVED:
+                reservation = QuotaReservation(
+                    session.user_id,
+                    session.upload_id,
+                    marker.bytes,
+                    marker.owner_token,
+                )
+                released = await self.quota.release(reservation)
+                if released is not True:
+                    return {"upload_id": str(upload_id), "status": "retry"}
+                marker_status = await self.sessions.release_reservation_once(
+                    session.user_id,
+                    session.upload_id,
+                    marker.owner_token,
+                )
+                if not _reservation_marker_settled(marker_status):
+                    return {"upload_id": str(upload_id), "status": "retry"}
+            deleted = await self.sessions.delete_locked(upload_id, lock_token=token)
+            return {"upload_id": str(upload_id), "status": "cleaned" if deleted else "lock_lost"}
+        finally:
+            with suppress(Exception):
+                await asyncio.shield(self.sessions.release_lock(upload_id, token))
+
+    async def _cleanup_objects(self, session) -> bool:
+        try:
+            await self.s3.delete_object(session.s3_key)
+        except Exception as exc:  # noqa: BLE001 -- normalize S3 adapter-specific missing errors
+            if not HostedTusMultipartService._is_missing(exc):
+                return False
+        try:
+            await self.s3.abort_multipart(session.s3_key, session.multipart_upload_id)
+        except Exception as exc:  # noqa: BLE001 -- normalize S3 adapter-specific missing errors
+            if not HostedTusMultipartService._is_missing(exc):
+                return False
+        return True
+
+
 @router.options("")
 async def tus_options():
     return Response(
@@ -290,6 +1197,8 @@ async def tus_options():
 @router.post("", status_code=201)
 async def tus_create(request: Request):
     user_id = await _get_user_id(request)
+    if settings.TUS_MULTIPART_ENABLED:
+        return await _hosted_tus_service(request).create(request, user_id)
     _check_tus_version(request)
 
     upload_length_str = request.headers.get("Upload-Length")
@@ -382,6 +1291,8 @@ async def tus_create(request: Request):
 @router.head("/{upload_id}")
 async def tus_head(upload_id: str, request: Request):
     user_id = await _get_user_id(request)
+    if settings.TUS_MULTIPART_ENABLED:
+        return await _hosted_tus_service(request).head(upload_id, request, user_id)
     upload = _get_upload(upload_id, user_id)
     return Response(
         status_code=200,
@@ -396,6 +1307,8 @@ async def tus_head(upload_id: str, request: Request):
 @router.patch("/{upload_id}", status_code=204)
 async def tus_patch(upload_id: str, request: Request):
     user_id = await _get_user_id(request)
+    if settings.TUS_MULTIPART_ENABLED:
+        return await _hosted_tus_service(request).patch(upload_id, request, user_id)
     _check_tus_version(request)
 
     content_type = request.headers.get("Content-Type", "")

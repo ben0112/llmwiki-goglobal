@@ -150,6 +150,8 @@ async def _finish_hosted_startup(app: FastAPI, pool):
 
     app.state.s3_service = s3_service
     app.state.ocr_service = ocr_service
+    app.state.tus_service = None
+    app.state.tus_session_store = None
     app.state.auth_provider = None  # Uses Supabase JWKS auth via deps.py
 
     from services.hosted import HostedServiceFactory
@@ -163,13 +165,34 @@ async def _finish_hosted_startup(app: FastAPI, pool):
         ocr_service=ocr_service,
     )
 
+    if settings.TUS_MULTIPART_ENABLED:
+        if s3_service is None or app.state.quota_service is None or app.state.redis is None:
+            raise RuntimeError("Hosted multipart TUS requires S3, Redis, and quota coordination")
+        from infra.tus import HostedTusMultipartService
+        from infra.tus_sessions import TusSessionStore
+
+        app.state.tus_session_store = TusSessionStore(app.state.redis)
+        app.state.tus_service = HostedTusMultipartService(
+            pool,
+            s3_service,
+            app.state.job_service,
+            app.state.quota_service,
+            app.state.tus_session_store,
+            session_ttl_seconds=settings.TUS_SESSION_TTL_SECONDS,
+            stale_seconds=settings.TUS_STALE_SECONDS,
+            lock_seconds=settings.TUS_LOCK_SECONDS,
+            max_patch_bytes=settings.TUS_MAX_PATCH_BYTES,
+        )
+
     from routes.ws import setup_listener
 
     listener_task = await setup_listener(settings.listen_database_url)
+    cleanup_task = None
     try:
-        from infra.tus import cleanup_stale_uploads
+        if not settings.TUS_MULTIPART_ENABLED:
+            from infra.tus import cleanup_stale_uploads
 
-        cleanup_task = asyncio.create_task(cleanup_stale_uploads())
+            cleanup_task = asyncio.create_task(cleanup_stale_uploads())
     except BaseException:
         listener_task.cancel()
         try:
@@ -201,6 +224,7 @@ async def lifespan(app: FastAPI):
 
     app.state.job_service = None
     app.state.quota_service = None
+    app.state.redis = None
     quota_redis = None
     if settings.DURABLE_JOBS_ENABLED:
         from jobs.service import JobService
@@ -211,6 +235,7 @@ async def lifespan(app: FastAPI):
                 pool,
                 settings.REDIS_URL,
             )
+            app.state.redis = quota_redis
         except BaseException:
             await pool.close()
             raise
@@ -229,9 +254,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
-        cleanup_task.cancel()
+        if cleanup_task is not None:
+            cleanup_task.cancel()
         listener_task.cancel()
         for task in (cleanup_task, listener_task):
+            if task is None:
+                continue
             try:
                 await task
             except asyncio.CancelledError:
@@ -285,6 +313,9 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.ocr_service = None
     app.state.job_service = None
     app.state.quota_service = None
+    app.state.redis = None
+    app.state.tus_service = None
+    app.state.tus_session_store = None
     app.state.auth_provider = auth_provider
     app.state.workspace_path = str(workspace)
 
