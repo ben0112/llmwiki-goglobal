@@ -250,7 +250,7 @@ lexical profile 始终可用。hybrid/compare 只通过托管 hybrid service 的
 当前 v1 synthetic lexical baseline（单行、键排序稳定）：
 
 ```json
-{"case_count":2,"dataset_digest":"5d9969be5644602a859b1d25eba44e3881b61eb11fd84a4eb2aec1edea5e02c5","dataset_schema_version":1,"metrics":{"filtered_result_count":3,"latency_p50_ms":0.0,"latency_p95_ms":0.0,"mrr":1.0,"ndcg_at_10":1.0,"recall_at_10":1.0,"recall_at_20":1.0,"recall_at_5":1.0},"profile":"lexical","schema_version":1}
+{"case_count":2,"dataset_schema_version":1,"evaluation_dataset_digest":"5d9969be5644602a859b1d25eba44e3881b61eb11fd84a4eb2aec1edea5e02c5","metrics":{"filtered_result_count":3,"latency_p50_ms":0.0,"latency_p95_ms":0.0,"mrr":1.0,"ndcg_at_10":1.0,"recall_at_10":1.0,"recall_at_20":1.0,"recall_at_5":1.0},"profile":"lexical","schema_version":1}
 ```
 
 报告只包含 dataset identity、profile 与聚合指标；不会写出 query text、document content、API key、embedding 或原始异常字符串。baseline latency 来自 retriever 的 `SearchResult.latency_ms`（合成 adapter 固定为 `0.0`），不把 wall-clock jitter 写入稳定报告。

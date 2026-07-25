@@ -8,13 +8,14 @@ import inspect
 import json
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, BinaryIO
@@ -58,6 +59,10 @@ RetrieverFactory = Callable[[str, Path], object]
 
 class HybridConfigurationUnavailable(RuntimeError):
     """The later hosted hybrid-service wiring is not configured."""
+
+
+class EvaluationDatasetError(RuntimeError):
+    """The evaluation cohort or its sibling synthetic corpus is invalid."""
 
 
 class RetrievalContractError(RuntimeError):
@@ -142,7 +147,7 @@ class _SyntheticLexicalRetriever:
                 document_kind=chunk.document_kind,
                 metadata={"facets": dict(chunk.facets), "synthetic": True},
             )
-            for score, chunk in candidates[: query.limit]
+            for score, chunk in candidates
         )
         return SearchResult(
             hits=hits,
@@ -185,15 +190,21 @@ def _matches_filters(chunk: _CorpusChunk, query: SearchQuery) -> bool:
 
 
 def _logical_glob_matches(path_glob: str, path: str) -> bool:
+    if path_glob == "/":
+        return path.startswith("/")
+    directory = path_glob.endswith("/") or (
+        "*" not in path_glob and "." not in path_glob.rsplit("/", 1)[-1]
+    )
+    pattern = path_glob.rstrip("/") + "/*" if directory else path_glob
     expression: list[str] = ["^"]
     index = 0
-    while index < len(path_glob):
-        if path_glob[index] == "*":
-            while index + 1 < len(path_glob) and path_glob[index + 1] == "*":
+    while index < len(pattern):
+        if pattern[index] == "*":
+            while index + 1 < len(pattern) and pattern[index + 1] == "*":
                 index += 1
             expression.append(".*")
         else:
-            expression.append(re.escape(path_glob[index]))
+            expression.append(re.escape(pattern[index]))
         index += 1
     expression.append("$")
     return re.fullmatch("".join(expression), path) is not None
@@ -260,6 +271,8 @@ def _facets(value: object) -> Mapping[str, object]:
         if not isinstance(key, str) or not key or len(key) > 128:
             raise ValueError("corpus facets are invalid")
         if nested is not None and not isinstance(nested, (str, int, float, bool)):
+            raise ValueError("corpus facets are invalid")
+        if isinstance(nested, float) and not isfinite(nested):
             raise ValueError("corpus facets are invalid")
         result[key] = nested
     return MappingProxyType(result)
@@ -396,7 +409,11 @@ def configured_hosted_hybrid_retriever() -> object:
 
 def _default_retriever_factory(profile: str, dataset_path: Path) -> object:
     if profile == "lexical":
-        return _SyntheticLexicalRetriever(_load_corpus(dataset_path.with_name("corpus.jsonl")))
+        try:
+            chunks = _load_corpus(dataset_path.with_name("corpus.jsonl"))
+        except (OSError, ValueError):
+            raise EvaluationDatasetError from None
+        return _SyntheticLexicalRetriever(chunks)
     if profile == "hybrid":
         return configured_hosted_hybrid_retriever()
     raise RetrievalContractError
@@ -419,12 +436,16 @@ async def _retrieve_case(profile: str, retriever: object, query: SearchQuery) ->
         raise RetrievalContractError
     try:
         pending = retrieve(query)
+    except asyncio.CancelledError:
+        raise RetrievalExecutionError from None
     except Exception as exc:  # noqa: BLE001 - backend details must be discarded at the CLI boundary.
         raise RetrievalExecutionError from exc
     if not inspect.isawaitable(pending):
         raise RetrievalContractError
     try:
         result = await pending
+    except asyncio.CancelledError:
+        raise RetrievalExecutionError from None
     except Exception as exc:  # noqa: BLE001 - backend details must be discarded at the CLI boundary.
         raise RetrievalExecutionError from exc
     if type(result) is not SearchResult or result.profile != profile:
@@ -456,6 +477,10 @@ async def _evaluate_profile(profile: str, retriever: object, cases: Sequence[obj
 def _build_retriever(factory: RetrieverFactory, profile: str, dataset_path: Path) -> object:
     try:
         retriever = factory(profile, dataset_path)
+    except asyncio.CancelledError:
+        raise RetrievalExecutionError from None
+    except EvaluationDatasetError:
+        raise
     except HybridConfigurationUnavailable:
         raise
     except RetrievalContractError:
@@ -505,8 +530,8 @@ def _profile_payload(profile: str, report: EvaluationReport) -> dict[str, object
 def _base_payload(cases: Sequence[object], *, profile: str) -> dict[str, object]:
     return {
         "case_count": len(cases),
-        "dataset_digest": evaluation_dataset_digest(cases),
         "dataset_schema_version": EVALUATION_SCHEMA_VERSION,
+        "evaluation_dataset_digest": evaluation_dataset_digest(cases),
         "profile": profile,
         "schema_version": REPORT_SCHEMA_VERSION,
     }
@@ -544,35 +569,86 @@ def _json_bytes(payload: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
-def _write_output(path: Path, content: bytes) -> None:
-    temporary_path: Path | None = None
+def _open_output_parent(path: Path) -> tuple[int, int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None or not path.name:
+        raise OutputWriteError
     try:
+        return os.open(path.parent, os.O_RDONLY | directory | nofollow), nofollow
+    except OSError as exc:
+        raise OutputWriteError from exc
+
+
+def _create_output_temporary(parent_descriptor: int, basename: str, nofollow: int) -> tuple[int, str]:
+    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+    for _attempt in range(10):
+        temporary_name = f".{basename}.{secrets.token_hex(12)}.tmp"
         try:
-            current = path.lstat()
+            descriptor = os.open(
+                temporary_name,
+                create_flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            return descriptor, temporary_name
+        except FileExistsError:
+            continue
+    raise OutputWriteError
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OutputWriteError
+        remaining = remaining[written:]
+
+
+def _write_output(path: Path, content: bytes) -> None:
+    parent_descriptor = -1
+    temporary_descriptor = -1
+    temporary_name: str | None = None
+    try:
+        parent_descriptor, nofollow = _open_output_parent(path)
+        try:
+            current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
             current = None
         if current is not None and not stat.S_ISREG(current.st_mode):
             raise OutputWriteError
-        parent = path.parent
-        parent_stat = parent.stat()
-        if not stat.S_ISDIR(parent_stat.st_mode):
-            raise OutputWriteError
-        descriptor, raw_temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
-        temporary_path = Path(raw_temporary_path)
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
+        temporary_descriptor, temporary_name = _create_output_temporary(
+            parent_descriptor,
+            path.name,
+            nofollow,
+        )
+        _write_all(temporary_descriptor, content)
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        temporary_name = None
+        os.fsync(parent_descriptor)
     except OutputWriteError:
         raise
     except OSError as exc:
         raise OutputWriteError from exc
     finally:
-        if temporary_path is not None:
+        if temporary_descriptor >= 0:
             with suppress(OSError):
-                temporary_path.unlink()
+                os.close(temporary_descriptor)
+        if temporary_name is not None and parent_descriptor >= 0:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+        if parent_descriptor >= 0:
+            with suppress(OSError):
+                os.close(parent_descriptor)
 
 
 def _emit_error(category: str, code: str) -> None:
@@ -637,6 +713,9 @@ def _safe_evaluate_request(
 ) -> tuple[dict[str, object] | None, int]:
     try:
         return _evaluate_request(args, cases, factory, dataset_path)
+    except EvaluationDatasetError:
+        _emit_error("dataset", "dataset_invalid")
+        return None, 2
     except HybridConfigurationUnavailable:
         _emit_error("configuration", "hybrid_unavailable")
         return None, 2
