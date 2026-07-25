@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -74,6 +75,43 @@ def _cancelled_factory(_profile, _path):
     raise asyncio.CancelledError(
         "api_key=sk-cancelled query=private content=private embedding=[1,2,3]"
     )
+
+
+def _secret_base_exception_group(*, process_control=None):
+    leaves = [
+        asyncio.CancelledError("cancelled-leaf-secret"),
+        GeneratorExit("generator-leaf-secret"),
+        RuntimeError("runtime-leaf-secret"),
+    ]
+    if process_control is not None:
+        leaves.insert(1, process_control)
+    return BaseExceptionGroup("backend-group-secret", leaves)
+
+
+class _FactoryAttributeGroup:
+    def __getattribute__(self, name):
+        if name == "__call__":
+            raise _secret_base_exception_group()
+        return super().__getattribute__(name)
+
+    def __call__(self, profile, _path):
+        return _FakeRetriever(profile, _profile_results(profile))
+
+
+class _RetrieveAttributeGroup:
+    @property
+    def retrieve(self):
+        raise _secret_base_exception_group()
+
+
+class _SyncGroupRetriever:
+    def retrieve(self, _query):
+        raise _secret_base_exception_group()
+
+
+class _AsyncGroupRetriever:
+    async def retrieve(self, _query):
+        raise _secret_base_exception_group()
 
 
 def _profile_results(profile: str, *, eligible: bool = True) -> dict[str, tuple[tuple[SearchHit, ...], float]]:
@@ -378,16 +416,115 @@ def test_cancelled_factory_and_retrieval_are_sanitized(factory, capsys):
         assert secret not in captured.err
 
 
-@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
-def test_process_control_base_exceptions_are_not_swallowed(error_type):
+@pytest.mark.parametrize(
+    ("process_control", "expected_type", "expected_args"),
+    [
+        (KeyboardInterrupt("direct-process-control-secret"), KeyboardInterrupt, ()),
+        (SystemExit(7), SystemExit, (7,)),
+        (SystemExit("direct-process-control-secret"), SystemExit, (1,)),
+        (SystemExit(True), SystemExit, (1,)),
+        (SystemExit(False), SystemExit, (0,)),
+    ],
+)
+def test_direct_process_control_is_rethrown_without_backend_secrets(
+    process_control,
+    expected_type,
+    expected_args,
+):
     def factory(_profile, _path):
-        raise error_type
+        raise process_control
 
-    with pytest.raises(error_type):
+    with pytest.raises(expected_type) as caught:
         main(
             ["--dataset", str(DATASET), "--profile", "lexical"],
             retriever_factory=factory,
         )
+
+    assert caught.value.args == expected_args
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("process_control", "expected_type", "expected_args"),
+    [
+        (KeyboardInterrupt("process-control-leaf-secret"), KeyboardInterrupt, ()),
+        (SystemExit(7), SystemExit, (7,)),
+        (SystemExit("process-control-leaf-secret"), SystemExit, (1,)),
+    ],
+)
+def test_grouped_process_control_is_rethrown_without_secret_group(
+    process_control,
+    expected_type,
+    expected_args,
+):
+    def factory(_profile, _path):
+        raise _secret_base_exception_group(process_control=process_control)
+
+    with pytest.raises(expected_type) as caught:
+        main(
+            ["--dataset", str(DATASET), "--profile", "lexical"],
+            retriever_factory=factory,
+        )
+
+    assert caught.value.args == expected_args
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        _FactoryAttributeGroup(),
+        lambda _profile, _path: (_ for _ in ()).throw(_secret_base_exception_group()),
+        lambda _profile, _path: _RetrieveAttributeGroup(),
+        lambda _profile, _path: _SyncGroupRetriever(),
+        lambda _profile, _path: _AsyncGroupRetriever(),
+    ],
+)
+def test_backend_base_exception_groups_are_sanitized_at_every_boundary(factory, capsys):
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_failed"}
+    }
+    for secret in (
+        "backend-group-secret",
+        "cancelled-leaf-secret",
+        "generator-leaf-secret",
+        "runtime-leaf-secret",
+        "Indonesia export permit",
+        "Traceback",
+    ):
+        assert secret not in captured.err
+
+
+def test_final_async_runner_base_exception_group_is_sanitized(monkeypatch, capsys):
+    async def fail_after_retrieval(*_args):
+        raise _secret_base_exception_group()
+
+    factory, _retrievers, _factory_calls = _factory()
+    monkeypatch.setattr(retrieval_eval_module, "_evaluate_profile", fail_after_retrieval)
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_failed"}
+    }
+    assert "backend-group-secret" not in captured.err
+    assert "runtime-leaf-secret" not in captured.err
 
 
 def test_rejects_search_result_with_wrong_profile_without_leaking_hit_content(capsys):
@@ -495,6 +632,93 @@ def test_atomic_output_replaces_by_open_parent_dirfd(tmp_path, monkeypatch, caps
     assert isinstance(observed["src_dir_fd"], int)
     assert observed["src_dir_fd"] == observed["dst_dir_fd"]
     assert output_path.read_bytes() == stdout.encode("utf-8")
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_output_refuses_relative_and_absolute_ancestor_symlink(
+    absolute,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    real_parent = tmp_path / "private-target"
+    nested_target = real_parent / "nested"
+    nested_target.mkdir(parents=True)
+    symlink_ancestor = tmp_path / "customer-secret-ancestor"
+    symlink_ancestor.symlink_to(real_parent, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    output_path = symlink_ancestor / "nested" / "report.json"
+    output_argument = str(output_path if absolute else output_path.relative_to(tmp_path))
+    factory, _retrievers, _factory_calls = _factory()
+    descriptors_before = len(os.listdir("/dev/fd"))
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical", "--output-json", output_argument],
+        retriever_factory=factory,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 4
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "output", "code": "output_write_failed"}
+    }
+    assert not (nested_target / "report.json").exists()
+    assert not list(real_parent.rglob(".*.tmp"))
+    assert len(os.listdir("/dev/fd")) == descriptors_before
+    assert "customer-secret-ancestor" not in captured.err
+
+
+def test_output_walks_normal_relative_multilevel_directory_without_fd_or_temp_leak(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output_parent = tmp_path / "safe" / "nested" / "directory"
+    output_parent.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    factory, _retrievers, _factory_calls = _factory()
+    descriptors_before = len(os.listdir("/dev/fd"))
+
+    code = main(
+        [
+            "--dataset",
+            str(DATASET),
+            "--profile",
+            "lexical",
+            "--output-json",
+            "safe/nested/directory/report.json",
+        ],
+        retriever_factory=factory,
+    )
+    _payload, stdout = _read_json(capsys)
+
+    assert code == 0
+    assert (output_parent / "report.json").read_bytes() == stdout.encode("utf-8")
+    assert not list(output_parent.glob(".*.tmp"))
+    assert len(os.listdir("/dev/fd")) == descriptors_before
+
+
+@pytest.mark.parametrize("output_argument", ["safe/./dot-secret.json", "safe/../dotdot-secret.json"])
+def test_output_rejects_raw_dot_and_dotdot_components(output_argument, tmp_path, monkeypatch, capsys):
+    (tmp_path / "safe").mkdir()
+    monkeypatch.chdir(tmp_path)
+    factory, _retrievers, _factory_calls = _factory()
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical", "--output-json", output_argument],
+        retriever_factory=factory,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 4
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "output", "code": "output_write_failed"}
+    }
+    assert not (tmp_path / "safe" / "dot-secret.json").exists()
+    assert not (tmp_path / "dotdot-secret.json").exists()
+    assert "secret" not in captured.err
 
 
 def test_default_synthetic_lexical_baseline_is_stable_and_content_free(capsys):

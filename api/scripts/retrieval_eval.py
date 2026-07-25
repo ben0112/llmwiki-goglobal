@@ -77,6 +77,60 @@ class OutputWriteError(RuntimeError):
     """The requested report output could not be written safely."""
 
 
+_SAFE_BACKEND_EXCEPTIONS = (
+    EvaluationDatasetError,
+    HybridConfigurationUnavailable,
+    RetrievalContractError,
+    RetrievalExecutionError,
+)
+
+
+def _sanitized_process_control(error: BaseException) -> KeyboardInterrupt | SystemExit | None:
+    if isinstance(error, KeyboardInterrupt):
+        return KeyboardInterrupt()
+    if isinstance(error, SystemExit):
+        if isinstance(error.code, bool):
+            return SystemExit(int(error.code))
+        return SystemExit(error.code if type(error.code) is int else 1)
+    if isinstance(error, BaseExceptionGroup):
+        for nested in error.exceptions:
+            if process_control := _sanitized_process_control(nested):
+                return process_control
+    return None
+
+
+def _sanitized_backend_failure(error: BaseException) -> BaseException:
+    if process_control := _sanitized_process_control(error):
+        return process_control
+    return RetrievalExecutionError()
+
+
+def _backend_call(
+    operation: Callable[[], Any],
+    *,
+    passthrough: tuple[type[BaseException], ...] = (),
+) -> Any:
+    failure: BaseException | None = None
+    try:
+        return operation()
+    except BaseException as error:  # noqa: BLE001 - the privacy boundary must classify BaseExceptionGroup.
+        failure = error if isinstance(error, passthrough) else _sanitized_backend_failure(error)
+    if failure is None:  # pragma: no cover - the except path always assigns it.
+        raise RuntimeError("backend boundary lost its failure")
+    raise failure from None
+
+
+async def _await_backend(awaitable: object) -> Any:
+    failure: BaseException | None = None
+    try:
+        return await awaitable
+    except BaseException as error:  # noqa: BLE001 - the privacy boundary must classify BaseExceptionGroup.
+        failure = _sanitized_backend_failure(error)
+    if failure is None:  # pragma: no cover - the except path always assigns it.
+        raise RuntimeError("backend boundary lost its failure")
+    raise failure from None
+
+
 class _ArgumentError(ValueError):
     pass
 
@@ -431,23 +485,13 @@ def _parser() -> _SafeArgumentParser:
 
 
 async def _retrieve_case(profile: str, retriever: object, query: SearchQuery) -> SearchResult:
-    retrieve = getattr(retriever, "retrieve", None)
+    retrieve = _backend_call(lambda: getattr(retriever, "retrieve", None))
     if not callable(retrieve):
         raise RetrievalContractError
-    try:
-        pending = retrieve(query)
-    except asyncio.CancelledError:
-        raise RetrievalExecutionError from None
-    except Exception as exc:  # noqa: BLE001 - backend details must be discarded at the CLI boundary.
-        raise RetrievalExecutionError from exc
+    pending = _backend_call(lambda: retrieve(query))
     if not inspect.isawaitable(pending):
         raise RetrievalContractError
-    try:
-        result = await pending
-    except asyncio.CancelledError:
-        raise RetrievalExecutionError from None
-    except Exception as exc:  # noqa: BLE001 - backend details must be discarded at the CLI boundary.
-        raise RetrievalExecutionError from exc
+    result = await _await_backend(pending)
     if type(result) is not SearchResult or result.profile != profile:
         raise RetrievalContractError
     if any(type(hit) is not SearchHit for hit in result.hits):
@@ -475,19 +519,17 @@ async def _evaluate_profile(profile: str, retriever: object, cases: Sequence[obj
 
 
 def _build_retriever(factory: RetrieverFactory, profile: str, dataset_path: Path) -> object:
-    try:
-        retriever = factory(profile, dataset_path)
-    except asyncio.CancelledError:
-        raise RetrievalExecutionError from None
-    except EvaluationDatasetError:
-        raise
-    except HybridConfigurationUnavailable:
-        raise
-    except RetrievalContractError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - injected factory details must not cross the CLI boundary.
-        raise RetrievalExecutionError from exc
-    if not callable(getattr(retriever, "retrieve", None)):
+    factory_call = _backend_call(
+        lambda: getattr(factory, "__call__", None)  # noqa: B004 - attribute access is a guarded backend boundary.
+    )
+    if not callable(factory_call):
+        raise RetrievalContractError
+    retriever = _backend_call(
+        lambda: factory_call(profile, dataset_path),
+        passthrough=_SAFE_BACKEND_EXCEPTIONS,
+    )
+    retrieve = _backend_call(lambda: getattr(retriever, "retrieve", None))
+    if not callable(retrieve):
         raise RetrievalContractError
     return retriever
 
@@ -496,9 +538,15 @@ def _run_async(factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(factory())
+        return _backend_call(
+            lambda: asyncio.run(factory()),
+            passthrough=_SAFE_BACKEND_EXCEPTIONS,
+        )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrieval-eval") as executor:
-        return executor.submit(lambda: asyncio.run(factory())).result()
+        return _backend_call(
+            lambda: executor.submit(lambda: asyncio.run(factory())).result(),
+            passthrough=_SAFE_BACKEND_EXCEPTIONS,
+        )
 
 
 def _stable_number(value: float) -> float:
@@ -569,15 +617,41 @@ def _json_bytes(payload: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
-def _open_output_parent(path: Path) -> tuple[int, int]:
+def _raw_output_components(path: str | os.PathLike[str]) -> tuple[bool, tuple[str, ...], str]:
+    raw_path = os.fspath(path)
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path or raw_path.endswith("/"):
+        raise OutputWriteError
+    components = tuple(component for component in raw_path.split("/") if component)
+    if not components or any(component in {".", ".."} for component in components):
+        raise OutputWriteError
+    return raw_path.startswith("/"), components[:-1], components[-1]
+
+
+def _open_output_parent(path: str | os.PathLike[str]) -> tuple[int, int, str]:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
-    if nofollow is None or directory is None or not path.name:
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if nofollow is None or directory is None or cloexec is None:
         raise OutputWriteError
+    absolute, parent_components, basename = _raw_output_components(path)
+    descriptor = -1
     try:
-        return os.open(path.parent, os.O_RDONLY | directory | nofollow), nofollow
+        flags = os.O_RDONLY | directory | nofollow | cloexec
+        descriptor = os.open("/" if absolute else ".", flags)
+        for component in parent_components:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            with suppress(OSError):
+                os.close(descriptor)
+            descriptor = next_descriptor
+        result = (descriptor, nofollow, basename)
+        descriptor = -1
+        return result
     except OSError as exc:
         raise OutputWriteError from exc
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _create_output_temporary(parent_descriptor: int, basename: str, nofollow: int) -> tuple[int, str]:
@@ -606,21 +680,21 @@ def _write_all(descriptor: int, content: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _write_output(path: Path, content: bytes) -> None:
+def _write_output(path: str | os.PathLike[str], content: bytes) -> None:
     parent_descriptor = -1
     temporary_descriptor = -1
     temporary_name: str | None = None
     try:
-        parent_descriptor, nofollow = _open_output_parent(path)
+        parent_descriptor, nofollow, basename = _open_output_parent(path)
         try:
-            current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            current = os.stat(basename, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
             current = None
         if current is not None and not stat.S_ISREG(current.st_mode):
             raise OutputWriteError
         temporary_descriptor, temporary_name = _create_output_temporary(
             parent_descriptor,
-            path.name,
+            basename,
             nofollow,
         )
         _write_all(temporary_descriptor, content)
@@ -629,7 +703,7 @@ def _write_output(path: Path, content: bytes) -> None:
         temporary_descriptor = -1
         os.replace(
             temporary_name,
-            path.name,
+            basename,
             src_dir_fd=parent_descriptor,
             dst_dir_fd=parent_descriptor,
         )
@@ -737,7 +811,7 @@ def _emit_report(payload: Mapping[str, object], output_json: str | None, exit_co
     encoded = _json_bytes(payload)
     if output_json is not None:
         try:
-            _write_output(Path(output_json), encoded)
+            _write_output(output_json, encoded)
         except OutputWriteError:
             _emit_error("output", "output_write_failed")
             return 4
