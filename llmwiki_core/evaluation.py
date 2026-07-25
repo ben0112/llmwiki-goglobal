@@ -310,9 +310,10 @@ class PromotionDecision:
                 object.__setattr__(self, name, _finite_non_negative(name, value))
         has_ratios = self.recall_ratio is not None and self.latency_ratio is not None
         gates_pass = bool(has_ratios and self.recall_ratio >= 1.10 and self.latency_ratio <= 2.0)
+        gate_failure_is_visible = bool(has_ratios and (self.recall_ratio <= 1.10 or self.latency_ratio >= 2.0))
         consistent = (
             (self.eligible and self.reason == "eligible" and gates_pass)
-            or (not self.eligible and self.reason == "gate_failed" and has_ratios)
+            or (not self.eligible and self.reason == "gate_failed" and gate_failure_is_visible)
             or (
                 not self.eligible
                 and self.reason == "baseline_recall_zero"
@@ -452,16 +453,32 @@ def _is_filtered(query: SearchQuery) -> bool:
 
 
 def _canonical_json_value(value: object) -> object:
+    if value is None:
+        return ["none"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", "negative" if value < 0 else "nonnegative", format(abs(value), "x")]
+    if isinstance(value, float):
+        return ["float", value.hex()]
+    if isinstance(value, str):
+        return ["str", value]
     if isinstance(value, Mapping):
-        return {key: _canonical_json_value(value[key]) for key in sorted(value)}
-    if isinstance(value, (list, tuple)):
-        return [_canonical_json_value(item) for item in value]
+        items = [[_canonical_json_value(key), _canonical_json_value(nested)] for key, nested in value.items()]
+        items.sort(key=lambda item: _canonical_sort_key(item[0]))
+        return ["mapping", items]
+    if isinstance(value, tuple):
+        return ["tuple", [_canonical_json_value(item) for item in value]]
+    if isinstance(value, list):
+        return ["list", [_canonical_json_value(item) for item in value]]
     if isinstance(value, frozenset):
         values = [_canonical_json_value(item) for item in value]
-        return sorted(values, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+        return ["frozenset", sorted(values, key=_canonical_sort_key)]
     raise ValueError(f"unsupported canonical evaluation value: {type(value).__name__}")
+
+
+def _canonical_sort_key(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def evaluation_dataset_digest(cases: Sequence[EvalCase]) -> str:
@@ -492,7 +509,7 @@ def evaluation_dataset_digest(cases: Sequence[EvalCase]) -> str:
                     "candidate_limit": query.candidate_limit,
                     "area": query.area.value,
                     "scope": query.scope.value,
-                    "facets": _canonical_json_value(query.facets),
+                    "facets": query.facets,
                     "path_glob": query.path_glob,
                     "tags": list(query.tags),
                     "document_kinds": [kind.value for kind in query.document_kinds],
@@ -515,7 +532,7 @@ def evaluation_dataset_digest(cases: Sequence[EvalCase]) -> str:
             }
         )
     encoded = json.dumps(
-        payload,
+        _canonical_json_value(payload),
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,

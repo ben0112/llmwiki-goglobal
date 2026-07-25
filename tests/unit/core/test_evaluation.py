@@ -601,6 +601,47 @@ def test_dataset_digest_is_order_independent_and_definition_sensitive():
     assert "query first" not in digest
 
 
+def test_dataset_digest_distinguishes_container_types_and_stabilizes_sets():
+    tuple_case = _case(
+        "typed",
+        (RelevanceJudgment("doc", 1),),
+        facets={"value": ["a", "b"]},
+    )
+    set_case = _case(
+        "typed",
+        (RelevanceJudgment("doc", 1),),
+        facets={"value": {"a", "b"}},
+    )
+    reversed_set_case = _case(
+        "typed",
+        (RelevanceJudgment("doc", 1),),
+        facets={"value": set(reversed(("a", "b")))},
+    )
+
+    tuple_digest = evaluation_module.evaluation_dataset_digest((tuple_case,))
+    set_digest = evaluation_module.evaluation_dataset_digest((set_case,))
+
+    assert tuple_digest != set_digest
+    assert set_digest == evaluation_module.evaluation_dataset_digest((reversed_set_case,))
+
+
+def test_huge_integers_are_evaluated_and_hashed_without_decimal_conversion():
+    huge = 10**5000
+    case = _case(
+        "huge-integers",
+        (RelevanceJudgment("huge-doc", huge, huge),),
+        facets={"huge": huge},
+    )
+    run = _run("huge-integers", ("huge-doc", huge))
+
+    report = evaluate_rankings((case,), (run,))
+    first_digest = evaluation_module.evaluation_dataset_digest((case,))
+
+    assert report.ndcg_at_10 == 1
+    assert report.dataset_digest == first_digest
+    assert first_digest == evaluation_module.evaluation_dataset_digest((case,))
+
+
 def test_promotion_rejects_unknown_or_different_cohorts():
     baseline = _report(recall_at_10=0.5, latency_p95_ms=1)
 
@@ -667,6 +708,7 @@ def test_report_and_decision_constructors_reject_contradictions():
         (True, "gate_failed", 1.1, 1.0),
         (False, "eligible", 1.1, 1.0),
         (True, "eligible", 1.0, 1.0),
+        (False, "gate_failed", 2.0, 1.0),
         (False, "baseline_recall_zero", 1.1, 1.0),
         (False, "gate_failed", None, None),
         (False, "unknown", 1.0, 1.0),
