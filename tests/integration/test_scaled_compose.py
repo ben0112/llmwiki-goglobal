@@ -157,6 +157,54 @@ def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
     assert "Scaled Compose Smoke" in reader.pages[0].extract_text()
 
 
+def test_compose_recovery_reuses_explicit_scaled_env_file(monkeypatch, tmp_path):
+    env_file = tmp_path / "scaled.env"
+    env_file.write_text("DATABASE_URL=postgresql://postgres@ci-postgres/postgres\n")
+    monkeypatch.setenv("SCALED_COMPOSE_ENV_FILE", str(env_file))
+    captured = []
+
+    def fake_run(command, **kwargs):
+        captured.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker")
+
+    assert len(captured) == 1
+    command, kwargs = captured[0]
+    assert command == [
+        "docker",
+        "compose",
+        "-f",
+        str(COMPOSE),
+        "--env-file",
+        str(env_file),
+        "up",
+        "-d",
+        "--no-deps",
+        "--scale",
+        "worker=2",
+        "worker",
+    ]
+    assert kwargs == {"check": True, "text": True, "capture_output": True}
+
+
+def test_compose_command_omits_missing_default_env_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("SCALED_COMPOSE_ENV_FILE", raising=False)
+    monkeypatch.setitem(_compose.__globals__, "SELFHOST_ENV", tmp_path / "missing.env")
+    captured = []
+
+    def fake_run(command, **kwargs):
+        captured.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _compose("ps", "-q", "worker")
+
+    assert len(captured) == 1
+    assert "--env-file" not in captured[0]
+
+
 def _selfhost_env_value(name: str) -> str:
     try:
         lines = SELFHOST_ENV.read_text(encoding="utf-8").splitlines()
@@ -243,10 +291,14 @@ def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]
         "compose",
         "-f",
         str(COMPOSE),
-        "--env-file",
-        str(ROOT / "deploy/.env.selfhost"),
-        *args,
     ]
+    configured_env_file = os.getenv("SCALED_COMPOSE_ENV_FILE", "").strip()
+    env_file = Path(configured_env_file) if configured_env_file else SELFHOST_ENV
+    if not env_file.is_absolute():
+        env_file = ROOT / env_file
+    if configured_env_file or env_file.is_file():
+        command.extend(("--env-file", str(env_file)))
+    command.extend(args)
     return subprocess.run(command, check=check, text=True, capture_output=True)
 
 
