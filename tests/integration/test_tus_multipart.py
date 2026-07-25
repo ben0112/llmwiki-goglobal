@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -435,6 +436,59 @@ async def test_real_postgres_rollback_orphan_is_recovered_by_durable_cleanup(mul
     assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
 
 
+async def test_real_unknown_commit_is_reconciled_without_deleting_committed_object(multipart_runtime):
+    from infra.tus import HostedTusCleanupService, _CommitOutcomeError
+    from infra.tus_sessions import TusReservationState, TusSessionState
+
+    runtime = multipart_runtime
+    body = b"%PDF-committed"
+    location = await _create_upload(runtime, len(body))
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    session = await runtime["store"].get(upload_id)
+    original_persist = runtime["service_a"]._persist_document_job
+
+    async def commit_then_lose_outcome(actual_session):
+        document_id, job_id = await original_persist(actual_session)
+        raise _CommitOutcomeError(None, document_id, job_id)
+
+    runtime["service_a"]._persist_document_job = commit_then_lose_outcome
+    response = await runtime["a"].patch(
+        location,
+        headers=_headers(
+            runtime["user_id"],
+            **{"Upload-Offset": "0", "Content-Type": "application/offset+octet-stream"},
+        ),
+        content=body,
+    )
+
+    assert response.status_code == 503
+    unknown = await runtime["store"].get(upload_id)
+    assert unknown is not None
+    assert unknown.state is TusSessionState.UPLOADING
+    assert unknown.object_completed is True
+    assert await runtime["pool"].fetchval("SELECT COUNT(*) FROM documents WHERE id = $1", upload_id) == 1
+    assert await runtime["s3"].head_object(session.s3_key) is not None
+
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=86_400,
+        lock_seconds=10,
+    )
+    assert (await cleanup.cleanup(upload_id, runtime["user_id"]))["status"] == "committed"
+    recovered = await runtime["store"].get(upload_id)
+    assert recovered is not None and recovered.state is TusSessionState.COMPLETED
+    assert recovered.document_id == upload_id
+    assert await runtime["s3"].head_object(session.s3_key) is not None
+    marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
+    assert marker is not None and marker.state is TusReservationState.RELEASED
+    assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+
+
 async def test_real_stale_cleanup_treats_nosuch_as_success_replays_and_releases_quota_once(
     multipart_runtime,
 ):
@@ -477,3 +531,53 @@ async def test_real_stale_cleanup_treats_nosuch_as_success_replays_and_releases_
     marker = await runtime["store"].get_reservation(runtime["user_id"], upload_id)
     assert marker is not None and marker.state is TusReservationState.RELEASED
     assert await runtime["redis"].zscore(quota_keys(runtime["user_id"])[1], str(upload_id)) is None
+
+
+async def test_real_cleanup_scan_creates_claimable_successor_after_exhausted_job(multipart_runtime):
+    from infra.tus import HostedTusCleanupService
+    from jobs import repository
+
+    runtime = multipart_runtime
+    location = await _create_upload(runtime, 5 * MIB)
+    upload_id = UUID(location.rsplit("/", 1)[-1])
+    cleanup = HostedTusCleanupService(
+        runtime["pool"],
+        runtime["s3"],
+        JobService(runtime["pool"]),
+        HostedQuotaService(runtime["pool"], runtime["redis"]),
+        runtime["store"],
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=10,
+    )
+    first_scan = (datetime.now(UTC) + timedelta(minutes=5)).replace(second=15, microsecond=0)
+
+    await cleanup.enqueue_stale_jobs(now=first_scan)
+    await cleanup.enqueue_stale_jobs(now=first_scan.replace(second=45))
+    first_rows = await runtime["pool"].fetch(
+        "SELECT id, idempotency_key FROM background_jobs "
+        "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2",
+        runtime["user_id"],
+        str(upload_id),
+    )
+    assert len(first_rows) == 1
+    await runtime["pool"].execute(
+        "UPDATE background_jobs SET state = 'failed', attempt_count = max_attempts, updated_at = now() WHERE id = $1",
+        first_rows[0]["id"],
+    )
+
+    await cleanup.enqueue_stale_jobs(now=first_scan + timedelta(minutes=1))
+    rows = await runtime["pool"].fetch(
+        "SELECT id, state::text, idempotency_key FROM background_jobs "
+        "WHERE user_id = $1 AND job_type = 'upload.cleanup' AND payload->>'upload_id' = $2 "
+        "ORDER BY created_at, id",
+        runtime["user_id"],
+        str(upload_id),
+    )
+    assert len(rows) == 2
+    assert rows[0]["state"] == "failed"
+    assert rows[0]["idempotency_key"] != rows[1]["idempotency_key"]
+    async with runtime["pool"].acquire() as conn, conn.transaction():
+        claimed = await repository.claim(conn, rows[1]["id"], "cleanup-test-worker", lease_seconds=30)
+    assert claimed is not None
+    assert claimed.id == rows[1]["id"]

@@ -325,6 +325,29 @@ def _reservation_marker_settled(status) -> bool:
     }
 
 
+async def _release_quota_and_marker(quota, sessions, reservation) -> bool:
+    """Settle a released quota generation and its marker across response loss."""
+    from infra.quota import QuotaMarkerSettlementStatus
+
+    try:
+        released = await quota.release(reservation)
+    except Exception:  # noqa: BLE001 -- an executed Redis CAS may have lost its response
+        released = False
+    if released is True:
+        try:
+            marker_status = await sessions.release_reservation_once(
+                reservation.user_id,
+                reservation.upload_id,
+                reservation.owner_token,
+            )
+        except Exception:  # noqa: BLE001 -- marker CAS may have executed before its response was lost
+            marker_status = None
+        if marker_status is not None:
+            return _reservation_marker_settled(marker_status)
+    marker_settlement = await quota.settle_tus_marker_if_absent(reservation)
+    return marker_settlement is QuotaMarkerSettlementStatus.SETTLED
+
+
 async def _shielded(operation) -> None:
     task = asyncio.create_task(operation)
     try:
@@ -511,22 +534,18 @@ class HostedTusMultipartService:
                     type(exc).__name__,
                 )
             return
-        quota_ok = False
         try:
-            quota_ok = await self.quota.release(reservation) is True
+            await _release_quota_and_marker(self.quota, self.sessions, reservation)
         except Exception as exc:  # noqa: BLE001 -- quota backends expose adapter-specific failures
             logger.error("TUS create quota release failed upload_id=%s error_type=%s", reservation.upload_id, type(exc).__name__)
-        if marker_created and quota_ok:
-            with suppress(Exception):
-                await self.sessions.release_reservation_once(
-                    reservation.user_id,
-                    reservation.upload_id,
-                    reservation.owner_token,
-                )
 
     async def head(self, raw_upload_id: str, request: Request, user_id: str) -> Response:
         del request
         session = await self._owned_session(_canonical_upload_id(raw_upload_id), user_id)
+        from infra.tus_sessions import TusSessionState
+
+        if session.state is TusSessionState.COMPLETED:
+            await self._retry_completed_settlement(session)
         metadata = {
             "filename": session.filename,
             "knowledge_base_id": str(session.knowledge_base_id),
@@ -852,14 +871,18 @@ class HostedTusMultipartService:
                 commit_attempted = True
                 await self._commit_transaction(transaction)
         except (Exception, asyncio.CancelledError) as exc:
-            committed: bool | None = False
-            if commit_attempted and job is not None:
-                committed = await asyncio.shield(
+            committed: bool | None = False if transaction is None else None
+            if transaction is not None:
+                try:
+                    await asyncio.shield(transaction.rollback())
+                    committed = False
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001 -- rollback outcome stays unknown
+                    committed = None
+            if committed is not False and commit_attempted and job is not None:
+                confirmed = await asyncio.shield(
                     self._confirm_document_job_committed(session, document_id, job.id)
                 )
-            elif transaction is not None:
-                with suppress(Exception, asyncio.CancelledError):
-                    await asyncio.shield(transaction.rollback())
+                committed = True if confirmed is True else None
             raise _CommitOutcomeError(committed, document_id, None if job is None else job.id) from exc
         finally:
             if conn is not None:
@@ -963,20 +986,10 @@ class HostedTusMultipartService:
         if not objects_clean:
             return
         try:
-            released = await self.quota.release(reservation)
-        except Exception:  # noqa: BLE001 -- quota release failure retains marker and session
-            return
-        if released is not True:
-            return
-        try:
-            marker_status = await self.sessions.release_reservation_once(
-                session.user_id,
-                session.upload_id,
-                reservation.owner_token,
-            )
+            settled = await _release_quota_and_marker(self.quota, self.sessions, reservation)
         except Exception:  # noqa: BLE001 -- marker failure retains the cleanup session
             return
-        if not _reservation_marker_settled(marker_status):
+        if not settled:
             return
         with suppress(Exception):
             await self.sessions.delete_locked(session.upload_id, lock_token=token)
@@ -1100,23 +1113,29 @@ class HostedTusCleanupService:
         self.stale_seconds = stale_seconds
         self.lock_seconds = lock_seconds
 
-    async def enqueue_stale_jobs(self) -> int:
+    async def enqueue_stale_jobs(self, *, now: datetime | None = None) -> int:
         from infra.tus_sessions import TusSessionState
         from jobs.models import JobCreate, JobType
 
-        stale_before = datetime.now(UTC).timestamp() - self.stale_seconds
+        current = now or datetime.now(UTC)
+        stale_before = current.timestamp() - self.stale_seconds
+        scan_bucket = int(current.timestamp() // 60)
         created = 0
         async for session in self.sessions.iter_sessions():
             if session.state is TusSessionState.COMPLETED:
-                continue
-            if session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
+                marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+                if marker is None or marker.state.value != "reserved":
+                    continue
+            elif session.object_completed:
+                pass
+            elif session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
                 continue
             await self.jobs.create(
                 JobCreate(
                     job_type=JobType.UPLOAD_CLEANUP,
                     user_id=session.user_id,
                     payload={"upload_id": str(session.upload_id)},
-                    idempotency_key=f"upload.cleanup:{session.upload_id}:{int(session.updated_at.timestamp() * 1_000_000)}",
+                    idempotency_key=f"upload.cleanup:{session.upload_id}:scan:{scan_bucket}",
                 ),
                 authenticated_user_id=session.user_id,
             )
@@ -1143,13 +1162,19 @@ class HostedTusCleanupService:
             if session.user_id != expected_user_id:
                 return {"upload_id": str(upload_id), "status": "owner_mismatch"}
             if session.state is TusSessionState.COMPLETED:
-                return {"upload_id": str(upload_id), "status": "committed"}
+                settled = await self._settle_completed(session)
+                return {"upload_id": str(upload_id), "status": "committed" if settled else "retry"}
+            if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
+                return {"upload_id": str(upload_id), "status": "lock_lost"}
+            if session.object_completed:
+                reconciled = await self._reconcile_object_completed(session, token)
+                if reconciled is True:
+                    return {"upload_id": str(upload_id), "status": "committed"}
+                if reconciled is False or session.state is TusSessionState.UPLOADING:
+                    return {"upload_id": str(upload_id), "status": "retry"}
             stale_before = datetime.now(UTC).timestamp() - self.stale_seconds
             if session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
                 return {"upload_id": str(upload_id), "status": "active"}
-
-            if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
-                return {"upload_id": str(upload_id), "status": "lock_lost"}
             if session.state is TusSessionState.UPLOADING:
                 fenced = await self.sessions.mark_cleanup_required(
                     upload_id,
@@ -1174,21 +1199,62 @@ class HostedTusCleanupService:
                     marker.bytes,
                     marker.owner_token,
                 )
-                released = await self.quota.release(reservation)
-                if released is not True:
-                    return {"upload_id": str(upload_id), "status": "retry"}
-                marker_status = await self.sessions.release_reservation_once(
-                    session.user_id,
-                    session.upload_id,
-                    marker.owner_token,
-                )
-                if not _reservation_marker_settled(marker_status):
+                if not await _release_quota_and_marker(self.quota, self.sessions, reservation):
                     return {"upload_id": str(upload_id), "status": "retry"}
             deleted = await self.sessions.delete_locked(upload_id, lock_token=token)
             return {"upload_id": str(upload_id), "status": "cleaned" if deleted else "lock_lost"}
         finally:
             with suppress(Exception):
                 await asyncio.shield(self.sessions.release_lock(upload_id, token))
+
+    async def _settle_completed(self, session) -> bool:
+        from infra.quota import QuotaMarkerSettlementStatus, QuotaReservation
+        from infra.tus_sessions import TusReservationState
+
+        marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
+        if marker is None or marker.state is TusReservationState.RELEASED:
+            return True
+        reservation = QuotaReservation(session.user_id, session.upload_id, marker.bytes, marker.owner_token)
+        finalized = await self.quota.finalize(reservation)
+        if finalized is not True:
+            status = await self.quota.settle_tus_marker_if_absent(reservation)
+            return status is QuotaMarkerSettlementStatus.SETTLED
+        marker_status = await self.sessions.release_reservation_once(
+            session.user_id,
+            session.upload_id,
+            marker.owner_token,
+        )
+        return _reservation_marker_settled(marker_status)
+
+    async def _reconcile_object_completed(self, session, token: str) -> bool | None:
+        from infra.tus_sessions import CompleteStatus
+
+        row = await self.pool.fetchrow(
+            "SELECT d.id AS document_id, j.id AS job_id FROM documents d "
+            "JOIN background_jobs j ON j.document_id = d.id AND j.user_id = d.user_id "
+            "WHERE d.id = $1 AND d.user_id = $2 AND d.knowledge_base_id = $3 "
+            "AND d.filename = $4 AND d.file_size = $5 AND j.job_type = 'document.extract' "
+            "ORDER BY j.created_at ASC, j.id ASC LIMIT 1",
+            session.upload_id,
+            session.user_id,
+            session.knowledge_base_id,
+            session.filename,
+            session.total_length,
+        )
+        if row is None:
+            return None
+        result = await self.sessions.mark_complete(
+            session.upload_id,
+            session.offset,
+            row["document_id"],
+            row["job_id"],
+            self.session_ttl_seconds,
+            lock_token=token,
+        )
+        if result.status not in {CompleteStatus.COMPLETED, CompleteStatus.ALREADY_COMPLETED}:
+            return False
+        completed = await self.sessions.get(session.upload_id)
+        return completed is not None and await self._settle_completed(completed)
 
     async def _cleanup_objects(self, session) -> bool:
         try:

@@ -786,7 +786,12 @@ if session.state == 'completed' then
   redis.call('SET', KEYS[1], encoded, 'EX', ttl)
   return {1, session.offset, session.document_id, session.job_id}
 end
-if session.state ~= 'uploading' then return {5, session.offset, '', ''} end
+if session.state ~= 'uploading' and session.state ~= 'cleanup_required' then
+  return {5, session.offset, '', ''}
+end
+if session.state == 'cleanup_required' and not session.object_completed then
+  return {5, session.offset, '', ''}
+end
 if session.offset ~= expected then return {3, session.offset, '', ''} end
 if session.offset ~= session.total_length then return {6, session.offset, '', ''} end
 local timestamp = next_timestamp(session.updated_at)
