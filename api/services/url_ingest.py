@@ -30,6 +30,16 @@ DOWNLOAD_TIMEOUT = 30
 MAX_REDIRECTS = 5
 USER_AGENT = "LLMWiki/1.0 (+https://llmwiki.app)"
 URL_QUOTA_RESERVATION_TTL_SECONDS = 3600
+URL_QUOTA_RENEW_TTL_SECONDS = 120
+URL_TRANSACTION_TIMEOUT_SECONDS = 30
+
+
+def _validate_quota_timing() -> None:
+    if URL_TRANSACTION_TIMEOUT_SECONDS * 2 >= URL_QUOTA_RENEW_TTL_SECONDS:
+        raise RuntimeError("URL transaction timeout must stay well below its renewed quota TTL")
+
+
+_validate_quota_timing()
 
 _ARXIV_ABS_RE = re.compile(r"^(https?://(?:www\.)?arxiv\.org)/abs/(.+)$")
 _DISPOSITION_FILENAME_RE = re.compile(r'filename\*?=(?:"([^"]+)"|([^;\s]+))', re.IGNORECASE)
@@ -148,40 +158,42 @@ class UrlIngestService:
         transaction = None
         try:
             conn = await self.pool.acquire()
-            transaction = conn.transaction()
-            await transaction.start()
-            transaction_started = True
-            # Quota's Redis lock ends after admission. Keep the existing
-            # transaction-scoped serialization for the source_url recheck so
-            # two replicas cannot insert duplicate documents for one user.
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
-            duplicate = await self._find_by_source_url(user_id, kb_id, url, conn=conn)
-            if duplicate is None:
-                await self._insert_pending_document(
-                    conn,
-                    document_id,
-                    kb_id,
-                    user_id,
-                    pdf,
-                    path,
-                    url,
-                )
-                job = await self.jobs.create_in_transaction(
-                    conn,
-                    JobCreate(
-                        job_type=JobType.DOCUMENT_EXTRACT,
-                        user_id=UUID(user_id),
-                        knowledge_base_id=UUID(kb_id),
-                        document_id=UUID(document_id),
-                        payload={"document_id": document_id},
-                        idempotency_key=f"document.extract:{document_id}",
-                    ),
-                    authenticated_user_id=UUID(user_id),
-                )
-            else:
-                job = await self._ensure_existing_job(conn, duplicate, user_id, kb_id)
-            commit_attempted = True
-            await self._commit_transaction(transaction)
+            await self._renew_quota(reservation)
+            async with asyncio.timeout(URL_TRANSACTION_TIMEOUT_SECONDS):
+                transaction = conn.transaction()
+                await transaction.start()
+                transaction_started = True
+                # Quota's Redis lock ends after admission. Keep the existing
+                # transaction-scoped serialization for the source_url recheck so
+                # two replicas cannot insert duplicate documents for one user.
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
+                duplicate = await self._find_by_source_url(user_id, kb_id, url, conn=conn)
+                if duplicate is None:
+                    await self._insert_pending_document(
+                        conn,
+                        document_id,
+                        kb_id,
+                        user_id,
+                        pdf,
+                        path,
+                        url,
+                    )
+                    job = await self.jobs.create_in_transaction(
+                        conn,
+                        JobCreate(
+                            job_type=JobType.DOCUMENT_EXTRACT,
+                            user_id=UUID(user_id),
+                            knowledge_base_id=UUID(kb_id),
+                            document_id=UUID(document_id),
+                            payload={"document_id": document_id},
+                            idempotency_key=f"document.extract:{document_id}",
+                        ),
+                        authenticated_user_id=UUID(user_id),
+                    )
+                else:
+                    job = await self._ensure_existing_job(conn, duplicate, user_id, kb_id)
+                commit_attempted = True
+                await self._commit_transaction(transaction)
         except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - compensate all persistence failures.
             failure = exc
             failure_traceback = exc.__traceback__
@@ -286,6 +298,19 @@ class UrlIngestService:
                 reservation.upload_id,
                 type(exc).__name__,
             )
+
+    async def _renew_quota(self, reservation: QuotaReservation) -> None:
+        from infra.quota import QuotaUnavailable
+
+        quota = self.quota
+        if quota is None:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable")
+        try:
+            renewed = await quota.renew(reservation, URL_QUOTA_RENEW_TTL_SECONDS)
+        except QuotaUnavailable:
+            raise HTTPException(status_code=503, detail="Storage quota coordination is unavailable") from None
+        if not renewed:
+            raise HTTPException(status_code=503, detail="Storage quota reservation expired before persistence")
 
     async def _compensate_temporary_ingest(
         self,

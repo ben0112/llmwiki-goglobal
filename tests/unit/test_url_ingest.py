@@ -60,6 +60,11 @@ def test_url_ingest_accepts_durable_job_service_instead_of_ocr_service():
     assert service.quota is quota_service
 
 
+def test_url_quota_transaction_timeout_stays_well_inside_renewed_ttl():
+    assert ui.URL_TRANSACTION_TIMEOUT_SECONDS * 2 < ui.URL_QUOTA_RENEW_TTL_SECONDS
+    assert ui.URL_QUOTA_RENEW_TTL_SECONDS < ui.URL_QUOTA_RESERVATION_TTL_SECONDS
+
+
 class TestNormalizePdfUrl:
     def test_arxiv_abs_rewritten_to_pdf(self):
         assert _normalize_pdf_url("https://arxiv.org/abs/2506.06266") == "https://arxiv.org/pdf/2506.06266"

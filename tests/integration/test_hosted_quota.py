@@ -308,3 +308,142 @@ async def test_canonical_raw_record_with_dash_and_underscore_remains_operable(po
         assert await _reservation_state(redis_client, user_id) == ([], {}, {})
     finally:
         await _clear(redis_client, user_id)
+
+
+class _PauseAfterCommittedRead(HostedQuotaService):
+    def __init__(self, *args, read_done: asyncio.Event, allow_write: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read_done = read_done
+        self.allow_write = allow_write
+
+    async def _read_committed_usage(self, user_id):
+        usage = await super()._read_committed_usage(user_id)
+        self.read_done.set()
+        await self.allow_write.wait()
+        return usage
+
+
+class _ObserveLockAttempt:
+    def __init__(self, redis_client, attempted: asyncio.Event):
+        self._redis = redis_client
+        self.attempted = attempted
+
+    def __getattr__(self, name):
+        return getattr(self._redis, name)
+
+    async def set(self, *args, **kwargs):
+        self.attempted.set()
+        return await self._redis.set(*args, **kwargs)
+
+
+async def test_finalize_waits_for_inflight_admission_snapshot_before_removing_live_bytes(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    try:
+        b_service = HostedQuotaService(pool, redis_client)
+        b = await b_service.reserve(user_id, uuid4(), 60, ttl_seconds=60)
+        read_done = asyncio.Event()
+        allow_a_write = asyncio.Event()
+        a_service = _PauseAfterCommittedRead(
+            pool,
+            redis_client,
+            read_done=read_done,
+            allow_write=allow_a_write,
+        )
+        a_task = asyncio.create_task(a_service.reserve(user_id, uuid4(), 60, ttl_seconds=60))
+        await read_done.wait()
+        await _seed_committed_document(pool, user_id, byte_count=60)
+        finalize_attempted = asyncio.Event()
+        finalize_service = HostedQuotaService(pool, _ObserveLockAttempt(redis_client, finalize_attempted))
+        finalize_task = asyncio.create_task(finalize_service.finalize(b))
+        await finalize_attempted.wait()
+        await asyncio.sleep(0)
+        assert not finalize_task.done()
+
+        allow_a_write.set()
+        with pytest.raises(QuotaExceeded):
+            await a_task
+        assert await finalize_task is True
+        assert await _reservation_state(redis_client, user_id) == ([], {}, {})
+    finally:
+        await _clear(redis_client, user_id)
+
+
+async def test_renew_never_revives_missing_expired_or_stale_generation(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    upload_id = uuid4()
+    service = HostedQuotaService(pool, redis_client)
+    missing = QuotaReservation(user_id, upload_id, 10, secrets.token_urlsafe(24))
+    try:
+        assert await service.renew(missing, ttl_seconds=60) is False
+        assert await _reservation_state(redis_client, user_id) == ([], {}, {})
+
+        expired = await service.reserve(user_id, upload_id, 10, ttl_seconds=60)
+        await redis_client.zadd(quota_keys(user_id)[1], {str(upload_id): 0})
+        expired_state = await _reservation_state(redis_client, user_id)
+        assert await service.renew(expired, ttl_seconds=60) is False
+        assert await _reservation_state(redis_client, user_id) == expired_state
+
+        await _clear(redis_client, user_id)
+        old = await service.reserve(user_id, upload_id, 10, ttl_seconds=60)
+        new = await service.reserve(user_id, upload_id, 20, ttl_seconds=60)
+        new_state = await _reservation_state(redis_client, user_id)
+        assert await service.renew(old, ttl_seconds=60) is False
+        assert await _reservation_state(redis_client, user_id) == new_state
+        assert await service.renew(new, ttl_seconds=120) is True
+        assert (await _reservation_state(redis_client, user_id))[0][0][1] > new_state[0][0][1]
+    finally:
+        await _clear(redis_client, user_id)
+
+
+class _AdmissionResponseProxy:
+    def __init__(self, redis_client, *, block_response: bool = False):
+        self._redis = redis_client
+        self.block_response = block_response
+        self.written = asyncio.Event()
+        self.allow_response = asyncio.Event()
+        self.intercepted = False
+
+    def __getattr__(self, name):
+        return getattr(self._redis, name)
+
+    async def eval(self, script, numkeys, *args):
+        result = await self._redis.eval(script, numkeys, *args)
+        if numkeys == 4 and not self.intercepted:
+            self.intercepted = True
+            self.written.set()
+            if self.block_response:
+                await self.allow_response.wait()
+                return result
+            raise ConnectionError("response lost after Redis executed admission")
+        return result
+
+
+async def test_real_redis_admission_response_loss_cas_releases_written_generation(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    proxy = _AdmissionResponseProxy(redis_client)
+    try:
+        with pytest.raises(QuotaUnavailable):
+            await HostedQuotaService(pool, proxy).reserve(user_id, uuid4(), 10, ttl_seconds=60)
+        assert await _reservation_state(redis_client, user_id) == ([], {}, {})
+    finally:
+        await _clear(redis_client, user_id)
+
+
+async def test_real_redis_outer_cancel_waits_for_response_and_cleans_written_generation(pool, redis_client):
+    user_id = await _seed_user(pool, limit=100)
+    proxy = _AdmissionResponseProxy(redis_client, block_response=True)
+    reserve = asyncio.create_task(HostedQuotaService(pool, proxy).reserve(user_id, uuid4(), 10, ttl_seconds=60))
+    try:
+        await proxy.written.wait()
+        reserve.cancel()
+        await asyncio.sleep(0)
+        assert not reserve.done()
+        proxy.allow_response.set()
+        with pytest.raises(asyncio.CancelledError):
+            await reserve
+        assert await _reservation_state(redis_client, user_id) == ([], {}, {})
+    finally:
+        proxy.allow_response.set()
+        if not reserve.done():
+            reserve.cancel()
+        await _clear(redis_client, user_id)

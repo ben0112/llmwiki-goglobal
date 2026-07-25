@@ -143,15 +143,20 @@ async def test_lock_lost_before_atomic_write_reacquires_and_rereads_postgres():
 @pytest.mark.parametrize("method", ["finalize", "release"])
 async def test_settlement_is_owner_token_cas_and_repeated_safe(method):
     quota = _module()
-    redis = _Redis(eval_results=[[1], [0]])
+    redis = (
+        _Redis(set_results=[True, True], eval_results=[[1], 1, [0], 1])
+        if method == "finalize"
+        else _Redis(eval_results=[[1], [0]])
+    )
     service = quota.HostedQuotaService(_Pool({}), redis)
     owner_token = secrets.token_urlsafe(24)
     reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, owner_token)
 
     assert await getattr(service, method)(reservation) is True
     assert await getattr(service, method)(reservation) is False
-    assert all(call[1] == 3 for call in redis.eval_calls)
-    assert all(call[2][-2:] == (owner_token, "10") for call in redis.eval_calls)
+    mutation_calls = [call for call in redis.eval_calls if call[1] != 1]
+    assert all(call[1] == (4 if method == "finalize" else 3) for call in mutation_calls)
+    assert all(call[2][-2:] == (owner_token, "10") for call in mutation_calls)
 
 
 @pytest.mark.parametrize(
@@ -236,6 +241,165 @@ async def test_settlement_cas_includes_immutable_reservation_bytes():
     _, key_count, args = redis.eval_calls[0]
     assert key_count == 3
     assert args[-3:] == (str(reservation.upload_id), reservation.owner_token, "10")
+
+
+async def test_finalize_acquires_user_lock_and_fences_four_key_lua():
+    quota = _module()
+    redis = _Redis(set_results=[True], eval_results=[[1], 1])
+    service = quota.HostedQuotaService(_Pool({}), redis)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    assert await service.finalize(reservation) is True
+
+    assert redis.set_calls[0][0][0] == quota.quota_lock_key(reservation.user_id)
+    _, key_count, args = redis.eval_calls[0]
+    assert key_count == 4
+    assert args[:4] == quota.quota_keys(reservation.user_id)
+    assert args[-3:] == (str(reservation.upload_id), reservation.owner_token, "10")
+
+
+async def test_finalize_reacquires_when_lua_reports_lock_lost():
+    quota = _module()
+    redis = _Redis(set_results=[True, True], eval_results=[[4], 0, [1], 1])
+    service = quota.HostedQuotaService(_Pool({}), redis, max_lock_attempts=2)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    assert await service.finalize(reservation) is True
+
+    assert len(redis.set_calls) == 2
+
+
+@pytest.mark.parametrize("status,expected", [(1, True), (0, False), (2, False)])
+async def test_renew_is_owner_bytes_cas_under_user_lock(status, expected):
+    quota = _module()
+    redis = _Redis(set_results=[True], eval_results=[[status], 1])
+    service = quota.HostedQuotaService(_Pool({}), redis)
+    reservation = quota.QuotaReservation(uuid4(), uuid4(), 10, secrets.token_urlsafe(24))
+
+    assert await service.renew(reservation, ttl_seconds=60) is expected
+
+    _, key_count, args = redis.eval_calls[0]
+    assert key_count == 4
+    assert args[:4] == quota.quota_keys(reservation.user_id)
+    assert args[-4:-1] == (str(reservation.upload_id), reservation.owner_token, "10")
+    assert args[-1] == "60000"
+
+
+class _AdmissionOutcomeRedis:
+    def __init__(self, *, cancel_after_write: bool = False, fail_before_write: bool = False):
+        self.cancel_after_write = cancel_after_write
+        self.fail_before_write = fail_before_write
+        self.owner = None
+        self.byte_count = None
+        self.set_calls = []
+        self.eval_calls = []
+
+    async def set(self, *args, **kwargs):
+        self.set_calls.append((args, kwargs))
+        return True
+
+    async def eval(self, script, numkeys, *args):
+        self.eval_calls.append((script, numkeys, args))
+        if numkeys == 4:
+            if self.fail_before_write:
+                raise ConnectionError("response lost before execution")
+            self.owner = args[-5]
+            self.byte_count = args[-2]
+            if self.cancel_after_write:
+                raise asyncio.CancelledError
+            raise ConnectionError("response lost after execution")
+        if numkeys == 3:
+            upload_id, owner, byte_count = args[-3:]
+            del upload_id
+            if owner == self.owner and byte_count == self.byte_count:
+                self.owner = None
+                self.byte_count = None
+                return [1]
+            return [2]
+        return 1
+
+
+async def test_admission_response_loss_best_effort_releases_written_generation():
+    quota = _module()
+    redis = _AdmissionOutcomeRedis()
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 0}),
+        redis,
+    )
+
+    with pytest.raises(quota.QuotaUnavailable) as raised:
+        await service.reserve(uuid4(), uuid4(), 10, ttl_seconds=60)
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert redis.owner is None
+
+
+async def test_admission_cancellation_after_write_releases_then_propagates_cancel():
+    quota = _module()
+    redis = _AdmissionOutcomeRedis(cancel_after_write=True)
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 0}),
+        redis,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.reserve(uuid4(), uuid4(), 10, ttl_seconds=60)
+
+    assert redis.owner is None
+
+
+async def test_unknown_admission_cleanup_cannot_delete_an_old_generation():
+    quota = _module()
+    redis = _AdmissionOutcomeRedis(fail_before_write=True)
+    redis.owner = secrets.token_urlsafe(24)
+    redis.byte_count = "20"
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 0}),
+        redis,
+    )
+
+    with pytest.raises(quota.QuotaUnavailable):
+        await service.reserve(uuid4(), uuid4(), 10, ttl_seconds=60)
+
+    assert redis.owner is not None
+    assert redis.byte_count == "20"
+
+
+class _BlockingAdmissionRedis(_AdmissionOutcomeRedis):
+    def __init__(self):
+        super().__init__()
+        self.written = asyncio.Event()
+        self.allow_response = asyncio.Event()
+
+    async def eval(self, script, numkeys, *args):
+        if numkeys == 4:
+            self.eval_calls.append((script, numkeys, args))
+            self.owner = args[-5]
+            self.byte_count = args[-2]
+            self.written.set()
+            await self.allow_response.wait()
+            return [1, 123]
+        return await super().eval(script, numkeys, *args)
+
+
+async def test_outer_cancellation_waits_for_admission_response_then_cas_releases():
+    quota = _module()
+    redis = _BlockingAdmissionRedis()
+    service = quota.HostedQuotaService(
+        _Pool({"storage_limit_bytes": 100, "committed_bytes": 0}),
+        redis,
+    )
+    reserve = asyncio.create_task(service.reserve(uuid4(), uuid4(), 10, ttl_seconds=60))
+    await redis.written.wait()
+
+    reserve.cancel()
+    await asyncio.sleep(0)
+    assert not reserve.done()
+    redis.allow_response.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reserve
+
+    assert redis.owner is None
 
 
 async def test_hosted_runtime_builds_one_pinged_shared_quota_service(monkeypatch):

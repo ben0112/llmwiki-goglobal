@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import services.url_ingest as url_ingest_module
 from botocore.exceptions import EndpointConnectionError
 from config import settings
 from fastapi import HTTPException
@@ -79,14 +80,19 @@ class RecordingQuota:
         reserve_error: Exception | None = None,
         finalize_error: Exception | None = None,
         release_error: Exception | None = None,
+        renew_result: bool = True,
+        renew_error: Exception | None = None,
     ) -> None:
         self.events = events
         self.reserve_error = reserve_error
         self.finalize_error = finalize_error
         self.release_error = release_error
+        self.renew_result = renew_result
+        self.renew_error = renew_error
         self.reservations: list[QuotaReservation] = []
         self.finalized: list[QuotaReservation] = []
         self.released: list[QuotaReservation] = []
+        self.renewed: list[QuotaReservation] = []
 
     async def reserve(self, user_id, upload_id, byte_count, ttl_seconds):
         del ttl_seconds
@@ -105,6 +111,15 @@ class RecordingQuota:
         if self.finalize_error is not None:
             raise self.finalize_error
         return True
+
+    async def renew(self, reservation, ttl_seconds):
+        del ttl_seconds
+        if self.events is not None:
+            self.events.append("quota_renew")
+        self.renewed.append(reservation)
+        if self.renew_error is not None:
+            raise self.renew_error
+        return self.renew_result
 
     async def release(self, reservation):
         if self.events is not None:
@@ -302,9 +317,76 @@ async def test_url_ingest_commits_document_and_job_atomically_after_upload(pool,
     assert json.loads(row["payload"]) == {"document_id": result["id"]}
     assert row["idempotency_key"] == f"document.extract:{result['id']}"
     assert s3.uploads == [f"{user_id}/{result['id']}/source.pdf"]
-    assert events == ["quota_reserve", "s3_upload", "pg_commit", "quota_finalize"]
+    assert events == ["quota_reserve", "s3_upload", "quota_renew", "pg_commit", "quota_finalize"]
     assert quota.finalized == quota.reservations
     assert quota.released == []
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_pool_wait_then_expired_renew_never_starts_transaction(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    acquire_started = asyncio.Event()
+    allow_acquire = asyncio.Event()
+
+    class GatedAcquirePool:
+        def __getattr__(self, name):
+            return getattr(pool, name)
+
+        async def acquire(self):
+            acquire_started.set()
+            await allow_acquire.wait()
+            return await pool.acquire()
+
+    s3 = RecordingS3()
+    quota = RecordingQuota()
+    service = UrlIngestService(GatedAcquirePool(), s3, JobService(pool), quota)
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+    ingest = asyncio.create_task(
+        service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/acquire-expired.pdf", "/")
+    )
+    await acquire_started.wait()
+    assert len(s3.objects) == 1
+    quota.renew_result = False
+    allow_acquire.set()
+
+    with pytest.raises(HTTPException) as raised:
+        await ingest
+
+    assert raised.value.status_code == 503
+    assert quota.renewed == quota.reservations
+    assert quota.released == quota.reservations
+    assert s3.objects == {}
+    assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_url_ingest_transaction_timeout_rolls_back_and_releases_reservation(pool, monkeypatch):
+    user_id, kb_id = await _seed_tenant(pool)
+    s3 = RecordingS3()
+    quota = RecordingQuota()
+    service = UrlIngestService(pool, s3, JobService(pool), quota)
+    pdf = DownloadedPdf(data=b"%PDF-1.7\ncontent", filename="paper.pdf")
+    monkeypatch.setattr(service, "_download", lambda _url: _async_value(pdf))
+    monkeypatch.setattr(url_ingest_module, "URL_TRANSACTION_TIMEOUT_SECONDS", 0.01)
+
+    async def block_inside_transaction(_user_id, _kb_id, _url, *, conn=None):
+        if conn is None:
+            return
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_find_by_source_url", block_inside_transaction)
+
+    with pytest.raises(TimeoutError):
+        await service.ingest_pdf(str(user_id), str(kb_id), "https://example.test/transaction-timeout.pdf", "/")
+
+    assert quota.renewed == quota.reservations
+    assert quota.released == quota.reservations
+    assert quota.finalized == []
+    assert s3.objects == {}
+    assert await pool.fetchval("SELECT count(*) FROM documents WHERE user_id = $1", user_id) == 0
+    assert await pool.fetchval("SELECT count(*) FROM background_jobs WHERE user_id = $1", user_id) == 0
 
 
 @pytest.mark.asyncio

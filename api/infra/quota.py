@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -18,6 +19,7 @@ MAX_QUOTA_BYTES = 9_999_999_999_999
 MAX_TTL_SECONDS = 2_147_483_647
 DEFAULT_LOCK_TTL_MS = 5_000
 DEFAULT_LOCK_ATTEMPTS = 512
+DEFAULT_REDIS_COMMAND_TIMEOUT_SECONDS = 6
 
 
 class RedisClient(Protocol):
@@ -65,6 +67,8 @@ class QuotaService(Protocol):
     async def finalize(self, reservation: QuotaReservation) -> bool: ...
 
     async def release(self, reservation: QuotaReservation) -> bool: ...
+
+    async def renew(self, reservation: QuotaReservation, ttl_seconds: int) -> bool: ...
 
     async def cleanup_expired(self, user_id: UUID) -> int: ...
 
@@ -272,6 +276,100 @@ return {1}
 )
 
 
+_FINALIZE_SCRIPT = (
+    _LUA_RECORD_VALIDATORS
+    + """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return {4}
+end
+if not canonical_uuid(ARGV[2]) or not canonical_owner(ARGV[3]) or not canonical_bytes(ARGV[4]) then
+  return {3}
+end
+local count = redis.call('ZCARD', KEYS[2])
+if redis.call('HLEN', KEYS[3]) ~= count or redis.call('HLEN', KEYS[4]) ~= count then
+  return {3}
+end
+local members = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
+for index = 1, #members, 2 do
+  local upload_id = members[index]
+  local raw_score = members[index + 1]
+  local raw_bytes = redis.call('HGET', KEYS[3], upload_id)
+  local owner = redis.call('HGET', KEYS[4], upload_id)
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not canonical_bytes(raw_bytes) or not canonical_owner(owner) then
+    return {3}
+  end
+end
+local score = redis.call('ZSCORE', KEYS[2], ARGV[2])
+local byte_count = redis.call('HGET', KEYS[3], ARGV[2])
+local owner = redis.call('HGET', KEYS[4], ARGV[2])
+if not score and not byte_count and not owner then
+  return {0}
+end
+if not score or not byte_count or not owner then
+  return {3}
+end
+if owner ~= ARGV[3] or byte_count ~= ARGV[4] then
+  return {2}
+end
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('HDEL', KEYS[3], ARGV[2])
+redis.call('HDEL', KEYS[4], ARGV[2])
+return {1}
+"""
+)
+
+
+_RENEW_SCRIPT = (
+    _LUA_RECORD_VALIDATORS
+    + f"""
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return {{4}}
+end
+local ttl_ms = tonumber(ARGV[5])
+if not canonical_uuid(ARGV[2]) or not canonical_owner(ARGV[3])
+   or not canonical_bytes(ARGV[4]) or not ttl_ms
+   or ttl_ms < 1000 or ttl_ms > {MAX_TTL_SECONDS * 1000} then
+  return {{3}}
+end
+local count = redis.call('ZCARD', KEYS[2])
+if redis.call('HLEN', KEYS[3]) ~= count or redis.call('HLEN', KEYS[4]) ~= count then
+  return {{3}}
+end
+local members = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
+for index = 1, #members, 2 do
+  local upload_id = members[index]
+  local raw_score = members[index + 1]
+  local raw_bytes = redis.call('HGET', KEYS[3], upload_id)
+  local owner = redis.call('HGET', KEYS[4], upload_id)
+  if not canonical_uuid(upload_id) or not canonical_score(raw_score)
+     or not canonical_bytes(raw_bytes) or not canonical_owner(owner) then
+    return {{3}}
+  end
+end
+local score = redis.call('ZSCORE', KEYS[2], ARGV[2])
+local byte_count = redis.call('HGET', KEYS[3], ARGV[2])
+local owner = redis.call('HGET', KEYS[4], ARGV[2])
+if not score and not byte_count and not owner then
+  return {{0}}
+end
+if not score or not byte_count or not owner then
+  return {{3}}
+end
+if owner ~= ARGV[3] or byte_count ~= ARGV[4] then
+  return {{2}}
+end
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+if tonumber(score) <= now_ms then
+  return {{0}}
+end
+redis.call('ZADD', KEYS[2], now_ms + ttl_ms, ARGV[2])
+return {{1}}
+"""
+)
+
+
 _CLEANUP_SCRIPT = (
     _LUA_RECORD_VALIDATORS
     + """
@@ -352,11 +450,17 @@ class HostedQuotaService:
         *,
         lock_ttl_ms: int = DEFAULT_LOCK_TTL_MS,
         max_lock_attempts: int = DEFAULT_LOCK_ATTEMPTS,
+        redis_command_timeout_seconds: int = DEFAULT_REDIS_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
         self._pool = pool
         self._redis = redis
         self._lock_ttl_ms = _require_integer(lock_ttl_ms, "lock_ttl_ms", maximum=MAX_TTL_SECONDS * 1000)
         self._max_lock_attempts = _require_integer(max_lock_attempts, "max_lock_attempts", maximum=10_000)
+        self._redis_command_timeout_seconds = _require_integer(
+            redis_command_timeout_seconds,
+            "redis_command_timeout_seconds",
+            maximum=MAX_TTL_SECONDS,
+        )
 
     async def reserve(
         self,
@@ -370,6 +474,7 @@ class HostedQuotaService:
         byte_count = _require_integer(byte_count, "byte_count", maximum=MAX_QUOTA_BYTES)
         ttl_seconds = _require_integer(ttl_seconds, "ttl_seconds", maximum=MAX_TTL_SECONDS)
         owner_token = secrets.token_urlsafe(24)
+        reservation = QuotaReservation(user_id, upload_id, byte_count, owner_token)
 
         for attempt in range(self._max_lock_attempts):
             lock_token = secrets.token_urlsafe(24)
@@ -390,21 +495,28 @@ class HostedQuotaService:
             error: BaseException | None = None
             try:
                 committed_bytes, storage_limit = await self._read_committed_usage(user_id)
-                response = await self._redis.eval(
-                    _RESERVE_SCRIPT,
-                    4,
-                    *quota_keys(user_id),
-                    lock_token,
-                    str(upload_id),
-                    owner_token,
-                    str(committed_bytes),
-                    str(storage_limit),
-                    str(byte_count),
-                    str(ttl_seconds * 1000),
+                response = await self._run_admission_eval(
+                    reservation,
+                    (
+                        *quota_keys(user_id),
+                        lock_token,
+                        str(upload_id),
+                        owner_token,
+                        str(committed_bytes),
+                        str(storage_limit),
+                        str(byte_count),
+                        str(ttl_seconds * 1000),
+                    ),
                 )
-                retry = _interpret_reserve_response(response)
+                try:
+                    retry = _interpret_reserve_response(response)
+                except QuotaExceeded:
+                    raise
+                except QuotaUnavailable:
+                    await self._best_effort_release(reservation)
+                    raise
                 if not retry:
-                    return QuotaReservation(user_id, upload_id, byte_count, owner_token)
+                    return reservation
             except (QuotaExceeded, QuotaUnavailable) as exc:
                 error = exc
             except Exception as exc:  # noqa: BLE001 - fail closed on Postgres or Redis errors.
@@ -422,10 +534,18 @@ class HostedQuotaService:
         raise QuotaUnavailable("Quota coordination is busy")
 
     async def finalize(self, reservation: QuotaReservation) -> bool:
-        return await self._settle(reservation)
+        return await self._run_fenced_mutation(reservation, _FINALIZE_SCRIPT)
 
     async def release(self, reservation: QuotaReservation) -> bool:
         return await self._settle(reservation)
+
+    async def renew(self, reservation: QuotaReservation, ttl_seconds: int) -> bool:
+        ttl_seconds = _require_integer(ttl_seconds, "ttl_seconds", maximum=MAX_TTL_SECONDS)
+        return await self._run_fenced_mutation(
+            reservation,
+            _RENEW_SCRIPT,
+            str(ttl_seconds * 1000),
+        )
 
     async def cleanup_expired(self, user_id: UUID) -> int:
         user_id = _require_uuid(user_id, "user_id")
@@ -449,6 +569,115 @@ class HostedQuotaService:
         if len(items) == 1 and _response_int(items[0]) == 0:
             raise QuotaUnavailable("Quota reservation state is invalid")
         raise QuotaUnavailable("Quota coordination returned an invalid response")
+
+    async def _run_admission_eval(
+        self,
+        reservation: QuotaReservation,
+        keys_and_args: tuple[str, ...],
+    ) -> object:
+        task = asyncio.create_task(self._redis.eval(_RESERVE_SCRIPT, 4, *keys_and_args))
+        try:
+            async with asyncio.timeout(self._redis_command_timeout_seconds):
+                return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._finish_redis_task(task)
+            await self._best_effort_release(reservation)
+            raise
+        except Exception:
+            await self._finish_redis_task(task)
+            await self._best_effort_release(reservation)
+            raise
+
+    async def _finish_redis_task(self, task: asyncio.Task) -> None:
+        if not task.done():
+            try:
+                async with asyncio.timeout(self._redis_command_timeout_seconds):
+                    await asyncio.shield(task)
+            except TimeoutError:
+                task.cancel()
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001 - cleanup observes backend task failures.
+                pass
+        with suppress(Exception, asyncio.CancelledError):
+            await task
+
+    async def _best_effort_release(self, reservation: QuotaReservation) -> None:
+        task = asyncio.create_task(self._settle(reservation))
+        try:
+            async with asyncio.timeout(self._redis_command_timeout_seconds):
+                await asyncio.shield(task)
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 - cleanup is deliberately best-effort.
+            task.cancel()
+            with suppress(Exception, asyncio.CancelledError):
+                await task
+
+    async def _run_fenced_mutation(
+        self,
+        reservation: QuotaReservation,
+        script: str,
+        *extra_args: str,
+    ) -> bool:
+        self._validate_reservation(reservation)
+        for attempt in range(self._max_lock_attempts):
+            lock_token = secrets.token_urlsafe(24)
+            try:
+                acquired = await self._redis.set(
+                    quota_lock_key(reservation.user_id),
+                    lock_token,
+                    nx=True,
+                    px=self._lock_ttl_ms,
+                )
+            except Exception as exc:  # noqa: BLE001 - Redis clients expose backend-specific failures.
+                raise QuotaUnavailable("Quota coordination is unavailable") from exc
+            if not acquired:
+                await asyncio.sleep(min(0.001 * (attempt + 1), 0.025))
+                continue
+
+            retry = False
+            try:
+                items = _response_items(
+                    await self._redis.eval(
+                        script,
+                        4,
+                        *quota_keys(reservation.user_id),
+                        lock_token,
+                        str(reservation.upload_id),
+                        reservation.owner_token,
+                        str(reservation.bytes),
+                        *extra_args,
+                    )
+                )
+                if len(items) != 1:
+                    raise QuotaUnavailable("Quota coordination returned an invalid response")
+                status = _response_int(items[0])
+                if status == 1:
+                    return True
+                if status in {0, 2}:
+                    return False
+                if status == 3:
+                    raise QuotaUnavailable("Quota reservation state is invalid")
+                if status == 4:
+                    retry = True
+                else:
+                    raise QuotaUnavailable("Quota coordination returned an invalid response")
+            except QuotaUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 - fail conservative and retain the reservation.
+                raise QuotaUnavailable("Quota coordination is unavailable") from exc
+            finally:
+                await self._release_lock(reservation.user_id, lock_token)
+            if retry:
+                await asyncio.sleep(0)
+
+        raise QuotaUnavailable("Quota coordination is busy")
+
+    @staticmethod
+    def _validate_reservation(reservation: QuotaReservation) -> None:
+        if not isinstance(reservation, QuotaReservation):
+            raise ValueError("reservation must be a QuotaReservation")
+        _require_uuid(reservation.user_id, "user_id")
+        _require_uuid(reservation.upload_id, "upload_id")
+        _require_integer(reservation.bytes, "bytes", maximum=MAX_QUOTA_BYTES)
+        _require_owner_token(reservation.owner_token)
 
     async def _read_committed_usage(self, user_id: UUID) -> tuple[int, int]:
         try:
@@ -477,12 +706,7 @@ class HostedQuotaService:
         return committed_bytes, storage_limit
 
     async def _settle(self, reservation: QuotaReservation) -> bool:
-        if not isinstance(reservation, QuotaReservation):
-            raise ValueError("reservation must be a QuotaReservation")
-        _require_uuid(reservation.user_id, "user_id")
-        _require_uuid(reservation.upload_id, "upload_id")
-        _require_integer(reservation.bytes, "bytes", maximum=MAX_QUOTA_BYTES)
-        _require_owner_token(reservation.owner_token)
+        self._validate_reservation(reservation)
         _, reservations_key, bytes_key, tokens_key = quota_keys(reservation.user_id)
         try:
             items = _response_items(
