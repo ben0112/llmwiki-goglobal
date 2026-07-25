@@ -76,6 +76,7 @@ class AppendPartStatus(StrEnum):
     ALREADY_COMPLETED = "already_completed"
     MALFORMED = "malformed"
     INVALID_BYTE_COUNT = "invalid_byte_count"
+    LOCK_LOST = "lock_lost"
 
 
 class CompleteStatus(StrEnum):
@@ -87,6 +88,7 @@ class CompleteStatus(StrEnum):
     NOT_UPLOADING = "not_uploading"
     INCOMPLETE = "incomplete"
     MALFORMED = "malformed"
+    LOCK_LOST = "lock_lost"
 
 
 class LockAcquireStatus(StrEnum):
@@ -169,21 +171,33 @@ def _require_ttl(ttl_seconds: object) -> int:
     return _require_safe_integer(ttl_seconds, "ttl_seconds", minimum=1, maximum=MAX_TTL_SECONDS)
 
 
-def _validate_text(value: object, name: str, *, max_length: int, forbid_path: bool = False) -> str:
-    if not isinstance(value, str) or not value or len(value) > max_length:
-        raise ValueError(f"{name} must be a non-empty string of at most {max_length} characters")
+def _validate_text(value: object, name: str, *, max_bytes: int, forbid_path: bool = False) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} must be valid UTF-8") from exc
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{name} must be at most {max_bytes} UTF-8 bytes")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError(f"{name} must not contain control characters")
-    if forbid_path and (value in {".", ".."} or "/" in value or "\\" in value):
+    if '"' in value or "\\" in value:
+        raise ValueError(f"{name} must not contain JSON metacharacters")
+    if forbid_path and (value in {".", ".."} or "/" in value):
         raise ValueError(f"{name} must be a sanitized basename")
     return value
 
 
+def _validate_ascii_opaque(value: object, name: str, *, max_bytes: int) -> str:
+    text = _validate_text(value, name, max_bytes=max_bytes)
+    if any(not 33 <= ord(character) <= 126 for character in text):
+        raise ValueError(f"{name} must contain only non-whitespace printable ASCII")
+    return text
+
+
 def _validate_etag(value: object) -> str:
-    etag = _validate_text(value, "etag", max_length=512)
-    if any(character.isspace() for character in etag):
-        raise ValueError("etag must not contain whitespace")
-    return etag
+    return _validate_ascii_opaque(value, "etag", max_bytes=512)
 
 
 def _require_utc(value: object, name: str) -> datetime:
@@ -243,14 +257,14 @@ class TusSession:
         _require_uuid(self.upload_id, "upload_id")
         _require_uuid(self.user_id, "user_id")
         _require_uuid(self.knowledge_base_id, "knowledge_base_id")
-        _validate_text(self.filename, "filename", max_length=255, forbid_path=True)
-        _validate_text(self.content_type, "content_type", max_length=255)
+        _validate_text(self.filename, "filename", max_bytes=255, forbid_path=True)
+        _validate_ascii_opaque(self.content_type, "content_type", max_bytes=255)
         total_length = _require_safe_integer(self.total_length, "total_length", maximum=MAX_UPLOAD_BYTES)
         offset = _require_safe_integer(self.offset, "offset", maximum=MAX_UPLOAD_BYTES)
         if offset > total_length:
             raise ValueError("offset must not exceed total_length")
-        _validate_text(self.s3_key, "s3_key", max_length=1_024)
-        _validate_text(self.multipart_upload_id, "multipart_upload_id", max_length=1_024)
+        _validate_ascii_opaque(self.s3_key, "s3_key", max_bytes=1_024)
+        _validate_ascii_opaque(self.multipart_upload_id, "multipart_upload_id", max_bytes=1_024)
         if not isinstance(self.parts, tuple) or any(not isinstance(part, TusPart) for part in self.parts):
             raise ValueError("parts must be a tuple of TusPart values")
         for expected, part in enumerate(self.parts, start=1):
@@ -265,6 +279,8 @@ class TusSession:
         if not isinstance(self.state, TusSessionState):
             raise ValueError("state must be a TusSessionState")
         _require_safe_integer(self.reservation_bytes, "reservation_bytes", maximum=MAX_UPLOAD_BYTES)
+        if self.reservation_bytes != self.total_length:
+            raise ValueError("reservation_bytes must equal total_length")
         if self.state is TusSessionState.UPLOADING:
             if self.document_id is not None or self.job_id is not None:
                 raise ValueError("uploading sessions cannot contain document or job IDs")
@@ -331,17 +347,17 @@ class TusSession:
                     )
                 )
             state = TusSessionState(payload["state"])
-            return cls(
+            session = cls(
                 upload_id=_parse_uuid(payload["upload_id"], "upload_id"),
                 user_id=_parse_uuid(payload["user_id"], "user_id"),
                 knowledge_base_id=_parse_uuid(payload["knowledge_base_id"], "knowledge_base_id"),
-                filename=_validate_text(payload["filename"], "filename", max_length=255, forbid_path=True),
-                content_type=_validate_text(payload["content_type"], "content_type", max_length=255),
+                filename=_validate_text(payload["filename"], "filename", max_bytes=255, forbid_path=True),
+                content_type=_validate_ascii_opaque(payload["content_type"], "content_type", max_bytes=255),
                 total_length=_parse_safe_integer(payload["total_length"], "total_length", maximum=MAX_UPLOAD_BYTES),
                 offset=_parse_safe_integer(payload["offset"], "offset", maximum=MAX_UPLOAD_BYTES),
-                s3_key=_validate_text(payload["s3_key"], "s3_key", max_length=1_024),
-                multipart_upload_id=_validate_text(
-                    payload["multipart_upload_id"], "multipart_upload_id", max_length=1_024
+                s3_key=_validate_ascii_opaque(payload["s3_key"], "s3_key", max_bytes=1_024),
+                multipart_upload_id=_validate_ascii_opaque(
+                    payload["multipart_upload_id"], "multipart_upload_id", max_bytes=1_024
                 ),
                 parts=tuple(parts),
                 created_at=_microseconds_to_datetime(payload["created_at"], "created_at"),
@@ -353,6 +369,9 @@ class TusSession:
                     payload["reservation_bytes"], "reservation_bytes", maximum=MAX_UPLOAD_BYTES
                 ),
             )
+            if raw != session.to_json():
+                raise InvalidTusSessionError("session JSON must use the canonical wire encoding")
+            return session
         except InvalidTusSessionError:
             raise
         except (ValueError, TypeError, KeyError) as exc:
@@ -360,49 +379,95 @@ class TusSession:
 
 
 def session_key(upload_id: UUID) -> str:
-    return f"tus:session:{_require_uuid(upload_id, 'upload_id')}"
+    return f"tus:session:{{{_require_uuid(upload_id, 'upload_id')}}}"
 
 
 def lock_key(upload_id: UUID) -> str:
-    return f"tus:lock:{_require_uuid(upload_id, 'upload_id')}"
+    return f"tus:lock:{{{_require_uuid(upload_id, 'upload_id')}}}"
 
 
 def reservation_key(user_id: UUID, upload_id: UUID) -> str:
-    return f"tus:reservation:{_require_uuid(user_id, 'user_id')}:{_require_uuid(upload_id, 'upload_id')}"
+    return f"tus:reservation:{{{_require_uuid(user_id, 'user_id')}}}:{{{_require_uuid(upload_id, 'upload_id')}}}"
 
 
-_LUA_RECORD_VALIDATOR = r"""
+_LUA_RECORD_CODEC = r"""
 local MAX_SAFE = 9007199254740991
 local MAX_UPLOAD = 9999999999999
-local function count(t)
-  local n = 0
-  for _ in pairs(t) do n = n + 1 end
-  return n
+local MAX_TTL = 2147483647
+
+local function count(table_value)
+  local size = 0
+  for _ in pairs(table_value) do size = size + 1 end
+  return size
 end
+
 local function safe_integer(value, minimum, maximum)
   return type(value) == 'number' and value == math.floor(value) and value >= minimum and value <= maximum
 end
-local function nonempty(value, maximum)
-  return type(value) == 'string' and #value > 0 and #value <= maximum and not string.find(value, '%c')
-end
-local function decimal_microseconds(value)
+
+local function canonical_decimal(value, minimum, maximum)
   if type(value) ~= 'string' or #value == 0 or #value > 16 or string.find(value, '[^0-9]') then return nil end
   if #value > 1 and string.sub(value, 1, 1) == '0' then return nil end
   local number = tonumber(value)
-  if not safe_integer(number, 0, MAX_SAFE) then return nil end
+  if not safe_integer(number, minimum, maximum) then return nil end
+  if string.format('%.0f', number) ~= value then return nil end
   return number
 end
-local function next_timestamp(previous)
-  local now = redis.call('TIME')
-  local timestamp = now[1] .. string.format('%06d', tonumber(now[2]))
-  local timestamp_number = tonumber(timestamp)
-  local previous_number = decimal_microseconds(previous)
-  if not previous_number then return nil end
-  if timestamp_number <= previous_number then
-    return string.format('%.0f', previous_number + 1)
+
+local function valid_utf8(value, maximum_bytes)
+  if type(value) ~= 'string' or #value == 0 or #value > maximum_bytes then return false end
+  local index = 1
+  while index <= #value do
+    local first = string.byte(value, index)
+    if first <= 0x7f then
+      index = index + 1
+    elseif first >= 0xc2 and first <= 0xdf then
+      local second = string.byte(value, index + 1)
+      if not second or second < 0x80 or second > 0xbf then return false end
+      index = index + 2
+    elseif first >= 0xe0 and first <= 0xef then
+      local second = string.byte(value, index + 1)
+      local third = string.byte(value, index + 2)
+      if not second or not third or third < 0x80 or third > 0xbf then return false end
+      if first == 0xe0 and (second < 0xa0 or second > 0xbf) then return false end
+      if first == 0xed and (second < 0x80 or second > 0x9f) then return false end
+      if first ~= 0xe0 and first ~= 0xed and (second < 0x80 or second > 0xbf) then return false end
+      index = index + 3
+    elseif first >= 0xf0 and first <= 0xf4 then
+      local second = string.byte(value, index + 1)
+      local third = string.byte(value, index + 2)
+      local fourth = string.byte(value, index + 3)
+      if not second or not third or not fourth
+        or third < 0x80 or third > 0xbf or fourth < 0x80 or fourth > 0xbf then return false end
+      if first == 0xf0 and (second < 0x90 or second > 0xbf) then return false end
+      if first == 0xf4 and (second < 0x80 or second > 0x8f) then return false end
+      if first ~= 0xf0 and first ~= 0xf4 and (second < 0x80 or second > 0xbf) then return false end
+      index = index + 4
+    else
+      return false
+    end
   end
-  return timestamp
+  return true
 end
+
+local function valid_filename(value)
+  if not valid_utf8(value, 255) or value == '.' or value == '..' then return false end
+  for index = 1, #value do
+    local byte = string.byte(value, index)
+    if byte < 32 or byte == 34 or byte == 47 or byte == 92 or byte == 127 then return false end
+  end
+  return true
+end
+
+local function ascii_opaque(value, maximum_bytes)
+  if type(value) ~= 'string' or #value == 0 or #value > maximum_bytes then return false end
+  for index = 1, #value do
+    local byte = string.byte(value, index)
+    if byte < 33 or byte > 126 or byte == 34 or byte == 92 then return false end
+  end
+  return true
+end
+
 local function uuid(value)
   if type(value) ~= 'string' or #value ~= 36
     or string.sub(value, 9, 9) ~= '-' or string.sub(value, 14, 14) ~= '-'
@@ -411,131 +476,186 @@ local function uuid(value)
   local _, hyphens = string.gsub(value, '%-', '')
   return hyphens == 4
 end
-local function valid_record(session)
-  if type(session) ~= 'table' or count(session) ~= 16 then return false end
-  if not uuid(session.upload_id) or not uuid(session.user_id) or not uuid(session.knowledge_base_id) then return false end
-  if not nonempty(session.filename, 255) or session.filename == '.' or session.filename == '..'
-    or string.find(session.filename, '[/\\]') then return false end
-  if not nonempty(session.content_type, 255) or not nonempty(session.s3_key, 1024)
-    or not nonempty(session.multipart_upload_id, 1024) then return false end
-  if not safe_integer(session.total_length, 0, MAX_UPLOAD)
-    or not safe_integer(session.offset, 0, MAX_UPLOAD)
-    or session.offset > session.total_length
-    or not safe_integer(session.reservation_bytes, 0, MAX_UPLOAD) then return false end
-  local created_at = decimal_microseconds(session.created_at)
-  local updated_at = decimal_microseconds(session.updated_at)
-  if not created_at or not updated_at or updated_at < created_at then return false end
-  if type(session.parts) ~= 'table' then return false end
-  local part_count = count(session.parts)
-  if part_count ~= #session.parts or part_count > 10000 then return false end
-  for index = 1, #session.parts do
-    local part = session.parts[index]
+
+local function parts_json(parts)
+  if type(parts) ~= 'table' then return nil end
+  local part_count = count(parts)
+  if part_count ~= #parts or part_count > 10000 then return nil end
+  local encoded = {}
+  for index = 1, #parts do
+    local part = parts[index]
     if type(part) ~= 'table' or count(part) ~= 2 or part.part_number ~= index
-      or not safe_integer(part.part_number, 1, 10000)
-      or not nonempty(part.etag, 512) or string.find(part.etag, '%s') then return false end
+      or not safe_integer(part.part_number, 1, 10000) or not ascii_opaque(part.etag, 512) then return nil end
+    encoded[index] = '{"etag":"' .. part.etag .. '","part_number":' .. string.format('%.0f', part.part_number) .. '}'
   end
+  return '[' .. table.concat(encoded, ',') .. ']'
+end
+
+local function canonical_record(session)
+  if type(session) ~= 'table' or count(session) ~= 16 then return nil end
+  if not uuid(session.upload_id) or not uuid(session.user_id) or not uuid(session.knowledge_base_id)
+    or not valid_filename(session.filename) or not ascii_opaque(session.content_type, 255)
+    or not ascii_opaque(session.s3_key, 1024) or not ascii_opaque(session.multipart_upload_id, 1024)
+    or not safe_integer(session.total_length, 0, MAX_UPLOAD)
+    or not safe_integer(session.offset, 0, MAX_UPLOAD) or session.offset > session.total_length
+    or not safe_integer(session.reservation_bytes, 0, MAX_UPLOAD)
+    or session.reservation_bytes ~= session.total_length then return nil end
+  local created_at = canonical_decimal(session.created_at, 0, MAX_SAFE)
+  local updated_at = canonical_decimal(session.updated_at, 0, MAX_SAFE)
+  if not created_at or not updated_at or updated_at < created_at then return nil end
+  local encoded_parts = parts_json(session.parts)
+  if not encoded_parts then return nil end
+  local document_json
+  local job_json
   if session.state == 'uploading' then
-    return session.document_id == cjson.null and session.job_id == cjson.null
+    if session.document_id ~= cjson.null or session.job_id ~= cjson.null then return nil end
+    document_json = 'null'
+    job_json = 'null'
+  elseif session.state == 'completed' then
+    if session.offset ~= session.total_length or not uuid(session.document_id) or not uuid(session.job_id) then return nil end
+    document_json = '"' .. session.document_id .. '"'
+    job_json = '"' .. session.job_id .. '"'
+  else
+    return nil
   end
-  if session.state == 'completed' then
-    return session.offset == session.total_length and uuid(session.document_id) and uuid(session.job_id)
-  end
-  return false
+  return '{"content_type":"' .. session.content_type
+    .. '","created_at":"' .. session.created_at
+    .. '","document_id":' .. document_json
+    .. ',"filename":"' .. session.filename
+    .. '","job_id":' .. job_json
+    .. ',"knowledge_base_id":"' .. session.knowledge_base_id
+    .. '","multipart_upload_id":"' .. session.multipart_upload_id
+    .. '","offset":' .. string.format('%.0f', session.offset)
+    .. ',"parts":' .. encoded_parts
+    .. ',"reservation_bytes":' .. string.format('%.0f', session.reservation_bytes)
+    .. ',"s3_key":"' .. session.s3_key
+    .. '","state":"' .. session.state
+    .. '","total_length":' .. string.format('%.0f', session.total_length)
+    .. ',"updated_at":"' .. session.updated_at
+    .. '","upload_id":"' .. session.upload_id
+    .. '","user_id":"' .. session.user_id .. '"}'
+end
+
+local function decode_canonical(raw)
+  local decoded, session = pcall(cjson.decode, raw)
+  if not decoded then return nil end
+  local encoded = canonical_record(session)
+  if not encoded or encoded ~= raw then return nil end
+  return session
+end
+
+local function redis_timestamp()
+  local now = redis.call('TIME')
+  local timestamp = now[1] .. string.format('%06d', tonumber(now[2]))
+  if not canonical_decimal(timestamp, 0, MAX_SAFE) then return nil end
+  return timestamp
+end
+
+local function next_timestamp(previous)
+  local previous_number = canonical_decimal(previous, 0, MAX_SAFE)
+  local timestamp = redis_timestamp()
+  if not previous_number or not timestamp then return nil end
+  local timestamp_number = tonumber(timestamp)
+  if timestamp_number > previous_number then return timestamp end
+  if previous_number >= MAX_SAFE then return nil end
+  return string.format('%.0f', previous_number + 1)
+end
+
+local function canonical_argument(value, minimum, maximum)
+  return canonical_decimal(value, minimum, maximum)
 end
 """
 
 
 _CREATE_SESSION_LUA = (
-    _LUA_RECORD_VALIDATOR
+    _LUA_RECORD_CODEC
     + r"""
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-local decoded, session = pcall(cjson.decode, ARGV[1])
-if not decoded or not valid_record(session) then return 2 end
-local now = redis.call('TIME')
-local timestamp = now[1] .. string.format('%06d', tonumber(now[2]))
-local encoded, created_replacements = string.gsub(
-  ARGV[1], '"created_at":"%d+"', '"created_at":"' .. timestamp .. '"', 1
-)
-local updated_replacements
-encoded, updated_replacements = string.gsub(
-  encoded, '"updated_at":"%d+"', '"updated_at":"' .. timestamp .. '"', 1
-)
-if created_replacements ~= 1 or updated_replacements ~= 1 then return 2 end
-redis.call('SET', KEYS[1], encoded, 'EX', tonumber(ARGV[2]))
+local session = decode_canonical(ARGV[1])
+local ttl = canonical_argument(ARGV[2], 1, MAX_TTL)
+if not session or not ttl then return 2 end
+local timestamp = redis_timestamp()
+if not timestamp then return 2 end
+session.created_at = timestamp
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return 2 end
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
 return 1
 """
 )
 
 
 _APPEND_PART_LUA = (
-    _LUA_RECORD_VALIDATOR
+    _LUA_RECORD_CODEC
     + r"""
 local raw = redis.call('GET', KEYS[1])
 if not raw then return {2, 0} end
-local decoded, session = pcall(cjson.decode, raw)
-if not decoded or not valid_record(session) then return {7, 0} end
+local session = decode_canonical(raw)
+if not session then return {7, 0} end
+if redis.call('GET', KEYS[2]) ~= ARGV[6] then return {9, session.offset} end
 if session.state == 'completed' then return {6, session.offset} end
 if session.state ~= 'uploading' then return {3, session.offset} end
-local expected = tonumber(ARGV[1])
-local byte_count = tonumber(ARGV[2])
-local part_number = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[5])
+local expected = canonical_argument(ARGV[1], 0, MAX_UPLOAD)
+local byte_count = canonical_argument(ARGV[2], 0, MAX_UPLOAD)
+local part_number = canonical_argument(ARGV[3], 1, 10000)
+local ttl = canonical_argument(ARGV[5], 1, MAX_TTL)
+if not expected or not byte_count or not part_number or not ttl or not ascii_opaque(ARGV[4], 512) then
+  return {7, session.offset}
+end
 if session.offset ~= expected then return {1, session.offset} end
 if byte_count <= 0 then return {8, session.offset} end
 if session.offset + byte_count > session.total_length then return {4, session.offset} end
 if part_number ~= #session.parts + 1 then return {5, session.offset} end
+local timestamp = next_timestamp(session.updated_at)
+if not timestamp then return {7, session.offset} end
 table.insert(session.parts, {part_number = part_number, etag = ARGV[4]})
 session.offset = session.offset + byte_count
-session.updated_at = next_timestamp(session.updated_at)
-cjson.encode_number_precision(14)
-redis.call('SET', KEYS[1], cjson.encode(session), 'EX', ttl)
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return {7, session.offset - byte_count} end
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
 return {0, session.offset}
 """
 )
 
 
 _MARK_COMPLETE_LUA = (
-    _LUA_RECORD_VALIDATOR
+    _LUA_RECORD_CODEC
     + r"""
 local raw = redis.call('GET', KEYS[1])
 if not raw then return {4, 0, '', ''} end
-local decoded, session = pcall(cjson.decode, raw)
-if not decoded or not valid_record(session) then return {7, 0, '', ''} end
+local session = decode_canonical(raw)
+if not session then return {7, 0, '', ''} end
+if redis.call('GET', KEYS[2]) ~= ARGV[5] then return {8, session.offset, '', ''} end
+local expected = canonical_argument(ARGV[1], 0, MAX_UPLOAD)
+local ttl = canonical_argument(ARGV[4], 1, MAX_TTL)
 local document_id = ARGV[2]
 local job_id = ARGV[3]
-local ttl = tonumber(ARGV[4])
+if not expected or not ttl or not uuid(document_id) or not uuid(job_id) then return {7, session.offset, '', ''} end
 if session.state == 'completed' then
   if session.document_id ~= document_id or session.job_id ~= job_id then
     return {2, session.offset, session.document_id, session.job_id}
   end
   local timestamp = next_timestamp(session.updated_at)
-  local encoded, replacements = string.gsub(
-    raw, '"updated_at":"%d+"', '"updated_at":"' .. timestamp .. '"', 1
-  )
-  if replacements ~= 1 then return {7, 0, '', ''} end
+  if not timestamp then return {7, session.offset, '', ''} end
+  session.updated_at = timestamp
+  local encoded = canonical_record(session)
+  if not encoded then return {7, session.offset, '', ''} end
   redis.call('SET', KEYS[1], encoded, 'EX', ttl)
   return {1, session.offset, session.document_id, session.job_id}
 end
 if session.state ~= 'uploading' then return {5, session.offset, '', ''} end
-if session.offset ~= tonumber(ARGV[1]) then return {3, session.offset, '', ''} end
+if session.offset ~= expected then return {3, session.offset, '', ''} end
 if session.offset ~= session.total_length then return {6, session.offset, '', ''} end
+local timestamp = next_timestamp(session.updated_at)
+if not timestamp then return {7, session.offset, '', ''} end
 session.state = 'completed'
 session.document_id = document_id
 session.job_id = job_id
-local timestamp = next_timestamp(session.updated_at)
-local encoded, state_replacements = string.gsub(raw, '"state":"uploading"', '"state":"completed"', 1)
-local document_replacements
-encoded, document_replacements = string.gsub(
-  encoded, '"document_id":null', '"document_id":"' .. document_id .. '"', 1
-)
-local job_replacements
-encoded, job_replacements = string.gsub(encoded, '"job_id":null', '"job_id":"' .. job_id .. '"', 1)
-local updated_replacements
-encoded, updated_replacements = string.gsub(
-  encoded, '"updated_at":"%d+"', '"updated_at":"' .. timestamp .. '"', 1
-)
-if state_replacements ~= 1 or document_replacements ~= 1 or job_replacements ~= 1
-  or updated_replacements ~= 1 then return {7, 0, '', ''} end
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return {7, session.offset, '', ''} end
 redis.call('SET', KEYS[1], encoded, 'EX', ttl)
 return {0, session.offset, session.document_id, session.job_id}
 """
@@ -559,16 +679,20 @@ return 1
 _RELEASE_RESERVATION_LUA = r"""
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
+if redis.call('PTTL', KEYS[1]) <= 0 then return 3 end
 local decoded, reservation = pcall(cjson.decode, raw)
 if not decoded or type(reservation) ~= 'table' then return 3 end
 local count = 0
 for _ in pairs(reservation) do count = count + 1 end
 if count ~= 2 or type(reservation.bytes) ~= 'number' or reservation.bytes ~= math.floor(reservation.bytes)
   or reservation.bytes < 0 or reservation.bytes > 9999999999999 then return 3 end
+if reservation.state ~= 'reserved' and reservation.state ~= 'released' then return 3 end
+local canonical = '{"bytes":' .. string.format('%.0f', reservation.bytes)
+  .. ',"state":"' .. reservation.state .. '"}'
+if canonical ~= raw then return 3 end
 if reservation.state == 'released' then return 2 end
-if reservation.state ~= 'reserved' or redis.call('PTTL', KEYS[1]) <= 0 then return 3 end
-reservation.state = 'released'
-redis.call('SET', KEYS[1], cjson.encode(reservation), 'KEEPTTL')
+local released = '{"bytes":' .. string.format('%.0f', reservation.bytes) .. ',"state":"released"}'
+redis.call('SET', KEYS[1], released, 'KEEPTTL')
 return 1
 """
 
@@ -583,6 +707,7 @@ _APPEND_CODES = {
     6: AppendPartStatus.ALREADY_COMPLETED,
     7: AppendPartStatus.MALFORMED,
     8: AppendPartStatus.INVALID_BYTE_COUNT,
+    9: AppendPartStatus.LOCK_LOST,
 }
 _COMPLETE_CODES = {
     0: CompleteStatus.COMPLETED,
@@ -593,6 +718,7 @@ _COMPLETE_CODES = {
     5: CompleteStatus.NOT_UPLOADING,
     6: CompleteStatus.INCOMPLETE,
     7: CompleteStatus.MALFORMED,
+    8: CompleteStatus.LOCK_LOST,
 }
 _RESERVATION_RELEASE_CODES = {
     0: ReservationReleaseStatus.NOT_FOUND,
@@ -626,7 +752,7 @@ def _decode_protocol_text(value: object, name: str) -> str:
 
 
 class TusSessionStore:
-    """Operate one Redis key per call so every Lua script is cluster-slot safe."""
+    """Use one key or a hash-tagged same-slot key pair in every Lua call."""
 
     def __init__(self, redis: RedisClient):
         self._redis = redis
@@ -659,28 +785,33 @@ class TusSessionStore:
         part_number: int,
         etag: str,
         ttl_seconds: int,
+        *,
+        lock_token: str,
     ) -> AppendPartResult:
         expected = _require_safe_integer(expected_offset, "expected_offset", maximum=MAX_UPLOAD_BYTES)
         count = _require_safe_integer(byte_count, "byte_count", maximum=MAX_UPLOAD_BYTES)
         number = _require_safe_integer(part_number, "part_number", minimum=1, maximum=MAX_PART_NUMBER)
         validated_etag = _validate_etag(etag)
         ttl = _require_ttl(ttl_seconds)
+        token = _validate_ascii_opaque(lock_token, "lock token", max_bytes=512)
         raw = await self._redis.eval(
             _APPEND_PART_LUA,
-            1,
+            2,
             session_key(upload_id),
+            lock_key(upload_id),
             str(expected),
             str(count),
             str(number),
             validated_etag,
             str(ttl),
+            token,
         )
         values = _protocol_sequence(raw, 2)
         code = _protocol_integer(values[0], "append status code", maximum=max(_APPEND_CODES))
         status = _APPEND_CODES.get(code)
         if status is None:
             raise TusSessionProtocolError("Redis returned an unknown append status code")
-        offset = _protocol_integer(values[1], "offset")
+        offset = _protocol_integer(values[1], "offset", maximum=MAX_UPLOAD_BYTES)
         return AppendPartResult(status=status, offset=offset)
 
     async def mark_complete(
@@ -690,26 +821,31 @@ class TusSessionStore:
         document_id: UUID,
         job_id: UUID,
         ttl_seconds: int,
+        *,
+        lock_token: str,
     ) -> CompleteResult:
         expected = _require_safe_integer(expected_offset, "expected_offset", maximum=MAX_UPLOAD_BYTES)
         document = _require_uuid(document_id, "document_id")
         job = _require_uuid(job_id, "job_id")
         ttl = _require_ttl(ttl_seconds)
+        token = _validate_ascii_opaque(lock_token, "lock token", max_bytes=512)
         raw = await self._redis.eval(
             _MARK_COMPLETE_LUA,
-            1,
+            2,
             session_key(upload_id),
+            lock_key(upload_id),
             str(expected),
             str(document),
             str(job),
             str(ttl),
+            token,
         )
         values = _protocol_sequence(raw, 4)
         code = _protocol_integer(values[0], "completion status code", maximum=max(_COMPLETE_CODES))
         status = _COMPLETE_CODES.get(code)
         if status is None:
             raise TusSessionProtocolError("Redis returned an unknown completion status code")
-        offset = _protocol_integer(values[1], "offset")
+        offset = _protocol_integer(values[1], "offset", maximum=MAX_UPLOAD_BYTES)
         document_text = _decode_protocol_text(values[2], "document_id")
         job_text = _decode_protocol_text(values[3], "job_id")
         if status in {
@@ -722,6 +858,8 @@ class TusSessionStore:
                 committed_job = UUID(job_text)
             except ValueError as exc:
                 raise TusSessionProtocolError("Redis returned invalid committed identifiers") from exc
+            if str(committed_document) != document_text or str(committed_job) != job_text:
+                raise TusSessionProtocolError("Redis returned noncanonical committed identifiers")
         else:
             if document_text or job_text:
                 raise TusSessionProtocolError("Redis returned unexpected committed identifiers")
@@ -738,14 +876,14 @@ class TusSessionStore:
         return LockAcquireResult(LockAcquireStatus.ACQUIRED, token)
 
     async def renew_lock(self, upload_id: UUID, token: str, ttl_seconds: int) -> LockMutationStatus:
-        validated_token = _validate_text(token, "lock token", max_length=512)
+        validated_token = _validate_ascii_opaque(token, "lock token", max_bytes=512)
         ttl = _require_ttl(ttl_seconds)
         raw = await self._redis.eval(_RENEW_LOCK_LUA, 1, lock_key(upload_id), validated_token, str(ttl))
         code = _protocol_integer(raw, "lock renewal status", maximum=1)
         return LockMutationStatus.RENEWED if code == 1 else LockMutationStatus.NOT_OWNER
 
     async def release_lock(self, upload_id: UUID, token: str) -> LockMutationStatus:
-        validated_token = _validate_text(token, "lock token", max_length=512)
+        validated_token = _validate_ascii_opaque(token, "lock token", max_bytes=512)
         raw = await self._redis.eval(_RELEASE_LOCK_LUA, 1, lock_key(upload_id), validated_token)
         code = _protocol_integer(raw, "lock release status", maximum=1)
         return LockMutationStatus.RELEASED if code == 1 else LockMutationStatus.NOT_OWNER

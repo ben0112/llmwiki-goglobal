@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from redis.cluster import key_slot
 
 
 def _module():
@@ -92,6 +93,38 @@ def test_session_round_trip_is_explicit_and_contains_no_auth_material():
     assert "secret" not in lowered
 
 
+def test_wire_json_is_canonical_and_filename_limits_use_utf8_bytes():
+    module = _module()
+    session = _valid_session(module, filename="汉" * 50 + ".pdf")
+    assert module.TusSession.from_json(session.to_json()) == session
+
+    noncanonical = json.dumps(json.loads(session.to_json()), ensure_ascii=False)
+    with pytest.raises(module.InvalidTusSessionError):
+        module.TusSession.from_json(noncanonical)
+    with pytest.raises(ValueError, match="UTF-8 bytes"):
+        _valid_session(module, filename="汉" * 86)
+
+
+def test_session_reservation_bytes_must_equal_declared_length():
+    module = _module()
+    with pytest.raises(ValueError, match="reservation_bytes"):
+        _valid_session(module, reservation_bytes=11)
+
+
+def test_hash_tagged_keys_are_exact_and_mutation_keys_share_cluster_slot():
+    module = _module()
+    upload_id = uuid4()
+    user_id = uuid4()
+    session = f"tus:session:{{{upload_id}}}"
+    lock = f"tus:lock:{{{upload_id}}}"
+    reservation = f"tus:reservation:{{{user_id}}}:{{{upload_id}}}"
+
+    assert module.session_key(upload_id) == session
+    assert module.lock_key(upload_id) == lock
+    assert module.reservation_key(user_id, upload_id) == reservation
+    assert key_slot(session.encode()) == key_slot(lock.encode())
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -123,7 +156,7 @@ def test_session_decoder_rejects_malformed_or_inconsistent_records(mutate):
     mutate(payload)
 
     with pytest.raises(module.InvalidTusSessionError):
-        module.TusSession.from_json(json.dumps(payload))
+        module.TusSession.from_json(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
 def test_completed_state_requires_full_offset_and_stable_document_and_job_ids():
@@ -149,7 +182,7 @@ def test_completed_state_requires_full_offset_and_stable_document_and_job_ids():
             {key: str(value) if key.endswith("_id") and value is not None else value for key, value in changes.items()}
         )
         with pytest.raises(module.InvalidTusSessionError):
-            module.TusSession.from_json(json.dumps(payload))
+            module.TusSession.from_json(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
 @pytest.mark.parametrize("field", ["total_length", "offset", "reservation_bytes"])
@@ -175,7 +208,7 @@ def test_store_uses_exact_session_key_and_single_key_create_lua():
     assert redis.set_calls == []
     assert all(call[1] == 1 for call in redis.eval_calls)
     _, _, args = redis.eval_calls[0]
-    assert args[0] == f"tus:session:{session.upload_id}"
+    assert args[0] == f"tus:session:{{{session.upload_id}}}"
     assert json.loads(args[1])["upload_id"] == str(session.upload_id)
     assert args[2] == "120"
 
@@ -194,8 +227,10 @@ def test_get_returns_none_for_missing_record_and_fails_closed_for_malformed_reco
 def test_append_part_uses_one_key_lua_and_maps_only_bounded_status_codes():
     module = _module()
     upload_id = uuid4()
-    redis = FakeRedis(eval_results=[[0, 9], [1, 9], [99, 0]])
+    redis = FakeRedis(eval_results=[[9, 5], [0, 9], [1, 9], [99, 0]])
     store = module.TusSessionStore(redis)
+
+    fenced = asyncio.run(store.append_part(upload_id, 5, 4, 2, "etag-2", 60, lock_token="stale-token"))
 
     appended = asyncio.run(
         store.append_part(
@@ -205,6 +240,7 @@ def test_append_part_uses_one_key_lua_and_maps_only_bounded_status_codes():
             part_number=2,
             etag="etag-2",
             ttl_seconds=60,
+            lock_token="owner-token",
         )
     )
     mismatch = asyncio.run(
@@ -215,15 +251,17 @@ def test_append_part_uses_one_key_lua_and_maps_only_bounded_status_codes():
             part_number=2,
             etag="etag-2",
             ttl_seconds=60,
+            lock_token="owner-token",
         )
     )
 
+    assert fenced == module.AppendPartResult(module.AppendPartStatus.LOCK_LOST, 5)
     assert appended == module.AppendPartResult(module.AppendPartStatus.APPENDED, 9)
     assert mismatch == module.AppendPartResult(module.AppendPartStatus.OFFSET_MISMATCH, 9)
-    _, numkeys, args = redis.eval_calls[0]
-    assert numkeys == 1
-    assert args[0] == f"tus:session:{upload_id}"
-    assert args[1:] == ("5", "4", "2", "etag-2", "60")
+    _, numkeys, args = redis.eval_calls[1]
+    assert numkeys == 2
+    assert args[:2] == (f"tus:session:{{{upload_id}}}", f"tus:lock:{{{upload_id}}}")
+    assert args[2:] == ("5", "4", "2", "etag-2", "60", "owner-token")
     with pytest.raises(module.TusSessionProtocolError):
         asyncio.run(
             store.append_part(
@@ -233,6 +271,7 @@ def test_append_part_uses_one_key_lua_and_maps_only_bounded_status_codes():
                 part_number=1,
                 etag="etag-1",
                 ttl_seconds=60,
+                lock_token="owner-token",
             )
         )
 
@@ -255,6 +294,7 @@ def test_append_validates_lua_safe_inputs_before_calling_redis():
                     uuid4(),
                     etag="etag",
                     ttl_seconds=60,
+                    lock_token="owner-token",
                     **kwargs,
                 )
             )
@@ -283,6 +323,7 @@ def test_mark_complete_maps_first_duplicate_and_conflicting_markers():
                 document_id=document_id,
                 job_id=job_id,
                 ttl_seconds=120,
+                lock_token="owner-token",
             )
         )
         for _ in range(3)
@@ -296,7 +337,29 @@ def test_mark_complete_maps_first_duplicate_and_conflicting_markers():
     assert all(result.offset == 12 for result in results)
     assert all(result.document_id == document_id for result in results)
     assert all(result.job_id == job_id for result in results)
-    assert all(call[1] == 1 for call in redis.eval_calls)
+    assert all(call[1] == 2 for call in redis.eval_calls)
+    assert all(
+        call[2][:2] == (f"tus:session:{{{upload_id}}}", f"tus:lock:{{{upload_id}}}") for call in redis.eval_calls
+    )
+
+
+def test_impossible_offsets_and_noncanonical_uuid_responses_fail_protocol_closed():
+    module = _module()
+    upload_id = uuid4()
+    document_id = uuid4()
+    job_id = uuid4()
+    redis = FakeRedis(
+        eval_results=[
+            [0, module.MAX_UPLOAD_BYTES + 1],
+            [0, 0, str(document_id).upper(), str(job_id)],
+        ]
+    )
+    store = module.TusSessionStore(redis)
+
+    with pytest.raises(module.TusSessionProtocolError):
+        asyncio.run(store.append_part(upload_id, 0, 1, 1, "etag", 60, lock_token="owner-token"))
+    with pytest.raises(module.TusSessionProtocolError):
+        asyncio.run(store.mark_complete(upload_id, 0, document_id, job_id, 60, lock_token="owner-token"))
 
 
 def test_lock_tokens_are_opaque_and_owner_checked_with_single_key_scripts():
@@ -317,10 +380,10 @@ def test_lock_tokens_are_opaque_and_owner_checked_with_single_key_scripts():
     assert renewed is module.LockMutationStatus.RENEWED
     assert rejected is module.LockMutationStatus.NOT_OWNER
     assert released is module.LockMutationStatus.RELEASED
-    assert redis.set_calls[0][0] == f"tus:lock:{upload_id}"
+    assert redis.set_calls[0][0] == f"tus:lock:{{{upload_id}}}"
     assert redis.set_calls[0][2] == {"nx": True, "ex": 20}
     assert all(call[1] == 1 for call in redis.eval_calls)
-    assert all(call[2][0] == f"tus:lock:{upload_id}" for call in redis.eval_calls)
+    assert all(call[2][0] == f"tus:lock:{{{upload_id}}}" for call in redis.eval_calls)
 
 
 def test_reservation_uses_exact_key_and_release_is_typed_and_single_key():
@@ -341,7 +404,7 @@ def test_reservation_uses_exact_key_and_release_is_typed_and_single_key():
         module.ReservationReleaseStatus.ALREADY_RELEASED,
         module.ReservationReleaseStatus.NOT_FOUND,
     ]
-    key = f"tus:reservation:{user_id}:{upload_id}"
+    key = f"tus:reservation:{{{user_id}}}:{{{upload_id}}}"
     assert redis.set_calls[0][0] == key
     reservation_payload = json.loads(redis.set_calls[0][1])
     assert reservation_payload == {"bytes": 12, "state": "reserved"}
