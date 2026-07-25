@@ -105,6 +105,36 @@ def test_wire_json_is_canonical_and_filename_limits_use_utf8_bytes():
         _valid_session(module, filename="汉" * 86)
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        'report "final".pdf',
+        'report ""draft"".pdf',
+        '中文"最终".pdf',
+        'section\u2028"final".pdf',
+    ],
+)
+def test_quoted_filenames_use_canonical_json_escaping(filename):
+    module = _module()
+    session = _valid_session(module, filename=filename)
+
+    encoded = session.to_json()
+
+    assert '\\"' in encoded
+    assert json.loads(encoded)["filename"] == filename
+    assert module.TusSession.from_json(encoded) == session
+
+
+def test_filename_backslash_and_quotes_in_other_opaque_fields_remain_rejected():
+    module = _module()
+    with pytest.raises(ValueError):
+        _valid_session(module, filename="folder\\report.pdf")
+    with pytest.raises(ValueError):
+        _valid_session(module, content_type='application/"pdf')
+    with pytest.raises(ValueError):
+        module.TusPart(1, 'etag"quoted')
+
+
 def test_session_reservation_bytes_must_equal_declared_length():
     module = _module()
     with pytest.raises(ValueError, match="reservation_bytes"):

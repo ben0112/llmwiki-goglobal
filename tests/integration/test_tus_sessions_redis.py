@@ -166,6 +166,32 @@ async def test_real_redis_chinese_filename_round_trips_and_mutates(namespace):
     assert (await store.get(upload_id)).filename == filename
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        'report "final".pdf',
+        'report ""draft"".pdf',
+        '中文"最终".pdf',
+        'section\u2028"final".pdf',
+    ],
+)
+async def test_real_redis_quoted_filename_survives_full_completion(namespace, filename):
+    module, store, upload_id, user_id, kb_id = namespace
+    await store.create(
+        replace(_session(module, upload_id, user_id, kb_id, total=1), filename=filename),
+        ttl_seconds=60,
+    )
+    token = await _lock_token(module, store, upload_id)
+    append = await store.append_part(upload_id, 0, 1, 1, "etag-quoted", 60, lock_token=token)
+    complete = await store.mark_complete(upload_id, 1, uuid4(), uuid4(), 60, lock_token=token)
+
+    stored = await store.get(upload_id)
+    assert append.status is module.AppendPartStatus.APPENDED
+    assert complete.status is module.CompleteStatus.COMPLETED
+    assert stored.filename == filename
+    assert stored.state is module.TusSessionState.COMPLETED
+
+
 async def test_real_redis_append_is_atomic_and_refreshes_session_ttl(namespace, redis_client):
     module, store, upload_id, user_id, kb_id = namespace
     await store.create(_session(module, upload_id, user_id, kb_id), ttl_seconds=60)

@@ -171,7 +171,14 @@ def _require_ttl(ttl_seconds: object) -> int:
     return _require_safe_integer(ttl_seconds, "ttl_seconds", minimum=1, maximum=MAX_TTL_SECONDS)
 
 
-def _validate_text(value: object, name: str, *, max_bytes: int, forbid_path: bool = False) -> str:
+def _validate_text(
+    value: object,
+    name: str,
+    *,
+    max_bytes: int,
+    forbid_path: bool = False,
+    allow_quote: bool = False,
+) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
     try:
@@ -182,7 +189,7 @@ def _validate_text(value: object, name: str, *, max_bytes: int, forbid_path: boo
         raise ValueError(f"{name} must be at most {max_bytes} UTF-8 bytes")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError(f"{name} must not contain control characters")
-    if '"' in value or "\\" in value:
+    if "\\" in value or ('"' in value and not allow_quote):
         raise ValueError(f"{name} must not contain JSON metacharacters")
     if forbid_path and (value in {".", ".."} or "/" in value):
         raise ValueError(f"{name} must be a sanitized basename")
@@ -257,7 +264,7 @@ class TusSession:
         _require_uuid(self.upload_id, "upload_id")
         _require_uuid(self.user_id, "user_id")
         _require_uuid(self.knowledge_base_id, "knowledge_base_id")
-        _validate_text(self.filename, "filename", max_bytes=255, forbid_path=True)
+        _validate_text(self.filename, "filename", max_bytes=255, forbid_path=True, allow_quote=True)
         _validate_ascii_opaque(self.content_type, "content_type", max_bytes=255)
         total_length = _require_safe_integer(self.total_length, "total_length", maximum=MAX_UPLOAD_BYTES)
         offset = _require_safe_integer(self.offset, "offset", maximum=MAX_UPLOAD_BYTES)
@@ -351,7 +358,13 @@ class TusSession:
                 upload_id=_parse_uuid(payload["upload_id"], "upload_id"),
                 user_id=_parse_uuid(payload["user_id"], "user_id"),
                 knowledge_base_id=_parse_uuid(payload["knowledge_base_id"], "knowledge_base_id"),
-                filename=_validate_text(payload["filename"], "filename", max_bytes=255, forbid_path=True),
+                filename=_validate_text(
+                    payload["filename"],
+                    "filename",
+                    max_bytes=255,
+                    forbid_path=True,
+                    allow_quote=True,
+                ),
                 content_type=_validate_ascii_opaque(payload["content_type"], "content_type", max_bytes=255),
                 total_length=_parse_safe_integer(payload["total_length"], "total_length", maximum=MAX_UPLOAD_BYTES),
                 offset=_parse_safe_integer(payload["offset"], "offset", maximum=MAX_UPLOAD_BYTES),
@@ -454,9 +467,22 @@ local function valid_filename(value)
   if not valid_utf8(value, 255) or value == '.' or value == '..' then return false end
   for index = 1, #value do
     local byte = string.byte(value, index)
-    if byte < 32 or byte == 34 or byte == 47 or byte == 92 or byte == 127 then return false end
+    if byte < 32 or byte == 47 or byte == 92 or byte == 127 then return false end
   end
   return true
+end
+
+local function escape_filename(value)
+  if not valid_filename(value) then return nil end
+  local encoded = {}
+  for index = 1, #value do
+    if string.byte(value, index) == 34 then
+      encoded[#encoded + 1] = '\\"'
+    else
+      encoded[#encoded + 1] = string.sub(value, index, index)
+    end
+  end
+  return '"' .. table.concat(encoded) .. '"'
 end
 
 local function ascii_opaque(value, maximum_bytes)
@@ -493,8 +519,9 @@ end
 
 local function canonical_record(session)
   if type(session) ~= 'table' or count(session) ~= 16 then return nil end
+  local encoded_filename = escape_filename(session.filename)
   if not uuid(session.upload_id) or not uuid(session.user_id) or not uuid(session.knowledge_base_id)
-    or not valid_filename(session.filename) or not ascii_opaque(session.content_type, 255)
+    or not encoded_filename or not ascii_opaque(session.content_type, 255)
     or not ascii_opaque(session.s3_key, 1024) or not ascii_opaque(session.multipart_upload_id, 1024)
     or not safe_integer(session.total_length, 0, MAX_UPLOAD)
     or not safe_integer(session.offset, 0, MAX_UPLOAD) or session.offset > session.total_length
@@ -521,8 +548,8 @@ local function canonical_record(session)
   return '{"content_type":"' .. session.content_type
     .. '","created_at":"' .. session.created_at
     .. '","document_id":' .. document_json
-    .. ',"filename":"' .. session.filename
-    .. '","job_id":' .. job_json
+    .. ',"filename":' .. encoded_filename
+    .. ',"job_id":' .. job_json
     .. ',"knowledge_base_id":"' .. session.knowledge_base_id
     .. '","multipart_upload_id":"' .. session.multipart_upload_id
     .. '","offset":' .. string.format('%.0f', session.offset)
