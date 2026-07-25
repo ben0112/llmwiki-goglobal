@@ -674,3 +674,111 @@ async def test_transaction_cleanup_failure_cannot_mask_grouped_cancellation():
     assert str(raised.value) == ""
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def _control_signal(kind, code):
+    if kind == "keyboard-interrupt":
+        return KeyboardInterrupt("private terminal state")
+    return SystemExit(code)
+
+
+def _control_group(signal, shape):
+    if shape == "pure":
+        return BaseExceptionGroup("private pure group", [signal])
+    if shape == "mixed":
+        return BaseExceptionGroup(
+            "private mixed group",
+            [signal, RuntimeError("private backend dsn=postgres://token")],
+        )
+    return BaseExceptionGroup(
+        "private outer group",
+        [
+            RuntimeError("private outer backend"),
+            BaseExceptionGroup(
+                "private nested group",
+                [ValueError("private nested backend"), signal],
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "replace"])
+@pytest.mark.parametrize("shape", ["pure", "mixed", "nested"])
+@pytest.mark.parametrize(
+    ("kind", "code", "expected_type", "expected_code"),
+    [
+        ("keyboard-interrupt", None, KeyboardInterrupt, None),
+        ("system-exit-int", 9, SystemExit, 9),
+        ("system-exit-string", "unsafe", SystemExit, 1),
+        ("system-exit-true", True, SystemExit, 1),
+        ("system-exit-false", False, SystemExit, 0),
+        ("system-exit-none", None, SystemExit, 1),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+async def test_control_flow_groups_preserve_only_sanitized_process_signal(
+    operation, shape, kind, code, expected_type, expected_code
+):
+    failure = _control_group(_control_signal(kind, code), shape)
+    store = _store(_GroupedFailurePool(failure))
+
+    with pytest.raises(expected_type) as raised:
+        await _invoke_boundary(store, operation)
+    if expected_type is KeyboardInterrupt:
+        assert raised.value.args == ()
+    else:
+        assert raised.value.code == expected_code
+        assert raised.value.args == (expected_code,)
+    assert "private" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "replace"])
+@pytest.mark.parametrize(
+    ("failure", "expected_type", "expected_code"),
+    [
+        (
+            BaseExceptionGroup(
+                "private priority group",
+                [
+                    SystemExit(23),
+                    asyncio.CancelledError("private cancellation"),
+                    BaseExceptionGroup(
+                        "private nested keyboard group",
+                        [KeyboardInterrupt("private keyboard")],
+                    ),
+                ],
+            ),
+            KeyboardInterrupt,
+            None,
+        ),
+        (
+            BaseExceptionGroup(
+                "private priority group",
+                [
+                    asyncio.CancelledError("private cancellation"),
+                    RuntimeError("private backend"),
+                    SystemExit("unsafe"),
+                ],
+            ),
+            SystemExit,
+            1,
+        ),
+    ],
+    ids=["keyboard-before-system-exit", "system-exit-before-cancellation"],
+)
+async def test_grouped_process_signal_priority_is_stable(operation, failure, expected_type, expected_code):
+    store = _store(_GroupedFailurePool(failure))
+
+    with pytest.raises(expected_type) as raised:
+        await _invoke_boundary(store, operation)
+    if expected_type is KeyboardInterrupt:
+        assert raised.value.args == ()
+    else:
+        assert raised.value.code == expected_code
+        assert raised.value.args == (expected_code,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
