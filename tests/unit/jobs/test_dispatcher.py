@@ -1177,6 +1177,7 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
+
     class Redis:
         async def ping(self):
             return True
@@ -1192,8 +1193,17 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
         assert database_url == "postgresql://worker.test/jobs"
         return pool
 
+    async def check_readiness(**dependencies):
+        assert dependencies == {
+            "pool": pool,
+            "redis": redis,
+            "s3": s3,
+            "converter_url": "https://converter.test",
+        }
+
     monkeypatch.setattr(worker, "_create_pool", create_pool)
     monkeypatch.setattr(worker, "_create_s3_service", lambda: s3)
+    monkeypatch.setattr(worker, "_check_worker_readiness", check_readiness)
     monkeypatch.setattr(worker, "_make_worker_id", lambda: "host:42:opaque")
     runtime_settings = _runtime_settings(
         REDIS_URL="redis://worker.test/0",
@@ -1201,7 +1211,7 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
         AWS_ACCESS_KEY_ID="access",
         AWS_SECRET_ACCESS_KEY="secret",
         S3_BUCKET="bucket",
-        CONVERTER_URL="",
+        CONVERTER_URL="https://converter.test",
         CONVERTER_SECRET="converter-secret",
     )
     monkeypatch.setattr(worker.settings, "MODE", "local")

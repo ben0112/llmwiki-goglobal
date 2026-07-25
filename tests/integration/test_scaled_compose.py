@@ -25,6 +25,8 @@ import websockets
 ROOT = Path(__file__).parents[2]
 COMPOSE = ROOT / "deploy/docker-compose.selfhost.yml"
 NGINX = ROOT / "deploy/nginx.conf"
+DOCS = ROOT / "docs/self-hosting.md"
+SELFHOST_ENV = ROOT / "deploy/.env.selfhost"
 LIVE = os.getenv("SCALED_COMPOSE_TEST") == "1"
 
 
@@ -41,8 +43,8 @@ def test_scaled_compose_declares_private_replicas_and_gateway():
     assert "redis-data:/data" in text
     assert 'command: ["arq", "jobs.worker.WorkerSettings"]' in text
     assert "REDIS_URL: redis://redis:6379/0" in text
-    assert 'DURABLE_JOBS_ENABLED: "true"' in text
-    assert 'TUS_MULTIPART_ENABLED: "true"' in text
+    assert "DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}" in text
+    assert "TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}" in text
     assert "gateway:" in text
     assert '      - "8000:8000"' in text
 
@@ -72,8 +74,44 @@ def test_gateway_configuration_supports_dynamic_http_and_websocket_proxying():
         assert directive in text
 
 
+def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
+    text = DOCS.read_text(encoding="utf-8")
+    assert "DURABLE_JOBS_ENABLED=false" in text
+    assert "TUS_MULTIPART_ENABLED=false" in text
+    assert "stop worker" in text
+    assert "--scale worker=0" in text
+    assert "--scale api=1" in text
+    assert "--force-recreate" in text
+    assert "restart gateway" in text
+    assert "trap cleanup EXIT" in text
+    assert "SCALED_COMPOSE_TEST=1" in text
+    assert "safely reads `deploy/.env.selfhost`" in text
+
+
+def _selfhost_env_value(name: str) -> str:
+    try:
+        lines = SELFHOST_ENV.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, raw_value = stripped.partition("=")
+        if separator and key.strip() == name:
+            value = raw_value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            return value
+    return ""
+
+
+def _env_value(name: str, default: str = "") -> str:
+    return os.getenv(name, "").strip() or _selfhost_env_value(name) or default
+
+
 def _required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    value = _env_value(name)
     if not value:
         pytest.fail(f"SCALED_COMPOSE_TEST=1 requires {name}")
     return value
@@ -84,8 +122,7 @@ def _mini_pdf() -> bytes:
     objects = [
         b"<</Type/Catalog/Pages 2 0 R>>",
         b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
-        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
-        b"/Resources<</Font<</F1 5 0 R>>>>>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
         b"<</Length %d>>stream\n%s\nendstream" % (len(stream), stream),
         b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
     ]
@@ -106,9 +143,7 @@ def _mini_pdf() -> bytes:
 
 
 def _metadata(**values: str) -> str:
-    return ",".join(
-        f"{key} {base64.b64encode(value.encode()).decode()}" for key, value in values.items()
-    )
+    return ",".join(f"{key} {base64.b64encode(value.encode()).decode()}" for key, value in values.items())
 
 
 async def _wait_for_job(client: httpx.AsyncClient, job_id: str, timeout: float = 240) -> dict:
@@ -163,7 +198,7 @@ def _worker_container_for_owner(owner: str) -> str:
 )
 @pytest.mark.asyncio
 async def test_two_api_two_worker_recovery_smoke():
-    api_url = os.getenv("SCALED_TEST_API_URL", "http://127.0.0.1:8000").rstrip("/")
+    api_url = _env_value("SCALED_TEST_API_URL", "http://127.0.0.1:8000").rstrip("/")
     database_url = _required_env("SCALED_TEST_DATABASE_URL")
     token = _required_env("SCALED_TEST_TOKEN")
     user_id = UUID(_required_env("SCALED_TEST_USER_ID"))

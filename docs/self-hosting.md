@@ -232,6 +232,24 @@ use mixed flag values or multiple APIs on the rollback path. Re-enable Redis,
 workers, durable jobs, multipart storage, and two APIs in that order after the
 incident is resolved.
 
+Copyable incident rollback (the worker intentionally refuses to start when
+durable jobs are disabled):
+
+```bash
+# Set these two lines in deploy/.env.selfhost first:
+DURABLE_JOBS_ENABLED=false
+TUS_MULTIPART_ENABLED=false
+
+docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+  stop worker
+docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+  up -d --no-deps --scale worker=0 worker
+docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+  up -d --build --no-deps --force-recreate --scale api=1 api
+docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+  restart gateway
+```
+
 ### Security notes for an internal deployment
 
 - Keep the converter and Postgres off the public network; only the five
@@ -303,15 +321,23 @@ binary sources, which the annotation pipeline does not produce.
 
 ## Scaling verification
 
-With `STAGE=test` and the opt-in `SCALED_TEST_*` variables from
-`deploy/.env.selfhost.example`, run:
+With `STAGE=test` and the opt-in `SCALED_TEST_*` variables in
+`deploy/.env.selfhost`, run from the repository root. The pytest fixture
+safely reads `deploy/.env.selfhost` without sourcing or printing its secrets:
 
 ```bash
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-  up -d --build --scale api=2 --scale worker=2
+compose() {
+  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost "$@"
+}
+cleanup() {
+  compose down -v
+}
+trap cleanup EXIT
+
+compose up -d --build --scale api=2 --scale worker=2
+compose restart gateway
 SCALED_COMPOSE_TEST=1 PYTHONPATH=api .venv/bin/pytest \
   tests/integration/test_scaled_compose.py -q
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost down -v
 ```
 
 The live test requires a reachable self-hosted Supabase database and a valid

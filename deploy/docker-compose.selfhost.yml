@@ -86,8 +86,8 @@ services:
       GLOBAL_MAX_USERS: ${GLOBAL_MAX_USERS:-10000}
       SENTRY_DSN: ${SENTRY_DSN:-}
       REDIS_URL: redis://redis:6379/0
-      DURABLE_JOBS_ENABLED: "true"
-      TUS_MULTIPART_ENABLED: "true"
+      DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
+      TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
       STAGE: ${STAGE:-prod}
     expose:
       - "8000"
@@ -128,8 +128,8 @@ services:
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
       PDF_BACKEND: ${PDF_BACKEND:-opendataloader}
       REDIS_URL: redis://redis:6379/0
-      DURABLE_JOBS_ENABLED: "true"
-      TUS_MULTIPART_ENABLED: "true"
+      DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
+      TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
       STAGE: ${STAGE:-prod}
     depends_on:
       redis:

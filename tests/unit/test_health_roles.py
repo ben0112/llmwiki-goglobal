@@ -35,7 +35,12 @@ class Probe:
             raise self.failure
 
 
-def hosted_request(*, failing: str | None = None):
+def hosted_request(
+    *,
+    failing: str | None = None,
+    requires_redis: bool = True,
+    requires_s3: bool = True,
+):
     calls: list[str] = []
 
     def dependency(name: str) -> Probe:
@@ -47,6 +52,8 @@ def hosted_request(*, failing: str | None = None):
         pool=dependency("postgres"),
         redis=dependency("redis"),
         s3_service=dependency("s3"),
+        readiness_requires_redis=requires_redis,
+        readiness_requires_s3=requires_s3,
     )
     return SimpleNamespace(app=SimpleNamespace(state=state)), calls
 
@@ -64,6 +71,32 @@ async def test_hosted_api_readiness_fails_for_each_dependency_without_leaking_de
     assert raised.value.status_code == 503
     assert raised.value.detail == "not ready"
     assert calls[-1] == failing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["redis", "s3_service"])
+async def test_hosted_api_readiness_rejects_missing_required_dependency_object(missing):
+    from routes.health import ready
+
+    request, _calls = hosted_request()
+    setattr(request.app.state, missing, None)
+
+    with pytest.raises(HTTPException) as raised:
+        await ready(request)
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == "not ready"
+
+
+@pytest.mark.asyncio
+async def test_legacy_hosted_readiness_does_not_require_redis():
+    from routes.health import ready
+
+    request, calls = hosted_request(requires_redis=False)
+    request.app.state.redis = None
+
+    assert await ready(request) == {"status": "ready"}
+    assert calls == ["postgres", "s3"]
 
 
 @pytest.mark.asyncio
@@ -183,6 +216,83 @@ async def test_worker_startup_requires_every_role_dependency(monkeypatch, failin
     assert calls[-1] == failing
     assert pool.close_calls == 1
     assert ctx["redis"] is redis
+    assert "worker_context" not in ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing,settings_change,expected_s3_closes",
+    [
+        ("S3", {"AWS_ACCESS_KEY_ID": ""}, 0),
+        ("S3", {"AWS_SECRET_ACCESS_KEY": ""}, 0),
+        ("S3", {"S3_BUCKET": ""}, 0),
+        ("converter", {"CONVERTER_URL": ""}, 1),
+    ],
+)
+async def test_worker_startup_rejects_missing_required_configuration(
+    monkeypatch,
+    missing,
+    settings_change,
+    expected_s3_closes,
+):
+    from jobs import worker
+
+    calls: list[str] = []
+    pool = Probe("postgres", calls)
+    redis = Probe("redis", calls)
+    s3 = Probe("s3", calls)
+
+    async def create_pool(_database_url):
+        return pool
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, _url):
+            return Response()
+
+    values = {
+        "MODE": "hosted",
+        "DURABLE_JOBS_ENABLED": True,
+        "REDIS_URL": "redis://redis:6379/0",
+        "DATABASE_URL": "postgresql://database/jobs",
+        "AWS_ACCESS_KEY_ID": "access",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "S3_BUCKET": "bucket",
+        "CONVERTER_URL": "http://converter:8000",
+        "CONVERTER_SECRET": "converter-secret",
+        "TUS_MULTIPART_ENABLED": False,
+        "JOB_LEASE_SECONDS": 60,
+        "JOB_HEARTBEAT_SECONDS": 15,
+        "JOB_DISPATCH_BATCH_SIZE": 100,
+        "JOB_REDELIVER_SECONDS": 30,
+    }
+    values.update(settings_change)
+    monkeypatch.setattr(worker, "_create_pool", create_pool)
+    monkeypatch.setattr(worker, "_create_s3_service", lambda: s3)
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    ctx = {"redis": redis, "runtime_settings": SimpleNamespace(**values)}
+
+    with pytest.raises(RuntimeError, match=missing):
+        await worker.startup(ctx)
+
+    assert pool.close_calls == 1
+    assert s3.close_calls == expected_s3_closes
+    assert redis.close_calls == 0
+    assert ctx["redis"] is redis
+    assert "pool" not in ctx
+    assert "s3" not in ctx
     assert "worker_context" not in ctx
 
 

@@ -29,12 +29,16 @@ async def ready(request: Request):
                 raise RuntimeError("postgres is not initialized")
             await pool.fetchval("SELECT 1")
 
-            redis = getattr(state, "redis", None)
-            if redis is not None:
+            if getattr(state, "readiness_requires_redis", False):
+                redis = getattr(state, "redis", None)
+                if redis is None:
+                    raise RuntimeError("redis is not initialized")
                 await redis.ping()
 
-            s3_service = getattr(state, "s3_service", None)
-            if s3_service is not None:
+            if getattr(state, "readiness_requires_s3", False):
+                s3_service = getattr(state, "s3_service", None)
+                if s3_service is None:
+                    raise RuntimeError("s3 is not initialized")
                 await s3_service.head_bucket()
     except Exception as exc:  # noqa: BLE001 - dependency clients expose unrelated error types.
         logger.warning("readiness check failed error_type=%s", type(exc).__name__)

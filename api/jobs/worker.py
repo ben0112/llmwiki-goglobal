@@ -90,14 +90,16 @@ async def _check_worker_readiness(
     converter_url: str,
 ) -> None:
     """Verify every dependency needed before ARQ starts accepting jobs."""
+    if s3 is None:
+        raise RuntimeError("ARQ durable worker requires S3 configuration")
+    if not isinstance(converter_url, str) or not converter_url.strip():
+        raise RuntimeError("ARQ durable worker requires converter URL")
     await pool.fetchval("SELECT 1")
     await redis.ping()
-    if s3 is not None:
-        await s3.head_bucket()
-    if converter_url:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-            response = await client.get(f"{converter_url.rstrip('/')}/health")
-            response.raise_for_status()
+    await s3.head_bucket()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        response = await client.get(f"{converter_url.rstrip('/')}/health")
+        response.raise_for_status()
 
 
 def validate_worker_runtime(runtime_settings: object) -> None:

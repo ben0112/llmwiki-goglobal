@@ -39,6 +39,7 @@ class ReplicaIdentityMiddleware:
 
         await self.app(scope, receive, send_with_identity)
 
+
 from config import settings  # noqa: E402 - middleware must be defined before app imports.
 from infra.tasks import spawn_logged  # noqa: E402 - middleware must be defined before app imports.
 
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 if settings.SENTRY_DSN:
     import sentry_sdk
+
     sentry_sdk.init(
         dsn=settings.SENTRY_DSN,
         send_default_pii=True,
@@ -126,8 +128,7 @@ async def _recover_hosted_extractions(
         return []
 
     rows = await pool.fetch(
-        "SELECT id::text, user_id::text FROM documents "
-        "WHERE status IN ('pending', 'processing') AND NOT archived"
+        "SELECT id::text, user_id::text FROM documents WHERE status IN ('pending', 'processing') AND NOT archived"
     )
     for row in rows:
         logger.info("Recovering stuck document %s", row["id"][:8])
@@ -232,12 +233,18 @@ async def lifespan(app: FastAPI):
     # pay the cold-cache cost and so a JWKS outage at boot is visible
     # immediately rather than masked behind the first auth error.
     from auth import prefetch_jwks
+
     await prefetch_jwks()
 
     import asyncpg
+
     pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=2, max_size=10)
     app.state.pool = pool
     app.state.mode = "hosted"
+    app.state.readiness_requires_redis = bool(settings.DURABLE_JOBS_ENABLED)
+    app.state.readiness_requires_s3 = bool(
+        settings.TUS_MULTIPART_ENABLED or (settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET)
+    )
 
     app.state.job_service = None
     app.state.quota_service = None
@@ -332,12 +339,15 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.job_service = None
     app.state.quota_service = None
     app.state.redis = None
+    app.state.readiness_requires_redis = False
+    app.state.readiness_requires_s3 = False
     app.state.tus_service = None
     app.state.tus_session_store = None
     app.state.auth_provider = auth_provider
     app.state.workspace_path = str(workspace)
 
     from services.local import LocalServiceFactory
+
     app.state.factory = LocalServiceFactory(db, storage, local_user_id)
 
     logger.info("Local mode — workspace: %s", workspace)
@@ -350,6 +360,7 @@ async def _local_lifespan(app: FastAPI):
     from pathlib import Path
 
     from infra.db.sqlite import create_pool as create_sqlite_pool
+
     workspace = Path(app.state.workspace_path)
     db_path = str(workspace / ".llmwiki" / "index.db")
 
@@ -363,21 +374,24 @@ async def _local_lifespan(app: FastAPI):
     # 的表现就是"重启后 CPU 闲置、队列不动"
     from domain.local_processor import reconcile_workspace
     from infra.tasks import spawn_logged
-    reconcile_task = spawn_logged(
-        reconcile_workspace(reconcile_db, workspace), "startup-reconcile")
+
+    reconcile_task = spawn_logged(reconcile_workspace(reconcile_db, workspace), "startup-reconcile")
 
     # 磁盘↔索引定期对账:兜住 inotify 收不到的场景(Docker Desktop 宿主侧
     # 拷入 bind mount、容器停机期间的增删),启动即扫一轮
     from domain.watcher import sweep_loop
+
     sweep_task = spawn_logged(sweep_loop(sweep_db, workspace), "workspace-sweep")
 
     # 语料自动分类轮询(默认关;设置页/环境变量开启后才会真正跑)
     from routes.corpus_pipeline import auto_loop
+
     corpus_auto_task = asyncio.create_task(auto_loop(app))
 
     watcher_task = None
     try:
         from domain.watcher import watch_workspace
+
         # 同样走留痕封装:几万文件的工作区可能触发 inotify watch 上限
         # (ENOSPC)让 watcher 中途挂掉,裸 task 死了毫无声息
         watcher_task = spawn_logged(watch_workspace(watcher_db, workspace), "file-watcher")
@@ -439,17 +453,18 @@ app.add_middleware(
     # Local mode is single-user with no auth and binds wherever the operator
     # publishes it (localhost / LAN / overlay network) — accept any origin so
     # the web app works from whichever address the browser used.
-    **(
-        {"allow_origin_regex": r"^https?://.*$"}
-        if settings.MODE == "local"
-        else {"allow_origins": [settings.APP_URL]}
-    ),
+    **({"allow_origin_regex": r"^https?://.*$"} if settings.MODE == "local" else {"allow_origins": [settings.APP_URL]}),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=[
-        "Location", "Upload-Offset", "Upload-Length",
-        "Tus-Resumable", "Tus-Version", "Tus-Max-Size", "Tus-Extension",
+        "Location",
+        "Upload-Offset",
+        "Upload-Length",
+        "Tus-Resumable",
+        "Tus-Version",
+        "Tus-Max-Size",
+        "Tus-Extension",
         "X-Document-Id",
         "X-Job-Id",
         "X-API-Instance-ID",
@@ -469,6 +484,7 @@ if settings.MODE == "local":
     from routes.files import set_workspace_root
     from routes.local_graph import router as local_graph_router
     from routes.local_upload import router as local_upload_router
+
     app.include_router(local_upload_router)
     app.include_router(files_router)
     app.include_router(local_graph_router)
