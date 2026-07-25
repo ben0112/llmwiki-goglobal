@@ -77,6 +77,53 @@ class _ErrorRetriever:
         raise self.error
 
 
+class _RawRetriever:
+    def __init__(self, result):
+        self.result = result
+
+    async def retrieve(self, query):
+        return self.result
+
+
+class _BlockingRetriever:
+    def __init__(self, hit):
+        self.hit = hit
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def retrieve(self, query):
+        self.started.set()
+        try:
+            await self.release.wait()
+            return SearchResult(hits=(self.hit,), candidate_count=1)
+        finally:
+            self.finished.set()
+
+
+class _FailAfterPeerStarts:
+    def __init__(self, peer_started, error):
+        self.peer_started = peer_started
+        self.error = error
+
+    async def retrieve(self, query):
+        await self.peer_started.wait()
+        raise self.error
+
+
+class _SelfCancellingRetriever:
+    def __init__(self, peer_started):
+        self.peer_started = peer_started
+
+    async def retrieve(self, query):
+        await self.peer_started.wait()
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)
+        raise AssertionError("cancelled retriever resumed")
+
+
 class _FakeReranker:
     def __init__(self, output):
         self.output = output
@@ -95,6 +142,21 @@ class _FakeExpander:
     async def expand(self, query, hits):
         self.inputs.append(tuple(hits))
         return self.output
+
+
+class _EffectivelyInfiniteOutput:
+    def __init__(self, item):
+        self.item = item
+        self.pulls = 0
+
+    def __len__(self):
+        return 0
+
+    def __iter__(self):
+        while self.pulls < 10_000:
+            self.pulls += 1
+            yield self.item
+        raise RuntimeError("test safety stop: output was not bounded")
 
 
 class _CoordinatedRetriever:
@@ -540,6 +602,52 @@ async def test_hybrid_runs_lexical_and_vector_retrieval_concurrently():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failing_side", ["lexical", "vector"])
+async def test_hybrid_cancels_blocked_peer_when_child_fails(failing_side):
+    blocked = _BlockingRetriever(_hit("blocked"))
+    failing = _FailAfterPeerStarts(blocked.started, RuntimeError(f"{failing_side} failed"))
+    service = HybridRetrievalService(
+        lexical=failing if failing_side == "lexical" else blocked,
+        vector=blocked if failing_side == "lexical" else failing,
+    )
+
+    with pytest.raises(RuntimeError, match=f"{failing_side} failed"):
+        await service.retrieve(SearchQuery.build(text="q"))
+
+    assert blocked.finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_cleans_up_blocked_peer_when_child_cancels_itself():
+    blocked = _BlockingRetriever(_hit("blocked"))
+    service = HybridRetrievalService(
+        lexical=_SelfCancellingRetriever(blocked.started),
+        vector=blocked,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.retrieve(SearchQuery.build(text="q"))
+
+    assert blocked.finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_cleans_up_both_children_when_caller_cancels():
+    lexical = _BlockingRetriever(_hit("lexical"))
+    vector = _BlockingRetriever(_hit("vector"))
+    service = HybridRetrievalService(lexical=lexical, vector=vector)
+    request = asyncio.create_task(service.retrieve(SearchQuery.build(text="q")))
+    await asyncio.gather(lexical.started.wait(), vector.started.wait())
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert lexical.finished.is_set()
+    assert vector.finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_hybrid_uses_identity_for_stable_rrf_tie_breaking():
     service = HybridRetrievalService(
         lexical=_FakeRetriever([_hit("z", version=2), _hit("middle")]),
@@ -561,7 +669,9 @@ async def test_hybrid_counts_duplicate_only_once_per_retriever():
         rrf_k=10,
     )
 
-    result = await service.retrieve(SearchQuery.build(text="q", limit=2))
+    result = await service.retrieve(
+        SearchQuery.build(text="q", limit=2, candidate_limit=3)
+    )
 
     assert [item.document_id for item in result.hits] == ["a", "b"]
     assert result.hits[0].score == pytest.approx(1 / 11)
@@ -631,6 +741,64 @@ async def test_hybrid_does_not_swallow_vector_programming_errors():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_side", ["lexical", "vector"])
+async def test_hybrid_rejects_non_search_results_symmetrically(invalid_side):
+    invalid = _RawRetriever(object())
+    valid = _FakeRetriever([_hit("valid")])
+    service = HybridRetrievalService(
+        lexical=invalid if invalid_side == "lexical" else valid,
+        vector=valid if invalid_side == "lexical" else invalid,
+    )
+
+    with pytest.raises(TypeError, match=f"{invalid_side} retriever must return exact SearchResult"):
+        await service.retrieve(SearchQuery.build(text="q"))
+
+
+@pytest.mark.asyncio
+async def test_lexical_profile_rejects_search_result_subclasses():
+    class DerivedSearchResult(SearchResult):
+        pass
+
+    service = HybridRetrievalService(
+        lexical=_RawRetriever(DerivedSearchResult(hits=(), candidate_count=0))
+    )
+
+    with pytest.raises(TypeError, match="lexical retriever must return exact SearchResult"):
+        await service.retrieve(SearchQuery.build(text="q"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized_side", ["lexical", "vector"])
+async def test_hybrid_rejects_oversized_raw_results_before_scanning(
+    monkeypatch, oversized_side
+):
+    oversized = _RawRetriever(
+        SearchResult(
+            hits=(_hit("a"), _hit("b"), _hit("c")),
+            candidate_count=3,
+        )
+    )
+    valid = _FakeRetriever([_hit("valid")])
+    service = HybridRetrievalService(
+        lexical=oversized if oversized_side == "lexical" else valid,
+        vector=valid if oversized_side == "lexical" else oversized,
+    )
+    monkeypatch.setattr(
+        search_module,
+        "_unique_hits",
+        lambda hits: pytest.fail("oversized results must be rejected before deduplication"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"{oversized_side} retriever returned more hits than candidate_limit",
+    ):
+        await service.retrieve(
+            SearchQuery.build(text="q", limit=2, candidate_limit=2)
+        )
+
+
+@pytest.mark.asyncio
 async def test_hybrid_propagates_lexical_unavailability_without_fallback():
     service = HybridRetrievalService(
         lexical=_UnavailableRetriever(),
@@ -678,7 +846,7 @@ async def test_reranker_can_promote_hits_from_the_bounded_candidate_pool():
     promoted = _hit("c")
     reranker = _FakeReranker([promoted, _hit("a"), _hit("b")])
     service = HybridRetrievalService(
-        lexical=_FakeRetriever([_hit("a"), _hit("b"), promoted, _hit("outside")]),
+        lexical=_FakeRetriever([_hit("a"), _hit("b"), promoted]),
         reranker=reranker,
     )
 
@@ -688,6 +856,22 @@ async def test_reranker_can_promote_hits_from_the_bounded_candidate_pool():
 
     assert [item.document_id for item in reranker.inputs[0]] == ["a", "b", "c"]
     assert [item.document_id for item in result.hits] == ["c", "a"]
+
+
+@pytest.mark.asyncio
+async def test_reranker_rejects_infinite_output_after_bounded_scan():
+    output = _EffectivelyInfiniteOutput(_hit("a"))
+    service = HybridRetrievalService(
+        lexical=_FakeRetriever([_hit("a")]),
+        reranker=_FakeReranker(output),
+    )
+
+    with pytest.raises(ValueError, match="reranker output exceeds scan limit"):
+        await service.retrieve(
+            SearchQuery.build(text="q", limit=2, candidate_limit=3)
+        )
+
+    assert output.pulls == 17
 
 
 @pytest.mark.asyncio
@@ -723,7 +907,60 @@ async def test_expander_is_not_called_when_direct_hits_fill_the_limit():
     assert expander.inputs == []
 
 
-@pytest.mark.parametrize("rrf_k", [True, 0, -1, 1.5, float("inf")])
+@pytest.mark.asyncio
+async def test_expander_rejects_infinite_output_after_bounded_scan():
+    output = _EffectivelyInfiniteOutput(object())
+    service = HybridRetrievalService(
+        lexical=_FakeRetriever([_hit("direct")]),
+        expander=_FakeExpander(output),
+    )
+
+    with pytest.raises(ValueError, match="expander output exceeds scan limit"):
+        await service.retrieve(
+            SearchQuery.build(text="q", limit=2, candidate_limit=3)
+        )
+
+    assert output.pulls == 17
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"lexical": object()}, "lexical.retrieve must be callable"),
+        (
+            {"lexical": _FakeRetriever([]), "vector": object()},
+            "vector.retrieve must be callable",
+        ),
+        (
+            {"lexical": _FakeRetriever([]), "reranker": object()},
+            "reranker.rerank must be callable",
+        ),
+        (
+            {"lexical": _FakeRetriever([]), "expander": object()},
+            "expander.expand must be callable",
+        ),
+    ],
+)
+def test_hybrid_rejects_invalid_ports_at_construction(kwargs, message):
+    with pytest.raises(TypeError, match=message):
+        HybridRetrievalService(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_rrf_preserves_adjacent_rank_order_at_maximum_k():
+    service = HybridRetrievalService(
+        lexical=_FakeRetriever([_hit("z"), _hit("a")]),
+        vector=_FakeRetriever([]),
+        rrf_k=1_000_000,
+    )
+
+    result = await service.retrieve(SearchQuery.build(text="q", limit=2))
+
+    assert [hit.document_id for hit in result.hits] == ["z", "a"]
+    assert result.hits[0].score > result.hits[1].score
+
+
+@pytest.mark.parametrize("rrf_k", [True, 0, -1, 1.5, float("inf"), 1_000_001])
 def test_hybrid_rejects_invalid_rrf_k(rrf_k):
     with pytest.raises(ValueError, match="rrf_k"):
         HybridRetrievalService(lexical=_FakeRetriever([]), rrf_k=rrf_k)

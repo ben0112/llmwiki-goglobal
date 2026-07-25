@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from itertools import islice
 from math import isfinite
 from numbers import Real
 from time import perf_counter
@@ -337,10 +338,13 @@ class RetrieverUnavailable(RuntimeError):
 
 
 _VECTOR_UNAVAILABLE = object()
+_MAX_RRF_K = 1_000_000
+_MIN_POSTPROCESS_SCAN_LIMIT = 16
+_MAX_POSTPROCESS_SCAN_LIMIT = 600
 
 
 class HybridRetrievalService:
-    """Compose lexical and optional vector retrieval with bounded post-processing."""
+    """Compose retrieval with bounded post-processing and RRF k up to 1,000,000."""
 
     def __init__(
         self,
@@ -351,8 +355,19 @@ class HybridRetrievalService:
         expander: ContextExpander | None = None,
         rrf_k: int = 60,
     ) -> None:
-        if isinstance(rrf_k, bool) or not isinstance(rrf_k, int) or rrf_k <= 0:
-            raise ValueError("rrf_k must be a positive integer")
+        _require_callable_port(lexical, method="retrieve", label="lexical")
+        if vector is not None:
+            _require_callable_port(vector, method="retrieve", label="vector")
+        if reranker is not None:
+            _require_callable_port(reranker, method="rerank", label="reranker")
+        if expander is not None:
+            _require_callable_port(expander, method="expand", label="expander")
+        if (
+            isinstance(rrf_k, bool)
+            or not isinstance(rrf_k, int)
+            or not 1 <= rrf_k <= _MAX_RRF_K
+        ):
+            raise ValueError(f"rrf_k must be between 1 and {_MAX_RRF_K}")
         self._lexical = lexical
         self._vector = vector
         self._reranker = reranker
@@ -362,7 +377,11 @@ class HybridRetrievalService:
     async def retrieve(self, query: SearchQuery) -> SearchResult:
         started_at = perf_counter()
         if self._vector is None:
-            lexical = await self._lexical.retrieve(query)
+            lexical = _validate_backend_result(
+                await self._lexical.retrieve(query),
+                query=query,
+                label="lexical",
+            )
             return await self._finish(
                 query,
                 lexical.hits,
@@ -372,11 +391,12 @@ class HybridRetrievalService:
                 started_at=started_at,
             )
 
-        lexical, vector = await asyncio.gather(
+        lexical_raw, vector_raw = await _gather_retrievers(
             self._lexical.retrieve(query),
             self._retrieve_vector(query),
         )
-        if vector is _VECTOR_UNAVAILABLE:
+        lexical = _validate_backend_result(lexical_raw, query=query, label="lexical")
+        if vector_raw is _VECTOR_UNAVAILABLE:
             return await self._finish(
                 query,
                 lexical.hits,
@@ -386,8 +406,7 @@ class HybridRetrievalService:
                 started_at=started_at,
             )
 
-        if not isinstance(vector, SearchResult):
-            raise TypeError("vector retriever must return SearchResult")
+        vector = _validate_backend_result(vector_raw, query=query, label="vector")
         fused = _reciprocal_rank_fusion(lexical.hits, vector.hits, rrf_k=self._rrf_k)
         return await self._finish(
             query,
@@ -417,15 +436,28 @@ class HybridRetrievalService:
         started_at: float,
     ) -> SearchResult:
         candidates = list(_unique_hits(hits))[: query.candidate_limit]
+        scan_limit = min(
+            _MAX_POSTPROCESS_SCAN_LIMIT,
+            max(_MIN_POSTPROCESS_SCAN_LIMIT, query.candidate_limit + query.limit),
+        )
         if self._reranker is not None and candidates:
             reranked = await self._reranker.rerank(query, tuple(candidates))
-            candidates = _sanitize_reranked(candidates, reranked)
+            candidates = _sanitize_reranked(
+                candidates,
+                reranked,
+                scan_limit=scan_limit,
+            )
         direct = candidates[: query.limit]
 
         final = direct
         if self._expander is not None and final and len(final) < query.limit:
             expanded = await self._expander.expand(query, tuple(final))
-            final = _append_expanded(final, expanded, limit=query.limit)
+            final = _append_expanded(
+                final,
+                expanded,
+                limit=query.limit,
+                scan_limit=scan_limit,
+            )
 
         return SearchResult(
             hits=tuple(final),
@@ -433,6 +465,36 @@ class HybridRetrievalService:
             latency_ms=max(latency_ms, (perf_counter() - started_at) * 1000),
             profile=profile,
         )
+
+
+def _require_callable_port(port: object, *, method: str, label: str) -> None:
+    if not callable(getattr(port, method, None)):
+        raise TypeError(f"{label}.{method} must be callable")
+
+
+async def _gather_retrievers(*coroutines) -> tuple[object, ...]:
+    tasks = tuple(asyncio.create_task(coroutine) for coroutine in coroutines)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _validate_backend_result(
+    result: object,
+    *,
+    query: SearchQuery,
+    label: str,
+) -> SearchResult:
+    if type(result) is not SearchResult:
+        raise TypeError(f"{label} retriever must return exact SearchResult")
+    if len(result.hits) > query.candidate_limit:
+        raise ValueError(f"{label} retriever returned more hits than candidate_limit")
+    return result
 
 
 def _unique_hits(hits: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
@@ -466,11 +528,13 @@ def _reciprocal_rank_fusion(
 def _sanitize_reranked(
     direct: Sequence[SearchHit],
     reranked: Sequence[SearchHit],
+    *,
+    scan_limit: int,
 ) -> list[SearchHit]:
     known = {hit.identity: hit for hit in direct}
     ordered: list[SearchHit] = []
     seen: set[tuple[str, int, int]] = set()
-    for hit in reranked:
+    for hit in _bounded_output(reranked, label="reranker", scan_limit=scan_limit):
         if not isinstance(hit, SearchHit) or hit.identity not in known or hit.identity in seen:
             continue
         ordered.append(known[hit.identity])
@@ -484,17 +548,24 @@ def _append_expanded(
     expanded: Sequence[SearchHit],
     *,
     limit: int,
+    scan_limit: int,
 ) -> list[SearchHit]:
     result = list(direct)
     seen = {hit.identity for hit in result}
-    for hit in expanded:
+    for hit in _bounded_output(expanded, label="expander", scan_limit=scan_limit):
         if not isinstance(hit, SearchHit) or hit.identity in seen:
             continue
-        result.append(hit)
         seen.add(hit.identity)
-        if len(result) == limit:
-            break
+        if len(result) < limit:
+            result.append(hit)
     return result
+
+
+def _bounded_output(output: object, *, label: str, scan_limit: int):
+    for index, item in enumerate(islice(output, scan_limit + 1), start=1):
+        if index > scan_limit:
+            raise ValueError(f"{label} output exceeds scan limit")
+        yield item
 
 
 def _freeze_json_like(value: object, *, label: str) -> object:
