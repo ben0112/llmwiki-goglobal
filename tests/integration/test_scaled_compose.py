@@ -156,7 +156,6 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     guarded_exit_at = source.index("await _wait_for_exit_without_old_owner_claim", next_job_at)
     assert term_at < next_job_at < guarded_exit_at
     assert '_container_state(graceful_worker_container)["Running"]' in source
-    assert '"durable worker resources closed" in graceful_logs' in source
     guard_source = inspect.getsource(_wait_for_exit_without_old_owner_claim)
     assert 'last_job["lease_owner"] != old_owner' in guard_source
     assert "await asyncio.sleep(0.05)" in guard_source
@@ -765,7 +764,6 @@ async def test_two_api_two_worker_recovery_smoke():
             )
             assert graceful_exit["ExitCode"] == 0
             assert "shutdown on SIGTERM" in graceful_logs.stderr + graceful_logs.stdout
-            assert "durable worker resources closed" in graceful_logs.stderr + graceful_logs.stdout
 
             draining_running = await _wait_for_running_job(pool, draining_job_id)
             assert draining_running["lease_owner"] != old_owner

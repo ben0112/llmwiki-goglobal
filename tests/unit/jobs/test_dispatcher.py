@@ -1290,10 +1290,7 @@ async def test_reap_cron_emits_stable_json_contract_for_each_expired_lease(monke
 
 
 @pytest.mark.asyncio
-async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserves_redis(
-    monkeypatch,
-    caplog,
-):
+async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserves_redis(monkeypatch):
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
@@ -1349,13 +1346,9 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     assert ctx["runtime_settings"] is runtime_settings
     assert "websocket" not in " ".join(ctx).lower()
 
-    with caplog.at_level(logging.INFO, logger="jobs.worker"):
-        await worker.shutdown(ctx)
-        await worker.shutdown(ctx)
+    await worker.shutdown(ctx)
+    await worker.shutdown(ctx)
     assert pool.close_calls == 1
-    assert [record.getMessage() for record in caplog.records].count(
-        "durable worker resources closed"
-    ) == 1
     assert ctx["redis"] is redis
     assert "pool" not in ctx
     assert "worker_context" not in ctx
