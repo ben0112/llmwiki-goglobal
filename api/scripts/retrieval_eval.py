@@ -725,8 +725,51 @@ def _write_output(path: str | os.PathLike[str], content: bytes) -> None:
                 os.close(parent_descriptor)
 
 
+def _discard_failed_stream_buffer(buffer: Any) -> None:
+    with suppress(AttributeError, OSError, TypeError, ValueError):
+        buffer.seek(0)
+        buffer.truncate(0)
+
+
+def _silence_failed_stream(buffer: Any) -> None:
+    try:
+        descriptor = buffer.fileno()
+    except (AttributeError, OSError, TypeError, ValueError):
+        _discard_failed_stream_buffer(buffer)
+        return
+
+    null_descriptor = -1
+    try:
+        null_descriptor = os.open(
+            os.devnull,
+            os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        os.dup2(null_descriptor, descriptor, inheritable=False)
+    except (OSError, TypeError, ValueError):
+        _discard_failed_stream_buffer(buffer)
+        return
+    finally:
+        if null_descriptor >= 0:
+            with suppress(OSError):
+                os.close(null_descriptor)
+
+    with suppress(OSError, ValueError):
+        buffer.flush()
+
+
+def _emit_stream(stream: Any, content: bytes) -> bool:
+    buffer = getattr(stream, "buffer", stream)
+    try:
+        buffer.write(content)
+        buffer.flush()
+    except (OSError, ValueError):
+        _silence_failed_stream(buffer)
+        return False
+    return True
+
+
 def _emit_error(category: str, code: str) -> None:
-    sys.stderr.buffer.write(_json_bytes({"error": {"category": category, "code": code}}))
+    _emit_stream(sys.stderr, _json_bytes({"error": {"category": category, "code": code}}))
 
 
 def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace | None, int]:
@@ -815,9 +858,7 @@ def _emit_report(payload: Mapping[str, object], output_json: str | None, exit_co
         except OutputWriteError:
             _emit_error("output", "output_write_failed")
             return 4
-    try:
-        sys.stdout.buffer.write(encoded)
-    except OSError:
+    if not _emit_stream(sys.stdout, encoded):
         return 4
     return exit_code
 

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from llmwiki_core.search import SearchHit, SearchResult
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "retrieval" / "v1"
 DATASET = FIXTURE_ROOT / "cases.jsonl"
+REPO_ROOT = Path(__file__).parents[2]
 
 
 def _hit(document_id: str, chunk_index: int, *, content: str = "private fixture content") -> SearchHit:
@@ -154,6 +157,68 @@ def _read_json(capsys) -> tuple[dict[str, object], str]:
     return json.loads(captured.out), captured.out
 
 
+def _run_cli_with_closed_stream(
+    argv: list[str],
+    *,
+    stream: str,
+) -> subprocess.CompletedProcess[bytes]:
+    read_descriptor, write_descriptor = os.pipe()
+    os.close(read_descriptor)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT / "api")
+    streams = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    streams[stream] = write_descriptor
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "scripts.retrieval_eval", *argv],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=streams["stdout"],
+            stderr=streams["stderr"],
+        )
+    finally:
+        os.close(write_descriptor)
+    stdout, stderr = process.communicate(timeout=10)
+    return subprocess.CompletedProcess(
+        process.args,
+        process.returncode,
+        stdout or b"",
+        stderr or b"",
+    )
+
+
+class _EmissionFailingBuffer:
+    def __init__(self, failure: str) -> None:
+        self.content = bytearray()
+        self.failure = failure
+
+    def write(self, content: bytes) -> int:
+        if self.failure == "write":
+            raise BrokenPipeError("private immediate write failure")
+        self.content.extend(content)
+        return len(content)
+
+    def flush(self) -> None:
+        if self.failure == "flush":
+            raise BrokenPipeError("private delayed flush failure")
+
+    def seek(self, offset: int) -> int:
+        assert offset == 0
+        return 0
+
+    def truncate(self, size: int = 0) -> int:
+        del self.content[size:]
+        return size
+
+
+class _EmissionFailingStream:
+    def __init__(self, failure: str) -> None:
+        self.buffer = _EmissionFailingBuffer(failure)
+
+
 @pytest.mark.parametrize("profile", ["lexical", "hybrid"])
 def test_single_profile_report_is_deterministic_and_retrieves_each_case_once(profile, capsys):
     factory, retrievers, factory_calls = _factory()
@@ -258,6 +323,58 @@ def test_output_file_is_byte_identical_to_stdout(tmp_path, capsys):
     assert code == 0
     assert captured.err == ""
     assert output_path.read_bytes() == captured.out.encode("utf-8")
+
+
+def test_real_closed_stdout_pipe_returns_four_without_shutdown_diagnostics():
+    completed = _run_cli_with_closed_stream(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        stream="stdout",
+    )
+
+    assert completed.returncode == 4
+    assert completed.stdout == b""
+    assert b"Exception ignored" not in completed.stderr
+    assert b"Traceback" not in completed.stderr
+    assert b"BrokenPipeError" not in completed.stderr
+
+
+def test_real_closed_stderr_pipe_preserves_invalid_arguments_exit_code():
+    completed = _run_cli_with_closed_stream([], stream="stderr")
+
+    assert completed.returncode == 2
+    assert completed.stdout == b""
+
+
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_stdout_emission_failure_without_file_descriptor_returns_four_and_clears_buffer(
+    failure,
+    monkeypatch,
+):
+    stream = _EmissionFailingStream(failure)
+    factory, _retrievers, _factory_calls = _factory()
+    monkeypatch.setattr(retrieval_eval_module.sys, "stdout", stream)
+
+    code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+
+    assert code == 4
+    assert stream.buffer.content == b""
+
+
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_stderr_emission_failure_without_file_descriptor_preserves_business_exit_code(
+    failure,
+    monkeypatch,
+):
+    stream = _EmissionFailingStream(failure)
+    monkeypatch.setattr(retrieval_eval_module.sys, "stderr", stream)
+
+    code = main([])
+
+    assert code == 2
+    assert stream.buffer.content == b""
 
 
 @pytest.mark.parametrize(
