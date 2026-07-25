@@ -98,6 +98,7 @@ def test_loads_synthetic_fixture_and_all_current_query_filters():
     ("mutate", "message"),
     [
         (lambda payload: payload.update(schema_version=2), "unsupported schema_version"),
+        (lambda payload: payload.update(schema_version=1.0), "unsupported schema_version"),
         (lambda payload: payload.pop("relevance"), "missing fields: relevance"),
         (lambda payload: payload.update(extra=True), "unknown fields: extra"),
         (lambda payload: payload.update(case_id="  "), "case_id must be a nonblank string"),
@@ -138,6 +139,12 @@ def test_parser_rejects_invalid_or_non_strict_cases(tmp_path, mutate, message):
 def test_parser_rejects_duplicate_case_ids(tmp_path):
     with pytest.raises(ValueError, match="duplicate case_id: case-1"):
         load_cases(_write_jsonl(tmp_path, _case_payload(), _case_payload()))
+
+
+def test_positive_integer_grades_are_not_subject_to_an_arbitrary_domain_cap():
+    judgment = RelevanceJudgment("fixture-policy", 101)
+
+    assert judgment.grade == 101
 
 
 def test_parser_rejects_duplicate_and_overlapping_relevance(tmp_path):
@@ -290,6 +297,7 @@ def test_value_types_reject_invalid_rankings_latencies_and_duplicate_cases():
     ("baseline_recall", "hybrid_recall", "baseline_latency", "hybrid_latency", "eligible"),
     [
         (0.50, 0.55, 10.0, 20.0, True),
+        (0.75, 0.825, 0.3, 0.6, True),
         (0.50, 0.549999, 10.0, 20.0, False),
         (0.50, 0.55, 10.0, 20.000001, False),
     ],

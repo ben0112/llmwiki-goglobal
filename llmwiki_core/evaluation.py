@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from math import ceil, isfinite, log2
 from numbers import Real
 from os import PathLike
@@ -19,7 +20,6 @@ MAX_LINE_BYTES = 256 * 1024
 MAX_CASES = 10_000
 MAX_RELEVANCE_PER_CASE = 10_000
 MAX_RANKING_LENGTH = 10_000
-MAX_GRADE = 100
 
 _CASE_FIELDS = frozenset({"schema_version", "case_id", "query", "relevance"})
 _QUERY_FIELDS = frozenset(
@@ -94,8 +94,8 @@ class RelevanceJudgment:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "document_id", _nonblank_string("document_id", self.document_id))
-        if isinstance(self.grade, bool) or not isinstance(self.grade, int) or not 1 <= self.grade <= MAX_GRADE:
-            raise ValueError(f"grade must be a positive integer no greater than {MAX_GRADE}")
+        if isinstance(self.grade, bool) or not isinstance(self.grade, int) or self.grade <= 0:
+            raise ValueError("grade must be a positive integer")
         object.__setattr__(self, "chunk_index", _chunk_index(self.chunk_index))
 
     @property
@@ -129,7 +129,7 @@ class EvalCase:
     relevance: tuple[RelevanceJudgment, ...]
 
     def __post_init__(self) -> None:
-        if isinstance(self.schema_version, bool) or self.schema_version != EVALUATION_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != EVALUATION_SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version: {self.schema_version!r}")
         object.__setattr__(self, "case_id", _nonblank_string("case_id", self.case_id))
         if not isinstance(self.query, SearchQuery):
@@ -319,7 +319,7 @@ def _parse_case(value: object) -> EvalCase:
         required=_CASE_FIELDS,
     )
     schema_version = raw_case["schema_version"]
-    if isinstance(schema_version, bool) or schema_version != EVALUATION_SCHEMA_VERSION:
+    if type(schema_version) is not int or schema_version != EVALUATION_SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version: {schema_version!r}")
     return EvalCase.build(
         schema_version=schema_version,
@@ -394,9 +394,10 @@ def _case_metrics(case: EvalCase, run: EvaluationRun) -> tuple[float, float, flo
     relevant_count = len(case.relevance)
     recalls = tuple(sum(rank <= cutoff for rank, _judgment in matches) / relevant_count for cutoff in (5, 10, 20))
     mrr = 0.0 if not matches else 1.0 / matches[0][0]
-    dcg = sum((2**judgment.grade - 1) / log2(rank + 1) for rank, judgment in matches if rank <= 10)
+    max_grade = max(item.grade for item in case.relevance)
+    dcg = sum(_scaled_gain(judgment.grade, max_grade) / log2(rank + 1) for rank, judgment in matches if rank <= 10)
     ideal_grades = sorted((item.grade for item in case.relevance), reverse=True)[:10]
-    ideal_dcg = sum((2**grade - 1) / log2(rank + 1) for rank, grade in enumerate(ideal_grades, 1))
+    ideal_dcg = sum(_scaled_gain(grade, max_grade) / log2(rank + 1) for rank, grade in enumerate(ideal_grades, 1))
     ndcg = dcg / ideal_dcg
     return (*recalls, mrr, ndcg)
 
@@ -404,6 +405,15 @@ def _case_metrics(case: EvalCase, run: EvaluationRun) -> tuple[float, float, flo
 def _nearest_rank(values: Sequence[float], percentile: float) -> float:
     ordered = sorted(values)
     return ordered[max(0, ceil(percentile * len(ordered)) - 1)]
+
+
+def _scaled_gain(grade: int, max_grade: int) -> float:
+    """Return ``(2**grade - 1) * 2**-max_grade`` without huge powers."""
+
+    scaled_unit = 0.0 if max_grade > 1074 else 2.0 ** (-max_grade)
+    delta = grade - max_grade
+    scaled_power = 0.0 if delta < -1074 else 2.0**delta
+    return scaled_power - scaled_unit
 
 
 def _index_cases_and_runs(
@@ -479,14 +489,16 @@ def promotion_decision(
         raise ValueError("promotion inputs must be EvaluationReport values")
     if lexical.recall_at_10 <= 0:
         return PromotionDecision(False, "baseline_recall_zero")
-    recall_ratio = hybrid.recall_at_10 / lexical.recall_at_10
-    latency_ratio = hybrid.latency_p95_ms / max(lexical.latency_p95_ms, 0.001)
-    eligible = recall_ratio >= 1.10 and latency_ratio <= 2.0
+    recall_ratio_decimal = Decimal(str(hybrid.recall_at_10)) / Decimal(str(lexical.recall_at_10))
+    latency_ratio_decimal = Decimal(str(hybrid.latency_p95_ms)) / max(
+        Decimal(str(lexical.latency_p95_ms)), Decimal("0.001")
+    )
+    eligible = recall_ratio_decimal >= Decimal("1.10") and latency_ratio_decimal <= Decimal("2.0")
     return PromotionDecision(
         eligible=eligible,
         reason="eligible" if eligible else "gate_failed",
-        recall_ratio=recall_ratio,
-        latency_ratio=latency_ratio,
+        recall_ratio=float(recall_ratio_decimal),
+        latency_ratio=float(latency_ratio_decimal),
     )
 
 
