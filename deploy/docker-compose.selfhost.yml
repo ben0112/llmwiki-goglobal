@@ -3,18 +3,29 @@
 # Prerequisites (see docs/self-hosting.md):
 #   1. A self-hosted Supabase stack (Postgres + GoTrue auth behind Kong) —
 #      run it from Supabase's official docker compose; it is NOT part of
-#      this file. Apply supabase/migrations/ 001..009 to its database.
+#      this file. Apply supabase/migrations/ 001..012 to its database.
 #   2. Copy deploy/.env.selfhost.example to deploy/.env.selfhost and fill it in.
 #
 # Build + run from the repository root:
 #   docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost up -d --build
 #
-# Scaling note: run exactly ONE api replica — resumable-upload state, the
-# WebSocket connection manager, and graph rebuild locks are process-local.
+# API and worker replicas scale independently. Gateway is the only public API
+# listener and resolves the current API task set through Docker DNS.
 
 name: llmwiki-selfhost
 
 services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -74,11 +85,69 @@ services:
       PDF_BACKEND: ${PDF_BACKEND:-opendataloader}
       GLOBAL_MAX_USERS: ${GLOBAL_MAX_USERS:-10000}
       SENTRY_DSN: ${SENTRY_DSN:-}
-      STAGE: prod
+      REDIS_URL: redis://redis:6379/0
+      DURABLE_JOBS_ENABLED: "true"
+      TUS_MULTIPART_ENABLED: "true"
+      STAGE: ${STAGE:-prod}
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 10
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      converter:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    command: ["arq", "jobs.worker.WorkerSettings"]
+    environment:
+      MODE: hosted
+      DATABASE_URL: ${DATABASE_URL}
+      DIRECT_DATABASE_URL: ${DIRECT_DATABASE_URL}
+      SUPABASE_URL: ${SUPABASE_URL}
+      APP_URL: ${APP_URL}
+      API_URL: ${API_URL}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL}
+      S3_FORCE_PATH_STYLE: "true"
+      CONVERTER_URL: http://converter:8000
+      CONVERTER_SECRET: ${CONVERTER_SECRET}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      PDF_BACKEND: ${PDF_BACKEND:-opendataloader}
+      REDIS_URL: redis://redis:6379/0
+      DURABLE_JOBS_ENABLED: "true"
+      TUS_MULTIPART_ENABLED: "true"
+      STAGE: ${STAGE:-prod}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      converter:
+        condition: service_started
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "8000:8000"
     depends_on:
-      minio:
+      api:
         condition: service_healthy
     restart: unless-stopped
 
@@ -133,3 +202,4 @@ services:
 
 volumes:
   minio-data:
+  redis-data:

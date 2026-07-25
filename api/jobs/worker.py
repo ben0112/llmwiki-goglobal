@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from uuid import UUID, uuid4
 
 import asyncpg
+import httpx
 from arq import cron
 from arq.connections import RedisSettings
 from arq.worker import create_worker as arq_create_worker
@@ -47,6 +48,16 @@ _UNHANDLED_MESSAGE = "The job encountered an unexpected error."
 _INVALID_RESULT_CODE = "invalid_job_result"
 _INVALID_RESULT_MESSAGE = "The job produced an invalid result."
 _OWNED_RESOURCES_CTX_KEY = "_durable_worker_owned_resources"
+_WORKER_RUNTIME_CTX_KEYS = (
+    "worker_context",
+    "handlers",
+    "worker_id",
+    "lease_seconds",
+    "heartbeat_seconds",
+    "dispatch_batch_size",
+    "reap_batch_size",
+    "redeliver_seconds",
+)
 
 
 async def _create_pool(database_url: str) -> asyncpg.Pool:
@@ -69,6 +80,24 @@ def _s3_is_configured(runtime_settings: object) -> bool:
         and getattr(runtime_settings, "AWS_ACCESS_KEY_ID", None)
         and getattr(runtime_settings, "AWS_SECRET_ACCESS_KEY", None)
     )
+
+
+async def _check_worker_readiness(
+    *,
+    pool: asyncpg.Pool,
+    redis: object,
+    s3: object | None,
+    converter_url: str,
+) -> None:
+    """Verify every dependency needed before ARQ starts accepting jobs."""
+    await pool.fetchval("SELECT 1")
+    await redis.ping()
+    if s3 is not None:
+        await s3.head_bucket()
+    if converter_url:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            response = await client.get(f"{converter_url.rstrip('/')}/health")
+            response.raise_for_status()
 
 
 def validate_worker_runtime(runtime_settings: object) -> None:
@@ -146,9 +175,18 @@ async def startup(ctx: dict) -> None:
                 "redeliver_seconds": runtime_settings.JOB_REDELIVER_SECONDS,
             }
         )
+        await _check_worker_readiness(
+            pool=pool,
+            redis=ctx["redis"],
+            s3=s3,
+            converter_url=runtime_settings.CONVERTER_URL,
+        )
         ctx[_OWNED_RESOURCES_CTX_KEY] = created_resources
     except BaseException:
-        await _close_worker_resources(ctx, owned_resources=created_resources)
+        try:
+            await _close_worker_resources(ctx, owned_resources=created_resources)
+        finally:
+            _clear_worker_runtime_context(ctx)
         raise
 
 
@@ -176,6 +214,11 @@ async def _close_worker_resources(
             await pool.close()
 
 
+def _clear_worker_runtime_context(ctx: dict) -> None:
+    for key in _WORKER_RUNTIME_CTX_KEYS:
+        ctx.pop(key, None)
+
+
 async def shutdown(ctx: dict) -> None:
     """Release worker-owned resources while leaving ARQ's Redis client alone."""
     owned_resources = ctx.pop(_OWNED_RESOURCES_CTX_KEY, None)
@@ -184,14 +227,7 @@ async def shutdown(ctx: dict) -> None:
     try:
         await _close_worker_resources(ctx, owned_resources=owned_resources)
     finally:
-        ctx.pop("worker_context", None)
-        ctx.pop("handlers", None)
-        ctx.pop("worker_id", None)
-        ctx.pop("lease_seconds", None)
-        ctx.pop("heartbeat_seconds", None)
-        ctx.pop("dispatch_batch_size", None)
-        ctx.pop("reap_batch_size", None)
-        ctx.pop("redeliver_seconds", None)
+        _clear_worker_runtime_context(ctx)
 
 
 async def _record_failure(
@@ -490,6 +526,22 @@ def run_durable_worker(runtime_settings: object = settings, **kwargs: object) ->
     worker_settings = build_worker_settings(runtime_settings)
     _merge_worker_context(runtime_settings, kwargs)
     return arq_run_worker(worker_settings, **kwargs)
+
+
+class WorkerSettings:
+    """ARQ CLI settings; startup performs the authoritative runtime validation."""
+
+    functions = [run_job]
+    cron_jobs = _build_cron_jobs()
+    max_jobs = 10
+    max_tries = 1
+    retry_jobs = False
+    keep_result = 0
+    job_timeout = 3600
+    on_startup = startup
+    on_shutdown = shutdown
+    redis_settings = RedisSettings.from_dsn(settings.REDIS_URL or "redis://localhost:6379/0")
+    ctx = {"runtime_settings": settings}
 
 
 def main() -> None:

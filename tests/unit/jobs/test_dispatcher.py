@@ -368,13 +368,16 @@ async def test_real_arq_cron_ids_change_by_schedule_and_dedupe_across_replicas()
     assert dispatch_ids[1] != first_dispatch_id
 
 
-def test_worker_module_does_not_expose_arq_cli_worker_settings():
+def test_worker_module_exposes_safe_arq_cli_worker_settings():
     from arq.utils import import_string
     from jobs import worker
 
-    assert not hasattr(worker, "WorkerSettings")
-    with pytest.raises(ImportError, match="does not define"):
-        import_string("jobs.worker.WorkerSettings")
+    imported = import_string("jobs.worker.WorkerSettings")
+    assert imported is worker.WorkerSettings
+    assert imported.functions == [worker.run_job]
+    assert imported.on_startup is worker.startup
+    assert imported.on_shutdown is worker.shutdown
+    assert imported.ctx == {"runtime_settings": worker.settings}
 
 
 @pytest.mark.parametrize(
@@ -546,7 +549,9 @@ class FakeWorkerPool:
     async def close(self):
         self.close_calls += 1
 
-    async def fetchval(self, query, serialized_json):
+    async def fetchval(self, query, serialized_json=None):
+        if query == "SELECT 1" and serialized_json is None:
+            return 1
         self.result_validation_calls.append((query, serialized_json))
         self.events.append("postgres-validate")
         if self.postgres_validation_error is not None:
@@ -1172,8 +1177,16 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     from jobs import worker
 
     pool = PoolWithConnectionTransaction()
-    redis = object()
-    s3 = object()
+    class Redis:
+        async def ping(self):
+            return True
+
+    class S3:
+        async def head_bucket(self):
+            return None
+
+    redis = Redis()
+    s3 = S3()
 
     async def create_pool(database_url):
         assert database_url == "postgresql://worker.test/jobs"
@@ -1188,7 +1201,7 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
         AWS_ACCESS_KEY_ID="access",
         AWS_SECRET_ACCESS_KEY="secret",
         S3_BUCKET="bucket",
-        CONVERTER_URL="https://converter.test",
+        CONVERTER_URL="",
         CONVERTER_SECRET="converter-secret",
     )
     monkeypatch.setattr(worker.settings, "MODE", "local")

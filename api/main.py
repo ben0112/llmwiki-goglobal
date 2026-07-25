@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+import socket
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware as _BaseCORSMiddleware
@@ -20,8 +21,26 @@ class CORSMiddleware(_BaseCORSMiddleware):
             return
         await super().__call__(scope, receive, send)
 
-from config import settings
-from infra.tasks import spawn_logged
+
+class ReplicaIdentityMiddleware:
+    """Expose a replica identity only to scaled smoke tests."""
+
+    def __init__(self, app, *, stage: str, instance_id: str):
+        self.app = app
+        self.instance_id = instance_id if stage == "test" else None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_identity(message):
+            if self.instance_id is not None and message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-api-instance-id", self.instance_id.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_identity)
+
+from config import settings  # noqa: E402 - middleware must be defined before app imports.
+from infra.tasks import spawn_logged  # noqa: E402 - middleware must be defined before app imports.
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +54,12 @@ if settings.SENTRY_DSN:
     )
 
 
-from routes.health import router as health_router
-from routes.knowledge_bases import router as knowledge_bases_router
-from routes.documents import router as documents_router
-from routes.me import router as me_router
-from routes.usage import router as usage_router
-from routes.corpus_pipeline import router as corpus_pipeline_router
+from routes.corpus_pipeline import router as corpus_pipeline_router  # noqa: E402
+from routes.documents import router as documents_router  # noqa: E402
+from routes.health import router as health_router  # noqa: E402
+from routes.knowledge_bases import router as knowledge_bases_router  # noqa: E402
+from routes.me import router as me_router  # noqa: E402
+from routes.usage import router as usage_router  # noqa: E402
 
 
 async def _repair_hosted_derived_drift(pool) -> list[dict]:
@@ -195,10 +214,8 @@ async def _finish_hosted_startup(app: FastAPI, pool):
             cleanup_task = asyncio.create_task(cleanup_stale_uploads())
     except BaseException:
         listener_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await listener_task
-        except asyncio.CancelledError:
-            pass
         raise
     return listener_task, cleanup_task
 
@@ -277,9 +294,10 @@ async def _local_lifespan_inner(app: FastAPI):
     """Local mode: SQLite + local filesystem + single-user auth."""
     import uuid
     from pathlib import Path
+
+    from infra.auth.local import LocalAuthProvider
     from infra.db.sqlite import create_pool as create_sqlite_pool
     from infra.storage.local import LocalStorageService
-    from infra.auth.local import LocalAuthProvider
 
     workspace = Path(settings.WORKSPACE_PATH).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -330,6 +348,7 @@ async def _local_lifespan_inner(app: FastAPI):
 async def _local_lifespan(app: FastAPI):
     db = await _local_lifespan_inner(app)
     from pathlib import Path
+
     from infra.db.sqlite import create_pool as create_sqlite_pool
     workspace = Path(app.state.workspace_path)
     db_path = str(workspace / ".llmwiki" / "index.db")
@@ -373,31 +392,21 @@ async def _local_lifespan(app: FastAPI):
         if pipeline_task is not None and not pipeline_task.done():
             # 逐条状态即时落库,取消只丢弃当前未完成的单条,下轮自动续跑
             pipeline_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await pipeline_task
-            except asyncio.CancelledError:
-                pass
         corpus_auto_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await corpus_auto_task
-        except asyncio.CancelledError:
-            pass
         reconcile_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await reconcile_task
-        except asyncio.CancelledError:
-            pass
         sweep_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await sweep_task
-        except asyncio.CancelledError:
-            pass
         if watcher_task:
             watcher_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await watcher_task
-            except asyncio.CancelledError:
-                pass
         await reconcile_db.close()
         await watcher_db.close()
         await sweep_db.close()
@@ -406,15 +415,20 @@ async def _local_lifespan(app: FastAPI):
 
 app = FastAPI(title="LLM Wiki API", lifespan=lifespan)
 
+app.add_middleware(
+    ReplicaIdentityMiddleware,
+    stage=settings.STAGE,
+    instance_id=socket.gethostname(),
+)
+
 # Rate limiting — applied as middleware so every authenticated route gets a
 # broad ceiling. Hot endpoints can add tighter `@limiter.limit(...)` overrides.
 # Skip in local mode where there's only one user.
 if settings.MODE != "local":
+    from infra.rate_limit import limiter
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
     from slowapi.middleware import SlowAPIMiddleware
-
-    from infra.rate_limit import limiter
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -438,6 +452,7 @@ app.add_middleware(
         "Tus-Resumable", "Tus-Version", "Tus-Max-Size", "Tus-Extension",
         "X-Document-Id",
         "X-Job-Id",
+        "X-API-Instance-ID",
     ],
 )
 
@@ -450,9 +465,10 @@ app.include_router(knowledge_bases_router)
 app.include_router(documents_router)
 
 if settings.MODE == "local":
-    from routes.local_upload import router as local_upload_router
-    from routes.files import router as files_router, set_workspace_root
+    from routes.files import router as files_router
+    from routes.files import set_workspace_root
     from routes.local_graph import router as local_graph_router
+    from routes.local_upload import router as local_upload_router
     app.include_router(local_upload_router)
     app.include_router(files_router)
     app.include_router(local_graph_router)
