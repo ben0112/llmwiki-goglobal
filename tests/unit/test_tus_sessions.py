@@ -272,6 +272,26 @@ def test_store_uses_exact_session_key_and_single_key_create_lua():
     assert args[2] == "120"
 
 
+def test_store_create_under_lock_uses_same_slot_keys_and_maps_lock_loss():
+    module = _module()
+    redis = FakeRedis(eval_results=[1, 3])
+    store = module.TusSessionStore(redis)
+    session = _valid_session(module)
+    token = "L" * 32
+
+    created = asyncio.run(store.create_under_lock(session, ttl_seconds=120, lock_token=token))
+    lock_lost = asyncio.run(store.create_under_lock(session, ttl_seconds=120, lock_token=token))
+
+    assert created is module.SessionCreateStatus.CREATED
+    assert lock_lost is module.SessionCreateStatus.LOCK_LOST
+    assert all(call[1] == 2 for call in redis.eval_calls)
+    _, _, args = redis.eval_calls[0]
+    assert key_slot(args[0].encode()) == key_slot(args[1].encode())
+    assert args[0] == f"tus:session:{{{session.upload_id}}}"
+    assert args[1] == f"tus:lock:{{{session.upload_id}}}"
+    assert args[4] == token
+
+
 def test_get_returns_none_for_missing_record_and_fails_closed_for_malformed_record():
     module = _module()
     upload_id = uuid4()
@@ -480,12 +500,8 @@ def test_reservation_marker_persists_quota_owner_and_release_is_token_fenced():
     redis = FakeRedis(set_results=[True, None], get_result=payload, eval_results=[4, 1, 2])
     store = module.TusSessionStore(redis)
 
-    created = asyncio.run(
-        store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90)
-    )
-    duplicate = asyncio.run(
-        store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90)
-    )
+    created = asyncio.run(store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90))
+    duplicate = asyncio.run(store.create_reservation(user_id, upload_id, 12, owner_token=owner_token, ttl_seconds=90))
     marker = asyncio.run(store.get_reservation(user_id, upload_id))
     wrong_owner = asyncio.run(store.release_reservation_once(user_id, upload_id, "C" * 32))
     released = asyncio.run(store.release_reservation_once(user_id, upload_id, owner_token))

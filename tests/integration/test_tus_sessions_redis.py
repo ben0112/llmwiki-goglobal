@@ -152,6 +152,22 @@ async def test_real_redis_concurrent_cas_allows_exactly_one_append(namespace):
     assert session.parts[0].etag in {"etag-a", "etag-b"}
 
 
+async def test_real_redis_create_under_lock_is_atomic_with_lock_ownership(namespace, redis_client):
+    module, store, upload_id, user_id, kb_id = namespace
+    session = _session(module, upload_id, user_id, kb_id)
+    stale = await _lock_token(module, store, upload_id)
+    await redis_client.delete(module.lock_key(upload_id))
+    owner = await _lock_token(module, store, upload_id)
+
+    lost = await store.create_under_lock(session, ttl_seconds=60, lock_token=stale)
+    assert lost is module.SessionCreateStatus.LOCK_LOST
+    assert await store.get(upload_id) is None
+
+    created = await store.create_under_lock(session, ttl_seconds=60, lock_token=owner)
+    assert created is module.SessionCreateStatus.CREATED
+    assert await store.get(upload_id) is not None
+
+
 async def test_real_redis_stale_lock_owner_cannot_append_or_complete(namespace, redis_client):
     module, store, upload_id, user_id, kb_id = namespace
     await store.create(_session(module, upload_id, user_id, kb_id, total=5), ttl_seconds=60)

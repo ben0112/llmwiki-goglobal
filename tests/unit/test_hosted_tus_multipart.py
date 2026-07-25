@@ -199,6 +199,7 @@ class Store:
         self.marker = None
         self.marker_reads = 0
         self.renew_status = LockMutationStatus.RENEWED
+        self.lock_token = None
 
     async def create_reservation(self, user_id, upload_id, bytes_reserved, *, owner_token, ttl_seconds):
         self.events.append("marker.create")
@@ -230,18 +231,31 @@ class Store:
         self.session = session
         return SessionCreateStatus.CREATED
 
+    async def create_under_lock(self, session, ttl_seconds, *, lock_token):
+        if lock_token != self.lock_token:
+            return SessionCreateStatus.LOCK_LOST
+        return await self.create(session, ttl_seconds)
+
     async def get(self, upload_id):
         return self.session
 
     async def acquire_lock(self, upload_id, ttl_seconds):
-        return LockAcquireResult(LockAcquireStatus.ACQUIRED, "L" * 32)
+        if self.lock_token is not None:
+            return LockAcquireResult(LockAcquireStatus.CONTENDED, None)
+        self.lock_token = "L" * 32
+        return LockAcquireResult(LockAcquireStatus.ACQUIRED, self.lock_token)
 
     async def renew_lock(self, upload_id, token, ttl_seconds):
         self.events.append("lock.renew")
+        if token != self.lock_token:
+            return LockMutationStatus.NOT_OWNER
         return self.renew_status
 
     async def release_lock(self, upload_id, token):
         self.events.append("lock.release")
+        if token != self.lock_token:
+            return LockMutationStatus.NOT_OWNER
+        self.lock_token = None
         return LockMutationStatus.RELEASED
 
     async def append_part(self, upload_id, expected_offset, byte_count, part_number, etag, ttl_seconds, *, lock_token):
@@ -365,7 +379,9 @@ async def test_create_compensates_completed_stages_in_reverse_order(monkeypatch,
     elif stage == "s3":
         assert events == ["quota.reserve", "s3.create", "quota.release", "marker.release"]
     else:
-        assert events[-3:] == ["s3.abort", "quota.release", "marker.release"]
+        assert events.index("session.create") < events.index("s3.abort")
+        assert events.index("s3.abort") < events.index("quota.release") < events.index("marker.release")
+        assert events[-1] == "lock.release"
 
 
 @pytest.mark.parametrize(
@@ -400,6 +416,233 @@ async def test_create_rejects_invalid_session_metadata_before_quota_or_s3(
     assert response.status_code == 400
     assert "quota.reserve" not in events
     assert "s3.create" not in events
+
+
+async def test_create_holds_upload_lock_across_marker_and_session_visibility(monkeypatch):
+    from infra.tus import HostedTusCleanupService
+
+    events = []
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+
+    class BlockingStore(Store):
+        async def create_under_lock(self, session, ttl_seconds, *, lock_token):
+            self.events.append("session.create")
+            create_started.set()
+            await allow_create.wait()
+            if lock_token != self.lock_token:
+                return SessionCreateStatus.LOCK_LOST
+            self.session = session
+            return SessionCreateStatus.CREATED
+
+        async def iter_sessions(self):
+            if self.session is not None:
+                yield self.session
+
+        async def iter_reservations(self):
+            if self.marker is not None:
+                assert self.session is None
+                yield USER_ID, self.pending_upload_id, self.marker
+
+        async def create_reservation(self, user_id, upload_id, bytes_reserved, *, owner_token, ttl_seconds):
+            self.pending_upload_id = upload_id
+            return await super().create_reservation(
+                user_id,
+                upload_id,
+                bytes_reserved,
+                owner_token=owner_token,
+                ttl_seconds=ttl_seconds,
+            )
+
+    class Jobs:
+        async def ensure_upload_cleanup(self, command, *, authenticated_user_id):
+            return SimpleNamespace(), True
+
+    store = BlockingStore(events)
+    quota = Quota(events)
+    app = _app(monkeypatch, S3(events), quota, store, lock_seconds=1)
+    cleanup = HostedTusCleanupService(
+        Pool(),
+        S3(events),
+        Jobs(),
+        quota,
+        store,
+        session_ttl_seconds=300,
+        stale_seconds=60,
+        lock_seconds=1,
+    )
+
+    async with await _client(app) as client:
+        create_task = asyncio.create_task(
+            client.post(
+                "/v1/uploads",
+                headers={
+                    "X-Test-User": str(USER_ID),
+                    "Tus-Resumable": "1.0.0",
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata(),
+                },
+            )
+        )
+        await create_started.wait()
+        assert store.marker is not None and store.session is None
+        assert await cleanup.enqueue_stale_jobs() == 1
+        result = await cleanup.cleanup(store.pending_upload_id, USER_ID)
+        assert result["status"] == "contended"
+        assert "quota.release" not in events
+        assert "marker.release" not in events
+        allow_create.set()
+        response = await create_task
+
+    assert response.status_code == 201
+    assert store.session is not None
+    assert store.marker.state is TusReservationState.RESERVED
+    assert "quota.release" not in events
+    assert "marker.release" not in events
+
+
+async def test_create_lock_loss_before_atomic_session_write_leaves_no_active_session(monkeypatch):
+    events = []
+
+    class LostLockStore(Store):
+        async def create_under_lock(self, session, ttl_seconds, *, lock_token):
+            self.events.append("session.create_under_lock")
+            self.lock_token = "X" * 32
+            return SessionCreateStatus.LOCK_LOST
+
+    store = LostLockStore(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/v1/uploads",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Length": "100",
+                "Upload-Metadata": _metadata(),
+            },
+        )
+
+    assert response.status_code == 503
+    assert store.session is None
+    assert events.index("session.create_under_lock") < events.index("s3.abort")
+    assert events.index("s3.abort") < events.index("quota.release")
+
+
+async def test_create_session_response_loss_deletes_session_before_releasing_quota(monkeypatch):
+    events = []
+
+    class LostCreateResponseStore(Store):
+        async def create_under_lock(self, session, ttl_seconds, *, lock_token):
+            await super().create_under_lock(session, ttl_seconds, lock_token=lock_token)
+            raise RuntimeError("create response lost")
+
+    store = LostCreateResponseStore(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/v1/uploads",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Length": "100",
+                "Upload-Metadata": _metadata(),
+            },
+        )
+
+    assert response.status_code == 503
+    assert store.session is None
+    assert events.index("s3.abort") < events.index("session.delete") < events.index("quota.release")
+
+
+async def test_create_lock_contention_aborts_before_exposing_marker(monkeypatch):
+    events = []
+
+    class ContendedStore(Store):
+        async def acquire_lock(self, upload_id, ttl_seconds):
+            return LockAcquireResult(LockAcquireStatus.CONTENDED, None)
+
+    store = ContendedStore(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/v1/uploads",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Length": "100",
+                "Upload-Metadata": _metadata(),
+            },
+        )
+
+    assert response.status_code == 503
+    assert store.marker is None and store.session is None
+    assert events == ["quota.reserve", "s3.create", "s3.abort", "quota.release", "marker.release"]
+
+
+async def test_create_cancellation_compensates_while_initialization_lock_is_held(monkeypatch):
+    events = []
+    create_started = asyncio.Event()
+
+    class CancelledStore(Store):
+        async def create_under_lock(self, session, ttl_seconds, *, lock_token):
+            create_started.set()
+            await asyncio.Event().wait()
+
+    store = CancelledStore(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    async with await _client(app) as client:
+        task = asyncio.create_task(
+            client.post(
+                "/v1/uploads",
+                headers={
+                    "X-Test-User": str(USER_ID),
+                    "Tus-Resumable": "1.0.0",
+                    "Upload-Length": "100",
+                    "Upload-Metadata": _metadata(),
+                },
+            )
+        )
+        await create_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert store.session is None
+    assert events.index("s3.abort") < events.index("quota.release") < events.index("marker.release")
+    assert events[-1] == "lock.release"
+
+
+async def test_create_lock_release_response_loss_does_not_replace_success(monkeypatch):
+    events = []
+
+    class LostReleaseStore(Store):
+        async def release_lock(self, upload_id, token):
+            await super().release_lock(upload_id, token)
+            raise RuntimeError("release response lost")
+
+    store = LostReleaseStore(events)
+    app = _app(monkeypatch, S3(events), Quota(events), store)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/v1/uploads",
+            headers={
+                "X-Test-User": str(USER_ID),
+                "Tus-Resumable": "1.0.0",
+                "Upload-Length": "100",
+                "Upload-Metadata": _metadata(),
+            },
+        )
+
+    assert response.status_code == 201
+    assert store.session is not None
+    assert store.marker is not None and store.marker.state is TusReservationState.RESERVED
+    assert "quota.release" not in events
 
 
 async def test_offset_is_not_committed_until_s3_returns_an_etag(monkeypatch):
@@ -1219,6 +1462,10 @@ async def test_cleanup_scan_enqueues_reserved_marker_without_session():
 
         async def iter_reservations(self):
             yield USER_ID, upload_id, marker
+
+        async def get(self, candidate_upload_id):
+            assert candidate_upload_id == upload_id
+            return
 
     class Jobs:
         async def ensure_upload_cleanup(self, command, *, authenticated_user_id):

@@ -408,9 +408,10 @@ class HostedTusMultipartService:
         self.lock_seconds = lock_seconds
         self.max_patch_bytes = max_patch_bytes
 
-    async def create(self, request: Request, user_id: str) -> Response:
+    async def create(self, request: Request, user_id: str) -> Response:  # noqa: C901
         from infra.quota import QuotaExceeded, QuotaUnavailable
         from infra.tus_sessions import (
+            LockAcquireStatus,
             ReservationCreateStatus,
             SessionCreateStatus,
             TusSession,
@@ -462,8 +463,16 @@ class HostedTusMultipartService:
         multipart_id = None
         marker_created = False
         session = None
+        lock_token = None
+        lock_lost = asyncio.Event()
+        lock_renewal = None
         try:
             multipart_id = await self.s3.create_multipart(key, CONTENT_TYPES.get(ext, "application/octet-stream"))
+            acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
+            if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
+                raise RuntimeError("upload initialization lock is unavailable")
+            lock_token = acquired.token
+            lock_renewal = asyncio.create_task(self._renew_upload_lock(upload_id, lock_token, lock_lost))
             now = datetime.now(UTC)
             session = TusSession(
                 upload_id=upload_id,
@@ -495,24 +504,56 @@ class HostedTusMultipartService:
             if marker is not ReservationCreateStatus.CREATED:
                 raise RuntimeError("reservation marker collision")
             marker_created = True
-            created = await self.sessions.create(session, self.session_ttl_seconds)
+            created = await self.sessions.create_under_lock(
+                session,
+                self.session_ttl_seconds,
+                lock_token=lock_token,
+            )
             if created is not SessionCreateStatus.CREATED:
                 raise RuntimeError("upload session collision")
         except asyncio.CancelledError:
-            await _shielded(self._compensate_create(reservation, key, multipart_id, marker_created, session))
+            await _shielded(
+                self._compensate_create(
+                    reservation,
+                    key,
+                    multipart_id,
+                    marker_created,
+                    session,
+                    lock_token=lock_token,
+                )
+            )
             raise
         except Exception:  # noqa: BLE001 -- all adapter failures require the same compensation
-            await _shielded(self._compensate_create(reservation, key, multipart_id, marker_created, session))
+            await _shielded(
+                self._compensate_create(
+                    reservation,
+                    key,
+                    multipart_id,
+                    marker_created,
+                    session,
+                    lock_token=lock_token,
+                )
+            )
             raise HTTPException(status_code=503, detail="Could not initialize resumable upload") from None
+        finally:
+            if lock_renewal is not None:
+                lock_renewal.cancel()
+                with suppress(asyncio.CancelledError):
+                    await lock_renewal
+            if lock_token is not None:
+                with suppress(Exception):
+                    await asyncio.shield(self.sessions.release_lock(upload_id, lock_token))
         return Response(status_code=201, headers=_tus_headers({"Location": f"/v1/uploads/{upload_id}"}))
 
-    async def _compensate_create(
+    async def _compensate_create(  # noqa: C901
         self,
         reservation,
         key: str,
         multipart_id: str | None,
         marker_created: bool,
         session,
+        *,
+        lock_token: str | None,
     ) -> None:
         abort_ok = True
         if multipart_id is not None:
@@ -545,17 +586,22 @@ class HostedTusMultipartService:
                 cleanup_session = replace(session, state=TusSessionState.CLEANUP_REQUIRED)
                 created = await self.sessions.create(cleanup_session, self.session_ttl_seconds)
                 if created is SessionCreateStatus.ALREADY_EXISTS:
-                    acquired = await self.sessions.acquire_lock(session.upload_id, self.lock_seconds)
-                    if acquired.token is not None:
+                    cleanup_token = lock_token
+                    acquired = None
+                    if cleanup_token is None:
+                        acquired = await self.sessions.acquire_lock(session.upload_id, self.lock_seconds)
+                        cleanup_token = acquired.token
+                    if cleanup_token is not None:
                         try:
                             await self.sessions.mark_cleanup_required(
                                 session.upload_id,
                                 session.offset,
                                 self.session_ttl_seconds,
-                                lock_token=acquired.token,
+                                lock_token=cleanup_token,
                             )
                         finally:
-                            await self.sessions.release_lock(session.upload_id, acquired.token)
+                            if acquired is not None:
+                                await self.sessions.release_lock(session.upload_id, cleanup_token)
             except Exception as exc:  # noqa: BLE001 -- recovery is best effort and must retain ownership
                 logger.error(
                     "TUS create recovery marker failed upload_id=%s error_type=%s",
@@ -563,6 +609,28 @@ class HostedTusMultipartService:
                     type(exc).__name__,
                 )
             return
+        if session is not None:
+            try:
+                stored = await self.sessions.get(session.upload_id)
+                owned = (
+                    stored is not None
+                    and stored.user_id == session.user_id
+                    and stored.knowledge_base_id == session.knowledge_base_id
+                    and stored.s3_key == session.s3_key
+                    and stored.multipart_upload_id == session.multipart_upload_id
+                    and stored.reservation_bytes == session.reservation_bytes
+                )
+                if stored is not None and (not owned or lock_token is None):
+                    return
+                if owned and not await self.sessions.delete_locked(session.upload_id, lock_token=lock_token):
+                    return
+            except Exception as exc:  # noqa: BLE001 -- retain quota when session ownership is uncertain
+                logger.error(
+                    "TUS create session compensation failed upload_id=%s error_type=%s",
+                    reservation.upload_id,
+                    type(exc).__name__,
+                )
+                return
         settled = False
         try:
             settled = await _release_quota_and_marker(self.quota, self.sessions, reservation)
@@ -1171,7 +1239,6 @@ class HostedTusCleanupService:
         stale_before = current.timestamp() - self.stale_seconds
         scan_bucket = int(current.timestamp() // 60)
         created = 0
-        seen: set[tuple[UUID, UUID]] = set()
 
         async def enqueue(user_id: UUID, upload_id: UUID) -> None:
             nonlocal created
@@ -1187,21 +1254,17 @@ class HostedTusCleanupService:
             created += int(was_created)
 
         async for session in self.sessions.iter_sessions():
-            seen.add((session.user_id, session.upload_id))
             if session.state is TusSessionState.COMPLETED:
                 marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
                 if marker is None or marker.state is not TusReservationState.RESERVED:
                     continue
             elif session.object_completed:
                 pass
-            elif (
-                session.state is not TusSessionState.CLEANUP_REQUIRED
-                and session.updated_at.timestamp() > stale_before
-            ):
+            elif session.state is not TusSessionState.CLEANUP_REQUIRED and session.updated_at.timestamp() > stale_before:
                 continue
             await enqueue(session.user_id, session.upload_id)
         async for user_id, upload_id, marker in self.sessions.iter_reservations():
-            if marker.state is TusReservationState.RESERVED and (user_id, upload_id) not in seen:
+            if marker.state is TusReservationState.RESERVED and await self.sessions.get(upload_id) is None:
                 await enqueue(user_id, upload_id)
         return created
 

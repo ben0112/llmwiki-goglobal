@@ -73,6 +73,7 @@ class TusSessionState(StrEnum):
 class SessionCreateStatus(StrEnum):
     CREATED = "created"
     ALREADY_EXISTS = "already_exists"
+    LOCK_LOST = "lock_lost"
 
 
 class AppendPartStatus(StrEnum):
@@ -731,6 +732,26 @@ return 1
 )
 
 
+_CREATE_SESSION_UNDER_LOCK_LUA = (
+    _LUA_RECORD_CODEC
+    + r"""
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then return 3 end
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+local session = decode_canonical(ARGV[1])
+local ttl = canonical_argument(ARGV[2], 1, MAX_TTL)
+if not session or not ttl then return 2 end
+local timestamp = redis_timestamp()
+if not timestamp then return 2 end
+session.created_at = timestamp
+session.updated_at = timestamp
+local encoded = canonical_record(session)
+if not encoded then return 2 end
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+return 1
+"""
+)
+
+
 _APPEND_PART_LUA = (
     _LUA_RECORD_CODEC
     + r"""
@@ -1008,6 +1029,34 @@ class TusSessionStore:
         code = _protocol_integer(raw, "session create status", maximum=2)
         if code == 2:
             raise TusSessionProtocolError("Redis rejected a locally validated session record")
+        return SessionCreateStatus.CREATED if code == 1 else SessionCreateStatus.ALREADY_EXISTS
+
+    async def create_under_lock(
+        self,
+        session: TusSession,
+        ttl_seconds: int,
+        *,
+        lock_token: str,
+    ) -> SessionCreateStatus:
+        """Create a session only while the caller still owns its upload lock."""
+        if not isinstance(session, TusSession):
+            raise ValueError("session must be a TusSession")
+        ttl = _require_ttl(ttl_seconds)
+        token = _validate_ascii_opaque(lock_token, "lock token", max_bytes=512)
+        raw = await self._redis.eval(
+            _CREATE_SESSION_UNDER_LOCK_LUA,
+            2,
+            session_key(session.upload_id),
+            lock_key(session.upload_id),
+            session.to_json(),
+            str(ttl),
+            token,
+        )
+        code = _protocol_integer(raw, "session create status", maximum=3)
+        if code == 2:
+            raise TusSessionProtocolError("Redis rejected a locally validated session record")
+        if code == 3:
+            return SessionCreateStatus.LOCK_LOST
         return SessionCreateStatus.CREATED if code == 1 else SessionCreateStatus.ALREADY_EXISTS
 
     async def get(self, upload_id: UUID) -> TusSession | None:
