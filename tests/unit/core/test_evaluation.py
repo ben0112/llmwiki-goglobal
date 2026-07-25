@@ -667,7 +667,6 @@ def test_report_and_decision_constructors_reject_contradictions():
         (True, "gate_failed", 1.1, 1.0),
         (False, "eligible", 1.1, 1.0),
         (True, "eligible", 1.0, 1.0),
-        (False, "gate_failed", 1.1, 2.0),
         (False, "baseline_recall_zero", 1.1, 1.0),
         (False, "gate_failed", None, None),
         (False, "unknown", 1.0, 1.0),
@@ -675,6 +674,9 @@ def test_report_and_decision_constructors_reject_contradictions():
     for args in inconsistent:
         with pytest.raises(ValueError, match="promotion decision fields are inconsistent"):
             PromotionDecision(*args)
+
+    rounded_gate_failure = PromotionDecision(False, "gate_failed", 1.1, 2.0)
+    assert rounded_gate_failure.eligible is False
 
 
 class _GuardedIterable:
@@ -710,6 +712,20 @@ def test_case_and_run_materialize_iterables_with_a_hard_bound(monkeypatch):
 
     assert relevance.consumed == 4
     assert ranking.consumed == 4
+
+
+def test_exact_gate_failure_survives_ratio_rounding_to_public_threshold():
+    baseline = float.fromhex("0x1.313542965b73bp-1")
+    hybrid = float.fromhex("0x1.4fba960bcaff4p-1")
+
+    decision = promotion_decision(
+        _report(recall_at_10=baseline, latency_p95_ms=1),
+        _report(recall_at_10=hybrid, latency_p95_ms=1),
+    )
+
+    assert decision.recall_ratio == 1.1
+    assert decision.eligible is False
+    assert decision.reason == "gate_failed"
 
 
 def test_public_evaluation_values_are_immutable():

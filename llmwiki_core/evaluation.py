@@ -312,7 +312,7 @@ class PromotionDecision:
         gates_pass = bool(has_ratios and self.recall_ratio >= 1.10 and self.latency_ratio <= 2.0)
         consistent = (
             (self.eligible and self.reason == "eligible" and gates_pass)
-            or (not self.eligible and self.reason == "gate_failed" and has_ratios and not gates_pass)
+            or (not self.eligible and self.reason == "gate_failed" and has_ratios)
             or (
                 not self.eligible
                 and self.reason == "baseline_recall_zero"
