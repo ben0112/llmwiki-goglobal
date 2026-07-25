@@ -154,7 +154,7 @@ python3 -m corpus.import_annotations \
 |---|---|
 | Postgres + 账号认证 | 自托管 Supabase(官方 docker compose;仅需 db/auth/kong) |
 | 对象存储 | MinIO(或任意 S3 兼容存储,经 `S3_ENDPOINT_URL`) |
-| api / mcp / converter | `deploy/docker-compose.selfhost.yml` |
+| gateway / api / worker / mcp / converter | `deploy/docker-compose.selfhost.yml`；API 与 durable worker 可独立横向扩容 |
 | Web 前端 | `web/Dockerfile` 构建镜像(`NEXT_PUBLIC_*` 构建期烧入) |
 
 **步骤**:
@@ -178,7 +178,7 @@ curl -fsS https://mcp.example.com/health     # ok
 
 - **登录方式只有邮箱密码**(GoTrue 原生支持),无任何外部身份提供商。
 - **MCP / API 用 API 密钥**:每个用户在 **设置 → 连接 AI 助手 (MCP)** 生成 `sv_` 密钥,作为静态 `Authorization: Bearer` 头同时通行 MCP 与 REST API(SHA-256 哈希存储、可吊销、记录最近使用时间)。无需 OAuth 服务。
-- **`api` 只跑一个副本**(TUS 上传状态、WebSocket 连接与图谱重建锁为进程内状态)。
+- **Hosted 默认使用 durable worker、Redis AOF 与 S3 multipart TUS**；Postgres 是任务账本，API 无进程内已接受任务或上传状态。可用 `--scale api=2 --scale worker=2` 独立扩容，gateway 是唯一公网 API 入口。架构与恢复规则见 [`docs/architecture/durable-jobs.md`](docs/architecture/durable-jobs.md)。
 - **converter 与 Postgres 不得暴露公网**;MinIO 的 S3 端口需公网可达(浏览器直传预签名 URL)。
 
 **托管模式导入语料** — 直接写入 Postgres,条目落入指定账号的知识库,分面检索/Web 语料库/lint/关系层即刻可用:

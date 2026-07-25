@@ -118,30 +118,13 @@ async def _recover_durable_extraction_jobs(pool, job_service) -> list:
 async def _recover_hosted_extractions(
     pool,
     *,
-    durable_jobs_enabled: bool,
     job_service,
-    ocr_service,
-    spawn=spawn_logged,
 ) -> list:
-    """Select exactly one Hosted recovery strategy for the rollout flag."""
-    if durable_jobs_enabled:
-        recovered = await _recover_durable_extraction_jobs(pool, job_service)
-        if recovered:
-            logger.info("Recovered %d durable document extraction job(s)", len(recovered))
-        return recovered
-    if ocr_service is None:
-        return []
-
-    rows = await pool.fetch(
-        "SELECT id::text, user_id::text FROM documents WHERE status IN ('pending', 'processing') AND NOT archived"
-    )
-    for row in rows:
-        logger.info("Recovering stuck document %s", row["id"][:8])
-        spawn(
-            ocr_service.process_document(row["id"], row["user_id"]),
-            f"recover:{row['id'][:8]}",
-        )
-    return rows
+    """Backfill only the durable ledger; Hosted process-local recovery is gone."""
+    recovered = await _recover_durable_extraction_jobs(pool, job_service)
+    if recovered:
+        logger.info("Recovered %d durable document extraction job(s)", len(recovered))
+    return recovered
 
 
 async def _start_hosted_quota_runtime(pool, redis_url: str):
@@ -202,41 +185,29 @@ async def _finish_hosted_startup(app: FastAPI, pool):
 
     await _recover_hosted_extractions(
         pool,
-        durable_jobs_enabled=settings.DURABLE_JOBS_ENABLED,
         job_service=app.state.job_service,
-        ocr_service=ocr_service,
     )
 
-    if settings.TUS_MULTIPART_ENABLED:
-        if s3_service is None or app.state.quota_service is None or app.state.redis is None:
-            raise RuntimeError("Hosted multipart TUS requires S3, Redis, and quota coordination")
-        from infra.tus import HostedTusMultipartService
-        from infra.tus_sessions import TusSessionStore
+    if s3_service is None or app.state.quota_service is None or app.state.redis is None:
+        raise RuntimeError("Hosted multipart TUS requires S3, Redis, and quota coordination")
+    from infra.tus import HostedTusMultipartService
+    from infra.tus_sessions import TusSessionStore
 
-        app.state.tus_session_store = TusSessionStore(app.state.redis)
-        app.state.tus_service = HostedTusMultipartService(
-            pool,
-            s3_service,
-            app.state.job_service,
-            app.state.quota_service,
-            app.state.tus_session_store,
-            session_ttl_seconds=settings.TUS_SESSION_TTL_SECONDS,
-            stale_seconds=settings.TUS_STALE_SECONDS,
-            lock_seconds=settings.TUS_LOCK_SECONDS,
-            max_patch_bytes=settings.TUS_MAX_PATCH_BYTES,
-        )
+    app.state.tus_session_store = TusSessionStore(app.state.redis)
+    app.state.tus_service = HostedTusMultipartService(
+        pool,
+        s3_service,
+        app.state.job_service,
+        app.state.quota_service,
+        app.state.tus_session_store,
+        session_ttl_seconds=settings.TUS_SESSION_TTL_SECONDS,
+        stale_seconds=settings.TUS_STALE_SECONDS,
+        lock_seconds=settings.TUS_LOCK_SECONDS,
+        max_patch_bytes=settings.TUS_MAX_PATCH_BYTES,
+    )
 
     listener = await _start_hosted_listener(app)
-    cleanup_task = None
-    try:
-        if not settings.TUS_MULTIPART_ENABLED:
-            from infra.tus import cleanup_stale_uploads
-
-            cleanup_task = asyncio.create_task(cleanup_stale_uploads())
-    except BaseException:
-        await listener.close()
-        raise
-    return listener, cleanup_task
+    return listener, None
 
 
 @asynccontextmanager
@@ -394,7 +365,6 @@ async def _local_lifespan(app: FastAPI):
     # 启动对账挂掉必须留痕:它负责接住停机断点的整个提取积压,静默死亡
     # 的表现就是"重启后 CPU 闲置、队列不动"
     from domain.local_processor import reconcile_workspace
-    from infra.tasks import spawn_logged
 
     reconcile_task = spawn_logged(reconcile_workspace(reconcile_db, workspace), "startup-reconcile")
 

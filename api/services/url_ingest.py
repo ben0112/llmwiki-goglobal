@@ -486,57 +486,6 @@ class UrlIngestService:
             )
 
 
-class _LegacyUrlIngestCompatibility(UrlIngestService):
-    """Rollback-only Hosted URL producer using process-local OCR dispatch."""
-
-    def __init__(self, pool: asyncpg.Pool, s3_service: S3Service, ocr_service: object):
-        super().__init__(pool, s3_service, job_service=None, quota_service=None)
-        self.ocr = ocr_service
-
-    async def _return_existing(self, existing: dict, user_id: str, kb_id: str) -> dict:
-        del user_id, kb_id
-        return {**existing, "already_exists": True}
-
-    async def _create_pending_document(
-        self,
-        user_id: str,
-        kb_id: str,
-        url: str,
-        path: str,
-        pdf: DownloadedPdf,
-    ) -> dict:
-        document_id = str(uuid4())
-        async with self.pool.acquire() as conn, conn.transaction():
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
-            await self._insert_within_quota(conn, document_id, kb_id, user_id, pdf, path, url)
-
-        try:
-            await self.s3.upload_bytes(
-                f"{user_id}/{document_id}/source.pdf",
-                pdf.data,
-                "application/pdf",
-            )
-        except Exception:  # noqa: BLE001 - legacy storage adapters expose different errors.
-            await self.pool.execute("DELETE FROM documents WHERE id = $1::uuid", document_id)
-            raise HTTPException(
-                status_code=502,
-                detail="Could not store the downloaded PDF — try again",
-            ) from None
-
-        from infra.tasks import spawn_logged
-
-        spawn_logged(
-            self.ocr.process_document(document_id, user_id),
-            f"url-ingest:{document_id[:8]}",
-        )
-        return {
-            "id": document_id,
-            "filename": pdf.filename,
-            "status": "pending",
-            "already_exists": False,
-        }
-
-
 def _normalize_pdf_url(url: str) -> str:
     """arXiv abstract pages link to a canonical PDF — fetch that directly."""
     match = _ARXIV_ABS_RE.match(url.strip())

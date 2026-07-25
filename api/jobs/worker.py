@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Mapping
 from uuid import UUID, uuid4
 
@@ -18,6 +19,7 @@ from arq.connections import RedisSettings
 from arq.worker import create_worker as arq_create_worker
 from arq.worker import run_worker as arq_run_worker
 from config import settings
+from telemetry import emit
 
 from jobs import repository
 from jobs.dispatcher import dispatch_cron
@@ -47,6 +49,8 @@ _UNHANDLED_CODE = "unhandled_worker_error"
 _UNHANDLED_MESSAGE = "The job encountered an unexpected error."
 _INVALID_RESULT_CODE = "invalid_job_result"
 _INVALID_RESULT_MESSAGE = "The job produced an invalid result."
+_SHUTDOWN_CODE = "worker_shutdown"
+_SHUTDOWN_MESSAGE = "Worker shutdown interrupted the job."
 _OWNED_RESOURCES_CTX_KEY = "_durable_worker_owned_resources"
 WORKER_STARTUP_TIMEOUT_SECONDS = 10.0
 WORKER_MAX_JOBS = 10
@@ -364,6 +368,16 @@ async def _run_claimed_job(
                 await repository.succeed(conn, job.id, worker_id, result)
             return _outcome("succeeded", job.id)
         except asyncio.CancelledError:
+            await asyncio.shield(
+                _record_failure(
+                    pool,
+                    job.id,
+                    worker_id,
+                    error_code=_SHUTDOWN_CODE,
+                    error_message=_SHUTDOWN_MESSAGE,
+                    retryable=True,
+                )
+            )
             raise
         except LeaseLost:
             logger.info("worker lease lost job_id=%s", job.id)
@@ -432,22 +446,59 @@ async def run_job(ctx: dict, job_id_text: str) -> dict[str, str]:
     if job is None:
         return _outcome("duplicate", job_id)
 
-    return await _run_claimed_job(
-        pool=pool,
-        job=job,
-        worker_id=worker_id,
-        lease_seconds=lease_seconds,
-        heartbeat_seconds=ctx["heartbeat_seconds"],
-        handlers=ctx["handlers"],
-        worker_context=ctx["worker_context"],
+    started = time.monotonic()
+    try:
+        outcome = await _run_claimed_job(
+            pool=pool,
+            job=job,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            heartbeat_seconds=ctx["heartbeat_seconds"],
+            handlers=ctx["handlers"],
+            worker_context=ctx["worker_context"],
+        )
+    except asyncio.CancelledError:
+        emit(
+            logger,
+            "durable_job_finished",
+            job_id=job.id,
+            job_type=job.job_type,
+            attempt=job.attempt_count,
+            state="retry_wait",
+            lease_owner=worker_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error_code=_SHUTDOWN_CODE,
+            replica_role="worker",
+        )
+        raise
+    emit(
+        logger,
+        "durable_job_finished",
+        job_id=job.id,
+        job_type=job.job_type,
+        attempt=job.attempt_count,
+        state=outcome["status"],
+        lease_owner=worker_id,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        error_code=None if outcome["status"] == "succeeded" else outcome["status"],
+        replica_role="worker",
     )
+    return outcome
 
 
 async def reap_cron(ctx: dict) -> None:
     """Recover a bounded batch of jobs whose PostgreSQL leases expired."""
     async with ctx["pool"].acquire() as conn, conn.transaction():
         reaped = await repository.reap_expired(conn, limit=ctx["reap_batch_size"])
-    logger.info("reaped expired durable jobs count=%d", len(reaped))
+    for job_id in reaped:
+        emit(
+            logger,
+            "durable_job_lease_reaped",
+            job_id=job_id,
+            state="retry_wait",
+            error_code="lease_expired",
+            replica_role="worker",
+        )
 
 
 async def upload_cleanup_cron(ctx: dict) -> None:

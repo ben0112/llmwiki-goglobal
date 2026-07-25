@@ -6,6 +6,7 @@ write routes (service-role with explicit user_id checks) are covered.
 """
 
 import time
+from types import SimpleNamespace
 
 import jwt as pyjwt
 import pytest
@@ -13,11 +14,15 @@ import pytest
 from tests.helpers import jwt as jwt_helper
 from tests.helpers.jwt import auth_headers
 from tests.integration.isolation.conftest import (
-    USER_A_ID, USER_A_EMAIL, USER_B_ID,
-    KB_A_ID, KB_B_ID,
-    DOC_A_ID, DOC_A2_ID, DOC_B_ID,
-    KEY_A_ID, KEY_B_ID,
-    REF_A_ID, REF_B_ID,
+    DOC_A2_ID,
+    DOC_A_ID,
+    DOC_B_ID,
+    KB_A_ID,
+    KB_B_ID,
+    KEY_B_ID,
+    USER_A_EMAIL,
+    USER_A_ID,
+    USER_B_ID,
 )
 
 
@@ -506,6 +511,29 @@ class TestGraphIsolation:
 
 class TestTUSUploadIsolation:
     """TUS upload routes enforce KB ownership on create and user_id on HEAD/PATCH."""
+
+    @pytest.fixture(autouse=True)
+    async def _durable_tus_service(self, pool):
+        """Exercise the Hosted route through the replica-safe service, without external S3/Redis."""
+        from infra.tus import HostedTusMultipartService
+        from main import app
+
+        from tests.unit.test_hosted_tus_multipart import S3, Quota, Store
+
+        events = []
+        app.state.tus_service = HostedTusMultipartService(
+            pool,
+            S3(events),
+            SimpleNamespace(),
+            Quota(events),
+            Store(events),
+            session_ttl_seconds=300,
+            stale_seconds=180,
+            lock_seconds=3,
+            max_patch_bytes=8 * 1024 * 1024,
+        )
+        yield
+        app.state.tus_service = None
 
     def _tus_headers(self, user_id, extra=None):
         headers = {

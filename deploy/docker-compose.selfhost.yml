@@ -15,6 +15,34 @@
 name: llmwiki-selfhost
 
 services:
+  ci-postgres:
+    profiles: ["ci"]
+    image: postgres:16.11-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "${CI_POSTGRES_PORT:-55434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ci-auth:
+    profiles: ["ci"]
+    image: python:3.11-alpine
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /jwks/auth/v1/.well-known &&
+        echo "$${CI_JWKS_B64}" | base64 -d > /jwks/auth/v1/.well-known/jwks.json &&
+        python -m http.server 8000 --directory /jwks
+    environment:
+      CI_JWKS_B64: ${CI_JWKS_B64}
+
   redis:
     image: redis:7.4.2-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
@@ -89,6 +117,7 @@ services:
       DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
       TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
       STAGE: ${STAGE:-prod}
+      LLMWIKI_REPLICA_ROLE: api
     expose:
       - "8000"
     healthcheck:
@@ -131,6 +160,7 @@ services:
       DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
       TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
       STAGE: ${STAGE:-prod}
+      LLMWIKI_REPLICA_ROLE: worker
     depends_on:
       redis:
         condition: service_healthy

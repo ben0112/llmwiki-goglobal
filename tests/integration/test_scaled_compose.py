@@ -82,13 +82,14 @@ def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
     rollback_block = rollback_section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     assert rollback_block.startswith("(\n  set -e\n")
     assert rollback_block.endswith("\n)")
-    assert "export DURABLE_JOBS_ENABLED=false" in rollback_block
-    assert "export TUS_MULTIPART_ENABLED=false" in rollback_block
-    assert "stop worker" in rollback_block
-    assert "--scale worker=0" in rollback_block
+    assert "ROLLBACK_REF" in rollback_block
+    assert 'git archive "$ROLLBACK_REF"' in rollback_block
+    assert "DURABLE_JOBS_ENABLED=false" not in rollback_block
+    assert "TUS_MULTIPART_ENABLED=false" not in rollback_block
+    assert "--scale worker=1" in rollback_block
     assert "--scale api=1" in rollback_block
     assert "--force-recreate" in rollback_block
-    assert "restart gateway" in rollback_block
+    assert "api worker gateway" in rollback_block
     assert "trap cleanup EXIT" in text
     assert "SCALED_COMPOSE_TEST=1" in text
     assert "safely reads `deploy/.env.selfhost`" in text

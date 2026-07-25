@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import secrets
 import sys
@@ -2042,16 +2043,10 @@ async def test_hosted_startup_durable_branch_backfills_without_legacy_spawn(monk
         calls.append((pool, job_service))
         return recovered
 
-    def forbidden_spawn(*_args):
-        raise AssertionError("durable startup must not spawn process-local extraction")
-
     monkeypatch.setattr(main, "_recover_durable_extraction_jobs", durable_recovery)
     result = await main._recover_hosted_extractions(
         object(),
-        durable_jobs_enabled=True,
         job_service="jobs",
-        ocr_service=object(),
-        spawn=forbidden_spawn,
     )
 
     assert result == recovered
@@ -2059,34 +2054,12 @@ async def test_hosted_startup_durable_branch_backfills_without_legacy_spawn(monk
 
 
 @pytest.mark.asyncio
-async def test_hosted_startup_rollback_branch_keeps_legacy_scan_and_spawn():
+async def test_hosted_startup_has_no_legacy_scan_or_spawn():
     from main import _recover_hosted_extractions
 
-    class FakePool:
-        async def fetch(self, query):
-            assert "pending" in query and "processing" in query
-            return [{"id": "document-1", "user_id": "user-1"}]
-
-    class FakeOCR:
-        async def process_document(self, document_id, user_id):
-            return document_id, user_id
-
-    spawned = []
-
-    def capture_spawn(coroutine, label):
-        spawned.append((coroutine, label))
-        coroutine.close()
-
-    result = await _recover_hosted_extractions(
-        FakePool(),
-        durable_jobs_enabled=False,
-        job_service=None,
-        ocr_service=FakeOCR(),
-        spawn=capture_spawn,
-    )
-
-    assert result == [{"id": "document-1", "user_id": "user-1"}]
-    assert [label for _, label in spawned] == ["recover:document"]
+    # The helper delegates only to the durable ledger path; no OCR/spawn inputs exist.
+    assert "ocr_service" not in inspect.signature(_recover_hosted_extractions).parameters
+    assert "spawn" not in inspect.signature(_recover_hosted_extractions).parameters
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,6 @@ from typing import Annotated
 from uuid import UUID
 
 from auth import get_current_user
-from config import settings
 from deps import get_document_service
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from infra.rate_limit import limiter
@@ -16,7 +15,7 @@ from services.types import (
     UpdateMetadata,
     UpsertHighlight,
 )
-from services.url_ingest import UrlIngestService, _LegacyUrlIngestCompatibility
+from services.url_ingest import UrlIngestService
 
 router = APIRouter(tags=["documents"])
 
@@ -116,17 +115,11 @@ async def create_document_from_url(request: Request, body: CreateFromUrl, respon
     state = request.app.state
     if not state.s3_service:
         raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
-    if settings.DURABLE_JOBS_ENABLED:
-        job_service = getattr(state, "job_service", None)
-        quota_service = getattr(state, "quota_service", None)
-        if not job_service or not quota_service:
-            raise HTTPException(status_code=503, detail="Durable URL ingestion is unavailable")
-        service = UrlIngestService(state.pool, state.s3_service, job_service, quota_service)
-    else:
-        ocr_service = getattr(state, "ocr_service", None)
-        if not ocr_service:
-            raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
-        service = _LegacyUrlIngestCompatibility(state.pool, state.s3_service, ocr_service)
+    job_service = getattr(state, "job_service", None)
+    quota_service = getattr(state, "quota_service", None)
+    if not job_service or not quota_service:
+        raise HTTPException(status_code=503, detail="Durable URL ingestion is unavailable")
+    service = UrlIngestService(state.pool, state.s3_service, job_service, quota_service)
     result = await service.ingest_pdf(user_id, str(body.knowledge_base_id), body.url, body.path)
     if job_id := result.get("job_id"):
         response.headers["X-Job-Id"] = job_id

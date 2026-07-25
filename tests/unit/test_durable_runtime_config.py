@@ -66,12 +66,13 @@ def test_hosted_durable_jobs_requires_redis(monkeypatch):
     _clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("MODE", "hosted")
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
+    monkeypatch.setenv("TUS_MULTIPART_ENABLED", "true")
 
     with pytest.raises(ValueError, match="REDIS_URL"):
         _settings()
 
 
-def test_tus_multipart_requires_durable_jobs(monkeypatch):
+def test_hosted_false_durable_jobs_flag_fails_fast(monkeypatch):
     _clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("MODE", "hosted")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
@@ -89,6 +90,17 @@ def test_hosted_tus_requires_redis(monkeypatch):
     monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
 
     with pytest.raises(ValueError, match="REDIS_URL"):
+        _settings()
+
+
+def test_hosted_false_multipart_flag_fails_fast(monkeypatch):
+    _clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("MODE", "hosted")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("DURABLE_JOBS_ENABLED", "true")
+    monkeypatch.setenv("TUS_MULTIPART_ENABLED", "false")
+
+    with pytest.raises(ValueError, match="TUS_MULTIPART_ENABLED"):
         _settings()
 
 

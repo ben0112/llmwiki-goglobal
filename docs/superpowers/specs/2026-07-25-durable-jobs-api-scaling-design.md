@@ -1,6 +1,6 @@
 # Durable Jobs and Hosted API Scaling Design
 
-**Status:** Confirmed design and implementation plan, pending implementation
+**Status:** Implemented and verified
 
 **Branch:** `feat/platform-architecture-evolution`
 
@@ -372,3 +372,20 @@ external services.
 - Hosted Compose no longer states or enforces a single API replica.
 - Local mode starts and passes its full suite without Redis, Postgres, S3, or
   worker configuration.
+
+## Implementation evidence
+
+The durable/scaled runtime baseline is commit
+`3e23aff6bfedd66a26f8154a57850703d400c932`; the Task 14 closing commit is the
+commit containing this status change. Verification commands:
+
+```bash
+PYTHONPATH=api .venv/bin/pytest tests/unit/ -q
+PYTHONPATH=api MODE=hosted .venv/bin/pytest tests/integration/ -q
+(cd mcp && ../.venv/bin/pytest ../tests/unit/mcp/ ../tests/integration/mcp/ -q)
+.venv/bin/ruff check api/jobs api/infra/redis.py api/infra/quota.py api/infra/tus_sessions.py api/infra/tus.py api/routes/jobs.py api/routes/health.py api/services/ocr.py api/services/graph.py api/services/s3.py api/services/url_ingest.py tests/unit/jobs tests/unit/test_durable_runtime_config.py tests/unit/test_tus_sessions.py tests/unit/test_hosted_quota.py tests/unit/test_health_roles.py tests/integration/test_background_job_schema.py tests/integration/test_background_job_repository.py tests/integration/test_background_job_leases.py tests/integration/test_job_delivery.py tests/integration/test_durable_extraction.py tests/integration/test_durable_graph_rebuild.py tests/integration/test_s3_multipart.py tests/integration/test_tus_sessions_redis.py tests/integration/test_hosted_quota.py tests/integration/test_tus_multipart.py tests/integration/test_durable_failure_matrix.py
+docker compose -f deploy/docker-compose.selfhost.yml config --quiet
+```
+
+GitHub Actions runs the fault matrix with Postgres, Redis 7.4, and MinIO and a
+non-optional two-API/two-worker Compose smoke with an ephemeral ES256 identity.

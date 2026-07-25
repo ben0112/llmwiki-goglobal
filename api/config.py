@@ -68,16 +68,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_durable_runtime(self) -> "Settings":
-        if (
-            self.MODE == "hosted"
-            and self.TUS_MULTIPART_ENABLED
-            and not self.DURABLE_JOBS_ENABLED
-        ):
-            raise ValueError("DURABLE_JOBS_ENABLED must be true when TUS_MULTIPART_ENABLED is true")
+        if self.MODE == "hosted" and not self.DURABLE_JOBS_ENABLED:
+            raise ValueError("Hosted mode requires DURABLE_JOBS_ENABLED=true; legacy in-process jobs were removed")
+        if self.MODE == "hosted" and not self.TUS_MULTIPART_ENABLED:
+            raise ValueError("Hosted mode requires TUS_MULTIPART_ENABLED=true; process-local uploads were removed")
 
-        if self.MODE == "hosted" and (
-            self.DURABLE_JOBS_ENABLED or self.TUS_MULTIPART_ENABLED
-        ) and not self.REDIS_URL:
+        if self.MODE == "hosted" and not self.REDIS_URL:
             raise ValueError("REDIS_URL is required for hosted durable runtime features")
 
         if self.JOB_HEARTBEAT_SECONDS >= self.JOB_LEASE_SECONDS:

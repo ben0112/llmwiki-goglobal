@@ -232,33 +232,26 @@ roll workers, roll API replicas one at a time, and update/restart the gateway
 last. Confirm `/ready`, one real upload, and one graph rebuild before removing
 old containers.
 
-`DURABLE_JOBS_ENABLED=true` and `TUS_MULTIPART_ENABLED=true` are the scalable
-path. During the compatibility release only, an emergency rollback can set
-both flags to `false`, stop all workers, and run **exactly one** API replica;
-that restores the legacy in-process Hosted execution/upload behavior. Do not
-use mixed flag values or multiple APIs on the rollback path. Re-enable Redis,
-workers, durable jobs, multipart storage, and two APIs in that order after the
-incident is resolved.
+`DURABLE_JOBS_ENABLED=true` and `TUS_MULTIPART_ENABLED=true` are required in
+Hosted mode. Current binaries fail fast if either is false; the process-local
+Hosted rollback path has been removed. Roll back API and worker together to a
+known-good release. Database migrations are additive, so leave the schema,
+Redis AOF, and objects intact. Never mix API producers and workers from
+different releases.
 
-Copyable incident rollback (the worker intentionally refuses to start when
-durable jobs are disabled):
+Copyable incident rollback (set `ROLLBACK_REF` to a tested tag or commit):
 
 ```bash
 (
   set -e
-
-  # Exported values override the true defaults in deploy/.env.selfhost:
-  export DURABLE_JOBS_ENABLED=false
-  export TUS_MULTIPART_ENABLED=false
-
-  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-    stop worker
-  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-    up -d --no-deps --scale worker=0 worker
-  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-    up -d --build --no-deps --force-recreate --scale api=1 api
-  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-    restart gateway
+  : "${ROLLBACK_REF:?set ROLLBACK_REF to a tested release}"
+  rollback_dir="$(mktemp -d)"
+  cleanup() { rm -rf "$rollback_dir"; }
+  trap cleanup EXIT
+  git archive "$ROLLBACK_REF" | tar -x -C "$rollback_dir"
+  docker compose -f "$rollback_dir/deploy/docker-compose.selfhost.yml" \
+    --env-file "$(pwd)/deploy/.env.selfhost" up -d --build --force-recreate \
+    --scale api=1 --scale worker=1 api worker gateway
 )
 ```
 

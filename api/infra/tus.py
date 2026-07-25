@@ -13,6 +13,7 @@ from config import settings
 from fastapi import APIRouter, HTTPException, Request, Response
 from infra.tasks import spawn_logged
 from starlette.requests import ClientDisconnect
+from telemetry import emit, replica_role
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def _validate_file_signature(temp_path: Path, ext: str) -> None:
         with open(temp_path, "rb") as f:
             head = f.read(16)
     except OSError as e:
-        raise HTTPException(status_code=400, detail=f"Could not read upload: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not read upload: {e}") from e
     # WebP is a RIFF container; check both the RIFF magic and the WEBP fourcc.
     if ext == "webp":
         if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
@@ -163,16 +164,15 @@ class TusUpload:
     last_activity: float = field(default_factory=time.time)
 
 
-class _LegacyTusCompatibility:
-    """Rollback-only process-local Hosted TUS state."""
+class _LocalTusState:
+    """Process-local TUS state used only by single-process Local mode."""
 
     def __init__(self) -> None:
         self.uploads: dict[str, TusUpload] = {}
 
 
-_legacy_tus_compatibility = _LegacyTusCompatibility()
-# Compatibility aliases remain for old tests/imports until the rollout flag is removed.
-_uploads = _legacy_tus_compatibility.uploads
+_local_tus_state = _LocalTusState()
+_uploads = _local_tus_state.uploads
 
 
 def _check_tus_version(request: Request):
@@ -192,8 +192,11 @@ def _parse_metadata(header: str) -> dict[str, str]:
         if len(parts) > 1:
             try:
                 value = b64decode(parts[1]).decode("utf-8")
-            except Exception:
-                raise HTTPException(status_code=400, detail=f"Invalid base64 in Upload-Metadata key '{key}'")
+            except (UnicodeDecodeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid base64 in Upload-Metadata key '{key}'",
+                ) from None
         else:
             value = ""
         result[key] = value
@@ -543,6 +546,13 @@ class HostedTusMultipartService:
             if lock_token is not None:
                 with suppress(Exception):
                     await asyncio.shield(self.sessions.release_lock(upload_id, lock_token))
+        emit(
+            logger,
+            "tus_session_created",
+            upload_id=upload_id,
+            state="uploading",
+            replica_role=replica_role("api"),
+        )
         return Response(status_code=201, headers=_tus_headers({"Location": f"/v1/uploads/{upload_id}"}))
 
     async def _compensate_create(  # noqa: C901
@@ -951,6 +961,13 @@ class HostedTusMultipartService:
         completed = await self.sessions.get(session.upload_id)
         if completed is None:
             raise HTTPException(status_code=503, detail="Upload completion state is unavailable")
+        emit(
+            logger,
+            "tus_session_completed",
+            upload_id=session.upload_id,
+            state="completed",
+            replica_role=replica_role("api"),
+        )
         return self._completed_response(completed, completed.offset)
 
     async def _renew_session_reservation(self, session):
@@ -1286,6 +1303,14 @@ class HostedTusCleanupService:
                 authenticated_user_id=user_id,
             )
             created += int(was_created)
+            if was_created:
+                emit(
+                    logger,
+                    "tus_session_stale",
+                    upload_id=upload_id,
+                    state="cleanup_required",
+                    replica_role=replica_role("worker"),
+                )
 
         async for session in self.sessions.iter_sessions():
             if session.state is TusSessionState.COMPLETED:
@@ -1311,36 +1336,46 @@ class HostedTusCleanupService:
             TusSessionState,
         )
 
+        def outcome(status: str) -> dict[str, object]:
+            emit(
+                logger,
+                "upload_cleanup_finished",
+                upload_id=upload_id,
+                state=status,
+                replica_role=replica_role("worker"),
+            )
+            return {"upload_id": str(upload_id), "status": status}
+
         acquired = await self.sessions.acquire_lock(upload_id, self.lock_seconds)
         if acquired.status is not LockAcquireStatus.ACQUIRED or acquired.token is None:
-            return {"upload_id": str(upload_id), "status": "contended"}
+            return outcome("contended")
         token = acquired.token
         try:
             session = await self.sessions.get(upload_id)
             if session is None:
                 marker = await self.sessions.get_reservation(expected_user_id, upload_id)
                 if marker is None or marker.state is TusReservationState.RELEASED:
-                    return {"upload_id": str(upload_id), "status": "already_clean"}
+                    return outcome("already_clean")
                 reservation = QuotaReservation(expected_user_id, upload_id, marker.bytes, marker.owner_token)
                 settled = await _release_quota_and_marker(self.quota, self.sessions, reservation)
-                return {"upload_id": str(upload_id), "status": "cleaned" if settled else "retry"}
+                return outcome("cleaned" if settled else "retry")
             if session.user_id != expected_user_id:
-                return {"upload_id": str(upload_id), "status": "owner_mismatch"}
+                return outcome("owner_mismatch")
             if session.state is TusSessionState.COMPLETED:
                 settled = await self._settle_completed(session)
-                return {"upload_id": str(upload_id), "status": "committed" if settled else "retry"}
+                return outcome("committed" if settled else "retry")
             if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
-                return {"upload_id": str(upload_id), "status": "lock_lost"}
+                return outcome("lock_lost")
             stale_before = datetime.now(UTC).timestamp() - self.stale_seconds
             stale = session.updated_at.timestamp() <= stale_before
             if session.object_completed:
                 reconciled = await self._reconcile_object_completed(session, token)
                 if reconciled is True:
-                    return {"upload_id": str(upload_id), "status": "committed"}
+                    return outcome("committed")
                 if reconciled is False or (session.state is TusSessionState.UPLOADING and not stale):
-                    return {"upload_id": str(upload_id), "status": "retry"}
+                    return outcome("retry")
             if session.state is not TusSessionState.CLEANUP_REQUIRED and not stale:
-                return {"upload_id": str(upload_id), "status": "active"}
+                return outcome("active")
             if session.state is TusSessionState.UPLOADING:
                 fenced = await self.sessions.mark_cleanup_required(
                     upload_id,
@@ -1349,13 +1384,13 @@ class HostedTusCleanupService:
                     lock_token=token,
                 )
                 if not fenced:
-                    return {"upload_id": str(upload_id), "status": "lock_lost"}
+                    return outcome("lock_lost")
                 session = replace(session, state=TusSessionState.CLEANUP_REQUIRED)
             objects_clean = await self._cleanup_objects(session)
             if not objects_clean:
-                return {"upload_id": str(upload_id), "status": "retry"}
+                return outcome("retry")
             if await self.sessions.renew_lock(upload_id, token, self.lock_seconds) is not LockMutationStatus.RENEWED:
-                return {"upload_id": str(upload_id), "status": "lock_lost"}
+                return outcome("lock_lost")
 
             marker = await self.sessions.get_reservation(session.user_id, session.upload_id)
             if marker is not None and marker.state is TusReservationState.RESERVED:
@@ -1366,9 +1401,9 @@ class HostedTusCleanupService:
                     marker.owner_token,
                 )
                 if not await _release_quota_and_marker(self.quota, self.sessions, reservation):
-                    return {"upload_id": str(upload_id), "status": "retry"}
+                    return outcome("retry")
             deleted = await self.sessions.delete_locked(upload_id, lock_token=token)
-            return {"upload_id": str(upload_id), "status": "cleaned" if deleted else "lock_lost"}
+            return outcome("cleaned" if deleted else "lock_lost")
         finally:
             with suppress(Exception):
                 await asyncio.shield(self.sessions.release_lock(upload_id, token))
@@ -1451,7 +1486,7 @@ async def tus_options():
 @router.post("", status_code=201)
 async def tus_create(request: Request):
     user_id = await _get_user_id(request)
-    if settings.TUS_MULTIPART_ENABLED:
+    if settings.MODE == "hosted":
         return await _hosted_tus_service(request).create(request, user_id)
     _check_tus_version(request)
 
@@ -1461,7 +1496,7 @@ async def tus_create(request: Request):
     try:
         upload_length = int(upload_length_str)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Upload-Length")
+        raise HTTPException(status_code=400, detail="Invalid Upload-Length") from None
     if upload_length < 1:
         raise HTTPException(status_code=400, detail="Upload-Length must be positive")
     if upload_length > MAX_SIZE:
@@ -1491,7 +1526,7 @@ async def tus_create(request: Request):
         import uuid as _uuid
         _uuid.UUID(kb_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid knowledge_base_id format")
+        raise HTTPException(status_code=400, detail="Invalid knowledge_base_id format") from None
 
     kb_owner = await pool.fetchval(
         "SELECT user_id::text FROM knowledge_bases WHERE id = $1::uuid",
@@ -1545,7 +1580,7 @@ async def tus_create(request: Request):
 @router.head("/{upload_id}")
 async def tus_head(upload_id: str, request: Request):
     user_id = await _get_user_id(request)
-    if settings.TUS_MULTIPART_ENABLED:
+    if settings.MODE == "hosted":
         return await _hosted_tus_service(request).head(upload_id, request, user_id)
     upload = _get_upload(upload_id, user_id)
     return Response(
@@ -1561,7 +1596,7 @@ async def tus_head(upload_id: str, request: Request):
 @router.patch("/{upload_id}", status_code=204)
 async def tus_patch(upload_id: str, request: Request):
     user_id = await _get_user_id(request)
-    if settings.TUS_MULTIPART_ENABLED:
+    if settings.MODE == "hosted":
         return await _hosted_tus_service(request).patch(upload_id, request, user_id)
     _check_tus_version(request)
 
@@ -1577,7 +1612,7 @@ async def tus_patch(upload_id: str, request: Request):
     try:
         client_offset = int(offset_str)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Upload-Offset")
+        raise HTTPException(status_code=400, detail="Invalid Upload-Offset") from None
 
     if client_offset != upload.upload_offset:
         raise HTTPException(status_code=409, detail="Offset mismatch")
@@ -1615,6 +1650,6 @@ async def tus_patch(upload_id: str, request: Request):
             raise
         except Exception:
             logger.exception("TUS finalization failed for upload %s", upload_id)
-            raise HTTPException(status_code=500, detail="Finalization failed")
+            raise HTTPException(status_code=500, detail="Finalization failed") from None
 
     return Response(status_code=204, headers=headers)

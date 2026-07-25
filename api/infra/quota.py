@@ -11,6 +11,8 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from telemetry import emit, replica_role
+
 logger = logging.getLogger(__name__)
 
 # Lua numbers are IEEE-754 doubles. This bound also stays below lua-cjson's
@@ -585,6 +587,13 @@ class HostedQuotaService:
                     await self._best_effort_release(reservation)
                     raise
                 if not retry:
+                    emit(
+                        logger,
+                        "quota_reserved",
+                        upload_id=upload_id,
+                        byte_count=byte_count,
+                        replica_role=replica_role("api"),
+                    )
                     return reservation
             except (QuotaExceeded, QuotaUnavailable) as exc:
                 error = exc
@@ -606,7 +615,16 @@ class HostedQuotaService:
         return await self._run_fenced_mutation(reservation, _FINALIZE_SCRIPT)
 
     async def release(self, reservation: QuotaReservation) -> bool:
-        return await self._settle(reservation)
+        released = await self._settle(reservation)
+        if released:
+            emit(
+                logger,
+                "quota_released",
+                upload_id=reservation.upload_id,
+                byte_count=reservation.bytes,
+                replica_role=replica_role("api"),
+            )
+        return released
 
     async def settle_tus_marker_if_absent(
         self,

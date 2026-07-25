@@ -9,6 +9,7 @@ from uuid import UUID
 
 import asyncpg
 from arq.connections import ArqRedis
+from telemetry import emit
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ class DispatchCandidate:
 
     job_id: UUID
     run_after: datetime
+    job_type: str | None = None
+    state: str | None = None
+    dispatch_attempts: int = 0
 
 
 def delivery_transport_id(candidate: DispatchCandidate) -> str:
@@ -38,7 +42,7 @@ _SELECT_DUE_JOB_IDS = """
 WITH dispatch_clock AS MATERIALIZED (
     SELECT clock_timestamp() AS checked_at
 )
-SELECT job.id, job.run_after
+SELECT job.id, job.run_after, job.job_type, job.state, job.dispatch_attempts
 FROM background_jobs AS job
 CROSS JOIN dispatch_clock
 WHERE job.state IN ('queued', 'retry_wait')
@@ -71,6 +75,9 @@ async def select_due_jobs(
         DispatchCandidate(
             job_id=row["id"] if isinstance(row["id"], UUID) else UUID(str(row["id"])),
             run_after=row["run_after"],
+            job_type=row.get("job_type"),
+            state=row.get("state"),
+            dispatch_attempts=row.get("dispatch_attempts", 0),
         )
         for row in rows
     ]
@@ -171,6 +178,20 @@ async def dispatch_due_jobs(
 
         if was_marked:
             marked += 1
+            dispatch_lag_ms = max(
+                0,
+                int((datetime.now(UTC) - candidate.run_after.astimezone(UTC)).total_seconds() * 1000),
+            )
+            emit(
+                logger,
+                "durable_job_dispatched",
+                job_id=job_id,
+                job_type=candidate.job_type,
+                state=candidate.state,
+                dispatch_attempts=candidate.dispatch_attempts + 1,
+                dispatch_lag_ms=dispatch_lag_ms,
+                replica_role="worker",
+            )
         else:
             mark_failed += 1
             logger.info("job dispatch mark skipped job_id=%s", job_id)

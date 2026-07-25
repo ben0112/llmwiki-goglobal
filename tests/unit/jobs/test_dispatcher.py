@@ -1174,11 +1174,24 @@ async def test_run_job_propagates_worker_cancellation(monkeypatch):
     async def handler(*_args):
         raise asyncio.CancelledError
 
+    recorded = []
+
+    async def record_failure(*args, **kwargs):
+        recorded.append((args, kwargs))
+        return True
+
     monkeypatch.setattr(worker.repository, "claim", claim)
     monkeypatch.setattr(worker, "JobLease", FakeLease)
+    monkeypatch.setattr(worker, "_record_failure", record_failure)
 
     with pytest.raises(asyncio.CancelledError):
         await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
+
+    assert recorded[0][1] == {
+        "error_code": "worker_shutdown",
+        "error_message": "Worker shutdown interrupted the job.",
+        "retryable": True,
+    }
 
 
 @pytest.mark.asyncio
