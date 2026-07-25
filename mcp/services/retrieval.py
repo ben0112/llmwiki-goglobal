@@ -375,7 +375,10 @@ def _validated_query_embedding(
     for coordinate in vectors[0]:
         if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
             raise InvalidEmbeddingResponse("invalid embedding response")
-        normalized = float(coordinate)
+        try:
+            normalized = float(coordinate)
+        except (OverflowError, ValueError):
+            raise InvalidEmbeddingResponse("invalid embedding response") from None
         if not isfinite(normalized):
             raise InvalidEmbeddingResponse("invalid embedding response")
         embedding.append(normalized)

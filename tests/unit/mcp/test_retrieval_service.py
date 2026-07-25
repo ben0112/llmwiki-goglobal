@@ -231,7 +231,12 @@ async def test_typed_vector_unavailability_falls_back_but_lexical_failure_is_vis
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "vectors",
-    [((1.0, 2.0),), ((0.0, 0.0, 0.0),), ((float("nan"), 0.0, 1.0),)],
+    [
+        ((1.0, 2.0),),
+        ((0.0, 0.0, 0.0),),
+        ((float("nan"), 0.0, 1.0),),
+        ((10**10_000, 0.0, 1.0),),
+    ],
 )
 async def test_invalid_query_embedding_fails_closed_to_lexical(vectors):
     from services.retrieval import HostedRetrievalService
