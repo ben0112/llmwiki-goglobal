@@ -34,7 +34,7 @@ jobs:
         run: pytest tests/unit/core/ -v
 
       - name: Run API unit tests
-        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_facet_rollup.py tests/unit/test_graph_local.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py -v
+        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_tus_sessions.py tests/unit/test_facet_rollup.py tests/unit/test_graph_local.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py tests/unit/test_local_document_invariants.py tests/unit/test_local_reconcile.py -v
 
       - name: Run MCP unit tests
         working-directory: mcp
@@ -109,6 +109,39 @@ jobs:
           S3_MULTIPART_TEST_SECRET_KEY: test-secret-key
           S3_MULTIPART_TEST_BUCKET: llmwiki-multipart-test
         run: PYTHONPATH=api pytest tests/integration/test_s3_multipart.py -v
+
+  redis-integration:
+    name: Integration tests (Redis)
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7.4.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies
+        run: pip install -r api/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run Redis TUS coordination tests
+        env:
+          TUS_REDIS_TEST_URL: redis://127.0.0.1:6379/0
+        run: PYTHONPATH=api pytest tests/integration/test_tus_sessions_redis.py -v
 
   postgres-integration:
     name: Integration tests (Postgres)
