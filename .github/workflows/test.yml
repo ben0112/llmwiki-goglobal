@@ -67,6 +67,49 @@ jobs:
         working-directory: mcp
         run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_atomic_wiki_write ../tests/integration/mcp/test_wiki_write_invariants.py::test_sqlite_startup_reconciles_disk_after_database_rollback -v
 
+  s3-integration:
+    name: Integration tests (MinIO)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies
+        run: pip install -r api/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Start MinIO
+        run: |
+          docker run --detach --name llmwiki-minio \
+            --publish 127.0.0.1:9000:9000 \
+            --env MINIO_ROOT_USER=test-access \
+            --env MINIO_ROOT_PASSWORD=test-secret-key \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              docker logs llmwiki-minio
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+      - name: Run multipart object-store tests
+        env:
+          S3_MULTIPART_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_MULTIPART_TEST_ACCESS_KEY: test-access
+          S3_MULTIPART_TEST_SECRET_KEY: test-secret-key
+          S3_MULTIPART_TEST_BUCKET: llmwiki-multipart-test
+        run: PYTHONPATH=api pytest tests/integration/test_s3_multipart.py -v
+
   postgres-integration:
     name: Integration tests (Postgres)
     runs-on: ubuntu-latest
