@@ -1,0 +1,504 @@
+"""Strict retrieval-evaluation fixtures, exact metrics, and promotion gates."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from math import ceil, isfinite, log2
+from numbers import Real
+from os import PathLike
+from pathlib import Path
+from typing import Any
+
+from .search import SearchArea, SearchQuery, SearchScope
+
+EVALUATION_SCHEMA_VERSION = 1
+MAX_DATASET_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 256 * 1024
+MAX_CASES = 10_000
+MAX_RELEVANCE_PER_CASE = 10_000
+MAX_RANKING_LENGTH = 10_000
+MAX_GRADE = 100
+
+_CASE_FIELDS = frozenset({"schema_version", "case_id", "query", "relevance"})
+_QUERY_FIELDS = frozenset(
+    {
+        "text",
+        "limit",
+        "area",
+        "scope",
+        "facets",
+        "candidate_limit",
+        "path_glob",
+        "tags",
+        "document_kinds",
+        "annotated_only",
+    }
+)
+_RELEVANCE_FIELDS = frozenset({"document_id", "chunk_index", "grade"})
+
+
+def _nonblank_string(name: str, value: object) -> str:
+    if not isinstance(value, str) or not (normalized := value.strip()):
+        raise ValueError(f"{name} must be a nonblank string")
+    if len(normalized) > 1024:
+        raise ValueError(f"{name} is too long")
+    return normalized
+
+
+def _chunk_index(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("chunk_index must be a non-negative integer or null")
+    return value
+
+
+def _finite_non_negative(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite and non-negative")
+    normalized = float(value)
+    if not isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return normalized
+
+
+def _strict_fields(
+    value: object,
+    *,
+    label: str,
+    allowed: frozenset[str],
+    required: frozenset[str],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    keys = set(value)
+    if any(not isinstance(key, str) for key in keys):
+        raise ValueError(f"{label} field names must be strings")
+    if unknown := sorted(keys - allowed):
+        raise ValueError(f"{label} has unknown fields: {', '.join(unknown)}")
+    if missing := sorted(required - keys):
+        prefix = "" if label == "case" else f"{label} has "
+        raise ValueError(f"{prefix}missing fields: {', '.join(missing)}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class RelevanceJudgment:
+    """One positive graded judgment at document or chunk granularity."""
+
+    document_id: str
+    grade: int
+    chunk_index: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "document_id", _nonblank_string("document_id", self.document_id))
+        if isinstance(self.grade, bool) or not isinstance(self.grade, int) or not 1 <= self.grade <= MAX_GRADE:
+            raise ValueError(f"grade must be a positive integer no greater than {MAX_GRADE}")
+        object.__setattr__(self, "chunk_index", _chunk_index(self.chunk_index))
+
+    @property
+    def identity(self) -> tuple[str, int | None]:
+        return (self.document_id, self.chunk_index)
+
+
+@dataclass(frozen=True, slots=True)
+class RankedResult:
+    """A content-free ranked retrieval identity used by evaluation runs."""
+
+    document_id: str
+    chunk_index: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "document_id", _nonblank_string("document_id", self.document_id))
+        object.__setattr__(self, "chunk_index", _chunk_index(self.chunk_index))
+
+    @property
+    def identity(self) -> tuple[str, int | None]:
+        return (self.document_id, self.chunk_index)
+
+
+@dataclass(frozen=True, slots=True)
+class EvalCase:
+    """A validated v1 query and its non-overlapping relevance judgments."""
+
+    schema_version: int
+    case_id: str
+    query: SearchQuery
+    relevance: tuple[RelevanceJudgment, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or self.schema_version != EVALUATION_SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema_version: {self.schema_version!r}")
+        object.__setattr__(self, "case_id", _nonblank_string("case_id", self.case_id))
+        if not isinstance(self.query, SearchQuery):
+            raise ValueError("query must be a SearchQuery")
+        try:
+            relevance = tuple(self.relevance)
+        except TypeError as exc:
+            raise ValueError("relevance must be a sequence") from exc
+        if not relevance:
+            raise ValueError("relevance must not be empty")
+        if len(relevance) > MAX_RELEVANCE_PER_CASE:
+            raise ValueError("too many relevance judgments")
+        if any(not isinstance(item, RelevanceJudgment) for item in relevance):
+            raise ValueError("relevance must contain RelevanceJudgment values")
+        _validate_relevance_overlap(relevance)
+        object.__setattr__(self, "relevance", relevance)
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        schema_version: int,
+        case_id: str,
+        query: Mapping[str, Any],
+        relevance: Sequence[RelevanceJudgment],
+    ) -> EvalCase:
+        query_fields = _strict_fields(
+            query,
+            label="query",
+            allowed=_QUERY_FIELDS,
+            required=frozenset({"text"}),
+        )
+        try:
+            search_query = SearchQuery.build(**query_fields)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid query: {exc}") from exc
+        return cls(schema_version, case_id, search_query, tuple(relevance))
+
+
+def _validate_relevance_overlap(relevance: Sequence[RelevanceJudgment]) -> None:
+    identities: set[tuple[str, int | None]] = set()
+    document_level: set[str] = set()
+    chunk_level: set[str] = set()
+    for judgment in relevance:
+        if judgment.identity in identities:
+            raise ValueError(f"duplicate relevance judgment: {judgment.document_id}")
+        identities.add(judgment.identity)
+        if judgment.chunk_index is None:
+            if judgment.document_id in chunk_level:
+                raise ValueError(f"document-level and chunk-level relevance overlap: {judgment.document_id}")
+            document_level.add(judgment.document_id)
+        else:
+            if judgment.document_id in document_level:
+                raise ValueError(f"document-level and chunk-level relevance overlap: {judgment.document_id}")
+            chunk_level.add(judgment.document_id)
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationRun:
+    """One ranked result list and observed latency for exactly one case."""
+
+    case_id: str
+    ranking: tuple[RankedResult, ...]
+    latency_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "case_id", _nonblank_string("case_id", self.case_id))
+        try:
+            ranking = tuple(self.ranking)
+        except TypeError as exc:
+            raise ValueError("ranking must be a sequence") from exc
+        if len(ranking) > MAX_RANKING_LENGTH:
+            raise ValueError("ranking is too large")
+        if any(not isinstance(result, RankedResult) for result in ranking):
+            raise ValueError("ranking must contain RankedResult values")
+        seen: set[tuple[str, int | None]] = set()
+        for result in ranking:
+            if result.identity in seen:
+                raise ValueError(f"duplicate ranked result: {result.document_id}")
+            seen.add(result.identity)
+        object.__setattr__(self, "ranking", ranking)
+        object.__setattr__(
+            self,
+            "latency_ms",
+            _finite_non_negative("latency_ms", self.latency_ms),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationReport:
+    """Macro-averaged retrieval metrics and nearest-rank latency summaries."""
+
+    case_count: int
+    recall_at_5: float
+    recall_at_10: float
+    recall_at_20: float
+    mrr: float
+    ndcg_at_10: float
+    filtered_result_count: int
+    latency_p50_ms: float
+    latency_p95_ms: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.case_count, bool) or not isinstance(self.case_count, int) or self.case_count <= 0:
+            raise ValueError("case_count must be a positive integer")
+        for name in ("recall_at_5", "recall_at_10", "recall_at_20", "mrr", "ndcg_at_10"):
+            normalized = _finite_non_negative(name, getattr(self, name))
+            if normalized > 1:
+                raise ValueError(f"{name} must not exceed 1")
+            object.__setattr__(self, name, normalized)
+        if (
+            isinstance(self.filtered_result_count, bool)
+            or not isinstance(self.filtered_result_count, int)
+            or self.filtered_result_count < 0
+        ):
+            raise ValueError("filtered_result_count must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "latency_p50_ms",
+            _finite_non_negative("latency_p50_ms", self.latency_p50_ms),
+        )
+        object.__setattr__(
+            self,
+            "latency_p95_ms",
+            _finite_non_negative("latency_p95_ms", self.latency_p95_ms),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionDecision:
+    """Measured decision for promoting hybrid retrieval over lexical retrieval."""
+
+    eligible: bool
+    reason: str
+    recall_ratio: float | None = None
+    latency_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.eligible, bool):
+            raise ValueError("eligible must be a boolean")
+        object.__setattr__(self, "reason", _nonblank_string("reason", self.reason))
+        for name in ("recall_ratio", "latency_ratio"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _finite_non_negative(name, value))
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_relevance(value: object) -> tuple[RelevanceJudgment, ...]:
+    if not isinstance(value, list):
+        raise ValueError("relevance must be an array")
+    if not value:
+        raise ValueError("relevance must not be empty")
+    if len(value) > MAX_RELEVANCE_PER_CASE:
+        raise ValueError("too many relevance judgments")
+    judgments: list[RelevanceJudgment] = []
+    for raw_judgment in value:
+        judgment = _strict_fields(
+            raw_judgment,
+            label="relevance",
+            allowed=_RELEVANCE_FIELDS,
+            required=frozenset({"document_id", "grade"}),
+        )
+        judgments.append(
+            RelevanceJudgment(
+                document_id=judgment["document_id"],
+                grade=judgment["grade"],
+                chunk_index=judgment.get("chunk_index"),
+            )
+        )
+    return tuple(judgments)
+
+
+def _parse_case(value: object) -> EvalCase:
+    raw_case = _strict_fields(
+        value,
+        label="case",
+        allowed=_CASE_FIELDS,
+        required=_CASE_FIELDS,
+    )
+    schema_version = raw_case["schema_version"]
+    if isinstance(schema_version, bool) or schema_version != EVALUATION_SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema_version: {schema_version!r}")
+    return EvalCase.build(
+        schema_version=schema_version,
+        case_id=raw_case["case_id"],
+        query=raw_case["query"],
+        relevance=_parse_relevance(raw_case["relevance"]),
+    )
+
+
+def load_cases(path: str | PathLike[str]) -> tuple[EvalCase, ...]:
+    """Load and strictly validate a bounded UTF-8 JSONL evaluation dataset."""
+
+    dataset_path = Path(path)
+    try:
+        if dataset_path.stat().st_size > MAX_DATASET_BYTES:
+            raise ValueError("evaluation dataset exceeds the size limit")
+    except OSError as exc:
+        raise ValueError("evaluation dataset cannot be read") from exc
+
+    cases: list[EvalCase] = []
+    case_ids: set[str] = set()
+    try:
+        with dataset_path.open("rb") as dataset:
+            for line_number, raw_line in enumerate(dataset, start=1):
+                if len(raw_line) > MAX_LINE_BYTES:
+                    raise ValueError(f"line exceeds size limit at line {line_number}")
+                if not raw_line.strip():
+                    raise ValueError(f"blank JSONL line at line {line_number}")
+                try:
+                    value = json.loads(raw_line.decode("utf-8"), object_pairs_hook=_unique_object)
+                    case = _parse_case(value)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+                    raise ValueError(f"invalid evaluation case at line {line_number}: {exc}") from exc
+                if case.case_id in case_ids:
+                    raise ValueError(f"duplicate case_id: {case.case_id}")
+                case_ids.add(case.case_id)
+                cases.append(case)
+                if len(cases) > MAX_CASES:
+                    raise ValueError("evaluation dataset has too many cases")
+    except OSError as exc:
+        raise ValueError("evaluation dataset cannot be read") from exc
+    if not cases:
+        raise ValueError("evaluation dataset must contain at least one case")
+    return tuple(cases)
+
+
+def _is_filtered(query: SearchQuery) -> bool:
+    return bool(
+        query.area is not SearchArea.ALL
+        or query.scope is not SearchScope.ALL
+        or query.facets
+        or query.path_glob is not None
+        or query.tags
+        or query.document_kinds
+        or query.annotated_only
+    )
+
+
+def _case_metrics(case: EvalCase, run: EvaluationRun) -> tuple[float, float, float, float, float]:
+    document_judgments = {item.document_id: item for item in case.relevance if item.chunk_index is None}
+    chunk_judgments = {item.identity: item for item in case.relevance if item.chunk_index is not None}
+    matched: set[tuple[str, int | None]] = set()
+    matches: list[tuple[int, RelevanceJudgment]] = []
+    for rank, result in enumerate(run.ranking, start=1):
+        judgment = document_judgments.get(result.document_id)
+        if judgment is None:
+            judgment = chunk_judgments.get(result.identity)
+        if judgment is not None and judgment.identity not in matched:
+            matched.add(judgment.identity)
+            matches.append((rank, judgment))
+
+    relevant_count = len(case.relevance)
+    recalls = tuple(sum(rank <= cutoff for rank, _judgment in matches) / relevant_count for cutoff in (5, 10, 20))
+    mrr = 0.0 if not matches else 1.0 / matches[0][0]
+    dcg = sum((2**judgment.grade - 1) / log2(rank + 1) for rank, judgment in matches if rank <= 10)
+    ideal_grades = sorted((item.grade for item in case.relevance), reverse=True)[:10]
+    ideal_dcg = sum((2**grade - 1) / log2(rank + 1) for rank, grade in enumerate(ideal_grades, 1))
+    ndcg = dcg / ideal_dcg
+    return (*recalls, mrr, ndcg)
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float:
+    ordered = sorted(values)
+    return ordered[max(0, ceil(percentile * len(ordered)) - 1)]
+
+
+def _index_cases_and_runs(
+    cases: Sequence[EvalCase],
+    runs: Sequence[EvaluationRun],
+) -> tuple[dict[str, EvalCase], dict[str, EvaluationRun]]:
+    cases_by_id: dict[str, EvalCase] = {}
+    for case in cases:
+        if case.case_id in cases_by_id:
+            raise ValueError(f"duplicate evaluation case: {case.case_id}")
+        cases_by_id[case.case_id] = case
+    runs_by_id: dict[str, EvaluationRun] = {}
+    for run in runs:
+        if run.case_id not in cases_by_id:
+            raise ValueError(f"unknown case_id in evaluation run: {run.case_id}")
+        if run.case_id in runs_by_id:
+            raise ValueError(f"duplicate evaluation run: {run.case_id}")
+        runs_by_id[run.case_id] = run
+    if runs_by_id.keys() != cases_by_id.keys():
+        raise ValueError("exactly one run per case is required")
+    return cases_by_id, runs_by_id
+
+
+def evaluate_rankings(
+    cases: Sequence[EvalCase],
+    runs: Sequence[EvaluationRun],
+) -> EvaluationReport:
+    """Evaluate exactly one ranked run per case using macro-averaged IR metrics."""
+
+    if isinstance(cases, (str, bytes)) or not isinstance(cases, Sequence):
+        raise ValueError("cases must be a sequence")
+    if isinstance(runs, (str, bytes)) or not isinstance(runs, Sequence):
+        raise ValueError("runs must be a sequence")
+    case_values = tuple(cases)
+    run_values = tuple(runs)
+    if not case_values:
+        raise ValueError("at least one evaluation case is required")
+    if len(case_values) > MAX_CASES or len(run_values) > MAX_CASES:
+        raise ValueError("evaluation input is too large")
+    if any(not isinstance(case, EvalCase) for case in case_values):
+        raise ValueError("cases must contain EvalCase values")
+    if any(not isinstance(run, EvaluationRun) for run in run_values):
+        raise ValueError("runs must contain EvaluationRun values")
+
+    _cases_by_id, runs_by_id = _index_cases_and_runs(case_values, run_values)
+
+    per_case = [_case_metrics(case, runs_by_id[case.case_id]) for case in case_values]
+    count = len(case_values)
+    averages = [sum(metrics[index] for metrics in per_case) / count for index in range(5)]
+    latencies = [runs_by_id[case.case_id].latency_ms for case in case_values]
+    return EvaluationReport(
+        case_count=count,
+        recall_at_5=averages[0],
+        recall_at_10=averages[1],
+        recall_at_20=averages[2],
+        mrr=averages[3],
+        ndcg_at_10=averages[4],
+        filtered_result_count=sum(
+            len(runs_by_id[case.case_id].ranking) for case in case_values if _is_filtered(case.query)
+        ),
+        latency_p50_ms=_nearest_rank(latencies, 0.50),
+        latency_p95_ms=_nearest_rank(latencies, 0.95),
+    )
+
+
+def promotion_decision(
+    lexical: EvaluationReport,
+    hybrid: EvaluationReport,
+) -> PromotionDecision:
+    """Apply the inclusive quality and latency gates for hybrid promotion."""
+
+    if not isinstance(lexical, EvaluationReport) or not isinstance(hybrid, EvaluationReport):
+        raise ValueError("promotion inputs must be EvaluationReport values")
+    if lexical.recall_at_10 <= 0:
+        return PromotionDecision(False, "baseline_recall_zero")
+    recall_ratio = hybrid.recall_at_10 / lexical.recall_at_10
+    latency_ratio = hybrid.latency_p95_ms / max(lexical.latency_p95_ms, 0.001)
+    eligible = recall_ratio >= 1.10 and latency_ratio <= 2.0
+    return PromotionDecision(
+        eligible=eligible,
+        reason="eligible" if eligible else "gate_failed",
+        recall_ratio=recall_ratio,
+        latency_ratio=latency_ratio,
+    )
+
+
+__all__ = [
+    "EVALUATION_SCHEMA_VERSION",
+    "EvalCase",
+    "EvaluationReport",
+    "EvaluationRun",
+    "PromotionDecision",
+    "RankedResult",
+    "RelevanceJudgment",
+    "evaluate_rankings",
+    "load_cases",
+    "promotion_decision",
+]

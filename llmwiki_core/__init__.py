@@ -10,6 +10,18 @@ from .documents import (
     join_logical_path,
     normalize_directory_path,
 )
+from .evaluation import (
+    EVALUATION_SCHEMA_VERSION,
+    EvalCase,
+    EvaluationReport,
+    EvaluationRun,
+    PromotionDecision,
+    RankedResult,
+    RelevanceJudgment,
+    evaluate_rankings,
+    load_cases,
+    promotion_decision,
+)
 from .facets import FACET_KEYS, UnknownFacetError, apply_rollup, rollup_from_metas, validate_facets
 from .references import build_lookup_maps, extract_references, parse_citation_filename, parse_wiki_links
 from .search import (
@@ -33,9 +45,16 @@ __all__ = [
     "DocumentIdentity",
     "DocumentKind",
     "DocumentStatus",
+    "EVALUATION_SCHEMA_VERSION",
+    "EvalCase",
+    "EvaluationReport",
+    "EvaluationRun",
     "FACET_KEYS",
     "HybridRetrievalService",
     "InvalidStatusTransition",
+    "PromotionDecision",
+    "RankedResult",
+    "RelevanceJudgment",
     "assert_status_transition",
     "chunk_pages",
     "chunk_text",
@@ -53,8 +72,11 @@ __all__ = [
     "apply_rollup",
     "build_lookup_maps",
     "extract_references",
+    "evaluate_rankings",
+    "load_cases",
     "parse_citation_filename",
     "parse_wiki_links",
+    "promotion_decision",
     "rollup_from_metas",
     "validate_facets",
 ]
