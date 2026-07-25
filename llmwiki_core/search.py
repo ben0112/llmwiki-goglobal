@@ -87,7 +87,7 @@ class SearchQuery:
             raise ValueError("annotated_only must be a boolean")
 
         try:
-            area = SearchArea(self.area or SearchArea.ALL)
+            area = SearchArea(SearchArea.ALL if self.area is None else self.area)
         except (TypeError, ValueError) as exc:
             raise ValueError("unsupported search area") from exc
         try:
@@ -127,7 +127,7 @@ class SearchQuery:
         return cls(
             text=text,
             limit=limit,
-            area=area or SearchArea.ALL,
+            area=SearchArea.ALL if area is None else area,
             scope=scope,
             facets={} if facets is None else facets,
             candidate_limit=candidate_limit,

@@ -77,6 +77,24 @@ def test_search_query_keeps_existing_builder_calls_compatible():
     assert query.annotated_only is False
 
 
+def test_search_query_treats_only_none_area_as_all():
+    assert SearchQuery(text="query", area=None).area is SearchArea.ALL
+    assert SearchQuery.build(text="query", area=None).area is SearchArea.ALL
+
+
+@pytest.mark.parametrize("area", [False, 0, "", []])
+@pytest.mark.parametrize("constructor", [SearchQuery, SearchQuery.build])
+def test_search_query_rejects_falsy_invalid_areas(area, constructor):
+    with pytest.raises(ValueError, match="unsupported search area"):
+        constructor(text="query", area=area)
+
+
+@pytest.mark.parametrize("constructor", [SearchQuery, SearchQuery.build])
+def test_search_query_scope_remains_fail_closed(constructor):
+    with pytest.raises(ValueError, match="unsupported search scope"):
+        constructor(text="query", scope=False)
+
+
 def test_search_query_direct_constructor_normalizes_and_freezes_inputs():
     facets = {"country": "IDN"}
     tags = ["Policy", " asean "]
