@@ -76,13 +76,17 @@ def test_gateway_configuration_supports_dynamic_http_and_websocket_proxying():
 
 def test_self_host_docs_make_rollback_and_scaled_smoke_commands_executable():
     text = DOCS.read_text(encoding="utf-8")
-    assert "export DURABLE_JOBS_ENABLED=false" in text
-    assert "export TUS_MULTIPART_ENABLED=false" in text
-    assert "stop worker" in text
-    assert "--scale worker=0" in text
-    assert "--scale api=1" in text
-    assert "--force-recreate" in text
-    assert "restart gateway" in text
+    rollback_section = text.split("Copyable incident rollback", 1)[1].split("### Security notes", 1)[0]
+    rollback_block = rollback_section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    assert rollback_block.startswith("(\n  set -e\n")
+    assert rollback_block.endswith("\n)")
+    assert "export DURABLE_JOBS_ENABLED=false" in rollback_block
+    assert "export TUS_MULTIPART_ENABLED=false" in rollback_block
+    assert "stop worker" in rollback_block
+    assert "--scale worker=0" in rollback_block
+    assert "--scale api=1" in rollback_block
+    assert "--force-recreate" in rollback_block
+    assert "restart gateway" in rollback_block
     assert "trap cleanup EXIT" in text
     assert "SCALED_COMPOSE_TEST=1" in text
     assert "safely reads `deploy/.env.selfhost`" in text

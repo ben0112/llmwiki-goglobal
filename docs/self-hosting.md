@@ -236,18 +236,22 @@ Copyable incident rollback (the worker intentionally refuses to start when
 durable jobs are disabled):
 
 ```bash
-# Exported values override the true defaults in deploy/.env.selfhost:
-export DURABLE_JOBS_ENABLED=false
-export TUS_MULTIPART_ENABLED=false
+(
+  set -e
 
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-  stop worker
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-  up -d --no-deps --scale worker=0 worker
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-  up -d --build --no-deps --force-recreate --scale api=1 api
-docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
-  restart gateway
+  # Exported values override the true defaults in deploy/.env.selfhost:
+  export DURABLE_JOBS_ENABLED=false
+  export TUS_MULTIPART_ENABLED=false
+
+  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+    stop worker
+  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+    up -d --no-deps --scale worker=0 worker
+  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+    up -d --build --no-deps --force-recreate --scale api=1 api
+  docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
+    restart gateway
+)
 ```
 
 ### Security notes for an internal deployment
