@@ -229,7 +229,13 @@ jobs:
             done
 
       - name: Run MCP Postgres isolation tests
-        run: python -m tests.helpers.ci_test_matrix integration-mcp-postgres | xargs env PYTHONPATH=mcp pytest -v
+        run: |
+          set -e
+          set -o pipefail
+          python -m tests.helpers.ci_test_matrix integration-mcp-postgres |
+            while IFS= read -r test_file; do
+              PYTHONPATH=mcp pytest "$test_file" -v
+            done
 
   scaled-compose:
     name: Required scaled Compose (2 API / 2 worker)

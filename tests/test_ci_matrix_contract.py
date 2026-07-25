@@ -21,7 +21,7 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
     ):
         command = f"python -m tests.helpers.ci_test_matrix {segment}"
         assert command in workflow
-        if segment == "integration-api":
+        if segment in {"integration-api", "integration-mcp-postgres"}:
             assert f"{command} |" in workflow
             assert "while IFS= read -r test_file; do" in workflow
             assert 'PYTHONPATH=api MODE=hosted pytest "$test_file" -v' in workflow
@@ -39,6 +39,18 @@ def test_api_integration_files_use_fresh_pytest_session_fixtures():
     assert "while IFS= read -r test_file; do" in step
     assert 'pytest "$test_file"' in step
     assert "xargs env PYTHONPATH=api MODE=hosted pytest" not in step
+
+
+def test_mcp_postgres_files_load_module_plugins_in_separate_pytest_processes():
+    """Collecting a fixture-provider module and its consumer together hides the plugin fixtures."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("- name: Run MCP Postgres isolation tests", 1)[1]
+    step = step.split("\n\n", 1)[0]
+
+    assert "set -o pipefail" in step
+    assert "while IFS= read -r test_file; do" in step
+    assert 'PYTHONPATH=mcp pytest "$test_file" -v' in step
+    assert "xargs env PYTHONPATH=mcp pytest" not in step
 
 
 def test_each_test_file_has_exactly_one_primary_ci_segment():
