@@ -20,12 +20,34 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
         "integration-api",
         "integration-mcp",
         "integration-mcp-postgres",
+        "integration-retrieval",
         "integration-redis",
         "integration-minio",
         "integration-scaled",
     ):
         command = f"python -m tests.helpers.ci_test_matrix run {segment} --"
         assert command in workflow
+
+
+def test_retrieval_evaluation_has_a_dedicated_pgvector_segment():
+    from tests.helpers.ci_test_matrix import SEGMENTS
+
+    assert SEGMENTS["integration-retrieval"] == (
+        "tests/integration/test_chunk_embeddings_schema.py",
+        "tests/integration/test_durable_embeddings.py",
+        "tests/integration/test_hybrid_failure_matrix.py",
+        "tests/integration/test_retrieval_evaluation.py",
+        "tests/integration/test_vector_store.py",
+    )
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("- name: Run deterministic retrieval promotion gate", 1)[1]
+    step = step.split("- name:", 1)[0]
+
+    assert "pgvector/pgvector:0.8.0-pg16" in workflow
+    assert "python -m tests.helpers.ci_test_matrix run integration-retrieval --" in step
+    assert "env PYTHONPATH=api MODE=hosted pytest -v" in step
+    assert "|| true" not in step
+    assert "|" not in step
 
 
 def test_api_integration_files_use_fresh_pytest_session_fixtures():

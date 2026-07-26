@@ -31,6 +31,13 @@ integration_mcp_postgres = {
 integration_redis = {INTEGRATION / "test_tus_sessions_redis.py"}
 integration_minio = {INTEGRATION / "test_s3_multipart.py"}
 integration_scaled = {INTEGRATION / "test_scaled_compose.py"}
+integration_retrieval = {
+    INTEGRATION / "test_chunk_embeddings_schema.py",
+    INTEGRATION / "test_durable_embeddings.py",
+    INTEGRATION / "test_hybrid_failure_matrix.py",
+    INTEGRATION / "test_retrieval_evaluation.py",
+    INTEGRATION / "test_vector_store.py",
+}
 
 SEGMENTS: dict[str, tuple[str, ...]] = {
     "unit-core": _relative(unit_core),
@@ -43,9 +50,11 @@ SEGMENTS: dict[str, tuple[str, ...]] = {
         - integration_redis
         - integration_minio
         - integration_scaled
+        - integration_retrieval
     ),
     "integration-mcp": _relative(integration_mcp - integration_mcp_postgres),
     "integration-mcp-postgres": _relative(integration_mcp_postgres),
+    "integration-retrieval": _relative(integration_retrieval),
     "integration-redis": _relative(integration_redis),
     "integration-minio": _relative(integration_minio),
     "integration-scaled": _relative(integration_scaled),

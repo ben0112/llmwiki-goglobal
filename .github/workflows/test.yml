@@ -222,6 +222,9 @@ jobs:
           TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
         run: python -m tests.helpers.ci_test_matrix run integration-api -- env PYTHONPATH=api MODE=hosted pytest -v
 
+      - name: Run deterministic retrieval promotion gate
+        run: python -m tests.helpers.ci_test_matrix run integration-retrieval -- env PYTHONPATH=api MODE=hosted pytest -v
+
       - name: Run MCP Postgres isolation tests
         run: python -m tests.helpers.ci_test_matrix run integration-mcp-postgres -- env PYTHONPATH=mcp pytest -v
 

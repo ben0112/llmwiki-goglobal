@@ -16,15 +16,20 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
+from numbers import Real
 from pathlib import Path
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any, BinaryIO
+from uuid import UUID
 
 from llmwiki_core import (
     EVALUATION_SCHEMA_VERSION,
     EvaluationReport,
     EvaluationRun,
+    HybridRetrievalService,
     RankedResult,
+    RetrieverUnavailable,
     SearchArea,
     SearchHit,
     SearchQuery,
@@ -36,6 +41,7 @@ from llmwiki_core import (
     promotion_decision,
 )
 from llmwiki_core.documents import DocumentKind
+from llmwiki_core.models import EmbeddingProfile
 
 REPORT_SCHEMA_VERSION = 1
 MAX_CORPUS_BYTES = 8 * 1024 * 1024
@@ -213,6 +219,372 @@ class _SyntheticLexicalRetriever:
             latency_ms=0.0,
             profile="lexical",
         )
+
+
+class _PostgresEvaluationLexicalRetriever:
+    """Tenant-scoped PostgreSQL lexical adapter used by evidence runs."""
+
+    def __init__(
+        self,
+        pool: object,
+        *,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        candidate_limit: int | None = None,
+    ) -> None:
+        self._pool = pool
+        self._user_id = user_id
+        self._knowledge_base_id = knowledge_base_id
+        self._candidate_limit = candidate_limit
+
+    async def retrieve(self, query: SearchQuery) -> SearchResult:
+        from services.vector_store import _facet_conditions, _logical_glob_to_sql_like
+
+        effective_query = _query_with_candidate_limit(query, self._candidate_limit)
+        started_at = perf_counter()
+        params: list[object] = [
+            self._user_id,
+            self._knowledge_base_id,
+            effective_query.text,
+        ]
+
+        def bind(value: object) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        where = [
+            "d.user_id=$1",
+            "d.knowledge_base_id=$2",
+            "dc.user_id=$1",
+            "dc.knowledge_base_id=$2",
+            "dc.document_version=d.version",
+            "d.status != 'failed'",
+            "NOT d.archived",
+        ]
+        if effective_query.annotated_only:
+            where.append("dc.has_highlight=true")
+        if effective_query.area is SearchArea.WIKI:
+            where.append("d.source_kind='wiki'")
+        elif effective_query.area is SearchArea.SOURCES:
+            where.append("d.source_kind!='wiki'")
+        if effective_query.document_kinds:
+            kinds = bind([kind.value for kind in effective_query.document_kinds])
+            where.append(f"d.source_kind=ANY({kinds}::text[])")
+        if effective_query.path_glob is not None:
+            path_pattern = bind(_logical_glob_to_sql_like(effective_query.path_glob))
+            where.append(f"(d.path || d.filename) LIKE {path_pattern} ESCAPE '\\'")
+        if effective_query.tags:
+            tags = bind(list(effective_query.tags))
+            where.append(
+                "ARRAY(SELECT lower(tag) FROM unnest(COALESCE(d.tags, ARRAY[]::text[])) tag) "
+                f"@> {tags}::text[]"
+            )
+        where.extend(_facet_conditions(dict(effective_query.facets), bind=bind))
+
+        searchable = {
+            SearchScope.ALL: "dc.content",
+            SearchScope.SOURCE: "dc.source_content",
+            SearchScope.ANNOTATIONS: "COALESCE(dc.annotations_text, '')",
+        }[effective_query.scope]
+        where.append(
+            f"to_tsvector('simple', {searchable}) @@ plainto_tsquery('simple', $3)"
+        )
+        limit_parameter = bind(effective_query.candidate_limit)
+        sql = (
+            "WITH filtered AS ("
+            "SELECT dc.document_id, dc.document_version, dc.chunk_index, dc.content, "
+            "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, d.tags, "
+            "d.source_kind, d.metadata, "
+            f"ts_rank_cd(to_tsvector('simple', {searchable}), "
+            "plainto_tsquery('simple', $3)) AS score "
+            "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
+            f"WHERE {' AND '.join(where)}"
+            "), counted AS ("
+            "SELECT *, count(*) OVER () AS candidate_count FROM filtered"
+            ") SELECT * FROM counted "
+            "ORDER BY score DESC, document_id, document_version, chunk_index "
+            f"LIMIT {limit_parameter}"
+        )
+        rows = await _postgres_fetch(self._pool, sql, params, label="lexical")
+        dictionaries = tuple(dict(row) for row in rows)
+        hits = tuple(_postgres_evaluation_hit(row) for row in dictionaries)
+        return SearchResult(
+            hits=hits,
+            candidate_count=(int(dictionaries[0]["candidate_count"]) if dictionaries else 0),
+            latency_ms=(perf_counter() - started_at) * 1000,
+            profile="lexical",
+        )
+
+
+class _PostgresEvaluationVectorRetriever:
+    """Query-embedding adapter over the production pgvector store."""
+
+    def __init__(
+        self,
+        pool: object,
+        *,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        profile: EmbeddingProfile,
+        embedding_client_factory: Callable[[], object],
+        candidate_limit: int,
+    ) -> None:
+        from services.vector_store import PostgresVectorStore
+
+        self._pool = pool
+        self._user_id = user_id
+        self._knowledge_base_id = knowledge_base_id
+        self._profile = profile
+        self._embedding_client_factory = embedding_client_factory
+        self._candidate_limit = candidate_limit
+        self._store = PostgresVectorStore(pool, profile=profile)
+
+    async def retrieve(self, query: SearchQuery) -> SearchResult:
+        if not await self._profile_is_available():
+            raise RetrieverUnavailable("evaluation vectors are unavailable")
+        client = self._embedding_client_factory()
+        try:
+            if getattr(client, "profile", None) != self._profile:
+                raise RetrieverUnavailable("evaluation query embedding is unavailable")
+            embed = getattr(client, "embed", None)
+            if not callable(embed):
+                raise RetrieverUnavailable("evaluation query embedding is unavailable")
+            vectors = await embed((query.text,))
+            embedding = _validated_evaluation_query_embedding(
+                vectors,
+                dimensions=self._profile.dimensions,
+            )
+        except RetrieverUnavailable:
+            raise
+        except BaseException as error:  # noqa: BLE001 - provider details must not cross the boundary.
+            if process_control := _sanitized_process_control(error):
+                raise process_control from None
+            raise RetrieverUnavailable("evaluation query embedding is unavailable") from None
+        finally:
+            close = getattr(client, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except BaseException as error:  # noqa: BLE001 - cleanup shares the privacy boundary.
+                    if process_control := _sanitized_process_control(error):
+                        raise process_control from None
+
+        effective_query = _query_with_candidate_limit(query, self._candidate_limit)
+        return await self._store.search(
+            user_id=self._user_id,
+            knowledge_base_id=self._knowledge_base_id,
+            query=effective_query,
+            embedding=embedding,
+        )
+
+    async def _profile_is_available(self) -> bool:
+        rows = await _postgres_fetch(
+            self._pool,
+            "SELECT EXISTS(SELECT 1 FROM chunk_embeddings ce "
+            "JOIN documents d ON d.id=ce.document_id "
+            "WHERE ce.user_id=$1 AND ce.knowledge_base_id=$2 "
+            "AND ce.provider=$3 AND ce.model=$4 AND ce.dimensions=$5 "
+            "AND d.user_id=$1 AND d.knowledge_base_id=$2 "
+            "AND ce.document_version=d.version AND NOT d.archived "
+            "AND d.status != 'failed') AS available",
+            (
+                self._user_id,
+                self._knowledge_base_id,
+                self._profile.provider,
+                self._profile.model,
+                self._profile.dimensions,
+            ),
+            label="vector",
+        )
+        return bool(rows and dict(rows[0]).get("available") is True)
+
+
+class _EvaluationLatencyRetriever:
+    def __init__(
+        self,
+        retriever: object,
+        *,
+        selected_profile: str,
+        latency_ms: Callable[[str, SearchQuery], Real] | None,
+    ) -> None:
+        self._retriever = retriever
+        self._selected_profile = selected_profile
+        self._latency_ms = latency_ms
+
+    async def retrieve(self, query: SearchQuery) -> SearchResult:
+        result = await self._retriever.retrieve(query)
+        if self._latency_ms is None:
+            return result
+        latency = self._latency_ms(self._selected_profile, query)
+        return SearchResult(
+            hits=result.hits,
+            candidate_count=result.candidate_count,
+            latency_ms=latency,
+            profile=result.profile,
+        )
+
+
+def postgres_evaluation_retriever_factory(
+    pool: object,
+    *,
+    user_id: str | UUID,
+    knowledge_base_id: str | UUID,
+    embedding_profile: EmbeddingProfile,
+    embedding_client_factory: Callable[[], object] | None,
+    lexical_candidate_limit: int,
+    vector_candidate_limit: int,
+    rrf_k: int,
+    latency_ms: Callable[[str, SearchQuery], Real] | None = None,
+) -> RetrieverFactory:
+    """Build real PostgreSQL lexical/hybrid adapters for one evaluation tenant.
+
+    Fake embeddings and deterministic latency are possible only through explicit
+    caller injection; neither becomes a deployment default.
+    """
+
+    user_uuid = _evaluation_uuid(user_id)
+    knowledge_base_uuid = _evaluation_uuid(knowledge_base_id)
+    if not isinstance(embedding_profile, EmbeddingProfile):
+        raise TypeError("embedding_profile must be an EmbeddingProfile")
+    if embedding_client_factory is not None and not callable(embedding_client_factory):
+        raise TypeError("embedding_client_factory must be callable")
+    for value in (lexical_candidate_limit, vector_candidate_limit):
+        if type(value) is not int or not 1 <= value <= 500:
+            raise ValueError("evaluation candidate limits must be between 1 and 500")
+    if latency_ms is not None and not callable(latency_ms):
+        raise TypeError("latency_ms must be callable")
+
+    def build(profile: str, _dataset_path: Path) -> object:
+        if profile == "lexical":
+            retriever: object = _PostgresEvaluationLexicalRetriever(
+                pool,
+                user_id=user_uuid,
+                knowledge_base_id=knowledge_base_uuid,
+            )
+        elif profile == "hybrid":
+            if embedding_client_factory is None:
+                raise HybridConfigurationUnavailable
+            retriever = HybridRetrievalService(
+                lexical=_PostgresEvaluationLexicalRetriever(
+                    pool,
+                    user_id=user_uuid,
+                    knowledge_base_id=knowledge_base_uuid,
+                    candidate_limit=lexical_candidate_limit,
+                ),
+                vector=_PostgresEvaluationVectorRetriever(
+                    pool,
+                    user_id=user_uuid,
+                    knowledge_base_id=knowledge_base_uuid,
+                    profile=embedding_profile,
+                    embedding_client_factory=embedding_client_factory,
+                    candidate_limit=vector_candidate_limit,
+                ),
+                rrf_k=rrf_k,
+            )
+        else:
+            raise RetrievalContractError
+        return _EvaluationLatencyRetriever(
+            retriever,
+            selected_profile=profile,
+            latency_ms=latency_ms,
+        )
+
+    return build
+
+
+def _evaluation_uuid(value: str | UUID) -> UUID:
+    if isinstance(value, bool):
+        raise ValueError("evaluation scope must contain UUIDs")
+    try:
+        return value if isinstance(value, UUID) else UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("evaluation scope must contain UUIDs") from None
+
+
+def _query_with_candidate_limit(query: SearchQuery, candidate_limit: int | None) -> SearchQuery:
+    if candidate_limit is None or candidate_limit == query.candidate_limit:
+        return query
+    return SearchQuery.build(
+        text=query.text,
+        limit=query.limit,
+        candidate_limit=candidate_limit,
+        area=query.area,
+        scope=query.scope,
+        facets=query.facets,
+        path_glob=query.path_glob,
+        tags=query.tags,
+        document_kinds=query.document_kinds,
+        annotated_only=query.annotated_only,
+    )
+
+
+async def _postgres_fetch(
+    pool: object,
+    sql: str,
+    params: Sequence[object],
+    *,
+    label: str,
+) -> Sequence[object]:
+    fetch = getattr(pool, "fetch", None)
+    if not callable(fetch):
+        raise RetrieverUnavailable(f"{label} evaluation store is unavailable")
+    try:
+        return await fetch(sql, *params)
+    except BaseException as error:  # noqa: BLE001 - database details must not cross the boundary.
+        if process_control := _sanitized_process_control(error):
+            raise process_control from None
+        raise RetrieverUnavailable(f"{label} evaluation store is unavailable") from None
+
+
+def _validated_evaluation_query_embedding(
+    vectors: object,
+    *,
+    dimensions: int,
+) -> tuple[float, ...]:
+    if (
+        isinstance(vectors, (str, bytes))
+        or not isinstance(vectors, Sequence)
+        or len(vectors) != 1
+        or isinstance(vectors[0], (str, bytes))
+        or not isinstance(vectors[0], Sequence)
+        or len(vectors[0]) != dimensions
+    ):
+        raise RetrieverUnavailable("evaluation query embedding is unavailable")
+    normalized: list[float] = []
+    for coordinate in vectors[0]:
+        if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
+            raise RetrieverUnavailable("evaluation query embedding is unavailable")
+        try:
+            value = float(coordinate)
+        except (OverflowError, TypeError, ValueError):
+            raise RetrieverUnavailable("evaluation query embedding is unavailable") from None
+        if not isfinite(value):
+            raise RetrieverUnavailable("evaluation query embedding is unavailable")
+        normalized.append(value)
+    if not any(normalized):
+        raise RetrieverUnavailable("evaluation query embedding is unavailable")
+    return tuple(normalized)
+
+
+def _postgres_evaluation_hit(row: Mapping[str, object]) -> SearchHit:
+    raw_metadata = row.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+    return SearchHit(
+        document_id=str(row["document_id"]),
+        document_version=int(row["document_version"]),
+        chunk_index=int(row["chunk_index"]),
+        content=str(row["content"]),
+        score=float(row["score"]),
+        path=f"{row['path']}{row['filename']}",
+        title=None if row.get("title") is None else str(row["title"]),
+        page=None if row.get("page") is None else int(row["page"]),
+        header_breadcrumb=(
+            None if row.get("header_breadcrumb") is None else str(row["header_breadcrumb"])
+        ),
+        tags=tuple(row.get("tags") or ()),
+        document_kind=DocumentKind(str(row["source_kind"])),
+        metadata=metadata,
+    )
 
 
 def _tokenize(value: str) -> tuple[str, ...]:
