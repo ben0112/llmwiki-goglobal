@@ -926,7 +926,7 @@ def _valid_backend_row():
         ("chunk_index", 10_000),
         ("content", None),
         ("content", 1),
-        ("content", "x" * 1_000_001),
+        pytest.param("content", "x" * 1_000_001, id="content-too-long"),
         ("path", None),
         ("path", 1),
         ("path", "relative/"),
