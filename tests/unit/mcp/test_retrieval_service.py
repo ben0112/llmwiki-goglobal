@@ -202,6 +202,48 @@ async def test_hybrid_forwards_identical_filters_and_configured_candidate_limits
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["source", "annotations"])
+async def test_scoped_hybrid_falls_back_before_building_embedding_client(scope):
+    from services.retrieval import HostedRetrievalService
+
+    vault = _Vault()
+    vault.lexical = SearchResult(
+        (_hit(f"scoped-{scope}"),),
+        1,
+        profile="lexical",
+    )
+    calls = {"factory": 0, "embed": 0, "aclose": 0}
+
+    class Client:
+        profile = PROFILE
+
+        async def embed(self, _texts):
+            calls["embed"] += 1
+            return ((1.0, 0.0, 0.0),)
+
+        async def aclose(self):
+            calls["aclose"] += 1
+
+    def build_client():
+        calls["factory"] += 1
+        return Client()
+
+    query = SearchQuery.build(text="permit", limit=1, scope=scope)
+    result = await HostedRetrievalService(
+        vault,
+        "kb-1",
+        settings=_settings(),
+        embedding_client_factory=build_client,
+    ).retrieve(query, profile="hybrid")
+
+    assert result.profile == "lexical_fallback"
+    assert result.hits == vault.lexical.hits
+    assert vault.lexical_queries[0][1].scope is query.scope
+    assert vault.vector_queries == []
+    assert calls == {"factory": 0, "embed": 0, "aclose": 0}
+
+
+@pytest.mark.asyncio
 async def test_typed_embedding_unavailability_falls_back_with_safe_structured_signal():
     from services.retrieval import HostedRetrievalService
 

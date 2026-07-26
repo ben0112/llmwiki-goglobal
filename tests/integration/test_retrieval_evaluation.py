@@ -543,6 +543,132 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
         assert secret not in first.out
 
 
+@pytest.mark.parametrize(
+    ("hybrid_latency_ms", "expected_code", "expected_eligible", "expected_reason"),
+    [
+        (20.0, 0, True, "eligible"),
+        (20.0001, 3, False, "gate_failed"),
+    ],
+    ids=("gate-pass", "gate-block"),
+)
+def test_hosted_cli_compare_runs_without_retriever_factory_injection(
+    evaluation_corpus,
+    monkeypatch,
+    capsys,
+    hybrid_latency_ms,
+    expected_code,
+    expected_eligible,
+    expected_reason,
+):
+    embedding_calls = []
+    owned_pools = []
+    real_builder = retrieval_eval.postgres_evaluation_retriever_factory
+
+    class OwnedPool:
+        def __init__(self, inner):
+            self.inner = inner
+            self.closed = False
+
+        def acquire(self):
+            return self.inner.acquire()
+
+        async def close(self):
+            self.closed = True
+            await self.inner.close()
+
+    async def create_pool(dsn):
+        assert dsn == os.environ["DATABASE_URL"]
+        inner = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+        owned = OwnedPool(inner)
+        owned_pools.append(owned)
+        return owned
+
+    def deterministic_builder(*args, **kwargs):
+        kwargs["latency_ms"] = (
+            lambda selected, _query: 10.0
+            if selected == "lexical"
+            else hybrid_latency_ms
+        )
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setenv("HYBRID_SEARCH_ENABLED", "true")
+    monkeypatch.setenv("RETRIEVAL_EVAL_USER_ID", str(USER_ID))
+    monkeypatch.setenv("RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID", str(KNOWLEDGE_BASE_ID))
+    monkeypatch.setenv("EMBEDDING_PROVIDER", PROFILE.provider)
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://private-embedding.invalid/v1")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "sk-private-hosted-evaluation")
+    monkeypatch.setenv("EMBEDDING_MODEL", PROFILE.model)
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", str(PROFILE.dimensions))
+    monkeypatch.setenv("HYBRID_LEXICAL_CANDIDATES", "1")
+    monkeypatch.setenv("HYBRID_VECTOR_CANDIDATES", "1")
+    monkeypatch.setenv("HYBRID_RRF_K", "60")
+    monkeypatch.setattr(retrieval_eval, "_create_hosted_pool", create_pool, raising=False)
+    monkeypatch.setattr(
+        retrieval_eval,
+        "_new_hosted_embedding_client",
+        lambda _configuration: _FakeQueryEmbeddingClient(embedding_calls),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_eval,
+        "postgres_evaluation_retriever_factory",
+        deterministic_builder,
+    )
+
+    code = main(
+        [
+            "--dataset",
+            str(evaluation_corpus.dataset),
+            "--compare",
+            "--hosted",
+            "--require-promotion-gate",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == expected_code
+    assert captured.err == ""
+    assert payload["evaluation_dataset_digest"] == EXPECTED_DATASET_DIGEST
+    assert payload["profiles"]["lexical"]["metrics"] == {
+        "filtered_result_count": 1,
+        "latency_p50_ms": 10.0,
+        "latency_p95_ms": 10.0,
+        "mrr": 0.5,
+        "ndcg_at_10": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_20": 0.5,
+        "recall_at_5": 0.5,
+    }
+    assert payload["profiles"]["hybrid"]["metrics"] == {
+        "filtered_result_count": 1,
+        "latency_p50_ms": hybrid_latency_ms,
+        "latency_p95_ms": hybrid_latency_ms,
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_20": 1.0,
+        "recall_at_5": 1.0,
+    }
+    assert payload["promotion"] == {
+        "eligible": expected_eligible,
+        "latency_ratio": hybrid_latency_ms / 10.0,
+        "reason": expected_reason,
+        "recall_ratio": 2.0,
+    }
+    assert embedding_calls == [("export permit",), ("semantic compliance",)]
+    assert len(owned_pools) == 1 and owned_pools[0].closed is True
+    for secret in (
+        os.environ["DATABASE_URL"],
+        str(USER_ID),
+        str(KNOWLEDGE_BASE_ID),
+        "sk-private-hosted-evaluation",
+        "export permit",
+        "semantic compliance",
+    ):
+        assert secret not in captured.out + captured.err
+
+
 def test_single_profile_uses_its_own_snapshot_without_vector_coverage(
     evaluation_corpus, capsys
 ):
@@ -989,6 +1115,17 @@ def test_evaluation_backend_rows_parse_exact_default_jsonb_text_shape():
         '{"value":"' + ("x" * 65_536) + '"}',
         ("{" + '"nested":{' * 34 + '"leaf":true' + "}" * 34 + "}"),
     ],
+    ids=(
+        "truncated",
+        "duplicate-key",
+        "array",
+        "null",
+        "scalar",
+        "nan",
+        "infinite",
+        "oversized",
+        "too-deep",
+    ),
 )
 def test_evaluation_backend_rows_reject_invalid_metadata_json_text(metadata):
     row = {**_valid_backend_row(), "metadata": metadata}
@@ -1003,6 +1140,15 @@ def test_evaluation_backend_rows_reject_invalid_metadata_json_text(metadata):
 @pytest.mark.parametrize(
     "tags",
     ["[]", (), {}, ["alpha", 1], [""], ["x" * 129], ["x"] * 101],
+    ids=(
+        "json-string",
+        "tuple",
+        "mapping",
+        "non-string",
+        "empty",
+        "tag-too-long",
+        "too-many",
+    ),
 )
 def test_evaluation_backend_rows_require_exact_string_array_tags(tags):
     row = {**_valid_backend_row(), "tags": tags}

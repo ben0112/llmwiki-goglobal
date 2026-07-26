@@ -237,10 +237,33 @@ PYTHONPATH=api MODE=hosted .venv/bin/python -m scripts.enqueue_embeddings \
 Repeat after the queue settles until it returns
 `{"enqueued":0,"scanned":0}`. Vectors are fenced by document version and the
 exact provider/model/dimensions tuple, so a model change cannot mix profiles.
-Run a representative private evaluation before allowing selected callers to
-request `retrieval_profile="hybrid"`; a passing gate never changes the lexical
-default automatically. Never commit a production evaluation corpus or report
-containing user data. The full operational and promotion contract is in
+Run the supported private Postgres comparison from a deployment shell that has
+the same embedding and `HYBRID_*` values. Load `DATABASE_URL` and API keys from
+your secret store; do not put either one on the command line:
+
+```bash
+: "${DATABASE_URL:?load DATABASE_URL from the deployment secret store}"
+export HYBRID_SEARCH_ENABLED=true
+export RETRIEVAL_EVAL_USER_ID=00000000-0000-0000-0000-000000000001
+export RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID=00000000-0000-0000-0000-000000000002
+PYTHONPATH=api MODE=hosted .venv/bin/python -m scripts.retrieval_eval \
+  --dataset /controlled/private-retrieval-cases.jsonl \
+  --compare --hosted --require-promotion-gate \
+  --output-json /controlled/private-retrieval-report.json
+```
+
+Before changing model or dimensions, stop new hybrid opt-ins and leave serving
+entry points on lexical. Roll API producers and workers together onto the new
+profile, reconcile until that exact profile has complete current-version
+coverage, and run the command above from a separately configured evaluator.
+Only after exit `0` and operator review should serving processes receive the
+new profile and selected canary callers resume hybrid. Exit `2` or `3`, or
+incomplete coverage, leaves serving hybrid disabled; restoring the previously
+tested profile is safe because old profile rows remain isolated and intact.
+
+A passing gate never changes the lexical default automatically. Never commit a
+production evaluation corpus or report containing user data. The full
+operational and promotion contract is in
 [`docs/architecture/retrieval.md`](architecture/retrieval.md).
 
 ## 7. Operations

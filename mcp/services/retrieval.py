@@ -23,6 +23,7 @@ from llmwiki_core.search import (
     SearchHit,
     SearchQuery,
     SearchResult,
+    SearchScope,
 )
 from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 from llmwiki_core.telemetry import TELEMETRY_SCHEMA_VERSION, emit, validated_event
@@ -237,6 +238,9 @@ class _VectorRetriever:
         self.available: bool | None = None
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
+        if query.scope is not SearchScope.ALL:
+            self.available = False
+            raise RetrieverUnavailable("vector retrieval does not support scoped content")
         client = None
         result = None
         main_failure: BaseException | None = None

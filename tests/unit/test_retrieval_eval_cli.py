@@ -826,6 +826,238 @@ def test_default_hybrid_fails_closed_with_typed_configuration_error(monkeypatch,
     assert "sk-do-not-print" not in captured.err
 
 
+def test_hosted_compare_missing_configuration_is_stable_and_private(monkeypatch, capsys):
+    monkeypatch.setenv("HYBRID_SEARCH_ENABLED", "false")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://private-user:secret@private.invalid/db")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "sk-private")
+    monkeypatch.setenv("RETRIEVAL_EVAL_USER_ID", "private-tenant")
+
+    code = main(["--dataset", str(DATASET), "--compare", "--hosted"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "configuration", "code": "hybrid_unavailable"}
+    }
+    for secret in ("private-user", "secret", "private.invalid", "sk-private", "private-tenant"):
+        assert secret not in captured.err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_failure", "expected_type", "expected_args"),
+    [
+        (lambda: KeyboardInterrupt("private"), KeyboardInterrupt, ()),
+        (lambda: SystemExit("private"), SystemExit, (1,)),
+        (lambda: asyncio.CancelledError("private"), asyncio.CancelledError, ()),
+        (lambda: GeneratorExit("private"), GeneratorExit, ()),
+    ],
+    ids=("keyboard", "system-exit", "cancelled", "generator-exit"),
+)
+async def test_hosted_embedding_validation_cleanup_control_outranks_primary_failure(
+    cleanup_failure,
+    expected_type,
+    expected_args,
+    monkeypatch,
+):
+    expected_profile = object()
+
+    class Configuration:
+        embedding_profile = expected_profile
+
+    class Client:
+        profile = object()
+
+        async def aclose(self):
+            raise cleanup_failure()
+
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "_new_hosted_embedding_client",
+        lambda _configuration: Client(),
+    )
+
+    with pytest.raises(expected_type) as caught:
+        await retrieval_eval_module._validate_hosted_embedding_client(Configuration())
+
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary_failure", "cleanup_failure", "expected_type", "expected_args"),
+    [
+        (lambda: RuntimeError("private-primary"), None, retrieval_eval_module.RetrievalExecutionError, ()),
+        (
+            lambda: RuntimeError("private-primary"),
+            lambda: KeyboardInterrupt("private-cleanup"),
+            KeyboardInterrupt,
+            (),
+        ),
+        (
+            lambda: RuntimeError("private-primary"),
+            lambda: SystemExit("private-cleanup"),
+            SystemExit,
+            (1,),
+        ),
+        (
+            lambda: RuntimeError("private-primary"),
+            lambda: asyncio.CancelledError("private-cleanup"),
+            asyncio.CancelledError,
+            (),
+        ),
+        (
+            lambda: RuntimeError("private-primary"),
+            lambda: GeneratorExit("private-cleanup"),
+            GeneratorExit,
+            (),
+        ),
+        (None, lambda: RuntimeError("private-cleanup"), retrieval_eval_module.RetrievalExecutionError, ()),
+    ],
+    ids=(
+        "primary-error",
+        "cleanup-keyboard",
+        "cleanup-system-exit",
+        "cleanup-cancelled",
+        "cleanup-generator-exit",
+        "cleanup-error",
+    ),
+)
+async def test_hosted_runtime_always_closes_pool_and_preserves_control_priority(
+    primary_failure,
+    cleanup_failure,
+    expected_type,
+    expected_args,
+    monkeypatch,
+):
+    class Configuration:
+        database_url = "postgresql://private.invalid/db"
+        user_id = object()
+        knowledge_base_id = object()
+        embedding_profile = object()
+        lexical_candidate_limit = 1
+        vector_candidate_limit = 1
+        rrf_k = 60
+
+    class Pool:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+            if cleanup_failure is not None:
+                raise cleanup_failure()
+
+    pool = Pool()
+
+    async def validate(_configuration):
+        return None
+
+    async def create_pool(_database_url):
+        return pool
+
+    async def evaluate(*_args):
+        if primary_failure is not None:
+            raise primary_failure()
+        return ({"safe": True}, 0)
+
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "_load_hosted_evaluation_configuration",
+        lambda _cases: Configuration(),
+    )
+    monkeypatch.setattr(retrieval_eval_module, "_validate_hosted_embedding_client", validate)
+    monkeypatch.setattr(retrieval_eval_module, "_create_hosted_pool", create_pool)
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "postgres_evaluation_retriever_factory",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(retrieval_eval_module, "_evaluate_request_async", evaluate)
+
+    with pytest.raises(expected_type) as caught:
+        await retrieval_eval_module._evaluate_hosted_request_async(
+            object(),
+            (),
+            DATASET,
+        )
+
+    assert pool.closed is True
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_hosted_cli_sanitizes_unknown_runtime_failure(monkeypatch, capsys):
+    async def fail(*_args):
+        raise RuntimeError("postgresql://private.invalid query=customer-secret")
+
+    monkeypatch.setattr(retrieval_eval_module, "_evaluate_hosted_request_async", fail)
+
+    code = main(["--dataset", str(DATASET), "--compare", "--hosted"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_failed"}
+    }
+    assert "private" not in captured.err
+    assert "customer" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("failure", "category", "code"),
+    [
+        (
+            retrieval_eval_module.HybridConfigurationUnavailable("private"),
+            "configuration",
+            "hybrid_unavailable",
+        ),
+        (
+            retrieval_eval_module.RetrievalContractError("private"),
+            "retrieval",
+            "retrieval_contract_invalid",
+        ),
+        (
+            retrieval_eval_module.RetrievalExecutionError("private"),
+            "retrieval",
+            "retrieval_failed",
+        ),
+        (TypeError("private"), "retrieval", "retrieval_contract_invalid"),
+        (ValueError("private"), "retrieval", "retrieval_contract_invalid"),
+        (RuntimeError("private"), "retrieval", "retrieval_failed"),
+    ],
+    ids=("hybrid", "contract", "execution", "type", "value", "unknown"),
+)
+def test_non_hosted_cli_preserves_stable_error_mapping(
+    failure,
+    category,
+    code,
+    monkeypatch,
+    capsys,
+):
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(retrieval_eval_module, "_evaluate_request", fail)
+
+    exit_code = main(
+        ["--dataset", str(DATASET), "--profile", "lexical"],
+        retriever_factory=lambda _profile, _path: object(),
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": category, "code": code}
+    }
+    assert "private" not in captured.err
+
+
 @pytest.mark.parametrize(
     ("factory", "expected_code"),
     [

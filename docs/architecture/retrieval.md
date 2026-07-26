@@ -71,6 +71,23 @@ complete coverage, and evaluate that exact profile. Jobs carrying the old
 profile stop without writing it after the configuration change. Old rows may
 remain as additive rollback data; exact-profile queries ignore them.
 
+Switch profiles without exposing callers to partial coverage:
+
+1. Stop new hybrid opt-ins and keep every serving entry point on lexical.
+2. Roll API producers and workers together onto the new immutable profile;
+   keep embedding work enabled there, but keep MCP and other serving entry
+   points from selecting hybrid.
+3. Run `enqueue_embeddings --missing` after each worker drain until it reports
+   no missing work, and confirm current-version coverage for the exact new
+   provider/model/dimensions tuple.
+4. Run the hosted comparison below in a separate evaluator process configured
+   with that exact profile. Do not enable serving hybrid if coverage is
+   incomplete or the gate exits `2` or `3`.
+5. After a passing report and operator review, roll serving processes onto the
+   new profile, then re-enable only the selected canary callers. Keep lexical
+   as the default. To abort, disable serving hybrid and restore the previously
+   tested profile; old vector rows remain usable because profiles never mix.
+
 ## Hosted configuration
 
 Hybrid retrieval is disabled by default. API, worker, and MCP processes must
@@ -129,24 +146,44 @@ PYTHONPATH=api .venv/bin/python -m scripts.retrieval_eval \
   --output-json retrieval-baseline.json
 ```
 
-Comparative execution uses the same CLI boundary with `--compare` and the
-real-Postgres retriever factory. The standalone repository command has no
-deployment credentials or implicit tenant selection, so it intentionally
-returns the stable `hybrid_unavailable` configuration error unless an
-operator-owned wrapper injects that factory. This prevents accidentally
-evaluating or disclosing the wrong tenant. The checked-in Postgres integration
-gate exercises that boundary directly:
+Comparative execution uses the supported `--hosted` CLI path. It builds the
+real Postgres retrievers and OpenAI-compatible embedding client inside one
+event loop; no Python-level retriever-factory injection or operator wrapper is
+required. The evaluator requires an explicit tenant and knowledge base and
+fails closed with stable `hybrid_unavailable` output when configuration is
+missing or invalid. Load the ordinary deployment embedding and hybrid settings
+first, and load `DATABASE_URL` and any API key from the deployment secret
+store rather than command-line arguments. Then run:
+
+```bash
+: "${DATABASE_URL:?load DATABASE_URL from the deployment secret store}"
+: "${EMBEDDING_BASE_URL:?load EMBEDDING_BASE_URL}"
+: "${EMBEDDING_MODEL:?load EMBEDDING_MODEL}"
+: "${EMBEDDING_DIMENSIONS:?load EMBEDDING_DIMENSIONS}"
+export HYBRID_SEARCH_ENABLED=true
+export RETRIEVAL_EVAL_USER_ID=00000000-0000-0000-0000-000000000001
+export RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID=00000000-0000-0000-0000-000000000002
+PYTHONPATH=api MODE=hosted .venv/bin/python -m scripts.retrieval_eval \
+  --dataset /controlled/private-retrieval-cases.jsonl \
+  --compare \
+  --hosted \
+  --require-promotion-gate \
+  --output-json /controlled/private-retrieval-report.json
+```
+
+The two UUIDs are required, validated parameters rather than inferred tenant
+state; replace the examples with the intended deployment identifiers. The
+command never prints the DSN, API key, UUIDs, queries, document content,
+embeddings, or backend exception strings. Success, failure, cancellation, and
+process-control paths all execute and validate asynchronous client/pool
+cleanup; if cleanup itself raises a process-control signal, the evaluator
+propagates a sanitized signal rather than claiming the underlying close
+completed. The checked-in real-Postgres integration gate for this entry point
+is:
 
 ```bash
 PYTHONPATH=api MODE=hosted .venv/bin/pytest \
   tests/integration/test_retrieval_evaluation.py -q
-```
-
-A deployment-specific wrapper should invoke the CLI equivalent:
-
-```text
-retrieval_eval --dataset <private-cases.jsonl> --compare \
-  --require-promotion-gate --output-json <private-report.json>
 ```
 
 The two profiles run against one read-only `REPEATABLE READ` snapshot and the

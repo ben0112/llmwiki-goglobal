@@ -54,6 +54,8 @@ MAX_CORPUS_TEXT_CHARS = 1_000_000
 _POSTGRES_INTEGER_MAX = 2_147_483_647
 _MAX_BACKEND_PATH_CHARS = 4_096
 _MAX_BACKEND_METADATA_BYTES = 64 * 1_024
+_MAX_HOSTED_DSN_CHARS = 8_192
+_MAX_HOSTED_SECRET_CHARS = 16_384
 
 _DOCUMENT_FIELDS = frozenset(
     {"schema_version", "document_id", "document_kind", "path", "title", "tags", "facets", "chunks"}
@@ -1323,10 +1325,173 @@ def _load_corpus(path: Path) -> tuple[_CorpusChunk, ...]:
     return tuple(chunks)
 
 
-def configured_hosted_hybrid_retriever() -> object:
-    """Return the hosted hybrid boundary once Task 6-9 configuration exists."""
+@dataclass(frozen=True, slots=True)
+class _HostedEvaluationConfiguration:
+    database_url: str
+    user_id: UUID
+    knowledge_base_id: UUID
+    embedding_profile: EmbeddingProfile
+    embedding_base_url: str
+    embedding_api_key: str
+    embedding_batch_size: int
+    embedding_timeout_seconds: float
+    lexical_candidate_limit: int
+    vector_candidate_limit: int
+    rrf_k: int
 
-    raise HybridConfigurationUnavailable
+
+def _required_hosted_environment(name: str, *, maximum: int) -> str:
+    value = os.environ.get(name)
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise HybridConfigurationUnavailable
+    return value.strip()
+
+
+def _hosted_integer(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, str(default))
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+        raise HybridConfigurationUnavailable
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise HybridConfigurationUnavailable
+    return value
+
+
+def _hosted_timeout() -> float:
+    raw = os.environ.get("EMBEDDING_TIMEOUT_SECONDS", "30")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise HybridConfigurationUnavailable from None
+    if not isfinite(value) or not 0 < value <= 300:
+        raise HybridConfigurationUnavailable
+    return value
+
+
+def _load_hosted_evaluation_configuration(
+    cases: Sequence[object],
+) -> _HostedEvaluationConfiguration:
+    if os.environ.get("HYBRID_SEARCH_ENABLED", "").strip().lower() not in {"1", "true"}:
+        raise HybridConfigurationUnavailable
+    try:
+        user_id = _evaluation_uuid(
+            _required_hosted_environment("RETRIEVAL_EVAL_USER_ID", maximum=64)
+        )
+        knowledge_base_id = _evaluation_uuid(
+            _required_hosted_environment(
+                "RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID",
+                maximum=64,
+            )
+        )
+        profile = EmbeddingProfile(
+            provider=os.environ.get("EMBEDDING_PROVIDER", "openai_compatible"),
+            model=_required_hosted_environment("EMBEDDING_MODEL", maximum=200),
+            dimensions=_hosted_integer(
+                "EMBEDDING_DIMENSIONS",
+                0,
+                minimum=1,
+                maximum=4_096,
+            ),
+        )
+    except (TypeError, ValueError):
+        raise HybridConfigurationUnavailable from None
+    lexical_limit = _hosted_integer(
+        "HYBRID_LEXICAL_CANDIDATES",
+        50,
+        minimum=1,
+        maximum=500,
+    )
+    vector_limit = _hosted_integer(
+        "HYBRID_VECTOR_CANDIDATES",
+        50,
+        minimum=1,
+        maximum=500,
+    )
+    request_limit = max((case.query.limit for case in cases), default=1)
+    if lexical_limit < request_limit or vector_limit < request_limit:
+        raise HybridConfigurationUnavailable
+    api_key = os.environ.get("EMBEDDING_API_KEY", "")
+    if not isinstance(api_key, str) or len(api_key) > _MAX_HOSTED_SECRET_CHARS:
+        raise HybridConfigurationUnavailable
+    return _HostedEvaluationConfiguration(
+        database_url=_required_hosted_environment(
+            "DATABASE_URL",
+            maximum=_MAX_HOSTED_DSN_CHARS,
+        ),
+        user_id=user_id,
+        knowledge_base_id=knowledge_base_id,
+        embedding_profile=profile,
+        embedding_base_url=_required_hosted_environment(
+            "EMBEDDING_BASE_URL",
+            maximum=4_096,
+        ),
+        embedding_api_key=api_key,
+        embedding_batch_size=_hosted_integer(
+            "EMBEDDING_BATCH_SIZE",
+            32,
+            minimum=1,
+            maximum=512,
+        ),
+        embedding_timeout_seconds=_hosted_timeout(),
+        lexical_candidate_limit=lexical_limit,
+        vector_candidate_limit=vector_limit,
+        rrf_k=_hosted_integer("HYBRID_RRF_K", 60, minimum=1, maximum=10_000),
+    )
+
+
+async def _create_hosted_pool(database_url: str) -> object:
+    import asyncpg
+
+    return await asyncpg.create_pool(database_url, min_size=1, max_size=4)
+
+
+def _new_hosted_embedding_client(
+    configuration: _HostedEvaluationConfiguration,
+) -> object:
+    from services.embeddings import OpenAIEmbeddingClient
+
+    return OpenAIEmbeddingClient(
+        profile=configuration.embedding_profile,
+        base_url=configuration.embedding_base_url,
+        api_key=configuration.embedding_api_key,
+        batch_size=configuration.embedding_batch_size,
+        timeout_seconds=configuration.embedding_timeout_seconds,
+    )
+
+
+async def _validate_hosted_embedding_client(
+    configuration: _HostedEvaluationConfiguration,
+) -> None:
+    client = None
+    primary_failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        client = _new_hosted_embedding_client(configuration)
+        if getattr(client, "profile", None) != configuration.embedding_profile:
+            raise HybridConfigurationUnavailable
+    except BaseException as error:  # noqa: BLE001 - configuration must remain private.
+        primary_failure = error
+    if client is not None:
+        try:
+            close = getattr(client, "aclose", None)
+            if not callable(close):
+                raise HybridConfigurationUnavailable
+            pending = close()
+            if not inspect.isawaitable(pending):
+                raise HybridConfigurationUnavailable
+            await pending
+        except BaseException as error:  # noqa: BLE001 - cleanup is part of validation.
+            cleanup_failure = error
+    if primary_failure is None and cleanup_failure is None:
+        return
+    failures = tuple(
+        failure
+        for failure in (primary_failure, cleanup_failure)
+        if failure is not None
+    )
+    if signal := sanitized_boundary_signal_or_unknown(*failures):
+        raise signal from None
+    raise HybridConfigurationUnavailable from None
 
 
 def _default_retriever_factory(profile: str, dataset_path: Path) -> object:
@@ -1337,7 +1502,7 @@ def _default_retriever_factory(profile: str, dataset_path: Path) -> object:
             raise EvaluationDatasetError from None
         return _SyntheticLexicalRetriever(chunks)
     if profile == "hybrid":
-        return configured_hosted_hybrid_retriever()
+        raise HybridConfigurationUnavailable
     raise RetrievalContractError
 
 
@@ -1347,6 +1512,7 @@ def _parser() -> _SafeArgumentParser:
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--profile", choices=("lexical", "hybrid"))
     selection.add_argument("--compare", action="store_true")
+    parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--require-promotion-gate", action="store_true")
     parser.add_argument("--output-json")
     return parser
@@ -1668,7 +1834,7 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace | No
     parser = _parser()
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
-        if args.require_promotion_gate and not args.compare:
+        if (args.require_promotion_gate or args.hosted) and not args.compare:
             raise _ArgumentError
     except _HelpRequested:
         emitted = _emit_stream(sys.stdout, parser.format_help().encode("utf-8"))
@@ -1688,7 +1854,7 @@ def _load_cli_cases(dataset_path: Path) -> tuple[Sequence[object] | None, int]:
     return cases, 0
 
 
-def _evaluate_request(
+async def _evaluate_request_async(
     args: argparse.Namespace,
     cases: Sequence[object],
     factory: RetrieverFactory,
@@ -1696,27 +1862,86 @@ def _evaluate_request(
 ) -> tuple[dict[str, object], int]:
     if not args.compare:
         profile = args.profile
-
-        async def evaluate_one() -> EvaluationReport:
-            async with _evaluation_session(factory):
-                retriever = _build_retriever(factory, profile, dataset_path)
-                return await _evaluate_profile(profile, retriever, cases)
-
-        report = _run_async(evaluate_one)
+        async with _evaluation_session(factory):
+            retriever = _build_retriever(factory, profile, dataset_path)
+            report = await _evaluate_profile(profile, retriever, cases)
         return _single_report(cases, profile, report), 0
 
-    async def evaluate_both() -> tuple[EvaluationReport, EvaluationReport]:
-        async with _evaluation_session(factory):
-            lexical_retriever = _build_retriever(factory, "lexical", dataset_path)
-            hybrid_retriever = _build_retriever(factory, "hybrid", dataset_path)
-            lexical = await _evaluate_profile("lexical", lexical_retriever, cases)
-            hybrid = await _evaluate_profile("hybrid", hybrid_retriever, cases)
-            return lexical, hybrid
-
-    lexical_report, hybrid_report = _run_async(evaluate_both)
+    async with _evaluation_session(factory):
+        lexical_retriever = _build_retriever(factory, "lexical", dataset_path)
+        hybrid_retriever = _build_retriever(factory, "hybrid", dataset_path)
+        lexical_report = await _evaluate_profile("lexical", lexical_retriever, cases)
+        hybrid_report = await _evaluate_profile("hybrid", hybrid_retriever, cases)
     payload, eligible = _compare_report(cases, lexical_report, hybrid_report)
     exit_code = 0 if eligible or not args.require_promotion_gate else 3
     return payload, exit_code
+
+
+def _evaluate_request(
+    args: argparse.Namespace,
+    cases: Sequence[object],
+    factory: RetrieverFactory,
+    dataset_path: Path,
+) -> tuple[dict[str, object], int]:
+    return _run_async(
+        lambda: _evaluate_request_async(args, cases, factory, dataset_path)
+    )
+
+
+def _raise_hosted_runtime_failure(
+    primary: BaseException | None,
+    cleanup: BaseException | None,
+) -> Never:
+    failures = tuple(error for error in (primary, cleanup) if error is not None)
+    if signal := sanitized_boundary_signal_or_unknown(*failures):
+        raise signal from None
+    if primary is not None and isinstance(primary, _SAFE_BACKEND_EXCEPTIONS):
+        raise type(primary)() from None
+    raise RetrievalExecutionError from None
+
+
+async def _evaluate_hosted_request_async(
+    args: argparse.Namespace,
+    cases: Sequence[object],
+    dataset_path: Path,
+) -> tuple[dict[str, object], int]:
+    configuration = _load_hosted_evaluation_configuration(cases)
+    await _validate_hosted_embedding_client(configuration)
+    pool = None
+    result: tuple[dict[str, object], int] | None = None
+    primary_failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        pool = await _create_hosted_pool(configuration.database_url)
+        factory = postgres_evaluation_retriever_factory(
+            pool,
+            user_id=configuration.user_id,
+            knowledge_base_id=configuration.knowledge_base_id,
+            embedding_profile=configuration.embedding_profile,
+            embedding_client_factory=lambda: _new_hosted_embedding_client(configuration),
+            lexical_candidate_limit=configuration.lexical_candidate_limit,
+            vector_candidate_limit=configuration.vector_candidate_limit,
+            rrf_k=configuration.rrf_k,
+        )
+        result = await _evaluate_request_async(args, cases, factory, dataset_path)
+    except BaseException as error:  # noqa: BLE001 - hosted boundary owns cleanup and privacy.
+        primary_failure = error
+    if pool is not None:
+        try:
+            close = getattr(pool, "close", None)
+            if not callable(close):
+                raise RetrievalExecutionError
+            pending = close()
+            if not inspect.isawaitable(pending):
+                raise RetrievalExecutionError
+            await pending
+        except BaseException as error:  # noqa: BLE001 - cleanup failures are sanitized below.
+            cleanup_failure = error
+    if primary_failure is not None or cleanup_failure is not None:
+        _raise_hosted_runtime_failure(primary_failure, cleanup_failure)
+    if result is None:  # pragma: no cover - success assigns before cleanup.
+        raise RetrievalExecutionError
+    return result
 
 
 def _safe_evaluate_request(
@@ -1747,6 +1972,29 @@ def _safe_evaluate_request(
         return None, 2
 
 
+def _safe_evaluate_hosted_request(
+    args: argparse.Namespace,
+    cases: Sequence[object],
+    dataset_path: Path,
+) -> tuple[dict[str, object] | None, int]:
+    try:
+        return _run_async(
+            lambda: _evaluate_hosted_request_async(args, cases, dataset_path)
+        )
+    except HybridConfigurationUnavailable:
+        _emit_error("configuration", "hybrid_unavailable")
+        return None, 2
+    except RetrievalContractError:
+        _emit_error("retrieval", "retrieval_contract_invalid")
+        return None, 2
+    except (RetrievalExecutionError, EvaluationDatasetError, TypeError, ValueError):
+        _emit_error("retrieval", "retrieval_failed")
+        return None, 2
+    except Exception:  # noqa: BLE001 - final privacy boundary discards backend details.
+        _emit_error("retrieval", "retrieval_failed")
+        return None, 2
+
+
 def _emit_report(payload: Mapping[str, object], output_json: str | None, exit_code: int) -> int:
     encoded = _json_bytes(payload)
     if output_json is not None:
@@ -1770,8 +2018,14 @@ def main(argv: Sequence[str] | None = None, retriever_factory: RetrieverFactory 
     cases, early_exit = _load_cli_cases(dataset_path)
     if cases is None:
         return early_exit
-    factory = _default_retriever_factory if retriever_factory is None else retriever_factory
-    payload, exit_code = _safe_evaluate_request(args, cases, factory, dataset_path)
+    if args.hosted:
+        if retriever_factory is not None:
+            _emit_error("arguments", "invalid_arguments")
+            return 2
+        payload, exit_code = _safe_evaluate_hosted_request(args, cases, dataset_path)
+    else:
+        factory = _default_retriever_factory if retriever_factory is None else retriever_factory
+        payload, exit_code = _safe_evaluate_request(args, cases, factory, dataset_path)
     if payload is None:
         return exit_code
     return _emit_report(payload, args.output_json, exit_code)

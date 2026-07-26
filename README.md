@@ -234,18 +234,27 @@ PYTHONPATH=api python -m scripts.retrieval_eval \
 
 CLI 从 dataset 同目录严格读取 `corpus.jsonl`，先应用 area、scope、facets、path glob、tags、document kind 与 annotated-only 过滤，再按正文/annotation 词项命中及标题排序信号产生可解释的确定性排名。它不会读取 relevance judgments 来生成排名。`--output-json` 使用临时文件加原子替换；已有普通文件可覆盖，目录、符号链接及其他非普通文件会被拒绝。stdout 与输出文件字节完全相同。
 
-比较 lexical 与 hybrid 并把 promotion gate 作为 CI 门禁：
+在部署环境中比较该租户/知识库的真实 Postgres lexical 与 hybrid，并把 promotion gate 作为门禁。先通过 secret manager 或部署环境加载 `DATABASE_URL`、`EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS` 及 `HYBRID_*` 配置；不要把 DSN 或 API key 写进命令行：
 
 ```bash
+: "${DATABASE_URL:?load DATABASE_URL from the deployment secret store}"
+: "${EMBEDDING_BASE_URL:?load EMBEDDING_BASE_URL}"
+: "${EMBEDDING_MODEL:?load EMBEDDING_MODEL}"
+: "${EMBEDDING_DIMENSIONS:?load EMBEDDING_DIMENSIONS}"
+export HYBRID_SEARCH_ENABLED=true
+export RETRIEVAL_EVAL_USER_ID=00000000-0000-0000-0000-000000000001
+export RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID=00000000-0000-0000-0000-000000000002
 PYTHONPATH=api python -m scripts.retrieval_eval \
-  --dataset tests/fixtures/retrieval/v1/cases.jsonl \
+  --dataset /controlled/private-retrieval-cases.jsonl \
   --compare \
-  --require-promotion-gate
+  --hosted \
+  --require-promotion-gate \
+  --output-json /controlled/private-retrieval-report.json
 ```
 
 lexical 是本地与托管模式的默认检索路径，不依赖模型或网络。托管模式已支持可选的 pgvector hybrid 检索：只有调用方显式传入 `retrieval_profile="hybrid"` 且 `HYBRID_SEARCH_ENABLED=true` 时才启用；通过 promotion gate 也只代表该 profile 有资格灰度，不会自动打开开关或改变默认值。向量存储/服务故障先在 adapter 边界清洗，再以已分类的可用性故障回退到 lexical 并标记 `lexical_fallback`；配置错误、lexical 故障、租户隔离错误及非可用性类意外错误不会被静默吞掉。
 
-standalone CLI 不接收数据库凭据或租户 ID；因此 `--compare` 必须由部署方注入真实 Postgres retriever factory，否则会以稳定的 `hybrid_unavailable` 失败关闭。真实比较在同一只读 `REPEATABLE READ` 快照和同一 dataset digest 上执行；门槛是 hybrid Recall@10 至少为 lexical 的 110%，且 p95 延迟不超过 lexical 的 2.0 倍。配置、回填/重嵌入、私有评测集、迁移、灰度及回滚流程见 [`docs/architecture/retrieval.md`](docs/architecture/retrieval.md)。
+`--hosted` 是受支持的真实 Postgres 入口，不需要 Python 级 retriever factory 注入；缺少或无效的数据库、租户、知识库、embedding profile 配置会以稳定的 `hybrid_unavailable` 失败关闭。真实比较在同一只读 `REPEATABLE READ` 快照和同一 dataset digest 上执行；成功、失败和进程控制路径都会执行并验证数据库池与 embedding client 的异步清理，清理自身抛出的控制信号会被清洗后传播。门槛是 hybrid Recall@10 至少为 lexical 的 110%，且 p95 延迟不超过 lexical 的 2.0 倍。配置、模型安全切换、回填/重嵌入、私有评测集、迁移、灰度及回滚流程见 [`docs/architecture/retrieval.md`](docs/architecture/retrieval.md)。
 
 退出码：`0` 表示评测成功（未要求 gate 时，即使 promotion 不合格仍为 `0`）；`2` 表示参数、dataset、配置或 retrieval 错误；`3` 表示 `--require-promotion-gate` 已启用且 hybrid 未通过；`4` 表示报告输出失败。错误输出只含稳定的 `code`/`category`，不会回显路径、查询、文档内容或底层异常。
 
