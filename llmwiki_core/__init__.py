@@ -32,6 +32,20 @@ from .models import (
     EmbeddingUnavailable,
     InvalidEmbeddingResponse,
 )
+from .rag import (
+    RagBudget,
+    RagCitation,
+    RagCompletionReason,
+    RagDomainError,
+    RagPageState,
+    RagRunConfig,
+    RagStepStatus,
+    RagStepType,
+    RagUsage,
+    RagWorkItem,
+    remaining_work_items,
+    validate_worklist,
+)
 from .references import build_lookup_maps, extract_references, parse_citation_filename, parse_wiki_links
 from .search import (
     ContextExpander,
@@ -69,6 +83,16 @@ __all__ = [
     "InvalidStatusTransition",
     "InvalidEmbeddingResponse",
     "PromotionDecision",
+    "RagBudget",
+    "RagCitation",
+    "RagCompletionReason",
+    "RagDomainError",
+    "RagPageState",
+    "RagRunConfig",
+    "RagStepStatus",
+    "RagStepType",
+    "RagUsage",
+    "RagWorkItem",
     "RankedResult",
     "RelevanceJudgment",
     "assert_status_transition",
@@ -94,7 +118,9 @@ __all__ = [
     "parse_citation_filename",
     "parse_wiki_links",
     "promotion_decision",
+    "remaining_work_items",
     "rollup_from_metas",
     "sanitized_boundary_signal_or_unknown",
     "validate_facets",
+    "validate_worklist",
 ]
