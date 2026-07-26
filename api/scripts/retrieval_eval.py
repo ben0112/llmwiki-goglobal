@@ -20,7 +20,7 @@ from numbers import Real
 from pathlib import Path
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Never
 from uuid import UUID
 
 from llmwiki_core import (
@@ -410,18 +410,63 @@ class _EvaluationLatencyRetriever:
         )
 
 
+async def _guarded_async_cleanup(
+    target: object,
+    attribute: str,
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
+    failures: list[BaseException],
+) -> bool:
+    """Attempt one cleanup getter and call without interrupting later cleanup."""
+
+    try:
+        operation = getattr(target, attribute, None)
+    except BaseException as error:  # noqa: BLE001 - cleanup must inventory every failure.
+        failures.append(error)
+        return True
+    if not callable(operation):
+        return False
+    try:
+        pending = operation(*args, **kwargs)
+        if inspect.isawaitable(pending):
+            await pending
+        else:
+            raise TypeError("cleanup operation must be awaitable")
+    except BaseException as error:  # noqa: BLE001 - cleanup must inventory every failure.
+        failures.append(error)
+    return True
+
+
+def _raise_session_failure(error: BaseException) -> Never:
+    """Raise a fresh boundary failure without retaining the injected body error."""
+
+    try:
+        raise error from None
+    finally:
+        error.__cause__ = None
+        error.__context__ = None
+
+
 class _PostgresEvaluationSnapshot:
     """One strict, transaction-bound read surface for an evaluation run."""
 
     def __init__(self, connection: object) -> None:
         self._connection = connection
         self._fetch_lock = asyncio.Lock()
+        self._active = True
+
+    def revoke(self) -> None:
+        self._active = False
 
     async def fetch(self, sql: str, *params: object) -> Sequence[object]:
+        if not self._active:
+            raise RetrieverUnavailable("evaluation store is unavailable") from None
         fetch = getattr(self._connection, "fetch", None)
         if not callable(fetch):
             raise RetrieverUnavailable("evaluation store is unavailable")
         async with self._fetch_lock:
+            if not self._active:
+                raise RetrieverUnavailable("evaluation store is unavailable") from None
             rows = await fetch(sql, *params)
         if "candidate_count" not in sql:
             return rows
@@ -454,13 +499,14 @@ class _PostgresEvaluationFactory:
         self._vector_candidate_limit = vector_candidate_limit
         self._rrf_k = rrf_k
         self._latency_ms = latency_ms
+        self._session_active = False
         self._snapshot: _PostgresEvaluationSnapshot | None = None
         self._coverage_cache: dict[EmbeddingProfile, bool] = {}
 
     def __call__(self, profile: str, _dataset_path: Path) -> object:
         snapshot = self._snapshot
-        if snapshot is None:
-            raise RetrievalContractError
+        if not self._session_active or snapshot is None:
+            raise RetrievalContractError from None
         if profile == "lexical":
             retriever: object = _PostgresEvaluationLexicalRetriever(
                 snapshot,
@@ -497,6 +543,8 @@ class _PostgresEvaluationFactory:
         )
 
     async def _profile_is_available(self) -> bool:
+        if not self._session_active:
+            raise RetrieverUnavailable("vector evaluation store is unavailable") from None
         cached = self._coverage_cache.get(self._embedding_profile)
         if cached is not None:
             return cached
@@ -542,36 +590,44 @@ class _PostgresEvaluationFactory:
         return available
 
     @asynccontextmanager
-    async def evaluation_session(self) -> AsyncIterator[None]:  # noqa: C901 - linear cleanup inventory.
-        if self._snapshot is not None:
-            raise RetrievalContractError
-        acquire = getattr(self._pool, "acquire", None)
-        if not callable(acquire):
-            raise RetrievalExecutionError
-
+    async def evaluation_session(self) -> AsyncIterator[None]:  # noqa: C901 - linear lifecycle inventory.
+        if self._session_active:
+            raise RetrievalContractError from None
+        self._session_active = True
+        self._snapshot = None
+        self._coverage_cache.clear()
         lease: object | None = None
         lease_entered = False
+        direct_acquire = False
         connection: object | None = None
         transaction: object | None = None
-        json_codec_enabled = False
+        json_codec_reset_required = False
         primary: BaseException | None = None
         cleanup_failures: list[BaseException] = []
         try:
+            acquire = getattr(self._pool, "acquire", None)
+            if not callable(acquire):
+                raise RetrievalExecutionError
             lease = acquire()
             enter = getattr(lease, "__aenter__", None)
-            if not callable(enter):
-                raise RetrievalExecutionError
-            connection = await enter()
-            lease_entered = True
+            if callable(enter):
+                connection = await enter()
+                lease_entered = True
+            elif inspect.isawaitable(lease):
+                connection = await lease
+                direct_acquire = True
+            else:
+                connection = lease
+                direct_acquire = True
             set_codec = getattr(connection, "set_type_codec", None)
             if callable(set_codec):
+                json_codec_reset_required = True
                 await set_codec(
                     "jsonb",
                     schema="pg_catalog",
                     encoder=json.dumps,
                     decoder=json.loads,
                 )
-                json_codec_enabled = True
             begin = getattr(connection, "transaction", None)
             if not callable(begin):
                 raise RetrievalExecutionError
@@ -586,40 +642,63 @@ class _PostgresEvaluationFactory:
         except BaseException as error:  # noqa: BLE001 - cleanup must run for all process controls.
             primary = error
         finally:
+            snapshot = self._snapshot
+            if snapshot is not None:
+                snapshot.revoke()
             self._snapshot = None
             self._coverage_cache.clear()
             if transaction is not None:
-                rollback = getattr(transaction, "rollback", None)
-                if callable(rollback):
-                    try:
-                        await rollback()
-                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
-                        cleanup_failures.append(error)
-            if connection is not None and json_codec_enabled:
-                reset_codec = getattr(connection, "reset_type_codec", None)
-                if callable(reset_codec):
-                    try:
-                        await reset_codec("jsonb", schema="pg_catalog")
-                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
-                        cleanup_failures.append(error)
+                await _guarded_async_cleanup(
+                    transaction,
+                    "rollback",
+                    (),
+                    {},
+                    cleanup_failures,
+                )
+            if connection is not None and json_codec_reset_required:
+                await _guarded_async_cleanup(
+                    connection,
+                    "reset_type_codec",
+                    ("jsonb",),
+                    {"schema": "pg_catalog"},
+                    cleanup_failures,
+                )
             if lease is not None and lease_entered:
-                exit_lease = getattr(lease, "__aexit__", None)
-                if callable(exit_lease):
-                    try:
-                        await exit_lease(None, None, None)
-                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
-                        cleanup_failures.append(error)
+                handled = await _guarded_async_cleanup(
+                    lease,
+                    "__aexit__",
+                    (None, None, None),
+                    {},
+                    cleanup_failures,
+                )
+                if not handled and connection is not None:
+                    await _guarded_async_cleanup(
+                        self._pool,
+                        "release",
+                        (connection,),
+                        {},
+                        cleanup_failures,
+                    )
+            elif direct_acquire and connection is not None:
+                await _guarded_async_cleanup(
+                    self._pool,
+                    "release",
+                    (connection,),
+                    {},
+                    cleanup_failures,
+                )
+            self._session_active = False
 
         if primary is not None:
             if signal := sanitized_boundary_signal_or_unknown(primary, *cleanup_failures):
-                raise signal from None
+                _raise_session_failure(signal)
             if isinstance(primary, _SAFE_BACKEND_EXCEPTIONS):
-                raise primary.with_traceback(primary.__traceback__) from None
-            raise RetrievalExecutionError from None
+                _raise_session_failure(type(primary)())
+            _raise_session_failure(RetrievalExecutionError())
         if cleanup_failures:
             if signal := sanitized_boundary_signal_or_unknown(*cleanup_failures):
-                raise signal from None
-            raise RetrievalExecutionError from None
+                _raise_session_failure(signal)
+            _raise_session_failure(RetrievalExecutionError())
 
 
 def postgres_evaluation_retriever_factory(
@@ -701,12 +780,16 @@ async def _postgres_fetch(
     fetch = getattr(pool, "fetch", None)
     if not callable(fetch):
         raise RetrieverUnavailable(f"{label} evaluation store is unavailable")
+    failure: BaseException | None = None
     try:
         return await fetch(sql, *params)
     except BaseException as error:  # noqa: BLE001 - database details must not cross the boundary.
-        if process_control := _sanitized_process_control(error):
-            raise process_control from None
-        raise RetrieverUnavailable(f"{label} evaluation store is unavailable") from None
+        failure = error
+    if failure is None:  # pragma: no cover - the except path always assigns it.
+        raise RuntimeError("evaluation store boundary lost its failure")
+    if process_control := _sanitized_process_control(failure):
+        _raise_session_failure(process_control)
+    _raise_session_failure(RetrieverUnavailable(f"{label} evaluation store is unavailable"))
 
 
 def _validated_evaluation_query_embedding(

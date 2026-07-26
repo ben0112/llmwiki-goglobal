@@ -953,7 +953,7 @@ def test_evaluation_backend_rows_reject_implicit_coercions(profile, field, inval
     row = _valid_backend_row()
     row[field] = invalid
 
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(retrieval_eval.RetrieverUnavailable) as raised:
         validator((row,), profile=profile)
 
     assert type(raised.value).__name__ == "RetrieverUnavailable"
@@ -1076,3 +1076,466 @@ async def test_snapshot_rolls_back_and_releases_for_boundary_signals(signal_type
         "codec:reset",
         "release",
     ]
+
+
+class _UnknownCleanupFailure(BaseException):
+    pass
+
+
+def _cleanup_failure(kind):
+    if kind == "ordinary":
+        return RuntimeError("private cleanup dsn=postgres://secret")
+    if kind == "keyboard":
+        return KeyboardInterrupt("private cleanup")
+    if kind == "system_exit":
+        return SystemExit("private cleanup")
+    if kind == "cancel":
+        return asyncio.CancelledError("private cleanup")
+    if kind == "generator_exit":
+        return GeneratorExit("private cleanup")
+    if kind == "unknown_group":
+        return BaseExceptionGroup(
+            "private cleanup group",
+            [RuntimeError("private ordinary"), _UnknownCleanupFailure("private unknown")],
+        )
+    raise AssertionError(f"unsupported cleanup failure: {kind}")
+
+
+def _expected_cleanup_failure(kind):
+    return {
+        "ordinary": retrieval_eval.RetrievalExecutionError,
+        "keyboard": KeyboardInterrupt,
+        "system_exit": SystemExit,
+        "cancel": asyncio.CancelledError,
+        "generator_exit": GeneratorExit,
+        "unknown_group": BaseException,
+    }[kind]
+
+
+class _CleanupFailurePlan:
+    def __init__(self, location, kind):
+        self.location = location
+        self.kind = kind
+        self.events = []
+
+    def getter(self, name, callback):
+        location = f"{name}:get"
+        self.events.append(location)
+        if self.location == location:
+            raise _cleanup_failure(self.kind)
+        return callback
+
+    async def call(self, name):
+        location = f"{name}:call"
+        self.events.append(location)
+        if self.location == location:
+            raise _cleanup_failure(self.kind)
+
+
+class _CleanupFailureTransaction:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def start(self):
+        self._plan.events.append("start")
+
+    @property
+    def rollback(self):
+        async def call():
+            await self._plan.call("rollback")
+
+        return self._plan.getter("rollback", call)
+
+
+class _CleanupFailureConnection:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def set_type_codec(self, *_args, **_kwargs):
+        self._plan.events.append("codec:set")
+
+    @property
+    def reset_type_codec(self):
+        async def call(*_args, **_kwargs):
+            await self._plan.call("codec:reset")
+
+        return self._plan.getter("codec:reset", call)
+
+    def transaction(self, **options):
+        assert options == {"isolation": "repeatable_read", "readonly": True}
+        self._plan.events.append("transaction")
+        return _CleanupFailureTransaction(self._plan)
+
+
+class _CleanupFailureLease:
+    def __init__(self, plan):
+        self._plan = plan
+        self._connection = _CleanupFailureConnection(plan)
+
+    async def __aenter__(self):
+        self._plan.events.append("acquire")
+        return self._connection
+
+    @property
+    def __aexit__(self):
+        async def call(*_args):
+            await self._plan.call("release")
+
+        return self._plan.getter("release", call)
+
+
+class _CleanupFailurePool:
+    def __init__(self, plan):
+        self._plan = plan
+
+    def acquire(self):
+        return _CleanupFailureLease(self._plan)
+
+
+_CLEANUP_LOCATIONS = [
+    f"{operation}:{boundary}"
+    for operation in ("rollback", "codec:reset", "release")
+    for boundary in ("get", "call")
+]
+_CLEANUP_FAILURE_KINDS = [
+    "ordinary",
+    "keyboard",
+    "system_exit",
+    "cancel",
+    "generator_exit",
+    "unknown_group",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", _CLEANUP_LOCATIONS)
+@pytest.mark.parametrize("kind", _CLEANUP_FAILURE_KINDS)
+async def test_snapshot_cleanup_guards_getters_and_calls_without_skipping_later_steps(
+    location,
+    kind,
+):
+    plan = _CleanupFailurePlan(location, kind)
+    factory = _fake_snapshot_factory(_CleanupFailurePool(plan))
+
+    with pytest.raises(_expected_cleanup_failure(kind)) as raised:
+        async with factory.evaluation_session():
+            assert factory._session_active is True
+
+    expected = ["acquire", "codec:set", "transaction", "start", "rollback:get"]
+    if location != "rollback:get":
+        expected.append("rollback:call")
+    expected.append("codec:reset:get")
+    if location != "codec:reset:get":
+        expected.append("codec:reset:call")
+    expected.append("release:get")
+    if location != "release:get":
+        expected.append("release:call")
+    assert plan.events == expected
+    assert raised.value.args == ((1,) if kind == "system_exit" else ())
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "private" not in str(raised.value)
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ordinary_failure_does_not_mask_primary_business_failure():
+    plan = _CleanupFailurePlan("rollback:call", "ordinary")
+    factory = _fake_snapshot_factory(_CleanupFailurePool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalContractError) as raised:
+        async with factory.evaluation_session():
+            raise retrieval_eval.RetrievalContractError
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert plan.events == [
+        "acquire",
+        "codec:set",
+        "transaction",
+        "start",
+        "rollback:get",
+        "rollback:call",
+        "codec:reset:get",
+        "codec:reset:call",
+        "release:get",
+        "release:call",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["keyboard", "system_exit", "cancel", "generator_exit"])
+async def test_cleanup_control_has_priority_over_primary_ordinary_failure(kind):
+    plan = _CleanupFailurePlan("rollback:call", kind)
+    factory = _fake_snapshot_factory(_CleanupFailurePool(plan))
+
+    with pytest.raises(_expected_cleanup_failure(kind)) as raised:
+        async with factory.evaluation_session():
+            raise RuntimeError("private business failure")
+
+    assert raised.value.args == ((1,) if kind == "system_exit" else ())
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert plan.events[-1] == "release:call"
+
+
+class _MultipleCleanupFailurePlan(_CleanupFailurePlan):
+    def __init__(self):
+        super().__init__(None, None)
+        self.failures = {
+            "rollback:call": "cancel",
+            "codec:reset:call": "system_exit",
+            "release:call": "keyboard",
+        }
+
+    async def call(self, name):
+        location = f"{name}:call"
+        self.events.append(location)
+        if kind := self.failures.get(location):
+            raise _cleanup_failure(kind)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_collects_all_failures_before_selecting_highest_priority_control():
+    plan = _MultipleCleanupFailurePlan()
+    factory = _fake_snapshot_factory(_CleanupFailurePool(plan))
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert plan.events[-6:] == [
+        "rollback:get",
+        "rollback:call",
+        "codec:reset:get",
+        "codec:reset:call",
+        "release:get",
+        "release:call",
+    ]
+
+
+class _SetupBarrierPlan:
+    def __init__(self, blocked_stage=None, *, fail_after_release=False):
+        self.blocked_stage = blocked_stage
+        self.fail_after_release = fail_after_release
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.events = []
+        self.acquire_count = 0
+        self.failures_remaining = 1 if fail_after_release else 0
+        self.blocked_claimed = False
+
+    async def step(self, stage):
+        self.events.append(stage)
+        if (
+            stage == self.blocked_stage
+            and self.failures_remaining
+            and not self.blocked_claimed
+        ):
+            self.blocked_claimed = True
+            self.started.set()
+            await self.release.wait()
+            self.failures_remaining -= 1
+            raise RuntimeError(f"private {stage} setup failure")
+
+
+class _SetupBarrierTransaction:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def start(self):
+        await self._plan.step("start")
+
+    async def rollback(self):
+        self._plan.events.append("rollback")
+
+
+class _SetupBarrierConnection:
+    def __init__(self, plan):
+        self._plan = plan
+        self.fetch_count = 0
+
+    async def set_type_codec(self, *_args, **_kwargs):
+        await self._plan.step("codec")
+
+    async def reset_type_codec(self, *_args, **_kwargs):
+        self._plan.events.append("codec:reset")
+
+    def transaction(self, **_options):
+        self._plan.events.append("transaction")
+        return _SetupBarrierTransaction(self._plan)
+
+    async def fetch(self, *_args):
+        self.fetch_count += 1
+        return ()
+
+
+class _SetupBarrierLease:
+    def __init__(self, plan):
+        self._plan = plan
+        self.connection = _SetupBarrierConnection(plan)
+
+    async def __aenter__(self):
+        self._plan.acquire_count += 1
+        await self._plan.step("acquire")
+        return self.connection
+
+    async def __aexit__(self, *_args):
+        self._plan.events.append("release")
+
+
+class _SetupBarrierPool:
+    def __init__(self, plan):
+        self._plan = plan
+        self.leases = []
+
+    def acquire(self):
+        lease = _SetupBarrierLease(self._plan)
+        self.leases.append(lease)
+        return lease
+
+
+class _DirectAcquirePool:
+    def __init__(self):
+        self.events = []
+        self.connection = _SetupBarrierConnection(_SetupBarrierPlan())
+
+    def acquire(self):
+        async def direct():
+            self.events.append("acquire")
+            return self.connection
+
+        return direct()
+
+    async def release(self, connection):
+        assert connection is self.connection
+        self.events.append("release")
+
+
+class _NoExitLease:
+    def __init__(self, pool):
+        self._pool = pool
+
+    async def __aenter__(self):
+        self._pool.events.append("acquire")
+        return self._pool.connection
+
+
+class _NoExitLeasePool(_DirectAcquirePool):
+    def acquire(self):
+        return _NoExitLease(self)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool_type", [_DirectAcquirePool, _NoExitLeasePool])
+async def test_snapshot_supports_direct_acquire_and_missing_lease_exit(pool_type):
+    pool = pool_type()
+    factory = _fake_snapshot_factory(pool)
+
+    async with factory.evaluation_session():
+        assert factory._session_active is True
+        assert factory._snapshot is not None
+
+    assert pool.events == ["acquire", "release"]
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_and_nested_sessions_reject_without_acquiring_or_clearing_owner():
+    plan = _SetupBarrierPlan()
+    pool = _SetupBarrierPool(plan)
+    factory = _fake_snapshot_factory(pool)
+    owner_started = asyncio.Event()
+    owner_release = asyncio.Event()
+
+    async def owner():
+        async with factory.evaluation_session():
+            owner_started.set()
+            await owner_release.wait()
+
+    owner_task = asyncio.create_task(owner())
+    await owner_started.wait()
+    owner_snapshot = factory._snapshot
+
+    with pytest.raises(retrieval_eval.RetrievalContractError) as concurrent:
+        async with factory.evaluation_session():
+            raise AssertionError("concurrent session must not enter")
+    with pytest.raises(retrieval_eval.RetrievalContractError) as nested:
+        async with factory.evaluation_session():
+            raise AssertionError("nested session must not enter")
+
+    assert concurrent.value.args == nested.value.args == ()
+    assert concurrent.value.__cause__ is concurrent.value.__context__ is None
+    assert nested.value.__cause__ is nested.value.__context__ is None
+    assert plan.acquire_count == 1
+    assert factory._session_active is True
+    assert factory._snapshot is owner_snapshot
+    owner_release.set()
+    await owner_task
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+    async with factory.evaluation_session():
+        assert factory._snapshot is not None
+    assert plan.acquire_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["acquire", "codec", "start"])
+async def test_setup_failure_keeps_concurrent_session_out_and_allows_next_run(blocked_stage):
+    plan = _SetupBarrierPlan(blocked_stage, fail_after_release=True)
+    pool = _SetupBarrierPool(plan)
+    factory = _fake_snapshot_factory(pool)
+
+    async def first():
+        async with factory.evaluation_session():
+            raise AssertionError("failing setup must not yield")
+
+    first_task = asyncio.create_task(first())
+    await plan.started.wait()
+    with pytest.raises(retrieval_eval.RetrievalContractError) as concurrent:
+        async with factory.evaluation_session():
+            raise AssertionError("concurrent setup must not enter")
+    assert concurrent.value.args == ()
+    assert plan.acquire_count == 1
+    assert factory._session_active is True
+
+    plan.release.set()
+    with pytest.raises(retrieval_eval.RetrievalExecutionError) as failed:
+        await first_task
+    assert failed.value.args == ()
+    assert failed.value.__cause__ is failed.value.__context__ is None
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+    async with factory.evaluation_session():
+        assert factory._snapshot is not None
+    assert plan.acquire_count == 2
+
+
+@pytest.mark.asyncio
+async def test_retriever_snapshot_is_revoked_after_session_exit():
+    plan = _SetupBarrierPlan()
+    pool = _SetupBarrierPool(plan)
+    factory = _fake_snapshot_factory(pool)
+
+    async with factory.evaluation_session():
+        retriever = factory("lexical", Path("unused"))
+        snapshot = factory._snapshot
+        assert snapshot is not None
+
+    with pytest.raises(retrieval_eval.RetrieverUnavailable) as raised:
+        await retriever.retrieve(
+            retrieval_eval.SearchQuery(text="outside session", limit=1, candidate_limit=1)
+        )
+
+    assert type(raised.value).__name__ == "RetrieverUnavailable"
+    assert raised.value.args == ("lexical evaluation store is unavailable",)
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert pool.leases[0].connection.fetch_count == 0
