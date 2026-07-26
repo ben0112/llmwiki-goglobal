@@ -200,10 +200,13 @@ outside the repository and contain no user content.
 
 ### Filter semantics
 
-Path glob, tags, document kind, annotation scope, and all corpus facets are
-compiled into backend queries before the retrieval limit is applied. Search
-contracts distinguish candidate count from returned count so post-processing
-cannot silently underfill a request.
+Path glob, tags, document kind, annotated-only, area, and all corpus facets are
+compiled into each supporting backend query before the retrieval limit is
+applied. Current whole-chunk vectors support only `scope=all`; a hybrid request
+for source-only or annotations-only scope makes the vector side typed
+unavailable and returns the correctly scoped lexical result as
+`lexical_fallback`. Search contracts distinguish candidate count from returned
+count so post-processing cannot silently underfill a request.
 
 Postgres adds indexes for high-traffic facet expressions or normalized facet
 columns selected from evaluation evidence. It does not add a broad collection
@@ -238,8 +241,8 @@ keep hybrid search opt-in even when those gates pass.
 
 ### Milestone 3 implementation evidence
 
-Milestone 3 is implemented through commit
-`5cca14310effaf977500fbc13ab58fff0a35bb88`. The implementation includes the
+Milestone 3's verified final candidate is
+`07c2e86bd2e3c1c5f9a7489fd0b7c7a7c298f61b`. The implementation includes the
 strict versioned evaluation schema and exact deterministic metrics,
 filter-before-limit compilation, version/profile-fenced pgvector storage,
 OpenAI-compatible and deterministic fake embedding adapters, durable embedding
@@ -254,19 +257,22 @@ Recall@5/10/20 `1.0`, MRR `1.0`, nDCG@10 `1.0`, filtered result count `1`,
 and p50/p95 `20.0 ms`. The result is eligible at recall ratio `2.0` and the
 inclusive latency boundary `2.0`.
 
-Verification for that exact SHA is tracked by
-[GitHub Actions run 30188190169](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30188190169).
+Verification for that exact SHA completed with all six jobs successful in
+[GitHub Actions run 30188848122](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30188848122).
 The retrieval segment owns the chunk schema, vector store, durable embeddings,
-hybrid failure matrix, and real-Postgres evaluation tests. Specification and
-quality reviews both concluded Critical `0`, Important `0`, Minor `0`, and
-`Ready: Yes`. Operational rollout, private-dataset handling, promotion, and
-rollback are documented in `docs/architecture/retrieval.md`; passing the gate
-only makes hybrid eligible and never changes the lexical deployment default.
+hybrid failure matrix, and real-Postgres evaluation tests. The historical Task
+11 specification and quality reviews of implementation commit `5cca143` both
+concluded Critical `0`, Important `0`, Minor `0`, and `Ready: Yes`; this does
+not claim a final Task 12 documentation-review result. Operational rollout,
+private-dataset handling, promotion, and rollback are documented in
+`docs/architecture/retrieval.md`; passing the gate only makes hybrid eligible
+and never changes the lexical deployment default.
 
 The Task 12 local milestone gate recorded `188` focused core tests, `450` API
 embedding/retrieval tests, `203` MCP retrieval/tool/facet tests, `44` MCP
 Postgres-isolation tests, and `8` CI ownership contract tests passing. Its
-reproducible service images are `pgvector/pgvector:0.8.0-pg16`,
+verification workflow's configured image tags are
+`pgvector/pgvector:0.8.0-pg16`, `python:3.11-alpine`,
 `redis:7.4.2-alpine`, `minio/minio:RELEASE.2025-04-22T22-12-26Z`,
 `minio/mc:RELEASE.2025-04-16T18-13-26Z`, and `nginx:1.27-alpine`.
 

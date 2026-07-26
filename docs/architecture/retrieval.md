@@ -9,12 +9,20 @@ Callers opt in per search with `retrieval_profile="hybrid"`; setting
 `HYBRID_SEARCH_ENABLED=true` makes that profile available but does not change
 the default argument.
 
-Hosted hybrid retrieval applies every path, tag, document-kind, annotation,
-scope, and corpus-facet filter inside both database candidate queries before
-their limits. It retrieves bounded lexical and vector candidate sets in
-parallel, combines them with reciprocal-rank fusion (RRF), preserves unique
-source/chunk identities, and can invoke bounded reranker and graph-expansion
-hooks. The hooks are optional and no model reranker is configured by default.
+For `scope=all`, hosted hybrid retrieval applies path, tag, document-kind,
+annotated-only, area, and corpus-facet filters inside both lexical and vector
+database candidate queries before their limits. It retrieves the bounded
+candidate sets in parallel, combines them with reciprocal-rank fusion (RRF),
+preserves unique source/chunk identities, and can invoke bounded reranker and
+graph-expansion hooks. The hooks are optional and no model reranker is
+configured by default.
+
+Document embeddings represent the whole chunk, so the vector backend cannot
+honor `scope=source` or `scope=annotations` independently. Those scoped hybrid
+requests raise the typed vector-unavailable signal and the whole request
+returns the lexical result as `lexical_fallback`; the lexical query still
+applies its source/annotation scope before its own limit. Vector retrieval is
+executed only for `scope=all`.
 
 Fallback is deliberately narrow. A typed vector availability failure returns
 the lexical result as profile `lexical_fallback` and emits fallback telemetry.
@@ -33,9 +41,12 @@ path even when hybrid support is configured.
 Migration `013_chunk_embeddings.sql` creates the `vector` extension and an
 RLS-protected `chunk_embeddings` table. A vector is identified by tenant,
 knowledge base, document, `document_version`, chunk index, provider, model,
-and dimensions. Retrieval joins only the current ready, non-archived document
-version and the exact configured embedding profile, so stale or mixed-profile
-vectors cannot enter a result.
+and dimensions. The durable writer verifies that the source is ready,
+non-archived, and still on the submitted current version before committing a
+complete vector set. Retrieval joins only the current document/chunk version
+and the exact configured embedding profile, and excludes failed or archived
+documents. It does not independently require `status=ready`; version fencing
+prevents stale or mixed-profile vectors from entering a result.
 
 Migration `014_document_embedding_jobs.sql` adds durable `document.embed`
 jobs and a reconciliation index. After extraction commits a new ready document
