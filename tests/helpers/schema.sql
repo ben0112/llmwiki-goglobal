@@ -805,8 +805,18 @@ CREATE TABLE rag_run_pages (
         preview_full_char_count IS NULL OR preview_full_char_count >= 0
     ),
     preview_truncated BOOLEAN NOT NULL DEFAULT false,
+    lint_summary JSONB CHECK (
+        lint_summary IS NULL OR (
+            jsonb_typeof(lint_summary) = 'object'
+            AND octet_length(lint_summary::text) <= 16384
+        )
+    ),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (state = 'committed' AND lint_summary IS NOT NULL)
+        OR (state <> 'committed' AND lint_summary IS NULL)
+    ),
     UNIQUE (run_id, ordinal),
     UNIQUE (run_id, path),
     UNIQUE (id, run_id, user_id, knowledge_base_id),

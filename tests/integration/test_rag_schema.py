@@ -143,9 +143,13 @@ async def _insert_page(pool, run_id, user_id, knowledge_base_id, *, ordinal=0, *
     row.update(values)
     columns = list(row)
     parameters = list(row.values())
+    placeholders = []
+    for index, column in enumerate(columns, 1):
+        cast = "::jsonb" if column == "lint_summary" else ""
+        placeholders.append(f"${index}{cast}")
     return await pool.fetchval(
         f"INSERT INTO rag_run_pages ({', '.join(columns)}) "
-        f"VALUES ({', '.join(f'${index}' for index in range(1, len(parameters) + 1))}) RETURNING id",
+        f"VALUES ({', '.join(placeholders)}) RETURNING id",
         *parameters,
     )
 
@@ -403,6 +407,7 @@ async def test_rag_schema_accepts_one_root_two_pages_and_three_steps(pool):
         document_id=document_id,
         version_read=1,
         version_committed=2,
+        lint_summary=json.dumps({"warnings": 0}),
     )
     await _insert_step(pool, run_id, user_id, knowledge_base_id, sequence=1, step_type="plan")
     await _insert_step(
@@ -653,6 +658,58 @@ async def test_rag_pages_reject_invalid_fields_and_duplicate_work_items(pool):
             knowledge_base_id,
             ordinal=99,
             path="/wiki/page-0.md",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rag_page_lint_summary_is_bounded_object_and_matches_committed_state(pool):
+    user_id, knowledge_base_id, document_id = await _seed_scope(pool)
+    run_id = await _insert_run(pool, user_id, knowledge_base_id)
+    summary_at_limit = await _json_with_octet_length(pool, "object", 16_384)
+    summary_over_limit = await _json_with_octet_length(pool, "object", 16_385)
+    page_id = await _insert_page(
+        pool,
+        run_id,
+        user_id,
+        knowledge_base_id,
+        state="committed",
+        document_id=document_id,
+        version_committed=1,
+        lint_summary=summary_at_limit,
+    )
+    assert await pool.fetchval("SELECT lint_summary FROM rag_run_pages WHERE id=$1", page_id)
+    for ordinal, lint_summary in enumerate((json.dumps([]), summary_over_limit), 1):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await _insert_page(
+                pool,
+                run_id,
+                user_id,
+                knowledge_base_id,
+                ordinal=ordinal,
+                state="committed",
+                document_id=document_id,
+                version_committed=1,
+                lint_summary=lint_summary,
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _insert_page(
+            pool,
+            run_id,
+            user_id,
+            knowledge_base_id,
+            ordinal=1_000_001,
+            state="committed",
+            document_id=document_id,
+            version_committed=1,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _insert_page(
+            pool,
+            run_id,
+            user_id,
+            knowledge_base_id,
+            ordinal=1_000_002,
+            lint_summary=json.dumps({}),
         )
 
 
