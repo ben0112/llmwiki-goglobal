@@ -149,6 +149,43 @@ def _evaluation_vector_adapter(client_factory, calls):
 
 
 @pytest.mark.asyncio
+async def test_evaluation_lexical_adapter_calls_shared_postgres_compiler(monkeypatch):
+    query = retrieval_eval.SearchQuery.build(text="private", limit=1, candidate_limit=2)
+    compiled = retrieval_eval.postgres_retrieval.PostgresLexicalQuery(
+        sql="SELECT 'shared-compiler' WHERE $1::text = 'shared-param'",
+        params=("shared-param",),
+    )
+    compiler_calls = []
+    fetch_calls = []
+
+    def compile_query(user_id, knowledge_base_id, received_query):
+        compiler_calls.append((user_id, knowledge_base_id, received_query))
+        return compiled
+
+    class Pool:
+        async def fetch(self, sql, *params):
+            fetch_calls.append((sql, params))
+            return ()
+
+    monkeypatch.setattr(
+        retrieval_eval.postgres_retrieval,
+        "compile_postgres_lexical_query",
+        compile_query,
+    )
+
+    result = await retrieval_eval._PostgresEvaluationLexicalRetriever(
+        Pool(),
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+    ).retrieve(query)
+
+    assert compiler_calls == [(USER_ID, KNOWLEDGE_BASE_ID, query)]
+    assert fetch_calls == [(compiled.sql, compiled.params)]
+    assert result.profile == "lexical"
+    assert result.hits == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scope", ["source", "annotations"])
 async def test_evaluation_scoped_hybrid_falls_back_before_vector_side_effects(scope):
     calls = {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
@@ -358,12 +395,13 @@ async def _seed_document(
     tags=("alpha",),
     metadata=None,
     annotated=False,
+    status="ready",
 ):
     await pool.execute(
         "INSERT INTO documents "
         "(id, knowledge_base_id, user_id, filename, path, source_kind, file_type, "
         "status, version, tags, metadata) "
-        "VALUES ($1,$2,$3,$4,$5,'source','md','ready',1,$6,$7::jsonb)",
+        "VALUES ($1,$2,$3,$4,$5,'source','md',$8,1,$6,$7::jsonb)",
         document_id,
         knowledge_base_id,
         user_id,
@@ -371,6 +409,7 @@ async def _seed_document(
         path,
         list(tags),
         json.dumps(metadata) if metadata is not None else None,
+        status,
     )
     await pool.execute(
         "INSERT INTO document_chunks "
@@ -388,6 +427,27 @@ async def _seed_document(
 
 @pytest.fixture(scope="module")
 async def evaluation_corpus(pool, tmp_path_factory):
+    operator_created = not await pool.fetchval(
+        "SELECT to_regoperator('&@~(text,text)') IS NOT NULL"
+    )
+    score_created = not await pool.fetchval(
+        "SELECT to_regprocedure('pgroonga_score(oid,tid)') IS NOT NULL"
+    )
+    if operator_created:
+        await pool.execute(
+            "CREATE FUNCTION evaluation_text_search(text, text) RETURNS boolean "
+            "LANGUAGE sql IMMUTABLE STRICT AS "
+            "'SELECT strpos(lower($1), lower($2)) > 0'"
+        )
+        await pool.execute(
+            "CREATE OPERATOR &@~ (LEFTARG=text, RIGHTARG=text, "
+            "FUNCTION=evaluation_text_search)"
+        )
+    if score_created:
+        await pool.execute(
+            "CREATE FUNCTION pgroonga_score(oid, tid) RETURNS double precision "
+            "LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 0.0::double precision'"
+        )
     await pool.execute(
         "INSERT INTO users (id,email) VALUES ($1,'evaluation@test.invalid'),"
         "($2,'other-evaluation@test.invalid')",
@@ -590,12 +650,110 @@ async def evaluation_corpus(pool, tmp_path_factory):
         PROFILE.dimensions,
     )
     fixture_root = tmp_path_factory.mktemp("retrieval-evaluation")
-    return SimpleNamespace(
+    corpus = SimpleNamespace(
         dataset=_dataset(fixture_root / "cases.jsonl"),
         pool=pool,
         current_count=coverage["current_count"],
         covered_count=coverage["covered_count"],
     )
+    try:
+        yield corpus
+    finally:
+        if score_created:
+            await pool.execute("DROP FUNCTION pgroonga_score(oid, tid)")
+        if operator_created:
+            await pool.execute("DROP OPERATOR &@~ (text, text)")
+            await pool.execute("DROP FUNCTION evaluation_text_search(text, text)")
+
+
+@pytest.mark.asyncio
+async def test_evaluator_and_serving_compiler_match_pgroonga_candidates_and_statuses(
+    evaluation_corpus,
+):
+    ready_id = UUID("00000000-0000-0000-0000-000000000301")
+    processing_id = UUID("00000000-0000-0000-0000-000000000302")
+    failed_id = UUID("00000000-0000-0000-0000-000000000303")
+    archived_id = UUID("00000000-0000-0000-0000-000000000304")
+    wrong_filter_id = UUID("00000000-0000-0000-0000-000000000305")
+    document_ids = (ready_id, processing_id, failed_id, archived_id, wrong_filter_id)
+    for document_id, status, tags in (
+        (ready_id, "ready", ("parity",)),
+        (processing_id, "processing", ("parity",)),
+        (failed_id, "failed", ("parity",)),
+        (archived_id, "ready", ("parity",)),
+        (wrong_filter_id, "ready", ("wrong",)),
+    ):
+        await _seed_document(
+            evaluation_corpus.pool,
+            user_id=USER_ID,
+            knowledge_base_id=KNOWLEDGE_BASE_ID,
+            document_id=document_id,
+            filename=f"{document_id}.md",
+            path="/compiler/",
+            content="compiler parity",
+            tags=tags,
+            metadata={"stage": "S9"},
+            annotated=True,
+            status=status,
+        )
+    await evaluation_corpus.pool.execute(
+        "UPDATE documents SET archived=true WHERE id=$1",
+        archived_id,
+    )
+    query = retrieval_eval.SearchQuery.build(
+        text="compiler parity",
+        limit=10,
+        candidate_limit=10,
+        area="sources",
+        scope="source",
+        facets={"stage": "S9"},
+        path_glob="/compiler/*.md",
+        tags=["parity"],
+        document_kinds=["source"],
+        annotated_only=True,
+    )
+    try:
+        compiled = retrieval_eval.postgres_retrieval.compile_postgres_lexical_query(
+            USER_ID,
+            KNOWLEDGE_BASE_ID,
+            query,
+        )
+        async with (
+            evaluation_corpus.pool.acquire() as connection,
+            connection.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            serving_rows = await connection.fetch(
+                compiled.sql,
+                *compiled.params,
+            )
+            snapshot = retrieval_eval._PostgresEvaluationSnapshot(connection)
+            evaluator_result = await retrieval_eval._PostgresEvaluationLexicalRetriever(
+                snapshot,
+                user_id=USER_ID,
+                knowledge_base_id=KNOWLEDGE_BASE_ID,
+            ).retrieve(query)
+            snapshot.revoke()
+    finally:
+        await evaluation_corpus.pool.execute(
+            "DELETE FROM documents WHERE id=ANY($1::uuid[])",
+            list(document_ids),
+        )
+
+    serving_identities = tuple(
+        (str(row["document_id"]), row["chunk_index"])
+        for row in serving_rows
+    )
+    evaluator_identities = tuple(
+        (hit.document_id, hit.chunk_index) for hit in evaluator_result.hits
+    )
+    assert serving_identities == evaluator_identities == (
+        (str(ready_id), 0),
+        (str(processing_id), 0),
+    )
+    assert evaluator_result.candidate_count == 2
+    assert "&@~" in compiled.sql
+    assert "pgroonga_score" in compiled.sql
+    assert "to_tsvector" not in compiled.sql
 
 
 def _factory(
@@ -709,7 +867,8 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     assert all(params[-1] == 1 for _sql, params in retrieval_fetches)
     assert sum("WITH current_chunks AS" in sql for sql, _params in recording_pool.fetches) == 2
     filtered_sql = next(sql for sql, params in retrieval_fetches if "S2" in params)
-    assert "::text AS metadata" in filtered_sql
+    assert "d.metadata" in filtered_sql
+    assert "::text AS metadata" not in filtered_sql
     for predicate in ("source_kind", "tags", "metadata", "has_highlight", "LIKE"):
         assert predicate in filtered_sql
     assert set(recording_pool.returned_document_ids) <= {

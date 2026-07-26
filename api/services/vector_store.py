@@ -11,12 +11,11 @@ from time import perf_counter
 from typing import Never
 from uuid import UUID
 
+import llmwiki_core.postgres_retrieval as postgres_retrieval
 from llmwiki_core.documents import DocumentKind
-from llmwiki_core.facets import validate_facets
 from llmwiki_core.models import EmbeddingProfile
 from llmwiki_core.search import (
     RetrieverUnavailable,
-    SearchArea,
     SearchHit,
     SearchQuery,
     SearchResult,
@@ -29,27 +28,6 @@ _POSTGRES_INTEGER_MAX = 2_147_483_647
 _MAX_SEARCH_TEXT_CHARS = 1_000_000
 _MAX_SEARCH_PATH_CHARS = 4_096
 _MAX_SEARCH_METADATA_BYTES = 64 * 1_024
-
-_SCALAR_FACETS = {
-    "genre": "genre",
-    "evidence": "evidence",
-    "origin": "origin",
-    "timeliness": "timeliness",
-    "state": "lifecycle_state",
-    "entry_id": "entry_id",
-}
-_ARRAY_FACETS = {
-    "rule": "rule_type",
-    "dept": "gov_dept",
-    "region": "geo_region",
-    "industry": "industry",
-    "mode": "mode",
-}
-_PRIMARY_EXTENSION_FACETS = {
-    "stage": ("stage", "stage_ext"),
-    "domain": ("domain", "domain_ext"),
-}
-
 
 class _VectorWriteRejected(ValueError):
     """A stable caller-visible version or chunk-set rejection."""
@@ -275,22 +253,14 @@ class PostgresVectorStore:
             "d.status != 'failed'",
             "NOT d.archived",
         ]
-        if query.annotated_only:
-            where.append("dc.has_highlight=true")
-        if query.area is SearchArea.WIKI:
-            where.append("d.source_kind='wiki'")
-        elif query.area is SearchArea.SOURCES:
-            where.append("d.source_kind!='wiki'")
-        if query.document_kinds:
-            where.append(f"d.source_kind=ANY({bind([kind.value for kind in query.document_kinds])}::text[])")
-        if query.path_glob is not None:
-            where.append(f"(d.path || d.filename) LIKE {bind(_logical_glob_to_sql_like(query.path_glob))} ESCAPE '\\'")
-        if query.tags:
-            where.append(
-                "ARRAY(SELECT lower(tag) FROM unnest(COALESCE(d.tags, ARRAY[]::text[])) tag) "
-                f"@> {bind(list(query.tags))}::text[]"
+        where.extend(
+            postgres_retrieval.postgres_document_filter_conditions(
+                query,
+                params,
+                doc_alias="d",
+                chunk_alias="dc",
             )
-        where.extend(_facet_conditions(dict(query.facets), bind=bind))
+        )
         limit_parameter = bind(query.candidate_limit)
 
         sql = (
@@ -556,74 +526,6 @@ def _candidate_limit(query: SearchQuery) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < query.limit or value > 500:
         raise ValueError("candidate limit must be between search limit and 500")
     return value
-
-
-def _logical_glob_to_sql_like(path_glob: str) -> str:
-    directory = path_glob.endswith("/") or (
-        "*" not in path_glob and "." not in path_glob.rsplit("/", 1)[-1] and path_glob != "/"
-    )
-    escaped: list[str] = []
-    index = 0
-    while index < len(path_glob):
-        char = path_glob[index]
-        if char == "*":
-            if index + 1 < len(path_glob) and path_glob[index + 1] == "*":
-                index += 1
-            escaped.append("%")
-        elif char in {"%", "_", "\\"}:
-            escaped.append("\\" + char)
-        else:
-            escaped.append(char)
-        index += 1
-    pattern = "".join(escaped)
-    if path_glob == "/":
-        return "/%"
-    if directory:
-        return pattern.rstrip("/") + "/%"
-    return pattern
-
-
-def _facet_conditions(facets: dict[str, object], *, bind) -> list[str]:
-    clean = validate_facets(facets)
-    conditions: list[str] = []
-    for key, value in clean.items():
-        parameter = bind(value)
-        if key == "timeliness":
-            conditions.append(
-                f"(d.metadata->>'timeliness'={parameter} OR "
-                f"d.metadata#>>'{{facet_rollup,timeliness_worst}}'={parameter})"
-            )
-        elif key in _SCALAR_FACETS:
-            conditions.append(f"d.metadata->>'{_SCALAR_FACETS[key]}'={parameter}")
-        elif key in _ARRAY_FACETS:
-            conditions.append(f"d.metadata->'{_ARRAY_FACETS[key]}' ? {parameter}")
-        elif key in _PRIMARY_EXTENSION_FACETS:
-            primary, extension = _PRIMARY_EXTENSION_FACETS[key]
-            conditions.append(
-                f"(d.metadata->>'{primary}'={parameter} OR "
-                f"d.metadata->'{extension}' ? {parameter} OR "
-                f"d.metadata#>'{{facet_rollup,{key}}}' ? {parameter})"
-            )
-        elif key == "country":
-            conditions.append(
-                f"(d.metadata->'geo_country' ? {parameter} OR "
-                f"d.metadata->'geo_country_names' ? {parameter} OR "
-                f"d.metadata#>'{{facet_rollup,country}}' ? {parameter})"
-            )
-        elif key == "business":
-            if "." in value:
-                conditions.append(
-                    f"(d.metadata#>>'{{business,code}}'={parameter} OR "
-                    f"d.metadata#>'{{facet_rollup,business}}' ? {parameter})"
-                )
-            else:
-                prefix = bind(f"{value}.%")
-                conditions.append(
-                    f"(d.metadata#>>'{{business,code}}'={parameter} OR "
-                    f"d.metadata#>>'{{business,code}}' LIKE {prefix} OR "
-                    f"d.metadata#>'{{facet_rollup,business}}' ? {parameter})"
-                )
-    return conditions
 
 
 def _search_hit(row: Mapping[str, object]) -> SearchHit:

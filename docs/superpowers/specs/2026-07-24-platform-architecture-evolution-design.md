@@ -241,13 +241,18 @@ keep hybrid search opt-in even when those gates pass.
 
 ### Milestone 3 implementation evidence
 
-Milestone 3's substantive hosted-evaluation candidate is
-`20b8e7b1333d13eb266f2d04438d330b28380a16`. The implementation includes the
+Milestone 3's latest substantive hosted-evaluation candidate is
+`396acbf6eaee49202d01ccd76aedb73d468c138e`. The implementation includes the
 strict versioned evaluation schema and exact deterministic metrics,
 filter-before-limit compilation, version/profile-fenced pgvector storage,
 OpenAI-compatible and deterministic fake embedding adapters, durable embedding
 reconciliation, bounded RRF, optional reranker and graph-expansion hooks, typed
 lexical fallback, and the inclusive 110% Recall@10 / 2.0x p95 promotion gate.
+The current follow-up also makes hosted serving and promotion evaluation call
+one pure production lexical compiler with identical PGroonga `&@~`,
+`pgroonga_score`, `status != 'failed'`, scope labeling, filter-before-limit,
+candidate-count, and stable-order semantics; it removes the evaluator-only
+`tsvector` approximation.
 
 The representative two-case real-Postgres comparison uses dataset digest
 `d45bf89f5b28694afe2b4af1d03d15e3ba59e02d3bc20129eff77b58ab39ab7f`.
@@ -257,25 +262,28 @@ Recall@5/10/20 `1.0`, MRR `1.0`, nDCG@10 `1.0`, filtered result count `1`,
 and p50/p95 `20.0 ms`. The result is eligible at recall ratio `2.0` and the
 inclusive latency boundary `2.0`.
 
-Verification for that exact SHA completed with all six jobs successful in
-[GitHub Actions run 30189989121](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30189989121).
+Verification for `396acbf6eaee49202d01ccd76aedb73d468c138e` completed with all
+six jobs successful in
+[GitHub Actions run 30190377917](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30190377917).
 The retrieval segment owns the chunk schema, vector store, durable embeddings,
 hybrid failure matrix, and real-Postgres evaluation tests. The historical Task
 11 specification and quality reviews of implementation commit `5cca143` both
 concluded Critical `0`, Important `0`, Minor `0`, and `Ready: Yes`; this does
-not claim the same result for `20b8e7b` or its follow-up. A Task 12
+not claim the same result for the Task 12 candidate or its follow-ups. A Task 12
 specification re-review of `20b8e7b` reported `3` Important and `1` Minor
-follow-ups. The current remediation addresses all four locally but remains
-pending specification and quality re-review; no zero-finding or readiness
-conclusion is recorded yet. Operational rollout, private-dataset handling,
-promotion, and rollback are documented in
+follow-ups, which `396acbf` addressed. The subsequent quality re-review reported
+`2` Important follow-ups: the outer async control-signal boundary and lexical
+serving/evaluator drift. The current local remediation addresses both but
+remains pending specification and quality re-review; no zero-finding or
+readiness conclusion is recorded yet. Operational rollout, private-dataset
+handling, promotion, and rollback are documented in
 `docs/architecture/retrieval.md`; passing the gate only makes hybrid eligible
 and never changes the lexical deployment default.
 
-The Task 12 local milestone gate for `20b8e7b` recorded `188` focused core
-tests, `452` API embedding/retrieval tests, `205` MCP retrieval/tool/facet
-tests, `44` MCP
-Postgres-isolation tests, and `8` CI ownership contract tests passing. Its
+The current Task 12 local milestone gate records `251` core tests,
+`141` CLI boundary tests, `463` API embedding/retrieval tests, `206` MCP
+retrieval/tool/facet tests, `48` MCP Postgres-isolation and hosted-corpus tests,
+and `8` CI ownership contract tests passing. Its
 verification workflow's configured image tags are
 `pgvector/pgvector:0.8.0-pg16`, `python:3.11-alpine`,
 `redis:7.4.2-alpine`, `minio/minio:RELEASE.2025-04-22T22-12-26Z`,

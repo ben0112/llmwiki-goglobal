@@ -36,6 +36,14 @@ Local mode is always lexical-only and requires no model or network access.
 Hosted callers that do not request `hybrid` also stay entirely on the lexical
 path even when hybrid support is configured.
 
+Hosted serving and promotion evaluation compile lexical candidates through the
+same pure shared Postgres compiler. Both therefore execute the production
+PGroonga `&@~` match and `pgroonga_score` ordering, use the same
+`status != 'failed'` and archive rules, derive source/annotation scope from the
+same labeled rows, and apply every document filter before `candidate_limit`.
+The evaluator does not maintain a `to_tsvector` approximation or an independent
+filter/status query.
+
 ## Storage and embedding lifecycle
 
 Migration `013_chunk_embeddings.sql` creates the `vector` extension and an
@@ -190,7 +198,9 @@ PYTHONPATH=api MODE=hosted .venv/bin/pytest \
 ```
 
 The two profiles run against one read-only `REPEATABLE READ` snapshot and the
-same dataset digest. The gate is inclusive: hybrid Recall@10 must be at least
+same dataset digest. Its lexical side is the exact shared production PGroonga
+candidate query, not a separate evaluator ranking implementation. The gate is
+inclusive: hybrid Recall@10 must be at least
 110% of lexical Recall@10, and hybrid p95 latency must be no more than 2.0x
 the lexical baseline. Exit code `3` means the comparison ran but did not pass;
 configuration/dataset/retrieval errors use `2`, and report-write errors use

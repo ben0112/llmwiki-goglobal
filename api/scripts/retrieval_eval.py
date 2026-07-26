@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any, BinaryIO, Never
 from uuid import UUID
 
+import llmwiki_core.postgres_retrieval as postgres_retrieval
 from llmwiki_core import (
     EVALUATION_SCHEMA_VERSION,
     EvaluationReport,
@@ -112,8 +113,39 @@ def _sanitized_process_control(error: BaseException) -> KeyboardInterrupt | Syst
     return None
 
 
-def _sanitized_backend_failure(error: BaseException) -> BaseException:
-    if process_control := _sanitized_process_control(error):
+def _contains_ordinary_failure(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        elif isinstance(current, Exception):
+            return True
+        pending.extend(
+            linked
+            for linked in (current.__cause__, current.__context__)
+            if linked is not None
+        )
+    return False
+
+
+def _sanitized_backend_failure(
+    error: BaseException,
+    *,
+    preserve_boundary_signals: bool = False,
+) -> BaseException:
+    if preserve_boundary_signals:
+        if signal := sanitized_boundary_signal_or_unknown(error):
+            if isinstance(signal, (asyncio.CancelledError, GeneratorExit)) and (
+                _contains_ordinary_failure(error)
+            ):
+                return RetrievalExecutionError()
+            return signal
+    elif process_control := _sanitized_process_control(error):
         return process_control
     return RetrievalExecutionError()
 
@@ -122,12 +154,20 @@ def _backend_call(
     operation: Callable[[], Any],
     *,
     passthrough: tuple[type[BaseException], ...] = (),
+    preserve_boundary_signals: bool = False,
 ) -> Any:
     failure: BaseException | None = None
     try:
         return operation()
     except BaseException as error:  # noqa: BLE001 - the privacy boundary must classify BaseExceptionGroup.
-        failure = error if isinstance(error, passthrough) else _sanitized_backend_failure(error)
+        failure = (
+            error
+            if isinstance(error, passthrough)
+            else _sanitized_backend_failure(
+                error,
+                preserve_boundary_signals=preserve_boundary_signals,
+            )
+        )
     if failure is None:  # pragma: no cover - the except path always assigns it.
         raise RuntimeError("backend boundary lost its failure")
     raise failure from None
@@ -245,75 +285,19 @@ class _PostgresEvaluationLexicalRetriever:
         self._candidate_limit = candidate_limit
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
-        from services.vector_store import _facet_conditions, _logical_glob_to_sql_like
-
         effective_query = _query_with_candidate_limit(query, self._candidate_limit)
         started_at = perf_counter()
-        params: list[object] = [
+        compiled = postgres_retrieval.compile_postgres_lexical_query(
             self._user_id,
             self._knowledge_base_id,
-            effective_query.text,
-        ]
-
-        def bind(value: object) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        where = [
-            "d.user_id=$1",
-            "d.knowledge_base_id=$2",
-            "dc.user_id=$1",
-            "dc.knowledge_base_id=$2",
-            "dc.document_version=d.version",
-            "d.status='ready'",
-            "NOT d.archived",
-        ]
-        if effective_query.annotated_only:
-            where.append("dc.has_highlight=true")
-        if effective_query.area is SearchArea.WIKI:
-            where.append("d.source_kind='wiki'")
-        elif effective_query.area is SearchArea.SOURCES:
-            where.append("d.source_kind!='wiki'")
-        if effective_query.document_kinds:
-            kinds = bind([kind.value for kind in effective_query.document_kinds])
-            where.append(f"d.source_kind=ANY({kinds}::text[])")
-        if effective_query.path_glob is not None:
-            path_pattern = bind(_logical_glob_to_sql_like(effective_query.path_glob))
-            where.append(f"(d.path || d.filename) LIKE {path_pattern} ESCAPE '\\'")
-        if effective_query.tags:
-            tags = bind(list(effective_query.tags))
-            where.append(
-                "ARRAY(SELECT lower(tag) FROM unnest(COALESCE(d.tags, ARRAY[]::text[])) tag) "
-                f"@> {tags}::text[]"
-            )
-        where.extend(_facet_conditions(dict(effective_query.facets), bind=bind))
-
-        searchable = {
-            SearchScope.ALL: "dc.content",
-            SearchScope.SOURCE: "dc.source_content",
-            SearchScope.ANNOTATIONS: "COALESCE(dc.annotations_text, '')",
-        }[effective_query.scope]
-        where.append(
-            f"to_tsvector('simple', {searchable}) @@ plainto_tsquery('simple', $3)"
+            effective_query,
         )
-        limit_parameter = bind(effective_query.candidate_limit)
-        sql = (
-            "WITH filtered AS ("
-            "SELECT dc.document_id, dc.document_version, dc.chunk_index, dc.content, "
-            "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, "
-            "COALESCE(d.tags, ARRAY[]::text[]) AS tags, d.source_kind, "
-            "COALESCE(d.metadata, '{}'::jsonb)::text AS metadata, "
-            f"ts_rank_cd(to_tsvector('simple', {searchable}), "
-            "plainto_tsquery('simple', $3)) AS score "
-            "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
-            f"WHERE {' AND '.join(where)}"
-            "), counted AS ("
-            "SELECT *, count(*) OVER () AS candidate_count FROM filtered"
-            ") SELECT * FROM counted "
-            "ORDER BY score DESC, document_id, document_version, chunk_index "
-            f"LIMIT {limit_parameter}"
+        rows = await _postgres_fetch(
+            self._pool,
+            compiled.sql,
+            compiled.params,
+            label="lexical",
         )
-        rows = await _postgres_fetch(self._pool, sql, params, label="lexical")
         dictionaries = tuple(dict(row) for row in rows)
         hits = tuple(_postgres_evaluation_hit(row) for row in dictionaries)
         return SearchResult(
@@ -1619,11 +1603,13 @@ def _run_async(factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
         return _backend_call(
             lambda: asyncio.run(factory()),
             passthrough=_SAFE_BACKEND_EXCEPTIONS,
+            preserve_boundary_signals=True,
         )
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrieval-eval") as executor:
         return _backend_call(
             lambda: executor.submit(lambda: asyncio.run(factory())).result(),
             passthrough=_SAFE_BACKEND_EXCEPTIONS,
+            preserve_boundary_signals=True,
         )
 
 

@@ -2,6 +2,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from llmwiki_core.models import EmbeddingProfile
+from llmwiki_core.postgres_retrieval import (
+    logical_glob_to_sql_like as logical_glob_to_sql_like,
+)
 from llmwiki_core.search import RetrieverUnavailable, SearchHit, SearchQuery, SearchResult
 from llmwiki_core.wiki import WikiWriteBundle
 
@@ -186,40 +189,6 @@ class VaultFS(ABC):
 
     @abstractmethod
     async def find_stale_pages(self, kb_id: str) -> list[dict]: ...
-
-
-def logical_glob_to_sql_like(path_glob: str) -> str:
-    """Translate a normalized logical glob into an escaped SQL LIKE value.
-
-    SQL's own `%`, `_`, and escape character stay literal. `?` is also
-    literal; only `*` and `**` are wildcards. Both star forms retain the
-    historical `fnmatch` behavior where a wildcard may span `/`. A trailing
-    slash (or a bare extensionless path) denotes a directory prefix.
-    """
-    directory = path_glob.endswith("/") or (
-        "*" not in path_glob
-        and "." not in path_glob.rsplit("/", 1)[-1]
-        and path_glob != "/"
-    )
-    escaped: list[str] = []
-    index = 0
-    while index < len(path_glob):
-        char = path_glob[index]
-        if char == "*":
-            if index + 1 < len(path_glob) and path_glob[index + 1] == "*":
-                index += 1
-            escaped.append("%")
-        elif char in {"%", "_", "\\"}:
-            escaped.append("\\" + char)
-        else:
-            escaped.append(char)
-        index += 1
-    pattern = "".join(escaped)
-    if path_glob == "/":
-        return "/%"
-    if directory:
-        return pattern.rstrip("/") + "/%"
-    return pattern
 
 
 def is_wiki_directory(path: str) -> bool:

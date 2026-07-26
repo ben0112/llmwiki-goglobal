@@ -1059,6 +1059,138 @@ def test_hosted_cli_sanitizes_unknown_runtime_failure(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
+    ("failure_factory", "expected_type", "expected_args"),
+    [
+        (lambda: KeyboardInterrupt("private-keyboard"), KeyboardInterrupt, ()),
+        (lambda: SystemExit("private-system-exit"), SystemExit, (1,)),
+        (lambda: asyncio.CancelledError("private-cancelled"), asyncio.CancelledError, ()),
+        (lambda: GeneratorExit("private-generator"), GeneratorExit, ()),
+        (
+            lambda: RuntimeError("private-ordinary"),
+            retrieval_eval_module.RetrievalExecutionError,
+            (),
+        ),
+    ],
+    ids=("keyboard", "system-exit", "cancelled", "generator-exit", "ordinary"),
+)
+def test_run_async_outer_boundary_sanitizes_direct_failures(
+    failure_factory,
+    expected_type,
+    expected_args,
+):
+    async def fail():
+        raise failure_factory()
+
+    with pytest.raises(expected_type) as caught:
+        retrieval_eval_module._run_async(fail)
+
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_factory", "expected_type", "expected_args"),
+    [
+        (lambda: KeyboardInterrupt("private-keyboard"), KeyboardInterrupt, ()),
+        (lambda: SystemExit("private-system-exit"), SystemExit, (1,)),
+        (lambda: asyncio.CancelledError("private-cancelled"), asyncio.CancelledError, ()),
+        (lambda: GeneratorExit("private-generator"), GeneratorExit, ()),
+    ],
+    ids=("keyboard", "system-exit", "cancelled", "generator-exit"),
+)
+async def test_run_async_thread_boundary_sanitizes_nested_loop_failures(
+    failure_factory,
+    expected_type,
+    expected_args,
+):
+    async def fail():
+        raise failure_factory()
+
+    with pytest.raises(expected_type) as caught:
+        retrieval_eval_module._run_async(fail)
+
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("failures", "expected_type", "expected_args"),
+    [
+        (
+            (GeneratorExit("private-generator"), asyncio.CancelledError("private-cancelled")),
+            asyncio.CancelledError,
+            (),
+        ),
+        (
+            (asyncio.CancelledError("private-cancelled"), SystemExit("private-exit")),
+            SystemExit,
+            (1,),
+        ),
+        (
+            (SystemExit(7), KeyboardInterrupt("private-keyboard")),
+            KeyboardInterrupt,
+            (),
+        ),
+    ],
+    ids=("cancel-over-generator", "exit-over-cancel", "keyboard-over-exit"),
+)
+def test_run_async_grouped_control_uses_shared_priority(
+    failures,
+    expected_type,
+    expected_args,
+):
+    async def fail():
+        raise BaseExceptionGroup("private-group", list(failures))
+
+    with pytest.raises(expected_type) as caught:
+        retrieval_eval_module._run_async(fail)
+
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("failure_factory", "expected_type", "expected_args"),
+    [
+        (lambda: KeyboardInterrupt("private-keyboard"), KeyboardInterrupt, ()),
+        (lambda: SystemExit("private-system-exit"), SystemExit, (1,)),
+        (lambda: asyncio.CancelledError("private-cancelled"), asyncio.CancelledError, ()),
+        (lambda: GeneratorExit("private-generator"), GeneratorExit, ()),
+        (
+            lambda: BaseExceptionGroup(
+                "private-group",
+                [GeneratorExit("private-generator"), asyncio.CancelledError("private-cancelled")],
+            ),
+            asyncio.CancelledError,
+            (),
+        ),
+    ],
+    ids=("keyboard", "system-exit", "cancelled", "generator-exit", "grouped"),
+)
+def test_hosted_main_outer_boundary_preserves_sanitized_control(
+    failure_factory,
+    expected_type,
+    expected_args,
+    monkeypatch,
+):
+    async def fail(*_args):
+        raise failure_factory()
+
+    monkeypatch.setattr(retrieval_eval_module, "_evaluate_hosted_request_async", fail)
+
+    with pytest.raises(expected_type) as caught:
+        main(["--dataset", str(DATASET), "--compare", "--hosted"])
+
+    assert caught.value.args == expected_args
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
     ("failure", "category", "code"),
     [
         (

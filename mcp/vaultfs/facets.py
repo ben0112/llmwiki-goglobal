@@ -9,7 +9,15 @@ facet filter implicitly narrows the search to classified corpus entries.
 The same facet keys work on both backends; only the SQL dialect differs.
 """
 
-from llmwiki_core.facets import FACET_KEYS, UnknownFacetError, validate_facets
+from llmwiki_core.facets import (
+    ARRAY_FACET_PATHS,
+    FACET_KEYS,
+    PRIMARY_EXTENSION_FACET_PATHS,
+    SCALAR_FACET_PATHS,
+    UnknownFacetError,
+    postgres_facet_conditions,
+    validate_facets,
+)
 
 __all__ = [
     "FACET_KEYS",
@@ -20,24 +28,11 @@ __all__ = [
 ]
 
 # facet key -> ("scalar", json path) | ("array", json path) | special-cased
-_SCALAR = {
-    "genre": "$.genre",
-    "evidence": "$.evidence",
-    "origin": "$.origin",
-    "timeliness": "$.timeliness",
-    "state": "$.lifecycle_state",
-    "entry_id": "$.entry_id",
-}
-_ARRAY = {
-    "rule": "$.rule_type",
-    "dept": "$.gov_dept",
-    "region": "$.geo_region",
-    "industry": "$.industry",
-    "mode": "$.mode",
-}
+_SCALAR = {key: f"$.{path}" for key, path in SCALAR_FACET_PATHS.items()}
+_ARRAY = {key: f"$.{path}" for key, path in ARRAY_FACET_PATHS.items()}
 _PRIMARY_EXT = {
-    "stage": ("$.stage", "$.stage_ext"),
-    "domain": ("$.domain", "$.domain_ext"),
+    key: (f"$.{primary}", f"$.{extension}")
+    for key, (primary, extension) in PRIMARY_EXTENSION_FACET_PATHS.items()
 }
 
 
@@ -96,57 +91,4 @@ def sqlite_facet_conditions(facets: dict[str, str], doc_alias: str = "d") -> tup
                 params.extend([value, f"{value}.%", value])
     if conds:
         conds.insert(0, f"{raw_meta} IS NOT NULL")
-    return conds, params
-
-
-def postgres_facet_conditions(
-    facets: dict[str, str],
-    start_index: int,
-    doc_alias: str = "d",
-) -> tuple[list[str], list]:
-    """(conditions, params) for Postgres; placeholders start at $start_index."""
-    meta = f"{doc_alias}.metadata"
-    conds: list[str] = []
-    params: list = []
-    n = start_index
-
-    def nxt(value) -> int:
-        nonlocal n
-        params.append(value)
-        n += 1
-        return n - 1
-
-    for key, value in facets.items():
-        if key == "timeliness":
-            i = nxt(value)
-            conds.append(f"({meta}->>'timeliness' = ${i} OR {meta}#>>'{{facet_rollup,timeliness_worst}}' = ${i})")
-        elif key in _SCALAR:
-            field = _SCALAR[key].removeprefix("$.")
-            conds.append(f"{meta}->>'{field}' = ${nxt(value)}")
-        elif key in _ARRAY:
-            field = _ARRAY[key].removeprefix("$.")
-            conds.append(f"{meta}->'{field}' ? ${nxt(value)}")
-        elif key in _PRIMARY_EXT:
-            primary, ext = (p.removeprefix("$.") for p in _PRIMARY_EXT[key])
-            i = nxt(value)
-            conds.append(
-                f"({meta}->>'{primary}' = ${i} OR {meta}->'{ext}' ? ${i} OR {meta}#>'{{facet_rollup,{key}}}' ? ${i})"
-            )
-        elif key == "country":
-            i = nxt(value)
-            conds.append(
-                f"({meta}->'geo_country' ? ${i} OR {meta}->'geo_country_names' ? ${i} "
-                f"OR {meta}#>'{{facet_rollup,country}}' ? ${i})"
-            )
-        elif key == "business":
-            if "." in value:
-                i = nxt(value)
-                conds.append(f"({meta}#>>'{{business,code}}' = ${i} OR {meta}#>'{{facet_rollup,business}}' ? ${i})")
-            else:
-                i = nxt(value)
-                j = nxt(f"{value}.%")
-                conds.append(
-                    f"({meta}#>>'{{business,code}}' = ${i} OR {meta}#>>'{{business,code}}' LIKE ${j} "
-                    f"OR {meta}#>'{{facet_rollup,business}}' ? ${i})"
-                )
     return conds, params

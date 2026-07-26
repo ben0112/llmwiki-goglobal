@@ -16,11 +16,11 @@ from config import settings
 from db import get_pool, scoped_execute, scoped_query, scoped_queryrow, service_execute, service_queryrow
 from services.chunker import chunk_text, store_chunks_pg
 
+import llmwiki_core.postgres_retrieval as postgres_retrieval
 from llmwiki_core.documents import DocumentKind
 from llmwiki_core.models import EmbeddingProfile
 from llmwiki_core.search import (
     RetrieverUnavailable,
-    SearchArea,
     SearchHit,
     SearchQuery,
     SearchResult,
@@ -34,7 +34,6 @@ from .base import (
     VaultFS,
     _vault_search_hit,
     is_wiki_directory,
-    logical_glob_to_sql_like,
 )
 from .facets import postgres_facet_conditions, validate_facets
 
@@ -159,39 +158,12 @@ def _postgres_document_filters(
     doc_alias: str,
     chunk_alias: str,
 ) -> list[str]:
-    def bind(value) -> str:
-        params.append(value)
-        return f"${len(params)}"
-
-    where: list[str] = []
-    if query.annotated_only:
-        where.append(f"{chunk_alias}.has_highlight=true")
-    if query.area is SearchArea.WIKI:
-        where.append(f"{doc_alias}.source_kind='wiki'")
-    elif query.area is SearchArea.SOURCES:
-        where.append(f"{doc_alias}.source_kind!='wiki'")
-    if query.document_kinds:
-        kinds = bind([kind.value for kind in query.document_kinds])
-        where.append(f"{doc_alias}.source_kind=ANY({kinds}::text[])")
-    if query.path_glob is not None:
-        path_pattern = bind(logical_glob_to_sql_like(query.path_glob))
-        where.append(
-            f"({doc_alias}.path || {doc_alias}.filename) LIKE {path_pattern} ESCAPE '\\'"
-        )
-    if query.tags:
-        tags = bind(list(query.tags))
-        where.append(
-            "ARRAY(SELECT lower(tag) FROM unnest(COALESCE("
-            f"{doc_alias}.tags, ARRAY[]::text[])) tag) @> {tags}::text[]"
-        )
-    facet_conds, facet_params = postgres_facet_conditions(
-        validate_facets(dict(query.facets)),
-        start_index=len(params) + 1,
+    return postgres_retrieval.postgres_document_filter_conditions(
+        query,
+        params,
         doc_alias=doc_alias,
+        chunk_alias=chunk_alias,
     )
-    where.extend(facet_conds)
-    params.extend(facet_params)
-    return where
 
 
 def _raise_postgres_ordinary_boundary(failure: BaseException, message: str) -> NoReturn:
@@ -537,77 +509,16 @@ class PostgresVaultFS(VaultFS):
 
     async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
         started_at = perf_counter()
-        params: list = [kb_id, query.text, self.user_id]
-
-        def bind(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        where = [
-            "dc.knowledge_base_id = $1",
-            "d.knowledge_base_id = $1",
-            "dc.user_id = $3",
-            "d.user_id = $3",
-            "dc.content &@~ $2",
-            "d.status != 'failed'",
-            "NOT d.archived",
-        ]
-        if query.annotated_only:
-            where.append("dc.has_highlight = true")
-        if query.area is SearchArea.WIKI:
-            where.append("d.source_kind = 'wiki'")
-        elif query.area is SearchArea.SOURCES:
-            where.append("d.source_kind != 'wiki'")
-        if query.document_kinds:
-            kinds = bind([kind.value for kind in query.document_kinds])
-            where.append(f"d.source_kind = ANY({kinds}::text[])")
-        if query.path_glob is not None:
-            path_pattern = bind(logical_glob_to_sql_like(query.path_glob))
-            where.append(f"(d.path || d.filename) LIKE {path_pattern} ESCAPE '\\'")
-        if query.tags:
-            tags = bind(list(query.tags))
-            where.append(
-                "ARRAY(SELECT lower(tag) FROM unnest("
-                "COALESCE(d.tags, ARRAY[]::text[])) tag) "
-                f"@> {tags}::text[]"
-            )
-
-        facet_conds, facet_params = postgres_facet_conditions(
-            validate_facets(dict(query.facets)),
-            start_index=len(params) + 1,
-            doc_alias="d",
+        compiled = postgres_retrieval.compile_postgres_lexical_query(
+            self.user_id,
+            kb_id,
+            query,
         )
-        where.extend(facet_conds)
-        params.extend(facet_params)
-
-        scope_where = ""
-        if query.scope is SearchScope.SOURCE:
-            scope_where = "WHERE source_hit"
-        elif query.scope is SearchScope.ANNOTATIONS:
-            scope_where = "WHERE annotation_hit"
-        limit_param = bind(query.candidate_limit)
 
         rows = await scoped_query(
             self.user_id,
-            "WITH labeled AS ("
-            "SELECT dc.document_id, dc.document_version, dc.content, "
-            "dc.source_content, dc.annotations_text, dc.has_highlight, "
-            "dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, d.metadata, "
-            "d.source_kind, pgroonga_score(dc.tableoid, dc.ctid) AS score, "
-            "(dc.source_content &@~ $2) AS source_hit, "
-            "(dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) "
-            "AS annotation_hit "
-            "FROM document_chunks dc JOIN documents d ON dc.document_id = d.id "
-            f"WHERE {' AND '.join(where)}"
-            "), filtered AS ("
-            f"SELECT * FROM labeled {scope_where}"
-            "), counted AS ("
-            "SELECT *, COUNT(*) OVER () AS candidate_count FROM filtered"
-            ") SELECT * FROM counted "
-            "ORDER BY score DESC, document_id, document_version, chunk_index "
-            f"LIMIT {limit_param}",
-            *params,
+            compiled.sql,
+            *compiled.params,
         )
         row_dicts = [dict(row) for row in rows]
         hits = tuple(_postgres_search_hit(row) for row in row_dicts)
