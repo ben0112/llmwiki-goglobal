@@ -126,17 +126,12 @@ class SearchHandler:
         )
         query = request.text
         scope = request.scope.value
-        if retrieval_profile == "lexical":
-            result = await self.fs.retrieve(self.kb_id, request)
-        elif retrieval_profile == "hybrid":
-            from services.retrieval import HostedRetrievalService
+        from services.retrieval import HostedRetrievalService
 
-            result = await HostedRetrievalService(self.fs, self.kb_id).retrieve(
-                request,
-                profile="hybrid",
-            )
-        else:
-            raise ValueError("unsupported retrieval profile")
+        result = await HostedRetrievalService(self.fs, self.kb_id).retrieve(
+            request,
+            profile=retrieval_profile,
+        )
         matches = [search_hit_to_legacy_dict(hit) for hit in result.hits]
 
         matches = await self._fold_corpus(matches)
@@ -220,7 +215,7 @@ class SearchHandler:
             lines.append(f"  {r['path']}{r['filename']} ({title}) — stale since {stale or '?'}")
         return "\n".join(lines)
 
-    async def _document_references(self, path: str) -> str:
+    async def _document_references(self, path: str) -> str:  # noqa: C901
         """Show forward references and backlinks for a specific document."""
         if not path or path in ("*", "**"):
             return "references mode requires a `path` to a specific document, or `query=\"uncited\"` / `query=\"stale\"`."
@@ -323,7 +318,7 @@ class SearchHandler:
             return matches
         try:
             ctx = await self.fs.corpus_search_context(self.kb_id, source_rps)
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional corpus folding fails open to search hits.
             return matches
         if not ctx.get("has_pipeline"):
             return matches
@@ -331,7 +326,7 @@ class SearchHandler:
         entries, states = ctx["entries"], ctx["states"]
         entry_native = {rp for rp in rps if rp.startswith("corpus/")}
         out: list[dict] = []
-        for m, rp in zip(matches, rps):
+        for m, rp in zip(matches, rps, strict=True):
             if rp.startswith(("corpus/", "wiki/")):
                 out.append(m)
                 continue

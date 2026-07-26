@@ -210,13 +210,17 @@ def emit(logger: object, event: str, /, **fields: object) -> None:
         separators=(",", ":"),
         sort_keys=True,
     )
+    failure = None
     try:
         logger.info(serialized)
-    except BaseException as failure:  # noqa: BLE001 - telemetry is a process boundary.
-        if signal := sanitized_process_signal(failure):
-            raise signal from None
-        if not isinstance(failure, Exception):
-            raise type(failure)() from None
+    except BaseException as caught:  # noqa: BLE001 - telemetry is a process boundary.
+        failure = caught
+    if failure is None:
+        return
+    if signal := sanitized_process_signal(failure):
+        raise signal from None
+    if not isinstance(failure, Exception):
+        raise type(failure)() from None
 
 
 __all__ = [

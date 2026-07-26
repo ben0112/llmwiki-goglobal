@@ -126,6 +126,8 @@ async def test_lexical_profile_preserves_exact_adapter_result_and_never_builds_e
 
     assert result is vault.lexical
     assert vault.lexical_queries == [("kb-1", query)]
+    assert vault.vector_queries == []
+    assert vault.expansions == []
     assert built == []
 
 

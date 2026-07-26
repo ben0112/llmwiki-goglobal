@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from datetime import timedelta
 from math import nan
 from uuid import uuid4
 
@@ -16,6 +18,7 @@ from jobs.service import JobService
 from scripts.enqueue_embeddings import reconcile_missing_embeddings
 
 from llmwiki_core.models import EmbeddingProfile, EmbeddingUnavailable
+from tests.helpers.telemetry_contract import assert_telemetry_event
 
 PROFILE = EmbeddingProfile("openai_compatible", "embed-v1", 3)
 
@@ -73,6 +76,78 @@ async def _claimed_job(pool, ids, *, profile=PROFILE, version=1, owner="embed-wo
     claimed = await repository.claim(pool, created.id, owner, 120)
     assert claimed is not None
     return claimed, JobLease(pool, claimed.id, owner, 120, 30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "attempt_count",
+        "max_attempts",
+        "cancel_requested",
+        "persisted_state",
+        "persisted_error",
+        "outcome",
+        "event_error",
+    ),
+    [
+        (1, 3, False, "retry_wait", "lease_expired", "retry", "lease_expired"),
+        (3, 3, False, "failed", "attempts_exhausted", "terminal", "attempts_exhausted"),
+        (1, 3, True, "cancelled", None, "terminal", "cancelled"),
+    ],
+)
+async def test_embedding_lease_reaper_emits_each_committed_attempt_once(
+    pool,
+    caplog,
+    attempt_count,
+    max_attempts,
+    cancel_requested,
+    persisted_state,
+    persisted_error,
+    outcome,
+    event_error,
+):
+    from jobs import worker
+
+    ids = await _seed_document(pool)
+    job, _lease = await _claimed_job(pool, ids)
+    await pool.execute(
+        "UPDATE background_jobs SET attempt_count=$2,max_attempts=$3,"
+        "lease_expires_at=clock_timestamp() - $4::interval,"
+        "cancel_requested_at=CASE WHEN $5 THEN clock_timestamp() ELSE NULL END "
+        "WHERE id=$1",
+        job.id,
+        attempt_count,
+        max_attempts,
+        timedelta(seconds=1),
+        cancel_requested,
+    )
+
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    row = await pool.fetchrow(
+        "SELECT state::text,error_code,lease_owner FROM background_jobs WHERE id=$1",
+        job.id,
+    )
+    assert row["state"] == persisted_state
+    assert row["error_code"] == persisted_error
+    assert row["lease_owner"] is None
+    assert_telemetry_event(
+        caplog,
+        "embedding_finished",
+        expected={
+            "job_id": str(job.id),
+            "attempt": attempt_count,
+            "outcome": outcome,
+            "error_code": event_error,
+            "provider": PROFILE.provider,
+            "model": PROFILE.model,
+            "dimensions": PROFILE.dimensions,
+            "chunk_count": 0,
+            "replica_role": "worker",
+        },
+    )
 
 
 def _context(pool):

@@ -288,6 +288,78 @@ async def test_ordinary_sink_failure_does_not_mask_success_or_create_duplicate_c
 
 
 @pytest.mark.asyncio
+async def test_ordinary_sink_failure_does_not_mask_default_lexical_result():
+    HostedRetrievalService = _hosted_retrieval_service()
+
+    calls = []
+
+    def failing_sink(event, **_fields):
+        calls.append(event)
+        raise RuntimeError("telemetry sink private")
+
+    vault = _Vault()
+    result = await HostedRetrievalService(
+        vault,
+        "kb",
+        settings=_settings(MODE="local", HYBRID_SEARCH_ENABLED=False, embedding_profile=None),
+        telemetry_sink=failing_sink,
+    ).retrieve(SearchQuery.build(text="secret", limit=2), profile="lexical")
+
+    assert result is vault.lexical
+    assert calls == ["retrieval_finished"]
+
+
+def _linked_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__cause__ = signal
+    return failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal", "expected", "exit_code"),
+    [
+        (KeyboardInterrupt("private"), KeyboardInterrupt, None),
+        (SystemExit("private"), SystemExit, 1),
+        (asyncio.CancelledError("private"), asyncio.CancelledError, None),
+        (GeneratorExit("private"), GeneratorExit, None),
+        (_linked_control(asyncio.CancelledError("private")), asyncio.CancelledError, None),
+        (
+            BaseExceptionGroup(
+                "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
+            ),
+            KeyboardInterrupt,
+            None,
+        ),
+    ],
+)
+async def test_default_lexical_sink_controls_propagate_sanitized(
+    signal,
+    expected,
+    exit_code,
+):
+    HostedRetrievalService = _hosted_retrieval_service()
+
+    def signal_sink(*_args, **_kwargs):
+        raise signal
+
+    service = HostedRetrievalService(
+        _Vault(),
+        "kb",
+        settings=_settings(MODE="local", HYBRID_SEARCH_ENABLED=False, embedding_profile=None),
+        telemetry_sink=signal_sink,
+    )
+    with pytest.raises(expected) as raised:
+        await service.retrieve(
+            SearchQuery.build(text="private query", limit=1), profile="lexical"
+        )
+
+    assert raised.value.args in ((), (exit_code,))
+    assert "private" not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
 async def test_injected_sink_still_passes_through_shared_fail_closed_sanitizer():
     HostedRetrievalService = _hosted_retrieval_service()
 

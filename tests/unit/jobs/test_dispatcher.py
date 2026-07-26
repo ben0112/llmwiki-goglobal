@@ -1374,6 +1374,201 @@ async def test_reap_cron_emits_persisted_transition_for_each_expired_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "transition_error", "outcome", "event_error"),
+    [
+        ("retry_wait", "lease_expired", "retry", "lease_expired"),
+        ("failed", "attempts_exhausted", "terminal", "attempts_exhausted"),
+        ("cancelled", None, "terminal", "cancelled"),
+    ],
+)
+async def test_reap_cron_emits_embedding_outcome_once_after_transaction(
+    monkeypatch,
+    caplog,
+    state,
+    transition_error,
+    outcome,
+    event_error,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+
+    pool = PoolWithConnectionTransaction()
+    document_id = uuid4()
+    transition = _job(
+        job_type=JobType.DOCUMENT_EMBED,
+        state=JobState(state),
+        knowledge_base_id=uuid4(),
+        document_id=document_id,
+        payload={
+            "document_id": str(document_id),
+            "document_version": 1,
+            "provider": "openai_compatible",
+            "model": "embed-v1",
+            "dimensions": 3,
+        },
+        attempt_count=2,
+        error_code=transition_error,
+    )
+    calls = 0
+
+    async def reap_expired(conn, *, limit, include_transitions):
+        nonlocal calls
+        assert conn is pool.connection
+        assert include_transitions is True
+        calls += 1
+        return [transition] if calls == 1 else []
+
+    emit_embedding_finished = worker._emit_embedding_finished
+
+    def emit_after_commit(record, *, duration_ms):
+        assert pool.active_connections == 0
+        assert pool.active_transactions == 0
+        emit_embedding_finished(record, duration_ms=duration_ms)
+
+    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    monkeypatch.setattr(worker, "_emit_embedding_finished", emit_after_commit)
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
+
+    assert pool.active_transactions == 0
+    assert_telemetry_event(
+        caplog,
+        "embedding_finished",
+        expected={
+            "job_id": str(transition.id),
+            "attempt": 2,
+            "outcome": outcome,
+            "error_code": event_error,
+            "provider": "openai_compatible",
+            "model": "embed-v1",
+            "dimensions": 3,
+            "chunk_count": 0,
+            "duration_ms": 0,
+            "replica_role": "worker",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_embedding_sink_failure_never_masks_committed_transition(
+    monkeypatch,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+
+    pool = PoolWithConnectionTransaction()
+    document_id = uuid4()
+    transition = _job(
+        job_type=JobType.DOCUMENT_EMBED,
+        state=JobState.RETRY_WAIT,
+        knowledge_base_id=uuid4(),
+        document_id=document_id,
+        payload={
+            "document_id": str(document_id),
+            "document_version": 1,
+            "provider": "openai_compatible",
+            "model": "embed-v1",
+            "dimensions": 3,
+        },
+        attempt_count=1,
+        error_code="lease_expired",
+    )
+
+    async def reap_expired(*_args, **_kwargs):
+        return [transition]
+
+    class FailingEmbeddingSink:
+        calls = []
+
+        def info(self, serialized):
+            self.calls.append(serialized)
+            if '"event":"embedding_finished"' in serialized:
+                raise RuntimeError("private sink")
+
+    sink = FailingEmbeddingSink()
+    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    monkeypatch.setattr(worker, "logger", sink)
+
+    await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    assert pool.active_transactions == 0
+    assert len(sink.calls) == 2
+
+
+def _linked_reaper_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__cause__ = signal
+    return failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal", "expected", "exit_code"),
+    [
+        (KeyboardInterrupt("private"), KeyboardInterrupt, None),
+        (SystemExit("private"), SystemExit, 1),
+        (asyncio.CancelledError("private"), asyncio.CancelledError, None),
+        (GeneratorExit("private"), GeneratorExit, None),
+        (_linked_reaper_control(asyncio.CancelledError("private")), asyncio.CancelledError, None),
+        (
+            BaseExceptionGroup(
+                "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
+            ),
+            KeyboardInterrupt,
+            None,
+        ),
+    ],
+)
+async def test_reap_cron_embedding_sink_controls_propagate_sanitized(
+    monkeypatch,
+    signal,
+    expected,
+    exit_code,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+
+    pool = PoolWithConnectionTransaction()
+    document_id = uuid4()
+    transition = _job(
+        job_type=JobType.DOCUMENT_EMBED,
+        state=JobState.RETRY_WAIT,
+        knowledge_base_id=uuid4(),
+        document_id=document_id,
+        payload={
+            "document_id": str(document_id),
+            "document_version": 1,
+            "provider": "openai_compatible",
+            "model": "embed-v1",
+            "dimensions": 3,
+        },
+        attempt_count=1,
+        error_code="lease_expired",
+    )
+
+    async def reap_expired(*_args, **_kwargs):
+        return [transition]
+
+    class SignalEmbeddingSink:
+        def info(self, serialized):
+            if '"event":"embedding_finished"' in serialized:
+                raise signal
+
+    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    monkeypatch.setattr(worker, "logger", SignalEmbeddingSink())
+
+    with pytest.raises(expected) as raised:
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    assert raised.value.args in ((), (exit_code,))
+    assert "private" not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert pool.active_transactions == 0
+
+
+@pytest.mark.asyncio
 async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserves_redis(monkeypatch):
     from jobs import worker
 

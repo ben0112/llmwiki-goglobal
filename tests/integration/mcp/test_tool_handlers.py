@@ -4,23 +4,32 @@ Tests the full flow through WriteHandler, ReadHandler, SearchHandler, DeleteHand
 Uses SqliteVaultFS with a temp workspace — no Postgres needed.
 """
 
+import asyncio
+import logging
 import uuid
 
 import pytest
 
 from llmwiki_core.search import SearchQuery, SearchResult
+from tests.helpers.telemetry_contract import assert_telemetry_event
 
 
 def _make_kb(kb_id: str) -> dict:
     return {"id": kb_id, "name": "test-workspace", "slug": "test-workspace"}
 
 
+def _linked_retrieval_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__cause__ = signal
+    return failure
+
+
 class TestWriteReadFlow:
 
     async def test_create_then_read_round_trip(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -117,8 +126,8 @@ class TestWriteReadFlow:
 
     async def test_create_uses_frontmatter_tags_as_index_source(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -147,8 +156,8 @@ class TestWriteReadFlow:
 
     async def test_create_with_overwrite_replaces_content(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -163,8 +172,8 @@ class TestWriteReadFlow:
 
     async def test_edit_replaces_text(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -198,8 +207,8 @@ class TestWriteReadFlow:
 
     async def test_edit_keeps_index_synced_to_frontmatter_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -220,8 +229,8 @@ class TestWriteReadFlow:
 
     async def test_append_adds_content(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -237,8 +246,8 @@ class TestWriteReadFlow:
 
     async def test_append_inserts_before_trailing_footnotes(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -260,8 +269,8 @@ class TestWriteReadFlow:
 
     async def test_append_renumbers_colliding_footnotes(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -288,8 +297,8 @@ class TestWriteReadFlow:
 
     async def test_append_keeps_index_synced_to_frontmatter_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -321,8 +330,8 @@ class TestLintTool:
 
     async def test_lint_passes_clean_wiki_page(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.lint import LintHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -602,8 +611,8 @@ class TestReadModes:
 
     async def test_read_falls_back_to_title(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -615,8 +624,8 @@ class TestReadModes:
 
     async def test_read_sections_filters_headings(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -630,8 +639,8 @@ class TestReadModes:
 
     async def test_read_glob_batch(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -683,8 +692,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_list_groups_sources_and_wiki(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -699,8 +708,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_list_filters_by_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -715,8 +724,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_chunks_after_indexing(self, fs, insert_chunk):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -729,8 +738,8 @@ class TestSearchDeleteLifecycle:
         result = await searcher.search_chunks("quantum", "*", None, 10)
         assert "quantum" in result.lower()
 
-    async def test_omitted_and_explicit_lexical_profiles_are_byte_identical(
-        self, fs, insert_chunk
+    async def test_omitted_and_explicit_lexical_profiles_are_byte_identical_and_observed(
+        self, fs, insert_chunk, caplog
     ):
         instance, kb_id = fs
         from tools.search import SearchHandler
@@ -741,12 +750,98 @@ class TestSearchDeleteLifecycle:
         await insert_chunk(str(doc["id"]), kb_id, "stable lexical output")
         searcher = SearchHandler(instance, _make_kb(kb_id))
 
-        omitted = await searcher.search_chunks("stable", "*", None, 10)
-        explicit = await searcher.search_chunks(
-            "stable", "*", None, 10, retrieval_profile="lexical"
+        with caplog.at_level(logging.INFO, logger="services.retrieval"):
+            omitted = await searcher.search_chunks("stable", "*", None, 10)
+        omitted_event = assert_telemetry_event(
+            caplog,
+            "retrieval_finished",
+            expected={"profile": "lexical", "result_count": 1},
         )
+        assert_telemetry_event(caplog, "retrieval_fallback", count=0)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="services.retrieval"):
+            explicit = await searcher.search_chunks(
+                "stable", "*", None, 10, retrieval_profile="lexical"
+            )
+        explicit_event = assert_telemetry_event(
+            caplog,
+            "retrieval_finished",
+            expected={"profile": "lexical", "result_count": 1},
+        )
+        assert_telemetry_event(caplog, "retrieval_fallback", count=0)
 
         assert explicit.encode() == omitted.encode()
+        assert omitted_event["retrieval_id"] != explicit_event["retrieval_id"]
+
+    async def test_lexical_handler_ordinary_telemetry_failure_never_masks_output(
+        self,
+        fs,
+        monkeypatch,
+    ):
+        instance, kb_id = fs
+        from services import retrieval
+        from tools.search import SearchHandler
+
+        calls = []
+
+        def failing_sink(event, **_fields):
+            calls.append(event)
+            raise RuntimeError("private sink")
+
+        monkeypatch.setattr(retrieval, "_log_telemetry", failing_sink)
+        result = await SearchHandler(instance, _make_kb(kb_id)).search_chunks(
+            "stable", "*", None, 10
+        )
+
+        assert result == "No matches for `stable` in test-workspace."
+        assert calls == ["retrieval_finished"]
+
+    @pytest.mark.parametrize(
+        ("signal", "expected", "exit_code"),
+        [
+            (KeyboardInterrupt("private"), KeyboardInterrupt, None),
+            (SystemExit("private"), SystemExit, 1),
+            (asyncio.CancelledError("private"), asyncio.CancelledError, None),
+            (GeneratorExit("private"), GeneratorExit, None),
+            (
+                _linked_retrieval_control(asyncio.CancelledError("private")),
+                asyncio.CancelledError,
+                None,
+            ),
+            (
+                BaseExceptionGroup(
+                    "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
+                ),
+                KeyboardInterrupt,
+                None,
+            ),
+        ],
+    )
+    async def test_lexical_handler_telemetry_controls_propagate_sanitized(
+        self,
+        fs,
+        monkeypatch,
+        signal,
+        expected,
+        exit_code,
+    ):
+        instance, kb_id = fs
+        from services import retrieval
+        from tools.search import SearchHandler
+
+        def signal_sink(*_args, **_kwargs):
+            raise signal
+
+        monkeypatch.setattr(retrieval, "_log_telemetry", signal_sink)
+        with pytest.raises(expected) as raised:
+            await SearchHandler(instance, _make_kb(kb_id)).search_chunks(
+                "private", "*", None, 10
+            )
+
+        assert raised.value.args in ((), (exit_code,))
+        assert "private" not in str(raised.value)
+        assert raised.value.__cause__ is None and raised.value.__context__ is None
 
     async def test_local_search_strictly_rejects_hybrid_and_unknown_profiles(self, fs):
         instance, kb_id = fs
@@ -943,8 +1038,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_delete_exact_path(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.delete import DeleteHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -984,10 +1079,10 @@ class TestSearchDeleteLifecycle:
 
     async def test_full_lifecycle(self, fs, insert_chunk):
         instance, kb_id = fs
-        from tools.write import WriteHandler
+        from tools.delete import DeleteHandler
         from tools.read import ReadHandler
         from tools.search import SearchHandler
-        from tools.delete import DeleteHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)

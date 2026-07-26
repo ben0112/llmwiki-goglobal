@@ -560,6 +560,7 @@ async def reap_cron(ctx: dict) -> None:
             error_code=transition.error_code,
             replica_role="worker",
         )
+        _emit_embedding_finished(transition, duration_ms=0)
 
 
 async def upload_cleanup_cron(ctx: dict) -> None:
