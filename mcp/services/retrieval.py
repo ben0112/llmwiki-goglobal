@@ -152,7 +152,7 @@ class HostedRetrievalService:
         if signal := sanitized_process_signal(failure):
             raise signal from None
         if not isinstance(failure, Exception):
-            raise type(failure)() from None
+            raise BaseException() from None
 
     def _validated_hybrid_profile(self) -> EmbeddingProfile:
         profile = getattr(self._settings, "embedding_profile", None)

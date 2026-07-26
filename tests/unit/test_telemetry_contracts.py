@@ -203,6 +203,45 @@ def test_linked_or_grouped_control_signals_from_sink_are_sanitized(signal):
     assert "private" not in str(raised.value)
 
 
+class _UnknownProcessSignal(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _UnknownProcessSignal("private direct"),
+        BaseExceptionGroup(
+            "private group",
+            [RuntimeError("ordinary"), _UnknownProcessSignal("private nested")],
+        ),
+    ],
+)
+def test_unknown_base_exception_from_sink_uses_safe_generic_propagation(failure):
+    from telemetry import emit
+
+    class SignalLogger:
+        def info(self, *_args, **_kwargs):
+            raise failure
+
+    with pytest.raises(BaseException) as raised:
+        emit(
+            SignalLogger(),
+            "retrieval_finished",
+            schema_version=1,
+            retrieval_id=uuid4(),
+            profile="lexical",
+            result_count=0,
+            candidate_count=0,
+            duration_ms=0,
+            error_code=None,
+        )
+
+    assert type(raised.value) is BaseException
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
 def test_embedding_finished_is_emitted_only_from_committed_worker_transition(caplog):
     worker_source = (ROOT / "api/jobs/worker.py").read_text(encoding="utf-8")
     provider_source = (ROOT / "api/services/embeddings.py").read_text(encoding="utf-8")
@@ -270,6 +309,89 @@ def test_embedding_attempt_event_uses_only_committed_transition_outcome(
             "chunk_count": chunk_count,
         },
     )
+
+
+def test_committed_embedding_attempt_emits_common_namespaced_model_identity(caplog):
+    from jobs.models import JobRecord, JobState, JobType
+    from jobs.worker import _emit_finished
+
+    job_id = uuid4()
+    document_id = uuid4()
+    transition = JobRecord(
+        id=job_id,
+        job_type=JobType.DOCUMENT_EMBED,
+        user_id=uuid4(),
+        state=JobState.SUCCEEDED,
+        knowledge_base_id=uuid4(),
+        document_id=document_id,
+        payload={
+            "document_id": str(document_id),
+            "document_version": 1,
+            "provider": "openai_compatible",
+            "model": "vendor/embed:v1",
+            "dimensions": 3,
+        },
+        result={"document_id": str(document_id), "embedded_chunks": 2},
+        attempt_count=1,
+    )
+
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        _emit_finished(transition, worker_id="worker-safe", started=time.monotonic())
+
+    assert_telemetry_event(
+        caplog,
+        "embedding_finished",
+        expected={
+            "job_id": str(job_id),
+            "model": "vendor/embed:v1",
+            "outcome": "success",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "https://user:pass@private.invalid/model",
+        "vendor//embed:v1",
+        "vendor\\embed:v1",
+        "vendor/embed v1",
+        "vendor/embed\nprivate",
+        "vendor/embed?token=private",
+        "vendor/embed#private",
+        "vendor/embed%2fprivate",
+        "/absolute/model",
+        "vendor/../private",
+        "vendor/.hidden",
+        "a" * 201,
+        "vendor/embed\N{FULLWIDTH COLON}v1",
+    ],
+)
+def test_embedding_model_identity_rejects_unsafe_or_ambiguous_values_without_logging(
+    caplog,
+    model,
+):
+    from telemetry import emit
+
+    with caplog.at_level(logging.INFO), pytest.raises(ValueError, match="model"):
+        emit(
+            logging.getLogger("test.telemetry.model"),
+            "embedding_finished",
+            schema_version=1,
+            job_id=uuid4(),
+            attempt=1,
+            outcome="success",
+            error_code="embedding_succeeded",
+            provider="openai_compatible",
+            model=model,
+            dimensions=3,
+            chunk_count=1,
+            duration_ms=0,
+            replica_role="worker",
+        )
+
+    assert "embedding_finished" not in caplog.text
+    assert model not in caplog.text
 
 
 def test_malformed_persisted_embedding_identity_fails_closed_without_masking_job_event(caplog):

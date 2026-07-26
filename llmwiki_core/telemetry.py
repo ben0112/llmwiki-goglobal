@@ -17,6 +17,7 @@ _MAX_COUNT = 2_147_483_647
 _MAX_DURATION_MS = 604_800_000.0
 _STABLE_CODE = compile_pattern(r"[a-z][a-z0-9_]{0,63}\Z")
 _PROFILE_IDENTITY = compile_pattern(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
+_MODEL_IDENTITY = compile_pattern(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}\Z")
 _FORBIDDEN_KEY_FRAGMENTS = (
     "authorization",
     "chunk",
@@ -151,6 +152,20 @@ def _require_profile_identity(fields: dict[str, object], name: str) -> None:
         raise TelemetryContractError(f"telemetry {name} must be a bounded profile identity")
 
 
+def _require_model_identity(fields: dict[str, object]) -> None:
+    value = fields["model"]
+    if not isinstance(value, str) or not _MODEL_IDENTITY.fullmatch(value):
+        raise TelemetryContractError("telemetry model must be a bounded model identity")
+    if value.count("/") > 1 or value.count(":") > 1 or "://" in value or "//" in value:
+        raise TelemetryContractError("telemetry model must be a bounded model identity")
+    if "/" in value and ":" in value and value.index(":") < value.index("/"):
+        raise TelemetryContractError("telemetry model must be a bounded model identity")
+    if any(not segment or segment.startswith(".") for segment in value.split("/")):
+        raise TelemetryContractError("telemetry model must be a bounded model identity")
+    if any(not segment for segment in value.split(":")):
+        raise TelemetryContractError("telemetry model must be a bounded model identity")
+
+
 def _validate_new_event(event: str, fields: dict[str, object]) -> None:
     _require_exact_fields(event, fields)
     if fields["schema_version"] != TELEMETRY_SCHEMA_VERSION or type(fields["schema_version"]) is not int:
@@ -176,7 +191,7 @@ def _validate_new_event(event: str, fields: dict[str, object]) -> None:
     _require_choice(fields, "outcome", _EMBEDDING_OUTCOMES)
     _require_stable_code(fields, "error_code")
     _require_profile_identity(fields, "provider")
-    _require_profile_identity(fields, "model")
+    _require_model_identity(fields)
     _require_integer(fields, "dimensions", minimum=1, maximum=4096)
     _require_integer(fields, "chunk_count", minimum=0, maximum=_MAX_COUNT)
     _require_choice(fields, "replica_role", frozenset({"worker"}))
@@ -220,7 +235,7 @@ def emit(logger: object, event: str, /, **fields: object) -> None:
     if signal := sanitized_process_signal(failure):
         raise signal from None
     if not isinstance(failure, Exception):
-        raise type(failure)() from None
+        raise BaseException() from None
 
 
 __all__ = [

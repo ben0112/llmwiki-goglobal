@@ -6,12 +6,13 @@ import asyncio
 
 
 def sanitized_process_signal(*failures: BaseException) -> BaseException | None:
-    """Select a fresh signal using KI > SystemExit > cancellation priority."""
+    """Select a fresh signal using KI > SystemExit > cancellation > GE priority."""
     seen: set[int] = set()
     pending = list(reversed(failures))
     system_exit_code = None
     has_system_exit = False
     has_cancellation = False
+    has_generator_exit = False
     while pending:
         current = pending.pop()
         identity = id(current)
@@ -33,6 +34,8 @@ def sanitized_process_signal(*failures: BaseException) -> BaseException | None:
                 has_system_exit = True
         elif isinstance(current, asyncio.CancelledError):
             has_cancellation = True
+        elif isinstance(current, GeneratorExit):
+            has_generator_exit = True
         if isinstance(current, BaseExceptionGroup):
             pending.extend(reversed(current.exceptions))
         pending.extend(
@@ -44,6 +47,8 @@ def sanitized_process_signal(*failures: BaseException) -> BaseException | None:
         return SystemExit(system_exit_code)
     if has_cancellation:
         return asyncio.CancelledError()
+    if has_generator_exit:
+        return GeneratorExit()
     return None
 
 

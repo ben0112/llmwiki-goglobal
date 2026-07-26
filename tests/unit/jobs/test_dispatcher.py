@@ -1503,6 +1503,16 @@ def _linked_reaper_control(signal):
     return failure
 
 
+def _context_reaper_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__context__ = signal
+    return failure
+
+
+class _UnknownReaperSignal(BaseException):
+    pass
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("signal", "expected", "exit_code"),
@@ -1512,6 +1522,33 @@ def _linked_reaper_control(signal):
         (asyncio.CancelledError("private"), asyncio.CancelledError, None),
         (GeneratorExit("private"), GeneratorExit, None),
         (_linked_reaper_control(asyncio.CancelledError("private")), asyncio.CancelledError, None),
+        (_linked_reaper_control(GeneratorExit("private")), GeneratorExit, None),
+        (_context_reaper_control(GeneratorExit("private")), GeneratorExit, None),
+        (
+            BaseExceptionGroup(
+                "private outer",
+                [BaseExceptionGroup("private inner", [GeneratorExit("private")])],
+            ),
+            GeneratorExit,
+            None,
+        ),
+        (
+            BaseExceptionGroup(
+                "private priority",
+                [GeneratorExit("private"), asyncio.CancelledError("private")],
+            ),
+            asyncio.CancelledError,
+            None,
+        ),
+        (_UnknownReaperSignal("private"), BaseException, None),
+        (
+            BaseExceptionGroup(
+                "private unknown",
+                [RuntimeError("ordinary"), _UnknownReaperSignal("private")],
+            ),
+            BaseException,
+            None,
+        ),
         (
             BaseExceptionGroup(
                 "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
@@ -1563,6 +1600,8 @@ async def test_reap_cron_embedding_sink_controls_propagate_sanitized(
         await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
 
     assert raised.value.args in ((), (exit_code,))
+    if expected is BaseException:
+        assert type(raised.value) is BaseException
     assert "private" not in str(raised.value)
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert pool.active_transactions == 0

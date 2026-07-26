@@ -676,6 +676,18 @@ async def test_transaction_cleanup_failure_cannot_mask_grouped_cancellation():
     assert raised.value.__context__ is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "replace"])
+async def test_direct_generator_exit_crosses_vector_boundary_sanitized(operation):
+    store = _store(_GroupedFailurePool(GeneratorExit("private backend")))
+
+    with pytest.raises(GeneratorExit) as raised:
+        await _invoke_boundary(store, operation)
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
 def _control_signal(kind, code):
     if kind == "keyboard-interrupt":
         return KeyboardInterrupt("private terminal state")

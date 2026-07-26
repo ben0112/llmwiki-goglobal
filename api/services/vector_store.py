@@ -115,6 +115,7 @@ class PostgresVectorStore:
             KeyboardInterrupt,
             SystemExit,
             asyncio.CancelledError,
+            GeneratorExit,
             BaseExceptionGroup,
             Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
         ) as caught:
@@ -335,6 +336,7 @@ async def _fetch_rows(pool, sql: str, params: Sequence[object]):
         KeyboardInterrupt,
         SystemExit,
         asyncio.CancelledError,
+        GeneratorExit,
         BaseExceptionGroup,
         Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
     ) as caught:
@@ -361,6 +363,7 @@ def _result_from_rows(rows, *, started_at: float) -> SearchResult:
         KeyboardInterrupt,
         SystemExit,
         asyncio.CancelledError,
+        GeneratorExit,
         BaseExceptionGroup,
         Exception,  # noqa: BLE001 - malformed backend rows are unavailable.
     ) as caught:

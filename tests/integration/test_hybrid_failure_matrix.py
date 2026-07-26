@@ -12,6 +12,10 @@ from llmwiki_core.search import RetrieverUnavailable, SearchHit, SearchQuery, Se
 PROFILE = EmbeddingProfile("openai_compatible", "embed-v1", 3)
 
 
+class _UnknownRetrievalSignal(BaseException):
+    pass
+
+
 def _hosted_retrieval_service():
     path = Path(__file__).parents[2] / "mcp/services/retrieval.py"
     spec = importlib.util.spec_from_file_location("task10_mcp_retrieval", path)
@@ -315,6 +319,12 @@ def _linked_control(signal):
     return failure
 
 
+def _context_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__context__ = signal
+    return failure
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("signal", "expected", "exit_code"),
@@ -324,6 +334,33 @@ def _linked_control(signal):
         (asyncio.CancelledError("private"), asyncio.CancelledError, None),
         (GeneratorExit("private"), GeneratorExit, None),
         (_linked_control(asyncio.CancelledError("private")), asyncio.CancelledError, None),
+        (_linked_control(GeneratorExit("private")), GeneratorExit, None),
+        (_context_control(GeneratorExit("private")), GeneratorExit, None),
+        (
+            BaseExceptionGroup(
+                "private outer",
+                [BaseExceptionGroup("private inner", [GeneratorExit("private")])],
+            ),
+            GeneratorExit,
+            None,
+        ),
+        (
+            BaseExceptionGroup(
+                "private priority",
+                [GeneratorExit("private"), asyncio.CancelledError("private")],
+            ),
+            asyncio.CancelledError,
+            None,
+        ),
+        (_UnknownRetrievalSignal("private"), BaseException, None),
+        (
+            BaseExceptionGroup(
+                "private unknown",
+                [RuntimeError("ordinary"), _UnknownRetrievalSignal("private")],
+            ),
+            BaseException,
+            None,
+        ),
         (
             BaseExceptionGroup(
                 "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
@@ -355,6 +392,8 @@ async def test_default_lexical_sink_controls_propagate_sanitized(
         )
 
     assert raised.value.args in ((), (exit_code,))
+    if expected is BaseException:
+        assert type(raised.value) is BaseException
     assert "private" not in str(raised.value)
     assert raised.value.__cause__ is None and raised.value.__context__ is None
 
