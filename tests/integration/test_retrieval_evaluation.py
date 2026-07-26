@@ -119,6 +119,190 @@ class _MutatingQueryEmbeddingClient(_FakeQueryEmbeddingClient):
         return await super().embed(texts)
 
 
+def _evaluation_vector_adapter(client_factory, calls):
+    async def profile_is_available():
+        calls["coverage"] += 1
+        return True
+
+    retriever = retrieval_eval._PostgresEvaluationVectorRetriever(
+        object(),
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        profile=PROFILE,
+        embedding_client_factory=client_factory,
+        candidate_limit=1,
+        profile_is_available=profile_is_available,
+    )
+
+    class Store:
+        async def search(self, **_kwargs):
+            calls["search"] += 1
+            return retrieval_eval.SearchResult(
+                (),
+                0,
+                latency_ms=1.0,
+                profile="vector",
+            )
+
+    retriever._store = Store()
+    return retriever
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["source", "annotations"])
+async def test_evaluation_scoped_hybrid_falls_back_before_vector_side_effects(scope):
+    calls = {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
+
+    class Client:
+        profile = PROFILE
+
+        async def embed(self, _texts):
+            calls["embed"] += 1
+            return ((1.0, 0.0, 0.0),)
+
+        async def aclose(self):
+            calls["close"] += 1
+
+    def build_client():
+        calls["factory"] += 1
+        return Client()
+
+    class Lexical:
+        async def retrieve(self, _query):
+            return retrieval_eval.SearchResult(
+                (),
+                0,
+                latency_ms=1.0,
+                profile="lexical",
+            )
+
+    result = await retrieval_eval.HybridRetrievalService(
+        lexical=Lexical(),
+        vector=_evaluation_vector_adapter(build_client, calls),
+    ).retrieve(
+        retrieval_eval.SearchQuery.build(
+            text="private scoped query",
+            limit=1,
+            scope=scope,
+        )
+    )
+
+    assert result.profile == "lexical_fallback"
+    assert calls == {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
+
+
+@pytest.mark.asyncio
+async def test_evaluation_vector_close_failure_fails_closed_before_search():
+    calls = {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
+
+    class Client:
+        profile = PROFILE
+
+        async def embed(self, _texts):
+            calls["embed"] += 1
+            return ((1.0, 0.0, 0.0),)
+
+        async def aclose(self):
+            calls["close"] += 1
+            raise RuntimeError("sk-private-close query=private")
+
+    def build_client():
+        calls["factory"] += 1
+        return Client()
+
+    with pytest.raises(retrieval_eval.RetrieverUnavailable) as raised:
+        await _evaluation_vector_adapter(build_client, calls).retrieve(
+            retrieval_eval.SearchQuery.build(text="private", limit=1)
+        )
+
+    assert calls == {"coverage": 1, "factory": 1, "embed": 1, "close": 1, "search": 0}
+    assert raised.value.args == ("evaluation query embedding is unavailable",)
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "private" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("close_failure", "expected_type", "expected_args"),
+    [
+        (lambda: KeyboardInterrupt("private"), KeyboardInterrupt, ()),
+        (lambda: SystemExit("private"), SystemExit, (1,)),
+        (lambda: asyncio.CancelledError("private"), asyncio.CancelledError, ()),
+        (lambda: GeneratorExit("private"), GeneratorExit, ()),
+    ],
+    ids=("keyboard", "system-exit", "cancelled", "generator-exit"),
+)
+async def test_evaluation_vector_cleanup_control_outranks_main_failure(
+    close_failure,
+    expected_type,
+    expected_args,
+):
+    calls = {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
+
+    class Client:
+        profile = PROFILE
+
+        async def embed(self, _texts):
+            calls["embed"] += 1
+            raise RuntimeError("private main failure")
+
+        async def aclose(self):
+            calls["close"] += 1
+            raise close_failure()
+
+    def build_client():
+        calls["factory"] += 1
+        return Client()
+
+    with pytest.raises(expected_type) as raised:
+        await _evaluation_vector_adapter(build_client, calls).retrieve(
+            retrieval_eval.SearchQuery.build(text="private", limit=1)
+        )
+
+    assert calls == {"coverage": 1, "factory": 1, "embed": 1, "close": 1, "search": 0}
+    assert raised.value.args == expected_args
+    assert raised.value.__cause__ is raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_shape", ["missing", "nonawaitable"])
+async def test_evaluation_vector_requires_awaitable_client_cleanup(close_shape):
+    calls = {"coverage": 0, "factory": 0, "embed": 0, "close": 0, "search": 0}
+
+    class Client:
+        profile = PROFILE
+
+        async def embed(self, _texts):
+            calls["embed"] += 1
+            return ((1.0, 0.0, 0.0),)
+
+    if close_shape == "nonawaitable":
+        def close(_self):
+            calls["close"] += 1
+
+        Client.aclose = close
+
+    def build_client():
+        calls["factory"] += 1
+        return Client()
+
+    with pytest.raises(retrieval_eval.RetrieverUnavailable) as raised:
+        await _evaluation_vector_adapter(build_client, calls).retrieve(
+            retrieval_eval.SearchQuery.build(text="private", limit=1)
+        )
+
+    expected_close_calls = 1 if close_shape == "nonawaitable" else 0
+    assert calls == {
+        "coverage": 1,
+        "factory": 1,
+        "embed": 1,
+        "close": expected_close_calls,
+        "search": 0,
+    }
+    assert raised.value.args == ("evaluation query embedding is unavailable",)
+    assert raised.value.__cause__ is raised.value.__context__ is None
+
+
 def _dataset(path: Path) -> Path:
     cases = (
         {

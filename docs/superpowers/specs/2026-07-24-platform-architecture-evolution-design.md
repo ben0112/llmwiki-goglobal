@@ -241,8 +241,8 @@ keep hybrid search opt-in even when those gates pass.
 
 ### Milestone 3 implementation evidence
 
-Milestone 3's verified final candidate is
-`07c2e86bd2e3c1c5f9a7489fd0b7c7a7c298f61b`. The implementation includes the
+Milestone 3's substantive hosted-evaluation candidate is
+`20b8e7b1333d13eb266f2d04438d330b28380a16`. The implementation includes the
 strict versioned evaluation schema and exact deterministic metrics,
 filter-before-limit compilation, version/profile-fenced pgvector storage,
 OpenAI-compatible and deterministic fake embedding adapters, durable embedding
@@ -258,18 +258,23 @@ and p50/p95 `20.0 ms`. The result is eligible at recall ratio `2.0` and the
 inclusive latency boundary `2.0`.
 
 Verification for that exact SHA completed with all six jobs successful in
-[GitHub Actions run 30188848122](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30188848122).
+[GitHub Actions run 30189989121](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30189989121).
 The retrieval segment owns the chunk schema, vector store, durable embeddings,
 hybrid failure matrix, and real-Postgres evaluation tests. The historical Task
 11 specification and quality reviews of implementation commit `5cca143` both
 concluded Critical `0`, Important `0`, Minor `0`, and `Ready: Yes`; this does
-not claim a final Task 12 documentation-review result. Operational rollout,
-private-dataset handling, promotion, and rollback are documented in
+not claim the same result for `20b8e7b` or its follow-up. A Task 12
+specification re-review of `20b8e7b` reported `3` Important and `1` Minor
+follow-ups. The current remediation addresses all four locally but remains
+pending specification and quality re-review; no zero-finding or readiness
+conclusion is recorded yet. Operational rollout, private-dataset handling,
+promotion, and rollback are documented in
 `docs/architecture/retrieval.md`; passing the gate only makes hybrid eligible
 and never changes the lexical deployment default.
 
-The Task 12 local milestone gate recorded `188` focused core tests, `450` API
-embedding/retrieval tests, `203` MCP retrieval/tool/facet tests, `44` MCP
+The Task 12 local milestone gate for `20b8e7b` recorded `188` focused core
+tests, `452` API embedding/retrieval tests, `205` MCP retrieval/tool/facet
+tests, `44` MCP
 Postgres-isolation tests, and `8` CI ownership contract tests passing. Its
 verification workflow's configured image tags are
 `pgvector/pgvector:0.8.0-pg16`, `python:3.11-alpine`,

@@ -324,6 +324,54 @@ class _PostgresEvaluationLexicalRetriever:
         )
 
 
+async def _evaluation_query_embedding(
+    client_factory: Callable[[], object],
+    profile: EmbeddingProfile,
+    text: str,
+) -> tuple[float, ...]:
+    client = None
+    embedding: tuple[float, ...] | None = None
+    primary_failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        client = client_factory()
+        if getattr(client, "profile", None) != profile:
+            raise RetrieverUnavailable("evaluation query embedding is unavailable")
+        embed = getattr(client, "embed", None)
+        if not callable(embed):
+            raise RetrieverUnavailable("evaluation query embedding is unavailable")
+        vectors = await embed((text,))
+        embedding = _validated_evaluation_query_embedding(
+            vectors,
+            dimensions=profile.dimensions,
+        )
+    except BaseException as error:  # noqa: BLE001 - provider details must not cross the boundary.
+        primary_failure = error
+    if client is not None:
+        try:
+            close = getattr(client, "aclose", None)
+            if not callable(close):
+                raise RetrieverUnavailable("evaluation query embedding is unavailable")
+            pending = close()
+            if not inspect.isawaitable(pending):
+                raise RetrieverUnavailable("evaluation query embedding is unavailable")
+            await pending
+        except BaseException as error:  # noqa: BLE001 - cleanup shares the privacy boundary.
+            cleanup_failure = error
+    failures = tuple(
+        failure
+        for failure in (primary_failure, cleanup_failure)
+        if failure is not None
+    )
+    if failures:
+        if signal := sanitized_boundary_signal_or_unknown(*failures):
+            raise signal from None
+        raise RetrieverUnavailable("evaluation query embedding is unavailable") from None
+    if embedding is None:  # pragma: no cover - successful validation always assigns it.
+        raise RetrieverUnavailable("evaluation query embedding is unavailable")
+    return embedding
+
+
 class _PostgresEvaluationVectorRetriever:
     """Query-embedding adapter over the production pgvector store."""
 
@@ -350,34 +398,15 @@ class _PostgresEvaluationVectorRetriever:
         self._store = PostgresVectorStore(pool, profile=profile)
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
+        if query.scope is not SearchScope.ALL:
+            raise RetrieverUnavailable("evaluation vectors do not support scoped content")
         if not await self._profile_is_available():
             raise RetrieverUnavailable("evaluation vectors are unavailable")
-        client = self._embedding_client_factory()
-        try:
-            if getattr(client, "profile", None) != self._profile:
-                raise RetrieverUnavailable("evaluation query embedding is unavailable")
-            embed = getattr(client, "embed", None)
-            if not callable(embed):
-                raise RetrieverUnavailable("evaluation query embedding is unavailable")
-            vectors = await embed((query.text,))
-            embedding = _validated_evaluation_query_embedding(
-                vectors,
-                dimensions=self._profile.dimensions,
-            )
-        except RetrieverUnavailable:
-            raise
-        except BaseException as error:  # noqa: BLE001 - provider details must not cross the boundary.
-            if process_control := _sanitized_process_control(error):
-                raise process_control from None
-            raise RetrieverUnavailable("evaluation query embedding is unavailable") from None
-        finally:
-            close = getattr(client, "aclose", None)
-            if callable(close):
-                try:
-                    await close()
-                except BaseException as error:  # noqa: BLE001 - cleanup shares the privacy boundary.
-                    if process_control := _sanitized_process_control(error):
-                        raise process_control from None
+        embedding = await _evaluation_query_embedding(
+            self._embedding_client_factory,
+            self._profile,
+            query.text,
+        )
 
         effective_query = _query_with_candidate_limit(query, self._candidate_limit)
         return await self._store.search(

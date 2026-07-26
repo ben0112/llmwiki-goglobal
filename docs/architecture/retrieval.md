@@ -149,11 +149,14 @@ PYTHONPATH=api .venv/bin/python -m scripts.retrieval_eval \
 Comparative execution uses the supported `--hosted` CLI path. It builds the
 real Postgres retrievers and OpenAI-compatible embedding client inside one
 event loop; no Python-level retriever-factory injection or operator wrapper is
-required. The evaluator requires an explicit tenant and knowledge base and
-fails closed with stable `hybrid_unavailable` output when configuration is
-missing or invalid. Load the ordinary deployment embedding and hybrid settings
-first, and load `DATABASE_URL` and any API key from the deployment secret
-store rather than command-line arguments. Then run:
+required. The evaluator requires an explicit tenant and knowledge base.
+Missing or invalid static hosted settings (including an empty DSN, tenant,
+knowledge base, or embedding profile) fail closed as `hybrid_unavailable`.
+A non-empty but malformed, unreachable, or runtime-invalid DSN reaches pool
+creation and is sanitized as `retrieval_failed`; neither classification emits
+connection details. Load the ordinary deployment embedding and hybrid settings
+first, and load `DATABASE_URL` and any API key from the deployment secret store
+rather than command-line arguments. Then run:
 
 ```bash
 : "${DATABASE_URL:?load DATABASE_URL from the deployment secret store}"

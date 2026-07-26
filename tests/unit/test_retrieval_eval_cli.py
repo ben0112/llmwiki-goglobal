@@ -844,6 +844,56 @@ def test_hosted_compare_missing_configuration_is_stable_and_private(monkeypatch,
         assert secret not in captured.err
 
 
+def test_hosted_nonempty_invalid_dsn_is_sanitized_as_retrieval_failure(monkeypatch, capsys):
+    database_url = "postgresql://private-user:private-password@invalid.invalid/private-db"
+    monkeypatch.setenv("HYBRID_SEARCH_ENABLED", "true")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("RETRIEVAL_EVAL_USER_ID", "00000000-0000-0000-0000-000000000001")
+    monkeypatch.setenv(
+        "RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID",
+        "00000000-0000-0000-0000-000000000002",
+    )
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://private-embedding.invalid/v1")
+    monkeypatch.setenv("EMBEDDING_MODEL", "private-model")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "3")
+
+    class Client:
+        def __init__(self, profile):
+            self.profile = profile
+
+        async def aclose(self):
+            return None
+
+    async def create_pool(dsn):
+        assert dsn == database_url
+        raise OSError("private connection failure")
+
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "_new_hosted_embedding_client",
+        lambda configuration: Client(configuration.embedding_profile),
+    )
+    monkeypatch.setattr(retrieval_eval_module, "_create_hosted_pool", create_pool)
+
+    code = main(["--dataset", str(DATASET), "--compare", "--hosted"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_failed"}
+    }
+    for secret in (
+        "private-user",
+        "private-password",
+        "invalid.invalid",
+        "private-db",
+        "private-model",
+        "private connection failure",
+    ):
+        assert secret not in captured.err
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("cleanup_failure", "expected_type", "expected_args"),
