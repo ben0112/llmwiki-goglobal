@@ -258,7 +258,7 @@ class _PostgresEvaluationLexicalRetriever:
             "dc.user_id=$1",
             "dc.knowledge_base_id=$2",
             "dc.document_version=d.version",
-            "d.status != 'failed'",
+            "d.status='ready'",
             "NOT d.archived",
         ]
         if effective_query.annotated_only:
@@ -380,13 +380,29 @@ class _PostgresEvaluationVectorRetriever:
     async def _profile_is_available(self) -> bool:
         rows = await _postgres_fetch(
             self._pool,
-            "SELECT EXISTS(SELECT 1 FROM chunk_embeddings ce "
-            "JOIN documents d ON d.id=ce.document_id "
+            "WITH current_chunks AS ("
+            "SELECT dc.document_id, dc.document_version, dc.chunk_index "
+            "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
+            "WHERE dc.user_id=$1 AND dc.knowledge_base_id=$2 "
+            "AND d.user_id=$1 AND d.knowledge_base_id=$2 "
+            "AND dc.document_version=d.version AND d.status='ready' AND NOT d.archived"
+            ") SELECT EXISTS(SELECT 1 FROM current_chunks) "
+            "AND NOT EXISTS("
+            "SELECT 1 FROM current_chunks cc WHERE NOT EXISTS("
+            "SELECT 1 FROM chunk_embeddings ce "
+            "WHERE ce.user_id=$1 AND ce.knowledge_base_id=$2 "
+            "AND ce.document_id=cc.document_id "
+            "AND ce.document_version=cc.document_version "
+            "AND ce.chunk_index=cc.chunk_index "
+            "AND ce.provider=$3 AND ce.model=$4 AND ce.dimensions=$5"
+            ")) AND NOT EXISTS("
+            "SELECT 1 FROM chunk_embeddings ce JOIN documents d ON d.id=ce.document_id "
             "WHERE ce.user_id=$1 AND ce.knowledge_base_id=$2 "
             "AND ce.provider=$3 AND ce.model=$4 AND ce.dimensions=$5 "
             "AND d.user_id=$1 AND d.knowledge_base_id=$2 "
             "AND ce.document_version=d.version AND NOT d.archived "
-            "AND d.status != 'failed') AS available",
+            "AND d.status NOT IN ('ready','failed')"
+            ") AS available",
             (
                 self._user_id,
                 self._knowledge_base_id,

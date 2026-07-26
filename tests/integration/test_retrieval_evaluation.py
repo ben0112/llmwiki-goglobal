@@ -25,8 +25,10 @@ SAME_USER_OTHER_KB_ID = UUID("00000000-0000-0000-0000-000000000015")
 SAME_USER_OTHER_DOCUMENT_ID = UUID("00000000-0000-0000-0000-000000000105")
 STALE_DOCUMENT_ID = UUID("00000000-0000-0000-0000-000000000106")
 OTHER_PROFILE_DOCUMENT_ID = UUID("00000000-0000-0000-0000-000000000107")
+EMPTY_KB_ID = UUID("00000000-0000-0000-0000-000000000016")
 PROFILE = EmbeddingProfile("openai_compatible", "evaluation-v1", 3)
 OTHER_PROFILE = EmbeddingProfile("openai_compatible", "evaluation-other", 3)
+OTHER_DIMENSIONS = EmbeddingProfile("openai_compatible", "evaluation-v1", 2)
 EXPECTED_DATASET_DIGEST = "d45bf89f5b28694afe2b4af1d03d15e3ba59e02d3bc20129eff77b58ab39ab7f"
 
 
@@ -162,12 +164,13 @@ async def evaluation_corpus(pool, tmp_path_factory):
     await pool.execute(
         "INSERT INTO knowledge_bases (id,user_id,name,slug) VALUES "
         "($1,$2,'Evaluation','evaluation'),($3,$4,'Other','other-evaluation'),"
-        "($5,$2,'Same User Other','same-user-other')",
+        "($5,$2,'Same User Other','same-user-other'),($6,$2,'Empty','empty-evaluation')",
         KNOWLEDGE_BASE_ID,
         USER_ID,
         OTHER_KB_ID,
         OTHER_TENANT_ID,
         SAME_USER_OTHER_KB_ID,
+        EMPTY_KB_ID,
     )
     await _seed_document(
         pool,
@@ -203,6 +206,15 @@ async def evaluation_corpus(pool, tmp_path_factory):
         annotated=True,
     )
     await pool.execute("UPDATE documents SET version=2 WHERE id=$1", STALE_DOCUMENT_ID)
+    await pool.execute(
+        "INSERT INTO document_chunks "
+        "(document_id,document_version,user_id,knowledge_base_id,chunk_index,content,"
+        "source_content,token_count) VALUES ($1,2,$2,$3,1,'current unrelated',"
+        "'current unrelated',2)",
+        STALE_DOCUMENT_ID,
+        USER_ID,
+        KNOWLEDGE_BASE_ID,
+    )
     await _seed_document(
         pool,
         user_id=USER_ID,
@@ -284,6 +296,24 @@ async def evaluation_corpus(pool, tmp_path_factory):
         PROFILE.model,
         "[1,0,0]",
     )
+    await pool.execute(
+        "INSERT INTO chunk_embeddings "
+        "(user_id,knowledge_base_id,document_id,document_version,chunk_index,"
+        "provider,model,dimensions,embedding) VALUES ($1,$2,$3,2,1,$4,$5,3,$6::vector)",
+        USER_ID,
+        KNOWLEDGE_BASE_ID,
+        STALE_DOCUMENT_ID,
+        PROFILE.provider,
+        PROFILE.model,
+        "[0,0,1]",
+    )
+    await PostgresVectorStore(pool, profile=PROFILE).replace_document_embeddings(
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        document_id=OTHER_PROFILE_DOCUMENT_ID,
+        document_version=1,
+        embeddings=((0, (0.0, 0.0, 1.0)),),
+    )
     await PostgresVectorStore(pool, profile=OTHER_PROFILE).replace_document_embeddings(
         user_id=USER_ID,
         knowledge_base_id=KNOWLEDGE_BASE_ID,
@@ -291,11 +321,57 @@ async def evaluation_corpus(pool, tmp_path_factory):
         document_version=1,
         embeddings=((0, (0.0, 1.0, 0.0)),),
     )
+    await pool.execute(
+        "INSERT INTO chunk_embeddings "
+        "(user_id,knowledge_base_id,document_id,document_version,chunk_index,"
+        "provider,model,dimensions,embedding) VALUES ($1,$2,$3,1,0,'other_provider',"
+        "$4,3,'[0,1,0]'::vector)",
+        USER_ID,
+        KNOWLEDGE_BASE_ID,
+        OTHER_PROFILE_DOCUMENT_ID,
+        PROFILE.model,
+    )
+    await PostgresVectorStore(pool, profile=OTHER_DIMENSIONS).replace_document_embeddings(
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        document_id=OTHER_PROFILE_DOCUMENT_ID,
+        document_version=1,
+        embeddings=((0, (0.0, 1.0)),),
+    )
+    coverage = await pool.fetchrow(
+        "WITH current_chunks AS ("
+        "SELECT dc.document_id,dc.document_version,dc.chunk_index FROM document_chunks dc "
+        "JOIN documents d ON d.id=dc.document_id WHERE dc.user_id=$1 "
+        "AND dc.knowledge_base_id=$2 AND d.user_id=$1 AND d.knowledge_base_id=$2 "
+        "AND dc.document_version=d.version AND d.status='ready' AND NOT d.archived"
+        ") SELECT count(*) AS current_count, count(*) FILTER (WHERE EXISTS("
+        "SELECT 1 FROM chunk_embeddings ce WHERE ce.user_id=$1 AND ce.knowledge_base_id=$2 "
+        "AND ce.document_id=current_chunks.document_id "
+        "AND ce.document_version=current_chunks.document_version "
+        "AND ce.chunk_index=current_chunks.chunk_index AND ce.provider=$3 "
+        "AND ce.model=$4 AND ce.dimensions=$5)) AS covered_count FROM current_chunks",
+        USER_ID,
+        KNOWLEDGE_BASE_ID,
+        PROFILE.provider,
+        PROFILE.model,
+        PROFILE.dimensions,
+    )
     fixture_root = tmp_path_factory.mktemp("retrieval-evaluation")
-    return SimpleNamespace(dataset=_dataset(fixture_root / "cases.jsonl"), pool=pool)
+    return SimpleNamespace(
+        dataset=_dataset(fixture_root / "cases.jsonl"),
+        pool=pool,
+        current_count=coverage["current_count"],
+        covered_count=coverage["covered_count"],
+    )
 
 
-def _factory(corpus, *, hybrid_latency_ms, profile=PROFILE):
+def _factory(
+    corpus,
+    *,
+    hybrid_latency_ms,
+    profile=PROFILE,
+    knowledge_base_id=KNOWLEDGE_BASE_ID,
+):
     factory_builder = getattr(retrieval_eval, "postgres_evaluation_retriever_factory", None)
     assert callable(factory_builder), "Postgres evaluation adapter is not implemented"
     calls = []
@@ -303,7 +379,7 @@ def _factory(corpus, *, hybrid_latency_ms, profile=PROFILE):
     factory = factory_builder(
         recording_pool,
         user_id=USER_ID,
-        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        knowledge_base_id=knowledge_base_id,
         embedding_profile=profile,
         embedding_client_factory=lambda: _FakeQueryEmbeddingClient(calls),
         lexical_candidate_limit=1,
@@ -337,6 +413,7 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     assert first.err == second.err == ""
     assert first.out == second.out
     assert first_payload == second_payload
+    assert evaluation_corpus.current_count == evaluation_corpus.covered_count == 5
     assert evaluation_dataset_digest(load_cases(evaluation_corpus.dataset)) == EXPECTED_DATASET_DIGEST
     assert first_payload == {
         "case_count": 2,
@@ -446,3 +523,120 @@ def test_missing_vector_profile_fails_closed_instead_of_passing_promotion(
     }
     for secret in ("missing-vectors", "postgresql://", "export permit"):
         assert secret not in captured.err
+
+
+async def _assert_missing_vector_fails_closed(
+    evaluation_corpus,
+    capsys,
+    *,
+    document_id,
+    document_version,
+    chunk_index,
+):
+    await evaluation_corpus.pool.execute(
+        "DELETE FROM chunk_embeddings WHERE user_id=$1 AND knowledge_base_id=$2 "
+        "AND document_id=$3 AND document_version=$4 AND chunk_index=$5 "
+        "AND provider=$6 AND model=$7 AND dimensions=$8",
+        USER_ID,
+        KNOWLEDGE_BASE_ID,
+        document_id,
+        document_version,
+        chunk_index,
+        PROFILE.provider,
+        PROFILE.model,
+        PROFILE.dimensions,
+    )
+    try:
+        factory, calls, _recording_pool = _factory(
+            evaluation_corpus,
+            hybrid_latency_ms=20.0,
+        )
+        code, payload, captured = _invoke(capsys, evaluation_corpus, factory)
+    finally:
+        await evaluation_corpus.pool.execute(
+            "INSERT INTO chunk_embeddings "
+            "(user_id,knowledge_base_id,document_id,document_version,chunk_index,"
+            "provider,model,dimensions,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector)",
+            USER_ID,
+            KNOWLEDGE_BASE_ID,
+            document_id,
+            document_version,
+            chunk_index,
+            PROFILE.provider,
+            PROFILE.model,
+            PROFILE.dimensions,
+            "[0,1,0]",
+        )
+
+    assert code == 2
+    assert payload is None
+    assert calls == []
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_contract_invalid"}
+    }
+    for secret in (str(document_id), "postgresql://", "semantic compliance", "[0,1,0]"):
+        assert secret not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_missing_related_current_chunk_vector_fails_closed_before_query_embedding(
+    evaluation_corpus, capsys
+):
+    await _assert_missing_vector_fails_closed(
+        evaluation_corpus,
+        capsys,
+        document_id=SEMANTIC_ID,
+        document_version=1,
+        chunk_index=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_filtered_nonrelevant_chunk_ignores_wrong_profiles_and_fails_closed(
+    evaluation_corpus, capsys
+):
+    await _assert_missing_vector_fails_closed(
+        evaluation_corpus,
+        capsys,
+        document_id=OTHER_PROFILE_DOCUMENT_ID,
+        document_version=1,
+        chunk_index=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_vector_does_not_cover_missing_current_document_version(
+    evaluation_corpus, capsys
+):
+    assert await evaluation_corpus.pool.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM chunk_embeddings WHERE document_id=$1 "
+        "AND document_version=1 AND provider=$2 AND model=$3 AND dimensions=$4)",
+        STALE_DOCUMENT_ID,
+        PROFILE.provider,
+        PROFILE.model,
+        PROFILE.dimensions,
+    )
+    await _assert_missing_vector_fails_closed(
+        evaluation_corpus,
+        capsys,
+        document_id=STALE_DOCUMENT_ID,
+        document_version=2,
+        chunk_index=1,
+    )
+
+
+def test_zero_current_chunk_cohort_fails_closed(evaluation_corpus, capsys):
+    factory, calls, _recording_pool = _factory(
+        evaluation_corpus,
+        hybrid_latency_ms=20.0,
+        knowledge_base_id=EMPTY_KB_ID,
+    )
+
+    code, payload, captured = _invoke(capsys, evaluation_corpus, factory)
+
+    assert code == 2
+    assert payload is None
+    assert calls == []
+    assert json.loads(captured.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_contract_invalid"}
+    }
