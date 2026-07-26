@@ -1,13 +1,23 @@
 """Atomic wiki-write values shared by storage adapters and tools."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .references import ReferenceEdge
 
 
 class VersionConflict(RuntimeError):
     """Raised when a compare-and-swap wiki update observes a stale version."""
+
+
+class DuplicateDocumentError(Exception):
+    """Raised when an active document already occupies a logical path."""
+
+    def __init__(self, dir_path: str, filename: str):
+        self.dir_path = dir_path
+        self.filename = filename
+        super().__init__(f"document already exists at {dir_path}{filename}")
 
 
 @dataclass(frozen=True)

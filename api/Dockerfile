@@ -10,6 +10,7 @@ RUN pip-audit -r requirements.lock --strict --desc
 
 COPY pyproject.toml ./
 COPY llmwiki_core/ llmwiki_core/
+COPY llmwiki_adapters/ llmwiki_adapters/
 RUN pip install --no-deps --no-cache-dir .
 
 # ---------------------------------------------------------------------------

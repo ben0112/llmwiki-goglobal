@@ -6,6 +6,9 @@ from llmwiki_core.postgres_retrieval import (
     logical_glob_to_sql_like as logical_glob_to_sql_like,
 )
 from llmwiki_core.search import RetrieverUnavailable, SearchHit, SearchQuery, SearchResult
+from llmwiki_core.wiki import (
+    DuplicateDocumentError as DuplicateDocumentError,
+)
 from llmwiki_core.wiki import WikiWriteBundle
 
 # Content-derived edge types, rebuilt from wiki page text on every write.
@@ -20,15 +23,6 @@ RELATION_TYPES = {
     "governed_by": "归口映射",
     "serves": "阶段服务包",
 }
-
-
-class DuplicateDocumentError(Exception):
-    """Raised when create_document hits a uniqueness constraint on (kb, path, filename)."""
-
-    def __init__(self, dir_path: str, filename: str):
-        self.dir_path = dir_path
-        self.filename = filename
-        super().__init__(f"document already exists at {dir_path}{filename}")
 
 
 class VaultFS(ABC):

@@ -60,6 +60,7 @@ from .search import (
     SearchScope,
 )
 from .signals import sanitized_boundary_signal_or_unknown
+from .wiki import DuplicateDocumentError, VersionConflict, WikiWriteBundle
 
 __version__ = "0.1.0"
 
@@ -69,6 +70,7 @@ __all__ = [
     "DocumentIdentity",
     "DocumentKind",
     "DocumentStatus",
+    "DuplicateDocumentError",
     "EVALUATION_SCHEMA_VERSION",
     "EvalCase",
     "EmbeddingClient",
@@ -109,6 +111,8 @@ __all__ = [
     "SearchResult",
     "SearchScope",
     "UnknownFacetError",
+    "VersionConflict",
+    "WikiWriteBundle",
     "apply_rollup",
     "build_lookup_maps",
     "extract_references",
