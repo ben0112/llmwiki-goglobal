@@ -104,6 +104,7 @@ def compile_postgres_lexical_query(
         "d.knowledge_base_id = $1",
         "dc.user_id = $3",
         "d.user_id = $3",
+        "dc.document_version = d.version",
         "dc.content &@~ $2",
         "d.status != 'failed'",
         "NOT d.archived",

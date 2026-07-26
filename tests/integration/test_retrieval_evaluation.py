@@ -675,13 +675,22 @@ async def test_evaluator_and_serving_compiler_match_pgroonga_candidates_and_stat
     failed_id = UUID("00000000-0000-0000-0000-000000000303")
     archived_id = UUID("00000000-0000-0000-0000-000000000304")
     wrong_filter_id = UUID("00000000-0000-0000-0000-000000000305")
-    document_ids = (ready_id, processing_id, failed_id, archived_id, wrong_filter_id)
+    stale_chunk_id = UUID("00000000-0000-0000-0000-000000000306")
+    document_ids = (
+        ready_id,
+        processing_id,
+        failed_id,
+        archived_id,
+        wrong_filter_id,
+        stale_chunk_id,
+    )
     for document_id, status, tags in (
         (ready_id, "ready", ("parity",)),
         (processing_id, "processing", ("parity",)),
         (failed_id, "failed", ("parity",)),
         (archived_id, "ready", ("parity",)),
         (wrong_filter_id, "ready", ("wrong",)),
+        (stale_chunk_id, "ready", ("parity",)),
     ):
         await _seed_document(
             evaluation_corpus.pool,
@@ -699,6 +708,10 @@ async def test_evaluator_and_serving_compiler_match_pgroonga_candidates_and_stat
     await evaluation_corpus.pool.execute(
         "UPDATE documents SET archived=true WHERE id=$1",
         archived_id,
+    )
+    await evaluation_corpus.pool.execute(
+        "UPDATE documents SET version=2 WHERE id=$1",
+        stale_chunk_id,
     )
     query = retrieval_eval.SearchQuery.build(
         text="compiler parity",
@@ -750,6 +763,7 @@ async def test_evaluator_and_serving_compiler_match_pgroonga_candidates_and_stat
         (str(ready_id), 0),
         (str(processing_id), 0),
     )
+    assert {row["candidate_count"] for row in serving_rows} == {2}
     assert evaluator_result.candidate_count == 2
     assert "&@~" in compiled.sql
     assert "pgroonga_score" in compiled.sql

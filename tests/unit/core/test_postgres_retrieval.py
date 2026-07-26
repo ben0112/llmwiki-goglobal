@@ -99,6 +99,7 @@ def test_shared_postgres_lexical_compiler_is_exact_pgroonga_serving_query(
     assert compiled.params == (KNOWLEDGE_BASE_ID, "private query", USER_ID, 7)
     assert "dc.content &@~ $2" in compiled.sql
     assert "pgroonga_score(dc.tableoid, dc.ctid) AS score" in compiled.sql
+    assert "dc.document_version = d.version" in compiled.sql
     assert "d.status != 'failed'" in compiled.sql
     assert "NOT d.archived" in compiled.sql
     assert "(dc.source_content &@~ $2) AS source_hit" in compiled.sql
