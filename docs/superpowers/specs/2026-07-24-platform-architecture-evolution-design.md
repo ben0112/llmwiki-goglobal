@@ -242,7 +242,7 @@ keep hybrid search opt-in even when those gates pass.
 ### Milestone 3 implementation evidence
 
 Milestone 3's latest substantive hosted-evaluation candidate is
-`2e8da85e1c55121204339ff2ef8cec95f299a4bb`. The implementation includes the
+`66337e5c949220c8d167af46a0ad0e4e7519128c`. The implementation includes the
 strict versioned evaluation schema and exact deterministic metrics,
 filter-before-limit compilation, version/profile-fenced pgvector storage,
 OpenAI-compatible and deterministic fake embedding adapters, durable embedding
@@ -252,7 +252,7 @@ The current follow-up also makes hosted serving and promotion evaluation call
 one pure production lexical compiler with identical PGroonga `&@~`,
 `pgroonga_score`, `status != 'failed'`, scope labeling, filter-before-limit,
 candidate-count, and stable-order semantics; it removes the evaluator-only
-`tsvector` approximation. The current local follow-up additionally fences every
+`tsvector` approximation. The candidate also fences every
 lexical candidate to `dc.document_version = d.version`.
 
 The representative two-case real-Postgres comparison uses dataset digest
@@ -263,9 +263,9 @@ Recall@5/10/20 `1.0`, MRR `1.0`, nDCG@10 `1.0`, filtered result count `1`,
 and p50/p95 `20.0 ms`. The result is eligible at recall ratio `2.0` and the
 inclusive latency boundary `2.0`.
 
-Verification for `2e8da85e1c55121204339ff2ef8cec95f299a4bb` completed with all
+Verification for `66337e5c949220c8d167af46a0ad0e4e7519128c` completed with all
 six jobs successful in
-[GitHub Actions run 30191342308](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30191342308).
+[GitHub Actions run 30191640099](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30191640099).
 The retrieval segment owns the chunk schema, vector store, durable embeddings,
 hybrid failure matrix, and real-Postgres evaluation tests. The historical Task
 11 specification and quality reviews of implementation commit `5cca143` both
@@ -277,9 +277,9 @@ follow-ups, which `396acbf` addressed. The subsequent quality re-review reported
 serving/evaluator drift, which `2e8da85` addressed. The specification re-review
 of `2e8da85` reported Critical `0`, Important `1`, Minor `0`, and `Ready: No`
 because lexical candidates were not fenced to the current document version.
-The current local remediation addresses that finding but remains pending
-specification and quality re-review; no zero-finding or readiness conclusion is
-recorded yet. Operational rollout, private-dataset
+Commit `66337e5` addressed that finding. The final Task 12 specification and
+quality re-reviews of `66337e5` both concluded Critical `0`, Important `0`,
+Minor `0`, and `Ready: Yes`. Operational rollout, private-dataset
 handling, promotion, and rollback are documented in
 `docs/architecture/retrieval.md`; passing the gate only makes hybrid eligible
 and never changes the lexical deployment default.
