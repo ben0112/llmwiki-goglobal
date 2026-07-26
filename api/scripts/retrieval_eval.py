@@ -300,7 +300,7 @@ class _PostgresEvaluationLexicalRetriever:
             "SELECT dc.document_id, dc.document_version, dc.chunk_index, dc.content, "
             "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, "
             "COALESCE(d.tags, ARRAY[]::text[]) AS tags, d.source_kind, "
-            "COALESCE(d.metadata, '{}'::jsonb) AS metadata, "
+            "COALESCE(d.metadata, '{}'::jsonb)::text AS metadata, "
             f"ts_rank_cd(to_tsvector('simple', {searchable}), "
             "plainto_tsquery('simple', $3)) AS score "
             "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
@@ -420,14 +420,12 @@ class _CleanupStatus(Enum):
 @dataclass
 class _CleanupObligations:
     release: bool = False
-    codec_reset: bool = False
     rollback: bool = False
 
 
 @dataclass
 class _CleanupProofs:
     released: bool = False
-    codec_reset: bool = False
     rolled_back: bool = False
 
 
@@ -468,8 +466,6 @@ def _validate_cleanup_obligations(
 
     if obligations.rollback and not proofs.rolled_back:
         failures.append(RetrievalExecutionError())
-    if obligations.codec_reset and not proofs.codec_reset:
-        failures.append(RetrievalExecutionError())
     if obligations.release and not proofs.released:
         failures.append(RetrievalExecutionError())
 
@@ -496,15 +492,6 @@ async def _settle_cleanup_obligations(
             failures,
         )
         proofs.rolled_back = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
-    if obligations.codec_reset and connection is not None:
-        status = await _guarded_async_cleanup(
-            connection,
-            "reset_type_codec",
-            ("jsonb",),
-            {"schema": "pg_catalog"},
-            failures,
-        )
-        proofs.codec_reset = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
     if obligations.release and connection is not None:
         if lease_entered and lease is not None:
             status = await _guarded_async_cleanup(
@@ -708,15 +695,6 @@ class _PostgresEvaluationFactory:
             else:
                 connection = lease
             obligations.release = True
-            set_codec = getattr(connection, "set_type_codec", None)
-            if callable(set_codec):
-                obligations.codec_reset = True
-                await set_codec(
-                    "jsonb",
-                    schema="pg_catalog",
-                    encoder=json.dumps,
-                    decoder=json.loads,
-                )
             begin = getattr(connection, "transaction", None)
             if not callable(begin):
                 raise RetrievalExecutionError
@@ -924,6 +902,26 @@ def _metadata_fits_boundary(value: Mapping[str, object]) -> bool:
     return len(encoded) <= _MAX_BACKEND_METADATA_BYTES
 
 
+def _evaluation_metadata_text(value: object) -> dict[str, object]:
+    """Parse the exact default-asyncpg JSONB text shape at the adapter boundary."""
+
+    if type(value) is not str:
+        raise ValueError("evaluation metadata must be JSON text")
+    try:
+        if len(value.encode("utf-8")) > _MAX_BACKEND_METADATA_BYTES:
+            raise ValueError("evaluation metadata exceeds the boundary")
+        decoded = json.loads(
+            value,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (RecursionError, UnicodeEncodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("evaluation metadata is invalid") from None
+    if type(decoded) is not dict or not _metadata_fits_boundary(decoded):
+        raise ValueError("evaluation metadata is invalid")
+    return decoded
+
+
 def _validated_evaluation_rows_impl(
     rows: object,
     *,
@@ -978,7 +976,7 @@ def _validated_evaluation_rows_impl(
             filename = row["filename"]
             score = row["score"]
             page = row["page"]
-            metadata = row["metadata"]
+            metadata = _evaluation_metadata_text(row["metadata"])
             tags = row["tags"]
             source_kind = row["source_kind"]
             title = row.get("title")
@@ -1014,10 +1012,7 @@ def _validated_evaluation_rows_impl(
                     page is not None
                     and (type(page) is not int or not 1 <= page <= _POSTGRES_INTEGER_MAX)
                 )
-                or not isinstance(metadata, Mapping)
-                or not _metadata_fits_boundary(metadata)
-                or isinstance(tags, (str, bytes))
-                or not isinstance(tags, Sequence)
+                or type(tags) is not list
                 or len(tags) > 100
                 or any(
                     type(tag) is not str

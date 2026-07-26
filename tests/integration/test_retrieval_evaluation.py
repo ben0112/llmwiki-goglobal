@@ -40,6 +40,7 @@ class _RecordingPool:
         self.returned_document_ids = []
         self.acquire_count = 0
         self.release_count = 0
+        self.codec_calls = 0
 
     def acquire(self):
         return _RecordingAcquire(self)
@@ -69,10 +70,12 @@ class _RecordingConnection:
         return self._connection.transaction(**options)
 
     async def set_type_codec(self, *args, **kwargs):
-        return await self._connection.set_type_codec(*args, **kwargs)
+        self._pool.codec_calls += 1
+        raise AssertionError("evaluation must not set connection codecs")
 
     async def reset_type_codec(self, *args, **kwargs):
-        return await self._connection.reset_type_codec(*args, **kwargs)
+        self._pool.codec_calls += 1
+        raise AssertionError("evaluation must not reset connection codecs")
 
     async def fetch(self, sql, *params):
         self._pool.fetches.append((sql, params))
@@ -465,6 +468,7 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     assert first.out == second.out
     assert first_payload == second_payload
     assert recording_pool.acquire_count == recording_pool.release_count == 2
+    assert recording_pool.codec_calls == 0
     assert evaluation_corpus.current_count == evaluation_corpus.covered_count == 5
     assert evaluation_dataset_digest(load_cases(evaluation_corpus.dataset)) == EXPECTED_DATASET_DIGEST
     assert first_payload == {
@@ -521,6 +525,7 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     assert all(params[-1] == 1 for _sql, params in retrieval_fetches)
     assert sum("WITH current_chunks AS" in sql for sql, _params in recording_pool.fetches) == 2
     filtered_sql = next(sql for sql, params in retrieval_fetches if "S2" in params)
+    assert "::text AS metadata" in filtered_sql
     for predicate in ("source_kind", "tags", "metadata", "has_highlight", "LIKE"):
         assert predicate in filtered_sql
     assert set(recording_pool.returned_document_ids) <= {
@@ -892,7 +897,7 @@ def _valid_backend_row():
         "header_breadcrumb": "Header",
         "tags": ["alpha"],
         "source_kind": "source",
-        "metadata": {"stage": "S2"},
+        "metadata": '{"stage":"S2"}',
         "candidate_count": 1,
     }
 
@@ -941,10 +946,9 @@ def _valid_backend_row():
         ("page", 0),
         ("page", -1),
         ("metadata", None),
-        ("metadata", "{}"),
+        ("metadata", {}),
         ("metadata", []),
-        ("metadata", {"nested": nan}),
-        ("metadata", {"x" * 1025: "value"}),
+        ("metadata", None),
     ],
 )
 def test_evaluation_backend_rows_reject_implicit_coercions(profile, field, invalid):
@@ -960,6 +964,129 @@ def test_evaluation_backend_rows_reject_implicit_coercions(profile, field, inval
     assert raised.value.args == ("evaluation row is invalid",)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_evaluation_backend_rows_parse_exact_default_jsonb_text_shape():
+    rows = retrieval_eval._validated_evaluation_rows(
+        (_valid_backend_row(),),
+        profile="lexical",
+    )
+
+    assert rows[0]["metadata"] == {"stage": "S2"}
+    assert rows[0]["tags"] == ("alpha",)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "{",
+        '{"stage":"S2","stage":"S3"}',
+        "[]",
+        "null",
+        '"scalar"',
+        '{"value":NaN}',
+        '{"value":1e999}',
+        '{"value":"' + ("x" * 65_536) + '"}',
+        ("{" + '"nested":{' * 34 + '"leaf":true' + "}" * 34 + "}"),
+    ],
+)
+def test_evaluation_backend_rows_reject_invalid_metadata_json_text(metadata):
+    row = {**_valid_backend_row(), "metadata": metadata}
+
+    with pytest.raises(retrieval_eval.RetrieverUnavailable) as raised:
+        retrieval_eval._validated_evaluation_rows((row,), profile="lexical")
+
+    assert raised.value.args == ("evaluation row is invalid",)
+    assert raised.value.__cause__ is raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "tags",
+    ["[]", (), {}, ["alpha", 1], [""], ["x" * 129], ["x"] * 101],
+)
+def test_evaluation_backend_rows_require_exact_string_array_tags(tags):
+    row = {**_valid_backend_row(), "tags": tags}
+
+    with pytest.raises(retrieval_eval.RetrieverUnavailable):
+        retrieval_eval._validated_evaluation_rows((row,), profile="lexical")
+
+
+class _SingleConnectionGuardLease:
+    def __init__(self, pool):
+        self._pool = pool
+        self._lease = pool._pool.acquire()
+        self._connection = None
+
+    async def __aenter__(self):
+        self._connection = await self._lease.__aenter__()
+        return _SingleConnectionGuard(self._pool, self._connection)
+
+    async def __aexit__(self, *args):
+        return await self._lease.__aexit__(*args)
+
+
+class _SingleConnectionGuard:
+    def __init__(self, pool, connection):
+        self._pool = pool
+        self._connection = connection
+
+    def transaction(self, **options):
+        return self._connection.transaction(**options)
+
+    async def fetch(self, sql, *params):
+        return await self._connection.fetch(sql, *params)
+
+    async def set_type_codec(self, *_args, **_kwargs):
+        self._pool.codec_calls += 1
+        raise AssertionError("evaluation must preserve default codecs")
+
+    async def reset_type_codec(self, *_args, **_kwargs):
+        self._pool.codec_calls += 1
+        raise AssertionError("evaluation must preserve default codecs")
+
+
+class _SingleConnectionGuardPool:
+    def __init__(self, pool):
+        self._pool = pool
+        self.codec_calls = 0
+
+    def acquire(self):
+        return _SingleConnectionGuardLease(self)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [None, RuntimeError, asyncio.CancelledError, GeneratorExit],
+)
+async def test_single_connection_evaluation_preserves_default_jsonb_codec(failure_type):
+    pool = await asyncpg.create_pool(
+        os.environ["DATABASE_URL"],
+        min_size=1,
+        max_size=1,
+    )
+    guarded = _SingleConnectionGuardPool(pool)
+    factory = _fake_snapshot_factory(guarded)
+    try:
+        if failure_type is None:
+            async with factory.evaluation_session():
+                rows = await factory._snapshot.fetch("SELECT '{}'::jsonb AS payload")
+                assert rows[0]["payload"] == "{}"
+        else:
+            expected = (
+                retrieval_eval.RetrievalExecutionError
+                if failure_type is RuntimeError
+                else failure_type
+            )
+            with pytest.raises(expected):
+                async with factory.evaluation_session():
+                    raise failure_type("private body")
+
+        async with pool.acquire() as connection:
+            assert await connection.fetchval("SELECT '{}'::jsonb") == "{}"
+        assert guarded.codec_calls == 0
+    finally:
+        await pool.close()
 
 
 def test_evaluation_backend_rows_reject_candidate_count_smaller_than_hits():
@@ -1006,14 +1133,10 @@ class _FakeSnapshotConnection:
         self._events = events
 
     async def set_type_codec(self, name, **options):
-        assert name == "jsonb"
-        assert options["schema"] == "pg_catalog"
-        self._events.append("codec:set")
+        raise AssertionError("evaluation must not set connection codecs")
 
     async def reset_type_codec(self, name, **options):
-        assert name == "jsonb"
-        assert options["schema"] == "pg_catalog"
-        self._events.append("codec:reset")
+        raise AssertionError("evaluation must not reset connection codecs")
 
     def transaction(self, **options):
         assert options == {"isolation": "repeatable_read", "readonly": True}
@@ -1069,11 +1192,9 @@ async def test_snapshot_rolls_back_and_releases_for_boundary_signals(signal_type
     assert raised.value.args == ()
     assert pool.events == [
         "acquire",
-        "codec:set",
         "transaction",
         "start",
         "rollback",
-        "codec:reset",
         "release",
     ]
 
@@ -1153,14 +1274,11 @@ class _CleanupFailureConnection:
         self._plan = plan
 
     async def set_type_codec(self, *_args, **_kwargs):
-        self._plan.events.append("codec:set")
+        raise AssertionError("evaluation must not set connection codecs")
 
     @property
     def reset_type_codec(self):
-        async def call(*_args, **_kwargs):
-            await self._plan.call("codec:reset")
-
-        return self._plan.getter("codec:reset", call)
+        raise AssertionError("evaluation must not reset connection codecs")
 
     def transaction(self, **options):
         assert options == {"isolation": "repeatable_read", "readonly": True}
@@ -1205,7 +1323,7 @@ class _CleanupFailurePool:
 
 _CLEANUP_LOCATIONS = [
     f"{operation}:{boundary}"
-    for operation in ("rollback", "codec:reset", "release")
+    for operation in ("rollback", "release")
     for boundary in ("get", "call")
 ]
 _CLEANUP_FAILURE_KINDS = [
@@ -1232,12 +1350,9 @@ async def test_snapshot_cleanup_guards_getters_and_calls_without_skipping_later_
         async with factory.evaluation_session():
             assert factory._session_active is True
 
-    expected = ["acquire", "codec:set", "transaction", "start", "rollback:get"]
+    expected = ["acquire", "transaction", "start", "rollback:get"]
     if location != "rollback:get":
         expected.append("rollback:call")
-    expected.append("codec:reset:get")
-    if location != "codec:reset:get":
-        expected.append("codec:reset:call")
     expected.append("release:get")
     if location != "release:get":
         expected.append("release:call")
@@ -1266,13 +1381,10 @@ async def test_cleanup_ordinary_failure_does_not_mask_primary_business_failure()
     assert raised.value.__cause__ is raised.value.__context__ is None
     assert plan.events == [
         "acquire",
-        "codec:set",
         "transaction",
         "start",
         "rollback:get",
         "rollback:call",
-        "codec:reset:get",
-        "codec:reset:call",
         "release:get",
         "release:call",
     ]
@@ -1300,7 +1412,6 @@ class _MultipleCleanupFailurePlan(_CleanupFailurePlan):
         super().__init__(None, None)
         self.failures = {
             "rollback:call": "cancel",
-            "codec:reset:call": "system_exit",
             "release:call": "keyboard",
         }
 
@@ -1322,11 +1433,9 @@ async def test_cleanup_collects_all_failures_before_selecting_highest_priority_c
 
     assert raised.value.args == ()
     assert raised.value.__cause__ is raised.value.__context__ is None
-    assert plan.events[-8:] == [
+    assert plan.events[-6:] == [
         "rollback:get",
         "rollback:call",
-        "codec:reset:get",
-        "codec:reset:call",
         "release:get",
         "release:call",
         "pool:release:get",
@@ -1359,10 +1468,10 @@ class _ExitFallbackConnection:
         self._plan = plan
 
     async def set_type_codec(self, *_args, **_kwargs):
-        self._plan.events.append("codec:set")
+        raise AssertionError("evaluation must not set connection codecs")
 
     async def reset_type_codec(self, *_args, **_kwargs):
-        self._plan.events.append("codec:reset")
+        raise AssertionError("evaluation must not reset connection codecs")
 
     def transaction(self, **_options):
         self._plan.events.append("transaction")
@@ -1521,22 +1630,19 @@ class _ObligationPlan:
         *,
         protocol="lease",
         lease_exit="success",
+        lease_exit_failure_kind=None,
         pool_release="success",
-        codec_reset="success",
         rollback="success",
         partial_setup=None,
-        reset_failure_kind=None,
     ):
         self.protocol = protocol
         self.lease_exit = lease_exit
+        self.lease_exit_failure_kind = lease_exit_failure_kind
         self.pool_release = pool_release
-        self.codec_reset = codec_reset
         self.rollback = rollback
         self.partial_setup = partial_setup
-        self.reset_failure_kind = reset_failure_kind
         self.events = []
         self.leased = False
-        self.codec_active = False
         self.transaction_active = False
 
 
@@ -1573,25 +1679,11 @@ class _ObligationConnection:
         self._plan = plan
 
     async def set_type_codec(self, *_args, **_kwargs):
-        self._plan.events.append("codec:set")
-        self._plan.codec_active = True
-        if self._plan.partial_setup == "codec":
-            raise RuntimeError("private partial codec setup")
+        raise AssertionError("evaluation must not set connection codecs")
 
     @property
     def reset_type_codec(self):
-        async def call(*_args, **_kwargs):
-            self._plan.events.append("codec:reset:call")
-            if self._plan.reset_failure_kind is not None:
-                raise _cleanup_failure(self._plan.reset_failure_kind)
-            self._plan.codec_active = False
-
-        return _obligation_operation(
-            self._plan,
-            "codec:reset",
-            self._plan.codec_reset,
-            call,
-        )
+        raise AssertionError("evaluation must not reset connection codecs")
 
     def transaction(self, **_options):
         self._plan.events.append("transaction")
@@ -1612,6 +1704,8 @@ class _ObligationLease:
     def __aexit__(self):
         async def call(*_args):
             self._plan.events.append("lease:exit:call")
+            if self._plan.lease_exit_failure_kind is not None:
+                raise _cleanup_failure(self._plan.lease_exit_failure_kind)
             self._plan.leased = False
 
         return _obligation_operation(
@@ -1653,7 +1747,6 @@ class _ObligationPool:
 def test_cleanup_obligation_validation_records_each_missing_proof():
     obligations = retrieval_eval._CleanupObligations(  # noqa: SLF001
         release=True,
-        codec_reset=True,
         rollback=True,
     )
     proofs = retrieval_eval._CleanupProofs()  # noqa: SLF001
@@ -1667,7 +1760,6 @@ def test_cleanup_obligation_validation_records_each_missing_proof():
 
     assert proofs == retrieval_eval._CleanupProofs()  # noqa: SLF001
     assert [type(failure) for failure in failures] == [
-        retrieval_eval.RetrievalExecutionError,
         retrieval_eval.RetrievalExecutionError,
         retrieval_eval.RetrievalExecutionError,
     ]
@@ -1718,33 +1810,12 @@ async def test_started_transaction_requires_completed_rollback_proof(rollback):
     assert "rollback:get" in plan.events
     assert "rollback:call" not in plan.events
     assert plan.transaction_active is True
-    assert plan.codec_active is False
     assert plan.leased is False
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("codec_reset", ["missing", "noncallable"])
-async def test_completed_codec_setup_requires_completed_reset_proof(codec_reset):
-    plan = _ObligationPlan(codec_reset=codec_reset)
-    factory = _fake_snapshot_factory(_ObligationPool(plan))
-
-    with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
-        async with factory.evaluation_session():
-            pass
-
-    assert raised.value.args == ()
-    assert raised.value.__cause__ is raised.value.__context__ is None
-    assert "codec:reset:get" in plan.events
-    assert "codec:reset:call" not in plan.events
-    assert plan.transaction_active is False
-    assert plan.codec_active is True
-    assert plan.leased is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("partial_setup", ["codec", "transaction"])
-async def test_partially_applied_setup_still_establishes_cleanup_obligation(partial_setup):
-    plan = _ObligationPlan(partial_setup=partial_setup)
+async def test_partially_started_transaction_still_establishes_rollback_obligation():
+    plan = _ObligationPlan(partial_setup="transaction")
     factory = _fake_snapshot_factory(_ObligationPool(plan))
 
     with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
@@ -1753,20 +1824,18 @@ async def test_partially_applied_setup_still_establishes_cleanup_obligation(part
 
     assert raised.value.args == ()
     assert raised.value.__cause__ is raised.value.__context__ is None
-    assert plan.codec_active is False
     assert plan.transaction_active is False
     assert plan.leased is False
-    if partial_setup == "codec":
-        assert "codec:reset:call" in plan.events
-        assert "transaction" not in plan.events
-    else:
-        assert "rollback:call" in plan.events
+    assert "rollback:call" in plan.events
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", _CLEANUP_FAILURE_KINDS)
 async def test_missing_obligation_combines_with_cleanup_failure_signal(kind):
-    plan = _ObligationPlan(rollback="missing", reset_failure_kind=kind)
+    plan = _ObligationPlan(
+        rollback="missing",
+        lease_exit_failure_kind=kind,
+    )
     factory = _fake_snapshot_factory(_ObligationPool(plan))
 
     with pytest.raises(_expected_cleanup_failure(kind)) as raised:
@@ -1777,7 +1846,6 @@ async def test_missing_obligation_combines_with_cleanup_failure_signal(kind):
     assert raised.value.__cause__ is raised.value.__context__ is None
     assert "private" not in str(raised.value)
     assert plan.transaction_active is True
-    assert plan.codec_active is True
     assert plan.leased is False
     assert factory._session_active is False
     assert factory._snapshot is None
@@ -1794,7 +1862,7 @@ async def test_successful_lease_exit_is_a_release_proof_without_pool_release():
 
     assert "lease:exit:call" in plan.events
     assert "pool:release:get" not in plan.events
-    assert plan.leased is plan.codec_active is plan.transaction_active is False
+    assert plan.leased is plan.transaction_active is False
 
 
 @pytest.mark.asyncio
@@ -1810,16 +1878,12 @@ async def test_pool_release_proof_remedies_missing_lease_exit_only():
         "pool:release:get",
         "pool:release:call",
     ]
-    assert plan.leased is plan.codec_active is plan.transaction_active is False
+    assert plan.leased is plan.transaction_active is False
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "unproved",
-    ["rollback", "codec_reset"],
-)
-async def test_release_proof_cannot_remedy_an_unproved_rollback_or_reset(unproved):
-    plan = _ObligationPlan(**{unproved: "missing"})
+async def test_release_proof_cannot_remedy_an_unproved_rollback():
+    plan = _ObligationPlan(rollback="missing")
     factory = _fake_snapshot_factory(_ObligationPool(plan))
 
     with pytest.raises(retrieval_eval.RetrievalExecutionError):
@@ -1872,10 +1936,10 @@ class _SetupBarrierConnection:
         self.fetch_count = 0
 
     async def set_type_codec(self, *_args, **_kwargs):
-        await self._plan.step("codec")
+        raise AssertionError("evaluation must not set connection codecs")
 
     async def reset_type_codec(self, *_args, **_kwargs):
-        self._plan.events.append("codec:reset")
+        raise AssertionError("evaluation must not reset connection codecs")
 
     def transaction(self, **_options):
         self._plan.events.append("transaction")
@@ -2000,7 +2064,7 @@ async def test_concurrent_and_nested_sessions_reject_without_acquiring_or_cleari
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked_stage", ["acquire", "codec", "start"])
+@pytest.mark.parametrize("blocked_stage", ["acquire", "start"])
 async def test_setup_failure_keeps_concurrent_session_out_and_allows_next_run(blocked_stage):
     plan = _SetupBarrierPlan(blocked_stage, fail_after_release=True)
     pool = _SetupBarrierPool(plan)
