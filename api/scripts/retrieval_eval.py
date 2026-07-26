@@ -11,9 +11,9 @@ import re
 import secrets
 import stat
 import sys
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
@@ -42,6 +42,7 @@ from llmwiki_core import (
 )
 from llmwiki_core.documents import DocumentKind
 from llmwiki_core.models import EmbeddingProfile
+from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 
 REPORT_SCHEMA_VERSION = 1
 MAX_CORPUS_BYTES = 8 * 1024 * 1024
@@ -49,6 +50,9 @@ MAX_CORPUS_LINE_BYTES = 256 * 1024
 MAX_CORPUS_DOCUMENTS = 10_000
 MAX_CORPUS_CHUNKS = 100_000
 MAX_CORPUS_TEXT_CHARS = 1_000_000
+_POSTGRES_INTEGER_MAX = 2_147_483_647
+_MAX_BACKEND_PATH_CHARS = 4_096
+_MAX_BACKEND_METADATA_BYTES = 64 * 1_024
 
 _DOCUMENT_FIELDS = frozenset(
     {"schema_version", "document_id", "document_kind", "path", "title", "tags", "facets", "chunks"}
@@ -293,8 +297,9 @@ class _PostgresEvaluationLexicalRetriever:
         sql = (
             "WITH filtered AS ("
             "SELECT dc.document_id, dc.document_version, dc.chunk_index, dc.content, "
-            "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, d.tags, "
-            "d.source_kind, d.metadata, "
+            "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, "
+            "COALESCE(d.tags, ARRAY[]::text[]) AS tags, d.source_kind, "
+            "COALESCE(d.metadata, '{}'::jsonb) AS metadata, "
             f"ts_rank_cd(to_tsvector('simple', {searchable}), "
             "plainto_tsquery('simple', $3)) AS score "
             "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
@@ -310,7 +315,7 @@ class _PostgresEvaluationLexicalRetriever:
         hits = tuple(_postgres_evaluation_hit(row) for row in dictionaries)
         return SearchResult(
             hits=hits,
-            candidate_count=(int(dictionaries[0]["candidate_count"]) if dictionaries else 0),
+            candidate_count=(dictionaries[0]["candidate_count"] if dictionaries else 0),
             latency_ms=(perf_counter() - started_at) * 1000,
             profile="lexical",
         )
@@ -328,6 +333,7 @@ class _PostgresEvaluationVectorRetriever:
         profile: EmbeddingProfile,
         embedding_client_factory: Callable[[], object],
         candidate_limit: int,
+        profile_is_available: Callable[[], Coroutine[Any, Any, bool]],
     ) -> None:
         from services.vector_store import PostgresVectorStore
 
@@ -337,6 +343,7 @@ class _PostgresEvaluationVectorRetriever:
         self._profile = profile
         self._embedding_client_factory = embedding_client_factory
         self._candidate_limit = candidate_limit
+        self._profile_is_available = profile_is_available
         self._store = PostgresVectorStore(pool, profile=profile)
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
@@ -377,9 +384,127 @@ class _PostgresEvaluationVectorRetriever:
             embedding=embedding,
         )
 
+
+class _EvaluationLatencyRetriever:
+    def __init__(
+        self,
+        retriever: object,
+        *,
+        selected_profile: str,
+        latency_ms: Callable[[str, SearchQuery], Real] | None,
+    ) -> None:
+        self._retriever = retriever
+        self._selected_profile = selected_profile
+        self._latency_ms = latency_ms
+
+    async def retrieve(self, query: SearchQuery) -> SearchResult:
+        result = await self._retriever.retrieve(query)
+        if self._latency_ms is None:
+            return result
+        latency = self._latency_ms(self._selected_profile, query)
+        return SearchResult(
+            hits=result.hits,
+            candidate_count=result.candidate_count,
+            latency_ms=latency,
+            profile=result.profile,
+        )
+
+
+class _PostgresEvaluationSnapshot:
+    """One strict, transaction-bound read surface for an evaluation run."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+        self._fetch_lock = asyncio.Lock()
+
+    async def fetch(self, sql: str, *params: object) -> Sequence[object]:
+        fetch = getattr(self._connection, "fetch", None)
+        if not callable(fetch):
+            raise RetrieverUnavailable("evaluation store is unavailable")
+        async with self._fetch_lock:
+            rows = await fetch(sql, *params)
+        if "candidate_count" not in sql:
+            return rows
+        profile = "vector" if "1.0 - distance AS score" in sql else "lexical"
+        return _validated_evaluation_rows(rows, profile=profile)
+
+
+class _PostgresEvaluationFactory:
+    """Reusable configuration with one fresh snapshot per evaluation request."""
+
+    def __init__(
+        self,
+        pool: object,
+        *,
+        user_id: UUID,
+        knowledge_base_id: UUID,
+        embedding_profile: EmbeddingProfile,
+        embedding_client_factory: Callable[[], object] | None,
+        lexical_candidate_limit: int,
+        vector_candidate_limit: int,
+        rrf_k: int,
+        latency_ms: Callable[[str, SearchQuery], Real] | None,
+    ) -> None:
+        self._pool = pool
+        self._user_id = user_id
+        self._knowledge_base_id = knowledge_base_id
+        self._embedding_profile = embedding_profile
+        self._embedding_client_factory = embedding_client_factory
+        self._lexical_candidate_limit = lexical_candidate_limit
+        self._vector_candidate_limit = vector_candidate_limit
+        self._rrf_k = rrf_k
+        self._latency_ms = latency_ms
+        self._snapshot: _PostgresEvaluationSnapshot | None = None
+        self._coverage_cache: dict[EmbeddingProfile, bool] = {}
+
+    def __call__(self, profile: str, _dataset_path: Path) -> object:
+        snapshot = self._snapshot
+        if snapshot is None:
+            raise RetrievalContractError
+        if profile == "lexical":
+            retriever: object = _PostgresEvaluationLexicalRetriever(
+                snapshot,
+                user_id=self._user_id,
+                knowledge_base_id=self._knowledge_base_id,
+            )
+        elif profile == "hybrid":
+            if self._embedding_client_factory is None:
+                raise HybridConfigurationUnavailable
+            retriever = HybridRetrievalService(
+                lexical=_PostgresEvaluationLexicalRetriever(
+                    snapshot,
+                    user_id=self._user_id,
+                    knowledge_base_id=self._knowledge_base_id,
+                    candidate_limit=self._lexical_candidate_limit,
+                ),
+                vector=_PostgresEvaluationVectorRetriever(
+                    snapshot,
+                    user_id=self._user_id,
+                    knowledge_base_id=self._knowledge_base_id,
+                    profile=self._embedding_profile,
+                    embedding_client_factory=self._embedding_client_factory,
+                    candidate_limit=self._vector_candidate_limit,
+                    profile_is_available=self._profile_is_available,
+                ),
+                rrf_k=self._rrf_k,
+            )
+        else:
+            raise RetrievalContractError
+        return _EvaluationLatencyRetriever(
+            retriever,
+            selected_profile=profile,
+            latency_ms=self._latency_ms,
+        )
+
     async def _profile_is_available(self) -> bool:
+        cached = self._coverage_cache.get(self._embedding_profile)
+        if cached is not None:
+            return cached
+        snapshot = self._snapshot
+        if snapshot is None:
+            raise RetrieverUnavailable("vector evaluation store is unavailable")
         rows = await _postgres_fetch(
-            self._pool,
+            snapshot,
             "WITH current_chunks AS ("
             "SELECT dc.document_id, dc.document_version, dc.chunk_index "
             "FROM document_chunks dc JOIN documents d ON d.id=dc.document_id "
@@ -406,38 +531,95 @@ class _PostgresEvaluationVectorRetriever:
             (
                 self._user_id,
                 self._knowledge_base_id,
-                self._profile.provider,
-                self._profile.model,
-                self._profile.dimensions,
+                self._embedding_profile.provider,
+                self._embedding_profile.model,
+                self._embedding_profile.dimensions,
             ),
             label="vector",
         )
-        return bool(rows and dict(rows[0]).get("available") is True)
+        available = bool(rows and dict(rows[0]).get("available") is True)
+        self._coverage_cache[self._embedding_profile] = available
+        return available
 
+    @asynccontextmanager
+    async def evaluation_session(self) -> AsyncIterator[None]:  # noqa: C901 - linear cleanup inventory.
+        if self._snapshot is not None:
+            raise RetrievalContractError
+        acquire = getattr(self._pool, "acquire", None)
+        if not callable(acquire):
+            raise RetrievalExecutionError
 
-class _EvaluationLatencyRetriever:
-    def __init__(
-        self,
-        retriever: object,
-        *,
-        selected_profile: str,
-        latency_ms: Callable[[str, SearchQuery], Real] | None,
-    ) -> None:
-        self._retriever = retriever
-        self._selected_profile = selected_profile
-        self._latency_ms = latency_ms
+        lease: object | None = None
+        lease_entered = False
+        connection: object | None = None
+        transaction: object | None = None
+        json_codec_enabled = False
+        primary: BaseException | None = None
+        cleanup_failures: list[BaseException] = []
+        try:
+            lease = acquire()
+            enter = getattr(lease, "__aenter__", None)
+            if not callable(enter):
+                raise RetrievalExecutionError
+            connection = await enter()
+            lease_entered = True
+            set_codec = getattr(connection, "set_type_codec", None)
+            if callable(set_codec):
+                await set_codec(
+                    "jsonb",
+                    schema="pg_catalog",
+                    encoder=json.dumps,
+                    decoder=json.loads,
+                )
+                json_codec_enabled = True
+            begin = getattr(connection, "transaction", None)
+            if not callable(begin):
+                raise RetrievalExecutionError
+            transaction = begin(isolation="repeatable_read", readonly=True)
+            start = getattr(transaction, "start", None)
+            if not callable(start):
+                raise RetrievalExecutionError
+            await start()
+            self._snapshot = _PostgresEvaluationSnapshot(connection)
+            self._coverage_cache.clear()
+            yield
+        except BaseException as error:  # noqa: BLE001 - cleanup must run for all process controls.
+            primary = error
+        finally:
+            self._snapshot = None
+            self._coverage_cache.clear()
+            if transaction is not None:
+                rollback = getattr(transaction, "rollback", None)
+                if callable(rollback):
+                    try:
+                        await rollback()
+                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
+                        cleanup_failures.append(error)
+            if connection is not None and json_codec_enabled:
+                reset_codec = getattr(connection, "reset_type_codec", None)
+                if callable(reset_codec):
+                    try:
+                        await reset_codec("jsonb", schema="pg_catalog")
+                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
+                        cleanup_failures.append(error)
+            if lease is not None and lease_entered:
+                exit_lease = getattr(lease, "__aexit__", None)
+                if callable(exit_lease):
+                    try:
+                        await exit_lease(None, None, None)
+                    except BaseException as error:  # noqa: BLE001 - best-effort cleanup.
+                        cleanup_failures.append(error)
 
-    async def retrieve(self, query: SearchQuery) -> SearchResult:
-        result = await self._retriever.retrieve(query)
-        if self._latency_ms is None:
-            return result
-        latency = self._latency_ms(self._selected_profile, query)
-        return SearchResult(
-            hits=result.hits,
-            candidate_count=result.candidate_count,
-            latency_ms=latency,
-            profile=result.profile,
-        )
+        if primary is not None:
+            if signal := sanitized_boundary_signal_or_unknown(primary, *cleanup_failures):
+                raise signal from None
+            if isinstance(primary, _SAFE_BACKEND_EXCEPTIONS):
+                raise primary.with_traceback(primary.__traceback__) from None
+            raise RetrievalExecutionError from None
+        if cleanup_failures:
+            if signal := sanitized_boundary_signal_or_unknown(*cleanup_failures):
+                raise signal from None
+            raise RetrievalExecutionError from None
 
 
 def postgres_evaluation_retriever_factory(
@@ -470,42 +652,17 @@ def postgres_evaluation_retriever_factory(
     if latency_ms is not None and not callable(latency_ms):
         raise TypeError("latency_ms must be callable")
 
-    def build(profile: str, _dataset_path: Path) -> object:
-        if profile == "lexical":
-            retriever: object = _PostgresEvaluationLexicalRetriever(
-                pool,
-                user_id=user_uuid,
-                knowledge_base_id=knowledge_base_uuid,
-            )
-        elif profile == "hybrid":
-            if embedding_client_factory is None:
-                raise HybridConfigurationUnavailable
-            retriever = HybridRetrievalService(
-                lexical=_PostgresEvaluationLexicalRetriever(
-                    pool,
-                    user_id=user_uuid,
-                    knowledge_base_id=knowledge_base_uuid,
-                    candidate_limit=lexical_candidate_limit,
-                ),
-                vector=_PostgresEvaluationVectorRetriever(
-                    pool,
-                    user_id=user_uuid,
-                    knowledge_base_id=knowledge_base_uuid,
-                    profile=embedding_profile,
-                    embedding_client_factory=embedding_client_factory,
-                    candidate_limit=vector_candidate_limit,
-                ),
-                rrf_k=rrf_k,
-            )
-        else:
-            raise RetrievalContractError
-        return _EvaluationLatencyRetriever(
-            retriever,
-            selected_profile=profile,
-            latency_ms=latency_ms,
-        )
-
-    return build
+    return _PostgresEvaluationFactory(
+        pool,
+        user_id=user_uuid,
+        knowledge_base_id=knowledge_base_uuid,
+        embedding_profile=embedding_profile,
+        embedding_client_factory=embedding_client_factory,
+        lexical_candidate_limit=lexical_candidate_limit,
+        vector_candidate_limit=vector_candidate_limit,
+        rrf_k=rrf_k,
+        latency_ms=latency_ms,
+    )
 
 
 def _evaluation_uuid(value: str | UUID) -> UUID:
@@ -582,24 +739,206 @@ def _validated_evaluation_query_embedding(
     return tuple(normalized)
 
 
+def _metadata_is_strict_json(value: object, *, depth: int = 0) -> bool:
+    if depth > 32:
+        return False
+    if value is None or type(value) in (bool, str):
+        return True
+    if type(value) is int:
+        return -_POSTGRES_INTEGER_MAX <= value <= _POSTGRES_INTEGER_MAX
+    if type(value) is float:
+        return isfinite(value)
+    if isinstance(value, Mapping):
+        if len(value) > 1_000:
+            return False
+        return all(
+            type(key) is str
+            and bool(key)
+            and len(key) <= 1_024
+            and "\x00" not in key
+            and _metadata_is_strict_json(nested, depth=depth + 1)
+            for key, nested in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return len(value) <= 10_000 and all(
+            _metadata_is_strict_json(nested, depth=depth + 1) for nested in value
+        )
+    return False
+
+
+def _metadata_fits_boundary(value: Mapping[str, object]) -> bool:
+    if not _metadata_is_strict_json(value):
+        return False
+    try:
+        encoded = json.dumps(
+            dict(value),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return len(encoded) <= _MAX_BACKEND_METADATA_BYTES
+
+
+def _validated_evaluation_rows_impl(
+    rows: object,
+    *,
+    profile: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Reject malformed backend rows without coercion or backend detail leakage."""
+
+    invalid = False
+    normalized: list[Mapping[str, object]] = []
+    candidate_count: int | None = None
+    if (
+        profile not in {"lexical", "vector"}
+        or isinstance(rows, (str, bytes))
+        or not isinstance(rows, Sequence)
+        or len(rows) > 10_000
+    ):
+        invalid = True
+    else:
+        for raw_row in rows:
+            is_asyncpg_record = (
+                type(raw_row).__name__ == "Record"
+                and type(raw_row).__module__.startswith("asyncpg.")
+            )
+            if not isinstance(raw_row, Mapping) and not is_asyncpg_record:
+                invalid = True
+                break
+            row = dict(raw_row)
+            required = {
+                "candidate_count",
+                "chunk_index",
+                "content",
+                "document_id",
+                "document_version",
+                "filename",
+                "metadata",
+                "page",
+                "path",
+                "score",
+                "source_kind",
+                "tags",
+            }
+            if not required <= row.keys():
+                invalid = True
+                break
+
+            raw_count = row["candidate_count"]
+            document_id = row["document_id"]
+            document_version = row["document_version"]
+            chunk_index = row["chunk_index"]
+            content = row["content"]
+            path = row["path"]
+            filename = row["filename"]
+            score = row["score"]
+            page = row["page"]
+            metadata = row["metadata"]
+            tags = row["tags"]
+            source_kind = row["source_kind"]
+            title = row.get("title")
+            header = row.get("header_breadcrumb")
+
+            if (
+                type(raw_count) is not int
+                or not 0 <= raw_count <= _POSTGRES_INTEGER_MAX
+                or (candidate_count is not None and raw_count != candidate_count)
+                or not isinstance(document_id, UUID)
+                or type(document_version) is not int
+                or not 1 <= document_version <= _POSTGRES_INTEGER_MAX
+                or type(chunk_index) is not int
+                or not 0 <= chunk_index < 10_000
+                or type(content) is not str
+                or len(content) > MAX_CORPUS_TEXT_CHARS
+                or type(path) is not str
+                or not path.startswith("/")
+                or "\x00" in path
+                or len(path) > _MAX_BACKEND_PATH_CHARS
+                or type(filename) is not str
+                or not filename
+                or filename in {".", ".."}
+                or "/" in filename
+                or "\\" in filename
+                or "\x00" in filename
+                or len(filename) > _MAX_BACKEND_PATH_CHARS
+                or type(score) is not float
+                or not isfinite(score)
+                or (profile == "lexical" and score < 0.0)
+                or (profile == "vector" and not -1.0 <= score <= 1.0)
+                or (
+                    page is not None
+                    and (type(page) is not int or not 1 <= page <= _POSTGRES_INTEGER_MAX)
+                )
+                or not isinstance(metadata, Mapping)
+                or not _metadata_fits_boundary(metadata)
+                or isinstance(tags, (str, bytes))
+                or not isinstance(tags, Sequence)
+                or len(tags) > 100
+                or any(
+                    type(tag) is not str
+                    or not tag.strip()
+                    or len(tag) > 128
+                    or "\x00" in tag
+                    for tag in tags
+                )
+                or type(source_kind) is not str
+                or source_kind not in {kind.value for kind in DocumentKind}
+                or (title is not None and (type(title) is not str or len(title) > 4_096))
+                or (header is not None and (type(header) is not str or len(header) > 4_096))
+            ):
+                invalid = True
+                break
+
+            candidate_count = raw_count
+            clean = {
+                **row,
+                "metadata": dict(metadata),
+                "tags": tuple(tags),
+            }
+            normalized.append(clean)
+
+        if not invalid and candidate_count is not None and candidate_count < len(normalized):
+            invalid = True
+
+    if invalid:
+        raise ValueError("evaluation row is invalid")
+    return tuple(normalized)
+
+
+def _validated_evaluation_rows(
+    rows: object,
+    *,
+    profile: str,
+) -> tuple[Mapping[str, object], ...]:
+    failure: BaseException | None = None
+    try:
+        return _validated_evaluation_rows_impl(rows, profile=profile)
+    except BaseException as error:  # noqa: BLE001 - malformed adapter values stay private.
+        failure = error
+    if failure is None:  # pragma: no cover - the except path always assigns it.
+        raise RuntimeError("evaluation row boundary lost its failure")
+    if signal := sanitized_boundary_signal_or_unknown(failure):
+        raise signal from None
+    raise RetrieverUnavailable("evaluation row is invalid") from None
+
+
 def _postgres_evaluation_hit(row: Mapping[str, object]) -> SearchHit:
-    raw_metadata = row.get("metadata")
-    metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
     return SearchHit(
         document_id=str(row["document_id"]),
-        document_version=int(row["document_version"]),
-        chunk_index=int(row["chunk_index"]),
-        content=str(row["content"]),
-        score=float(row["score"]),
+        document_version=row["document_version"],
+        chunk_index=row["chunk_index"],
+        content=row["content"],
+        score=row["score"],
         path=f"{row['path']}{row['filename']}",
-        title=None if row.get("title") is None else str(row["title"]),
-        page=None if row.get("page") is None else int(row["page"]),
-        header_breadcrumb=(
-            None if row.get("header_breadcrumb") is None else str(row["header_breadcrumb"])
-        ),
-        tags=tuple(row.get("tags") or ()),
-        document_kind=DocumentKind(str(row["source_kind"])),
-        metadata=metadata,
+        title=row.get("title"),
+        page=row.get("page"),
+        header_breadcrumb=row.get("header_breadcrumb"),
+        tags=row["tags"],
+        document_kind=DocumentKind(row["source_kind"]),
+        metadata=row["metadata"],
     )
 
 
@@ -926,10 +1265,25 @@ def _build_retriever(factory: RetrieverFactory, profile: str, dataset_path: Path
     return retriever
 
 
-def _run_async(factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
+@asynccontextmanager
+async def _evaluation_session(factory: RetrieverFactory) -> AsyncIterator[None]:
+    if not isinstance(factory, _PostgresEvaluationFactory):
+        yield
+        return
+    async with factory.evaluation_session():
+        yield
+
+
+def _has_running_event_loop() -> bool:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        return False
+    return True
+
+
+def _run_async(factory: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
+    if not _has_running_event_loop():
         return _backend_call(
             lambda: asyncio.run(factory()),
             passthrough=_SAFE_BACKEND_EXCEPTIONS,
@@ -1205,17 +1559,22 @@ def _evaluate_request(
 ) -> tuple[dict[str, object], int]:
     if not args.compare:
         profile = args.profile
-        retriever = _build_retriever(factory, profile, dataset_path)
-        report = _run_async(lambda: _evaluate_profile(profile, retriever, cases))
+
+        async def evaluate_one() -> EvaluationReport:
+            async with _evaluation_session(factory):
+                retriever = _build_retriever(factory, profile, dataset_path)
+                return await _evaluate_profile(profile, retriever, cases)
+
+        report = _run_async(evaluate_one)
         return _single_report(cases, profile, report), 0
 
-    lexical_retriever = _build_retriever(factory, "lexical", dataset_path)
-    hybrid_retriever = _build_retriever(factory, "hybrid", dataset_path)
-
     async def evaluate_both() -> tuple[EvaluationReport, EvaluationReport]:
-        lexical = await _evaluate_profile("lexical", lexical_retriever, cases)
-        hybrid = await _evaluate_profile("hybrid", hybrid_retriever, cases)
-        return lexical, hybrid
+        async with _evaluation_session(factory):
+            lexical_retriever = _build_retriever(factory, "lexical", dataset_path)
+            hybrid_retriever = _build_retriever(factory, "hybrid", dataset_path)
+            lexical = await _evaluate_profile("lexical", lexical_retriever, cases)
+            hybrid = await _evaluate_profile("hybrid", hybrid_retriever, cases)
+            return lexical, hybrid
 
     lexical_report, hybrid_report = _run_async(evaluate_both)
     payload, eligible = _compare_report(cases, lexical_report, hybrid_report)

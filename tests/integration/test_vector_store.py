@@ -670,6 +670,53 @@ class _RowsPool:
         return self._rows
 
 
+def _valid_vector_backend_row():
+    return {
+        "document_id": uuid4(),
+        "document_version": 1,
+        "chunk_index": 0,
+        "content": "content",
+        "page": 1,
+        "header_breadcrumb": "Header",
+        "path": "/target/",
+        "filename": "doc.md",
+        "title": "Document",
+        "tags": ["alpha"],
+        "source_kind": "source",
+        "metadata": '{"stage":"S2"}',
+        "score": 0.5,
+        "candidate_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("candidate_count", True),
+        ("document_id", "00000000-0000-0000-0000-000000000001"),
+        ("document_version", "1"),
+        ("score", "0.5"),
+        ("metadata", "not-json"),
+        ("metadata", []),
+    ],
+)
+async def test_vector_search_rejects_backend_row_coercions(field, invalid):
+    row = _valid_vector_backend_row()
+    row[field] = invalid
+    store = _store(_RowsPool([row]))
+
+    with pytest.raises(RetrieverUnavailable, match="vector store is unavailable") as raised:
+        await store.search(
+            user_id=uuid4(),
+            knowledge_base_id=uuid4(),
+            query=_query(),
+            embedding=(1.0, 0.0, 0.0),
+        )
+
+    assert raised.value.__cause__ is raised.value.__context__ is None
+
+
 class _CleanupTransaction:
     def __init__(self, failure):
         self._failure = failure

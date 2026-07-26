@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+from math import inf, nan
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -36,20 +38,51 @@ class _RecordingPool:
     def __init__(self):
         self.fetches = []
         self.returned_document_ids = []
+        self.acquire_count = 0
+        self.release_count = 0
+
+    def acquire(self):
+        return _RecordingAcquire(self)
+
+
+class _RecordingAcquire:
+    def __init__(self, pool):
+        self._pool = pool
+        self._connection = None
+
+    async def __aenter__(self):
+        self._connection = await asyncpg.connect(os.environ["DATABASE_URL"])
+        self._pool.acquire_count += 1
+        return _RecordingConnection(self._pool, self._connection)
+
+    async def __aexit__(self, _error_type, _error, _traceback):
+        await self._connection.close()
+        self._pool.release_count += 1
+
+
+class _RecordingConnection:
+    def __init__(self, pool, connection):
+        self._pool = pool
+        self._connection = connection
+
+    def transaction(self, **options):
+        return self._connection.transaction(**options)
+
+    async def set_type_codec(self, *args, **kwargs):
+        return await self._connection.set_type_codec(*args, **kwargs)
+
+    async def reset_type_codec(self, *args, **kwargs):
+        return await self._connection.reset_type_codec(*args, **kwargs)
 
     async def fetch(self, sql, *params):
-        self.fetches.append((sql, params))
-        connection = await asyncpg.connect(os.environ["DATABASE_URL"])
-        try:
-            rows = await connection.fetch(sql, *params)
-            self.returned_document_ids.extend(
-                str(row["document_id"])
-                for row in rows
-                if "document_id" in row
-            )
-            return rows
-        finally:
-            await connection.close()
+        self._pool.fetches.append((sql, params))
+        rows = await self._connection.fetch(sql, *params)
+        self._pool.returned_document_ids.extend(
+            str(row["document_id"])
+            for row in rows
+            if "document_id" in row
+        )
+        return rows
 
 
 class _FakeQueryEmbeddingClient:
@@ -68,6 +101,19 @@ class _FakeQueryEmbeddingClient:
 
     async def aclose(self):
         return None
+
+
+class _MutatingQueryEmbeddingClient(_FakeQueryEmbeddingClient):
+    def __init__(self, calls, mutation, state):
+        super().__init__(calls)
+        self._mutation = mutation
+        self._state = state
+
+    async def embed(self, texts):
+        if not self._state.done:
+            self._state.done = True
+            await self._mutation()
+        return await super().embed(texts)
 
 
 def _dataset(path: Path) -> Path:
@@ -371,6 +417,7 @@ def _factory(
     hybrid_latency_ms,
     profile=PROFILE,
     knowledge_base_id=KNOWLEDGE_BASE_ID,
+    embedding_client_factory=None,
 ):
     factory_builder = getattr(retrieval_eval, "postgres_evaluation_retriever_factory", None)
     assert callable(factory_builder), "Postgres evaluation adapter is not implemented"
@@ -381,7 +428,11 @@ def _factory(
         user_id=USER_ID,
         knowledge_base_id=knowledge_base_id,
         embedding_profile=profile,
-        embedding_client_factory=lambda: _FakeQueryEmbeddingClient(calls),
+        embedding_client_factory=(
+            (lambda: _FakeQueryEmbeddingClient(calls))
+            if embedding_client_factory is None
+            else embedding_client_factory(calls)
+        ),
         lexical_candidate_limit=1,
         vector_candidate_limit=1,
         rrf_k=60,
@@ -413,6 +464,7 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     assert first.err == second.err == ""
     assert first.out == second.out
     assert first_payload == second_payload
+    assert recording_pool.acquire_count == recording_pool.release_count == 2
     assert evaluation_corpus.current_count == evaluation_corpus.covered_count == 5
     assert evaluation_dataset_digest(load_cases(evaluation_corpus.dataset)) == EXPECTED_DATASET_DIGEST
     assert first_payload == {
@@ -467,6 +519,7 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
     retrieval_fetches = [item for item in recording_pool.fetches if "candidate_count" in item[0]]
     assert retrieval_fetches
     assert all(params[-1] == 1 for _sql, params in retrieval_fetches)
+    assert sum("WITH current_chunks AS" in sql for sql, _params in recording_pool.fetches) == 2
     filtered_sql = next(sql for sql, params in retrieval_fetches if "S2" in params)
     for predicate in ("source_kind", "tags", "metadata", "has_highlight", "LIKE"):
         assert predicate in filtered_sql
@@ -483,6 +536,27 @@ def test_real_postgres_comparison_is_exact_filtered_and_byte_stable(
         "postgresql://",
     ):
         assert secret not in first.out
+
+
+def test_single_profile_uses_its_own_snapshot_without_vector_coverage(
+    evaluation_corpus, capsys
+):
+    factory, embedding_calls, recording_pool = _factory(
+        evaluation_corpus, hybrid_latency_ms=20.0
+    )
+
+    code = main(
+        ["--dataset", str(evaluation_corpus.dataset), "--profile", "lexical"],
+        retriever_factory=factory,
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert json.loads(captured.out)["profile"] == "lexical"
+    assert captured.err == ""
+    assert embedding_calls == []
+    assert recording_pool.acquire_count == recording_pool.release_count == 1
+    assert not any("WITH current_chunks AS" in sql for sql, _ in recording_pool.fetches)
 
 
 def test_promotion_gate_strictly_rejects_latency_above_exact_boundary(
@@ -640,3 +714,365 @@ def test_zero_current_chunk_cohort_fails_closed(evaluation_corpus, capsys):
     assert json.loads(captured.err) == {
         "error": {"category": "retrieval", "code": "retrieval_contract_invalid"}
     }
+
+
+async def _external_execute(sql, *params):
+    connection = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        await connection.execute(sql, *params)
+    finally:
+        await connection.close()
+
+
+async def _external_add_current_chunk(document_id):
+    connection = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        async with connection.transaction():
+            await connection.execute(
+                "INSERT INTO documents "
+                "(id,knowledge_base_id,user_id,filename,path,source_kind,file_type,status,version) "
+                "VALUES ($1,$2,$3,'added.md','/target/','source','md','ready',1)",
+                document_id,
+                KNOWLEDGE_BASE_ID,
+                USER_ID,
+            )
+            await connection.execute(
+                "INSERT INTO document_chunks "
+                "(document_id,document_version,user_id,knowledge_base_id,chunk_index,content,"
+                "source_content,token_count) VALUES ($1,1,$2,$3,0,'added','added',1)",
+                document_id,
+                USER_ID,
+                KNOWLEDGE_BASE_ID,
+            )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation_kind", ["delete", "add", "version", "status"])
+async def test_compare_uses_one_repeatable_read_snapshot_and_next_run_sees_partial_coverage(
+    evaluation_corpus,
+    capsys,
+    mutation_kind,
+):
+    mutation_document_id = {
+        "add": UUID("00000000-0000-0000-0000-000000000201"),
+        "status": UUID("00000000-0000-0000-0000-000000000202"),
+    }.get(mutation_kind)
+    if mutation_kind == "version":
+        await evaluation_corpus.pool.execute(
+            "INSERT INTO document_chunks "
+            "(document_id,document_version,user_id,knowledge_base_id,chunk_index,content,"
+            "source_content,token_count) VALUES ($1,2,$2,$3,1,'future','future',1)",
+            OTHER_PROFILE_DOCUMENT_ID,
+            USER_ID,
+            KNOWLEDGE_BASE_ID,
+        )
+    elif mutation_kind == "status":
+        await evaluation_corpus.pool.execute(
+            "INSERT INTO documents "
+            "(id,knowledge_base_id,user_id,filename,path,source_kind,file_type,status,version) "
+            "VALUES ($1,$2,$3,'pending.md','/target/','source','md','pending',1)",
+            mutation_document_id,
+            KNOWLEDGE_BASE_ID,
+            USER_ID,
+        )
+        await evaluation_corpus.pool.execute(
+            "INSERT INTO document_chunks "
+            "(document_id,document_version,user_id,knowledge_base_id,chunk_index,content,"
+            "source_content,token_count) VALUES ($1,1,$2,$3,0,'pending','pending',1)",
+            mutation_document_id,
+            USER_ID,
+            KNOWLEDGE_BASE_ID,
+        )
+
+    async def mutate():
+        if mutation_kind == "delete":
+            await _external_execute(
+                "DELETE FROM chunk_embeddings WHERE document_id=$1 AND document_version=1 "
+                "AND chunk_index=0 AND provider=$2 AND model=$3 AND dimensions=$4",
+                SEMANTIC_ID,
+                PROFILE.provider,
+                PROFILE.model,
+                PROFILE.dimensions,
+            )
+        elif mutation_kind == "add":
+            await _external_add_current_chunk(mutation_document_id)
+        elif mutation_kind == "version":
+            await _external_execute(
+                "UPDATE documents SET version=2 WHERE id=$1",
+                OTHER_PROFILE_DOCUMENT_ID,
+            )
+        else:
+            await _external_execute(
+                "UPDATE documents SET status='ready' WHERE id=$1",
+                mutation_document_id,
+            )
+
+    state = SimpleNamespace(done=False)
+
+    def mutating_factory(calls):
+        return lambda: _MutatingQueryEmbeddingClient(calls, mutate, state)
+
+    try:
+        factory, calls, recording_pool = _factory(
+            evaluation_corpus,
+            hybrid_latency_ms=20.0,
+            embedding_client_factory=mutating_factory,
+        )
+        first_code, first_payload, first = _invoke(capsys, evaluation_corpus, factory)
+        next_factory, next_calls, next_pool = _factory(
+            evaluation_corpus,
+            hybrid_latency_ms=20.0,
+        )
+        next_code, next_payload, next_output = _invoke(
+            capsys,
+            evaluation_corpus,
+            next_factory,
+        )
+    finally:
+        if mutation_kind == "delete":
+            await evaluation_corpus.pool.execute(
+                "INSERT INTO chunk_embeddings "
+                "(user_id,knowledge_base_id,document_id,document_version,chunk_index,"
+                "provider,model,dimensions,embedding) VALUES ($1,$2,$3,1,0,$4,$5,$6,'[0,1,0]')",
+                USER_ID,
+                KNOWLEDGE_BASE_ID,
+                SEMANTIC_ID,
+                PROFILE.provider,
+                PROFILE.model,
+                PROFILE.dimensions,
+            )
+        elif mutation_kind == "add":
+            await evaluation_corpus.pool.execute(
+                "DELETE FROM documents WHERE id=$1",
+                mutation_document_id,
+            )
+        elif mutation_kind == "version":
+            await evaluation_corpus.pool.execute(
+                "UPDATE documents SET version=1 WHERE id=$1",
+                OTHER_PROFILE_DOCUMENT_ID,
+            )
+            await evaluation_corpus.pool.execute(
+                "DELETE FROM document_chunks WHERE document_id=$1 AND document_version=2",
+                OTHER_PROFILE_DOCUMENT_ID,
+            )
+        else:
+            await evaluation_corpus.pool.execute(
+                "DELETE FROM documents WHERE id=$1",
+                mutation_document_id,
+            )
+
+    assert first_code == 0
+    assert first_payload["promotion"]["eligible"] is True
+    assert first.err == ""
+    assert calls == [("export permit",), ("semantic compliance",)]
+    assert recording_pool.acquire_count == recording_pool.release_count == 1
+    assert sum("WITH current_chunks AS" in sql for sql, _ in recording_pool.fetches) == 1
+    assert next_code == 2
+    assert next_payload is None
+    assert next_calls == []
+    assert next_pool.acquire_count == next_pool.release_count == 1
+    assert json.loads(next_output.err) == {
+        "error": {"category": "retrieval", "code": "retrieval_contract_invalid"}
+    }
+
+
+def _valid_backend_row():
+    return {
+        "document_id": POLICY_ID,
+        "document_version": 1,
+        "chunk_index": 0,
+        "content": "content",
+        "score": 0.5,
+        "path": "/target/",
+        "filename": "policy.md",
+        "title": "Policy",
+        "page": 1,
+        "header_breadcrumb": "Header",
+        "tags": ["alpha"],
+        "source_kind": "source",
+        "metadata": {"stage": "S2"},
+        "candidate_count": 1,
+    }
+
+
+@pytest.mark.parametrize("profile", ["lexical", "vector"])
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("candidate_count", True),
+        ("candidate_count", "1"),
+        ("candidate_count", None),
+        ("candidate_count", -1),
+        ("candidate_count", 2**31),
+        ("document_id", str(POLICY_ID)),
+        ("document_id", None),
+        ("document_id", 101),
+        ("document_version", True),
+        ("document_version", "1"),
+        ("document_version", None),
+        ("document_version", 0),
+        ("document_version", 2**31),
+        ("chunk_index", True),
+        ("chunk_index", "0"),
+        ("chunk_index", None),
+        ("chunk_index", -1),
+        ("chunk_index", 10_000),
+        ("content", None),
+        ("content", 1),
+        ("content", "x" * 1_000_001),
+        ("path", None),
+        ("path", 1),
+        ("path", "relative/"),
+        ("path", "/bad\x00/"),
+        ("filename", None),
+        ("filename", 1),
+        ("filename", ""),
+        ("filename", "nested/file.md"),
+        ("score", True),
+        ("score", "0.5"),
+        ("score", None),
+        ("score", nan),
+        ("score", inf),
+        ("score", -inf),
+        ("page", True),
+        ("page", "1"),
+        ("page", 0),
+        ("page", -1),
+        ("metadata", None),
+        ("metadata", "{}"),
+        ("metadata", []),
+        ("metadata", {"nested": nan}),
+        ("metadata", {"x" * 1025: "value"}),
+    ],
+)
+def test_evaluation_backend_rows_reject_implicit_coercions(profile, field, invalid):
+    validator = getattr(retrieval_eval, "_validated_evaluation_rows", None)
+    assert callable(validator), "strict evaluation row validator is not implemented"
+    row = _valid_backend_row()
+    row[field] = invalid
+
+    with pytest.raises(Exception) as raised:
+        validator((row,), profile=profile)
+
+    assert type(raised.value).__name__ == "RetrieverUnavailable"
+    assert raised.value.args == ("evaluation row is invalid",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_evaluation_backend_rows_reject_candidate_count_smaller_than_hits():
+    validator = getattr(retrieval_eval, "_validated_evaluation_rows", None)
+    assert callable(validator), "strict evaluation row validator is not implemented"
+    first = _valid_backend_row()
+    second = {**_valid_backend_row(), "document_id": SEMANTIC_ID, "candidate_count": 1}
+
+    with pytest.raises(Exception) as raised:
+        validator((first, second), profile="lexical")
+
+    assert type(raised.value).__name__ == "RetrieverUnavailable"
+    assert raised.value.args == ("evaluation row is invalid",)
+
+
+@pytest.mark.parametrize(
+    ("profile", "score"),
+    [("lexical", -0.000001), ("vector", -1.000001), ("vector", 1.000001)],
+)
+def test_evaluation_backend_rows_reject_profile_score_out_of_range(profile, score):
+    row = {**_valid_backend_row(), "score": score}
+
+    with pytest.raises(Exception) as raised:
+        retrieval_eval._validated_evaluation_rows((row,), profile=profile)
+
+    assert type(raised.value).__name__ == "RetrieverUnavailable"
+    assert raised.value.args == ("evaluation row is invalid",)
+    assert raised.value.__cause__ is raised.value.__context__ is None
+
+
+class _FakeTransaction:
+    def __init__(self, events):
+        self._events = events
+
+    async def start(self):
+        self._events.append("start")
+
+    async def rollback(self):
+        self._events.append("rollback")
+
+
+class _FakeSnapshotConnection:
+    def __init__(self, events):
+        self._events = events
+
+    async def set_type_codec(self, name, **options):
+        assert name == "jsonb"
+        assert options["schema"] == "pg_catalog"
+        self._events.append("codec:set")
+
+    async def reset_type_codec(self, name, **options):
+        assert name == "jsonb"
+        assert options["schema"] == "pg_catalog"
+        self._events.append("codec:reset")
+
+    def transaction(self, **options):
+        assert options == {"isolation": "repeatable_read", "readonly": True}
+        self._events.append("transaction")
+        return _FakeTransaction(self._events)
+
+
+class _FakeSnapshotLease:
+    def __init__(self, events):
+        self._events = events
+        self._connection = _FakeSnapshotConnection(events)
+
+    async def __aenter__(self):
+        self._events.append("acquire")
+        return self._connection
+
+    async def __aexit__(self, error_type, error, traceback):
+        assert error_type is error is traceback is None
+        self._events.append("release")
+
+
+class _FakeSnapshotPool:
+    def __init__(self):
+        self.events = []
+
+    def acquire(self):
+        return _FakeSnapshotLease(self.events)
+
+
+def _fake_snapshot_factory(pool):
+    return retrieval_eval.postgres_evaluation_retriever_factory(
+        pool,
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        embedding_profile=PROFILE,
+        embedding_client_factory=None,
+        lexical_candidate_limit=1,
+        vector_candidate_limit=1,
+        rrf_k=60,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_type", [asyncio.CancelledError, GeneratorExit])
+async def test_snapshot_rolls_back_and_releases_for_boundary_signals(signal_type):
+    pool = _FakeSnapshotPool()
+    factory = _fake_snapshot_factory(pool)
+
+    with pytest.raises(signal_type) as raised:
+        async with factory.evaluation_session():
+            raise signal_type("private")
+
+    assert raised.value.args == ()
+    assert pool.events == [
+        "acquire",
+        "codec:set",
+        "transaction",
+        "start",
+        "rollback",
+        "codec:reset",
+        "release",
+    ]

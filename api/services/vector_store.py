@@ -26,6 +26,9 @@ from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 
 _MAX_EMBEDDINGS_PER_DOCUMENT = 10_000
 _POSTGRES_INTEGER_MAX = 2_147_483_647
+_MAX_SEARCH_TEXT_CHARS = 1_000_000
+_MAX_SEARCH_PATH_CHARS = 4_096
+_MAX_SEARCH_METADATA_BYTES = 64 * 1_024
 
 _SCALAR_FACETS = {
     "genre": "genre",
@@ -294,7 +297,8 @@ class PostgresVectorStore:
             "WITH filtered AS ("
             "SELECT ce.document_id, ce.document_version, ce.chunk_index, "
             "dc.content, dc.page, dc.header_breadcrumb, d.path, d.filename, "
-            "d.title, d.tags, d.source_kind, d.metadata, "
+            "d.title, COALESCE(d.tags, ARRAY[]::text[]) AS tags, d.source_kind, "
+            "COALESCE(d.metadata, '{}'::jsonb) AS metadata, "
             "ce.embedding <=> $6::vector AS distance "
             "FROM chunk_embeddings ce "
             "JOIN documents d ON d.id=ce.document_id "
@@ -335,9 +339,9 @@ def _result_from_rows(rows, *, started_at: float) -> SearchResult:
     failure = None
     result = None
     try:
-        dictionaries = [dict(row) for row in rows]
+        dictionaries = _validated_search_rows(rows)
         hits = tuple(_search_hit(row) for row in dictionaries)
-        candidate_count = int(dictionaries[0]["candidate_count"]) if dictionaries else 0
+        candidate_count = dictionaries[0]["candidate_count"] if dictionaries else 0
         result = SearchResult(
             hits=hits,
             candidate_count=candidate_count,
@@ -351,6 +355,125 @@ def _result_from_rows(rows, *, started_at: float) -> SearchResult:
     if result is None:
         raise RetrieverUnavailable("vector store is unavailable")
     return result
+
+
+def _strict_search_metadata(value: object) -> dict[str, object]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, Mapping):
+        raise ValueError("metadata must be a mapping")
+    metadata = dict(value)
+    encoded = json.dumps(
+        metadata,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > _MAX_SEARCH_METADATA_BYTES:
+        raise ValueError("metadata exceeds the search boundary")
+    return metadata
+
+
+def _validated_search_rows(rows: object) -> list[dict[str, object]]:
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or len(rows) > 10_000:
+        raise ValueError("search rows must be a bounded sequence")
+    normalized: list[dict[str, object]] = []
+    candidate_count: int | None = None
+    for raw_row in rows:
+        is_asyncpg_record = (
+            type(raw_row).__name__ == "Record"
+            and type(raw_row).__module__.startswith("asyncpg.")
+        )
+        if not isinstance(raw_row, Mapping) and not is_asyncpg_record:
+            try:
+                dict(raw_row)
+            except BaseException as failure:  # noqa: BLE001 - preserve boundary control classification.
+                if signal := sanitized_boundary_signal_or_unknown(failure):
+                    raise signal from None
+            raise ValueError("search row must be a database record")
+        row = dict(raw_row)
+        required = {
+            "candidate_count",
+            "chunk_index",
+            "content",
+            "document_id",
+            "document_version",
+            "filename",
+            "metadata",
+            "page",
+            "path",
+            "score",
+            "source_kind",
+            "tags",
+        }
+        if not required <= row.keys():
+            raise ValueError("search row is incomplete")
+
+        count = row["candidate_count"]
+        document_id = row["document_id"]
+        version = row["document_version"]
+        chunk_index = row["chunk_index"]
+        content = row["content"]
+        path = row["path"]
+        filename = row["filename"]
+        score = row["score"]
+        page = row["page"]
+        tags = row["tags"]
+        title = row.get("title")
+        header = row.get("header_breadcrumb")
+        source_kind = row["source_kind"]
+        if (
+            type(count) is not int
+            or not 0 <= count <= _POSTGRES_INTEGER_MAX
+            or (candidate_count is not None and count != candidate_count)
+            or not isinstance(document_id, UUID)
+            or type(version) is not int
+            or not 0 <= version <= _POSTGRES_INTEGER_MAX
+            or type(chunk_index) is not int
+            or not 0 <= chunk_index < _MAX_EMBEDDINGS_PER_DOCUMENT
+            or type(content) is not str
+            or len(content) > _MAX_SEARCH_TEXT_CHARS
+            or type(path) is not str
+            or not path.startswith("/")
+            or "\x00" in path
+            or len(path) > _MAX_SEARCH_PATH_CHARS
+            or type(filename) is not str
+            or not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or "\x00" in filename
+            or len(filename) > _MAX_SEARCH_PATH_CHARS
+            or type(score) is not float
+            or not isfinite(score)
+            or not -1.0 <= score <= 1.0
+            or (
+                page is not None
+                and (type(page) is not int or not 0 <= page <= _POSTGRES_INTEGER_MAX)
+            )
+            or isinstance(tags, (str, bytes))
+            or not isinstance(tags, Sequence)
+            or len(tags) > 100
+            or any(
+                type(tag) is not str
+                or not tag.strip()
+                or len(tag) > 128
+                or "\x00" in tag
+                for tag in tags
+            )
+            or type(source_kind) is not str
+            or source_kind not in {kind.value for kind in DocumentKind}
+            or (title is not None and (type(title) is not str or len(title) > _MAX_SEARCH_PATH_CHARS))
+            or (header is not None and (type(header) is not str or len(header) > _MAX_SEARCH_PATH_CHARS))
+        ):
+            raise ValueError("search row is invalid")
+        metadata = _strict_search_metadata(row["metadata"])
+        candidate_count = count
+        normalized.append({**row, "metadata": metadata, "tags": tuple(tags)})
+    if candidate_count is not None and candidate_count < len(normalized):
+        raise ValueError("candidate count is less than returned rows")
+    return normalized
 
 
 def _document_vectors(embeddings: object, *, dimensions: int) -> tuple[tuple[int, str], ...]:
@@ -504,30 +627,19 @@ def _facet_conditions(facets: dict[str, object], *, bind) -> list[str]:
 
 
 def _search_hit(row: Mapping[str, object]) -> SearchHit:
-    metadata = row.get("metadata")
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except json.JSONDecodeError:
-            metadata = {}
-    if not isinstance(metadata, Mapping):
-        metadata = {}
-    tags = row.get("tags")
-    if isinstance(tags, (str, bytes)) or not isinstance(tags, Sequence):
-        tags = ()
     return SearchHit(
         document_id=str(row["document_id"]),
-        document_version=int(row["document_version"]),
-        chunk_index=int(row["chunk_index"]),
-        content=str(row["content"]),
-        score=float(row["score"]),
+        document_version=row["document_version"],
+        chunk_index=row["chunk_index"],
+        content=row["content"],
+        score=row["score"],
         path=f"{row['path']}{row['filename']}",
         title=row.get("title"),
         page=row.get("page"),
         header_breadcrumb=row.get("header_breadcrumb"),
-        tags=tuple(tags),
-        document_kind=DocumentKind(str(row["source_kind"])),
-        metadata=dict(metadata),
+        tags=row["tags"],
+        document_kind=DocumentKind(row["source_kind"]),
+        metadata=row["metadata"],
     )
 
 
