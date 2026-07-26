@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequenc
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
 from numbers import Real
 from pathlib import Path
@@ -410,22 +411,28 @@ class _EvaluationLatencyRetriever:
         )
 
 
+class _CleanupStatus(Enum):
+    MISSING = "missing"
+    FAILED = "failed"
+    COMPLETED_SUCCESSFULLY = "completed_successfully"
+
+
 async def _guarded_async_cleanup(
     target: object,
     attribute: str,
     args: tuple[object, ...],
     kwargs: Mapping[str, object],
     failures: list[BaseException],
-) -> bool:
-    """Attempt one cleanup getter and call without interrupting later cleanup."""
+) -> _CleanupStatus:
+    """Attempt cleanup and report whether it completed, failed, or was missing."""
 
     try:
         operation = getattr(target, attribute, None)
     except BaseException as error:  # noqa: BLE001 - cleanup must inventory every failure.
         failures.append(error)
-        return True
+        return _CleanupStatus.FAILED
     if not callable(operation):
-        return False
+        return _CleanupStatus.MISSING
     try:
         pending = operation(*args, **kwargs)
         if inspect.isawaitable(pending):
@@ -434,7 +441,8 @@ async def _guarded_async_cleanup(
             raise TypeError("cleanup operation must be awaitable")
     except BaseException as error:  # noqa: BLE001 - cleanup must inventory every failure.
         failures.append(error)
-    return True
+        return _CleanupStatus.FAILED
+    return _CleanupStatus.COMPLETED_SUCCESSFULLY
 
 
 def _raise_session_failure(error: BaseException) -> Never:
@@ -664,14 +672,17 @@ class _PostgresEvaluationFactory:
                     cleanup_failures,
                 )
             if lease is not None and lease_entered:
-                handled = await _guarded_async_cleanup(
+                exit_status = await _guarded_async_cleanup(
                     lease,
                     "__aexit__",
                     (None, None, None),
                     {},
                     cleanup_failures,
                 )
-                if not handled and connection is not None:
+                if (
+                    exit_status is not _CleanupStatus.COMPLETED_SUCCESSFULLY
+                    and connection is not None
+                ):
                     await _guarded_async_cleanup(
                         self._pool,
                         "release",

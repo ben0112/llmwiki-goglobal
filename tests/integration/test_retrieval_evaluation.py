@@ -1117,6 +1117,7 @@ class _CleanupFailurePlan:
         self.location = location
         self.kind = kind
         self.events = []
+        self.leased = False
 
     def getter(self, name, callback):
         location = f"{name}:get"
@@ -1174,12 +1175,14 @@ class _CleanupFailureLease:
 
     async def __aenter__(self):
         self._plan.events.append("acquire")
+        self._plan.leased = True
         return self._connection
 
     @property
     def __aexit__(self):
         async def call(*_args):
             await self._plan.call("release")
+            self._plan.leased = False
 
         return self._plan.getter("release", call)
 
@@ -1190,6 +1193,14 @@ class _CleanupFailurePool:
 
     def acquire(self):
         return _CleanupFailureLease(self._plan)
+
+    @property
+    def release(self):
+        async def call(_connection):
+            await self._plan.call("pool:release")
+            self._plan.leased = False
+
+        return self._plan.getter("pool:release", call)
 
 
 _CLEANUP_LOCATIONS = [
@@ -1230,7 +1241,10 @@ async def test_snapshot_cleanup_guards_getters_and_calls_without_skipping_later_
     expected.append("release:get")
     if location != "release:get":
         expected.append("release:call")
+    if location in {"release:get", "release:call"}:
+        expected.extend(["pool:release:get", "pool:release:call"])
     assert plan.events == expected
+    assert plan.leased is False
     assert raised.value.args == ((1,) if kind == "system_exit" else ())
     assert raised.value.__cause__ is raised.value.__context__ is None
     assert "private" not in str(raised.value)
@@ -1262,6 +1276,7 @@ async def test_cleanup_ordinary_failure_does_not_mask_primary_business_failure()
         "release:get",
         "release:call",
     ]
+    assert plan.leased is False
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1292,7 @@ async def test_cleanup_control_has_priority_over_primary_ordinary_failure(kind):
     assert raised.value.args == ((1,) if kind == "system_exit" else ())
     assert raised.value.__cause__ is raised.value.__context__ is None
     assert plan.events[-1] == "release:call"
+    assert plan.leased is False
 
 
 class _MultipleCleanupFailurePlan(_CleanupFailurePlan):
@@ -1306,14 +1322,197 @@ async def test_cleanup_collects_all_failures_before_selecting_highest_priority_c
 
     assert raised.value.args == ()
     assert raised.value.__cause__ is raised.value.__context__ is None
-    assert plan.events[-6:] == [
+    assert plan.events[-8:] == [
         "rollback:get",
         "rollback:call",
         "codec:reset:get",
         "codec:reset:call",
         "release:get",
         "release:call",
+        "pool:release:get",
+        "pool:release:call",
     ]
+    assert plan.leased is False
+
+
+class _ExitFallbackPlan:
+    def __init__(self, mode):
+        self.mode = mode
+        self.events = []
+        self.leased = False
+        self.pool_release_attempts = 0
+
+
+class _ExitFallbackTransaction:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def start(self):
+        self._plan.events.append("start")
+
+    async def rollback(self):
+        self._plan.events.append("rollback")
+
+
+class _ExitFallbackConnection:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def set_type_codec(self, *_args, **_kwargs):
+        self._plan.events.append("codec:set")
+
+    async def reset_type_codec(self, *_args, **_kwargs):
+        self._plan.events.append("codec:reset")
+
+    def transaction(self, **_options):
+        self._plan.events.append("transaction")
+        return _ExitFallbackTransaction(self._plan)
+
+
+class _ExitFallbackLease:
+    def __init__(self, plan):
+        self._plan = plan
+        self.connection = _ExitFallbackConnection(plan)
+
+    async def __aenter__(self):
+        self._plan.events.append("acquire")
+        self._plan.leased = True
+        return self.connection
+
+    @property
+    def __aexit__(self):
+        self._plan.events.append("lease:exit:get")
+        if self._plan.mode == "getter_raises":
+            raise RuntimeError("private lease exit getter")
+        if self._plan.mode == "noncallable":
+            return object()
+
+        async def call(*_args):
+            self._plan.events.append("lease:exit:call")
+            if self._plan.mode == "call_before_release":
+                raise RuntimeError("private lease exit before release")
+            self._plan.leased = False
+            if self._plan.mode == "call_after_release":
+                raise RuntimeError("private lease exit after release")
+
+        return call
+
+
+class _ExitFallbackPool:
+    def __init__(self, mode):
+        self.plan = _ExitFallbackPlan(mode)
+        self.lease = _ExitFallbackLease(self.plan)
+
+    def acquire(self):
+        return self.lease
+
+    async def release(self, connection):
+        assert connection is self.lease.connection
+        self.plan.events.append("pool:release:call")
+        self.plan.pool_release_attempts += 1
+        if not self.plan.leased:
+            raise RuntimeError("private duplicate pool release")
+        self.plan.leased = False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["getter_raises", "noncallable", "call_before_release", "call_after_release"],
+)
+async def test_failed_or_missing_lease_exit_falls_back_to_pool_release(mode):
+    pool = _ExitFallbackPool(mode)
+    factory = _fake_snapshot_factory(pool)
+
+    if mode == "noncallable":
+        async with factory.evaluation_session():
+            pass
+    else:
+        with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
+            async with factory.evaluation_session():
+                pass
+        assert raised.value.args == ()
+        assert raised.value.__cause__ is raised.value.__context__ is None
+
+    assert pool.plan.pool_release_attempts == 1
+    assert pool.plan.leased is False
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+class _PoolReleaseFailureLease:
+    def __init__(self, plan):
+        self._plan = plan
+        self.connection = _CleanupFailureConnection(plan)
+
+    async def __aenter__(self):
+        self._plan.events.append("acquire")
+        self._plan.leased = True
+        return self.connection
+
+
+class _PoolReleaseFailurePool(_CleanupFailurePool):
+    def acquire(self):
+        return _PoolReleaseFailureLease(self._plan)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["get", "call"])
+@pytest.mark.parametrize("kind", _CLEANUP_FAILURE_KINDS)
+async def test_pool_release_failures_are_inventoried_and_session_state_is_cleared(
+    boundary,
+    kind,
+):
+    plan = _CleanupFailurePlan(f"pool:release:{boundary}", kind)
+    factory = _fake_snapshot_factory(_PoolReleaseFailurePool(plan))
+
+    with pytest.raises(_expected_cleanup_failure(kind)) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert "pool:release:get" in plan.events
+    if boundary == "call":
+        assert "pool:release:call" in plan.events
+    assert raised.value.args == ((1,) if kind == "system_exit" else ())
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "private" not in str(raised.value)
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_pool_release_ordinary_failure_does_not_mask_primary_business_failure():
+    plan = _CleanupFailurePlan("pool:release:call", "ordinary")
+    factory = _fake_snapshot_factory(_PoolReleaseFailurePool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalContractError) as raised:
+        async with factory.evaluation_session():
+            raise retrieval_eval.RetrievalContractError
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert plan.events[-2:] == ["pool:release:get", "pool:release:call"]
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_pool_release_control_failure_has_priority_over_primary_ordinary_failure():
+    plan = _CleanupFailurePlan("pool:release:call", "keyboard")
+    factory = _fake_snapshot_factory(_PoolReleaseFailurePool(plan))
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        async with factory.evaluation_session():
+            raise RuntimeError("private primary")
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
 
 
 class _SetupBarrierPlan:
