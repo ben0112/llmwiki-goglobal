@@ -236,6 +236,40 @@ run, Recall@10 improves by at least ten percent relative to lexical retrieval
 and p95 latency is no more than twice the lexical baseline. Deployments may
 keep hybrid search opt-in even when those gates pass.
 
+### Milestone 3 implementation evidence
+
+Milestone 3 is implemented through commit
+`5cca14310effaf977500fbc13ab58fff0a35bb88`. The implementation includes the
+strict versioned evaluation schema and exact deterministic metrics,
+filter-before-limit compilation, version/profile-fenced pgvector storage,
+OpenAI-compatible and deterministic fake embedding adapters, durable embedding
+reconciliation, bounded RRF, optional reranker and graph-expansion hooks, typed
+lexical fallback, and the inclusive 110% Recall@10 / 2.0x p95 promotion gate.
+
+The representative two-case real-Postgres comparison uses dataset digest
+`d45bf89f5b28694afe2b4af1d03d15e3ba59e02d3bc20129eff77b58ab39ab7f`.
+Its exact lexical metrics are Recall@5/10/20 `0.5`, MRR `0.5`, nDCG@10 `0.5`,
+filtered result count `1`, and p50/p95 `10.0 ms`; hybrid reports
+Recall@5/10/20 `1.0`, MRR `1.0`, nDCG@10 `1.0`, filtered result count `1`,
+and p50/p95 `20.0 ms`. The result is eligible at recall ratio `2.0` and the
+inclusive latency boundary `2.0`.
+
+Verification for that exact SHA is tracked by
+[GitHub Actions run 30188190169](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30188190169).
+The retrieval segment owns the chunk schema, vector store, durable embeddings,
+hybrid failure matrix, and real-Postgres evaluation tests. Specification and
+quality reviews both concluded Critical `0`, Important `0`, Minor `0`, and
+`Ready: Yes`. Operational rollout, private-dataset handling, promotion, and
+rollback are documented in `docs/architecture/retrieval.md`; passing the gate
+only makes hybrid eligible and never changes the lexical deployment default.
+
+The Task 12 local milestone gate recorded `188` focused core tests, `450` API
+embedding/retrieval tests, `203` MCP retrieval/tool/facet tests, `44` MCP
+Postgres-isolation tests, and `8` CI ownership contract tests passing. Its
+reproducible service images are `pgvector/pgvector:0.8.0-pg16`,
+`redis:7.4.2-alpine`, `minio/minio:RELEASE.2025-04-22T22-12-26Z`,
+`minio/mc:RELEASE.2025-04-16T18-13-26Z`, and `nginx:1.27-alpine`.
+
 ## Milestone 4: optional server-side RAG orchestration
 
 ### Product boundary

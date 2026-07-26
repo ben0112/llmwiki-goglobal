@@ -77,7 +77,7 @@ self-hosting compose — you do **not** need most of its services.
 
 ### Apply the migrations
 
-Run `supabase/migrations/001…013` in order against the stack's database:
+Run `supabase/migrations/001…014` in order against the stack's database:
 
 ```bash
 for f in supabase/migrations/*.sql; do
@@ -86,7 +86,7 @@ done
 ```
 
 They create the schema, RLS policies, PGroonga full-text indexes, versioned
-pgvector chunk storage, the
+pgvector chunk storage and durable embedding jobs, the
 `document_changes` NOTIFY trigger, and the `auth.users` trigger that
 provisions a `public.users` row (with page/storage quotas) on signup — which
 is why this must run on the Supabase database, not a bare Postgres.
@@ -194,6 +194,55 @@ without a page reload (exercises LISTEN/NOTIFY → WebSocket) → search for a
 term from the PDF (exercises PGroonga) → connect an MCP agent and run the
 `guide` tool.
 
+### Optional hybrid retrieval
+
+Lexical search remains the default and needs no embedding service. To make the
+hosted hybrid profile available, provide the same values to API, worker, and
+MCP, then restart/roll all three roles:
+
+```dotenv
+HYBRID_SEARCH_ENABLED=true
+EMBEDDING_PROVIDER=openai_compatible
+EMBEDDING_BASE_URL=https://embeddings.example.com/v1
+EMBEDDING_API_KEY=replace-with-secret
+EMBEDDING_MODEL=text-embedding-model
+EMBEDDING_DIMENSIONS=1536
+EMBEDDING_BATCH_SIZE=32
+EMBEDDING_TIMEOUT_SECONDS=30
+HYBRID_LEXICAL_CANDIDATES=50
+HYBRID_VECTOR_CANDIDATES=50
+HYBRID_RRF_K=60
+```
+
+The Compose skeleton does not forward these optional values yet. Add explicit
+`${VARIABLE}` mappings for every value above to the `environment` section of
+the `api`, `worker`, and `mcp` services (or inject the same values through your
+orchestrator). Values present only in `deploy/.env.selfhost` are available for
+Compose substitution but are not automatically copied into containers.
+
+Startup validation rejects hybrid in local mode, hybrid without durable jobs,
+blank endpoint/model values, invalid dimensions, and out-of-range numeric
+settings. Migrations `013` and `014` must already be applied, and the database
+must provide pgvector 0.8.x in addition to PGroonga.
+
+Newly extracted document versions enqueue durable embedding work. Backfill an
+existing corpus, or re-embed after changing model/dimensions, while workers are
+running:
+
+```bash
+PYTHONPATH=api MODE=hosted .venv/bin/python -m scripts.enqueue_embeddings \
+  --missing --page-size 100
+```
+
+Repeat after the queue settles until it returns
+`{"enqueued":0,"scanned":0}`. Vectors are fenced by document version and the
+exact provider/model/dimensions tuple, so a model change cannot mix profiles.
+Run a representative private evaluation before allowing selected callers to
+request `retrieval_profile="hybrid"`; a passing gate never changes the lexical
+default automatically. Never commit a production evaluation corpus or report
+containing user data. The full operational and promotion contract is in
+[`docs/architecture/retrieval.md`](architecture/retrieval.md).
+
 ## 7. Operations
 
 - **Backups**: `pg_dump` the Supabase database, mirror the MinIO bucket
@@ -233,7 +282,7 @@ term from the PDF (exercises PGroonga) → connect an MCP agent and run the
 
 ### Zero-downtime rollout and rollback
 
-Apply migrations through `012` before deploying application code; these
+Apply migrations through `014` before deploying application code; these
 migrations are additive for the rollout. Then update Redis/MinIO/converter,
 roll workers, roll API replicas one at a time, and update/restart the gateway
 last. Confirm `/ready`, one real upload, and one graph rebuild before removing
@@ -245,6 +294,12 @@ Hosted rollback path has been removed. Roll back API and worker together to a
 known-good release. Database migrations are additive, so leave the schema,
 Redis AOF, and objects intact. Never mix API producers and workers from
 different releases.
+
+Hybrid retrieval has an independent, data-preserving rollback: set
+`HYBRID_SEARCH_ENABLED=false` for API, worker, and MCP and roll/restart those
+roles. All callers return to lexical behavior; leave migrations `013`/`014`,
+embedding rows, and job history in place. Passing the promotion gate never
+flips this flag or changes the default profile automatically.
 
 Copyable incident rollback (set `ROLLBACK_REF` to a tested tag or commit):
 
