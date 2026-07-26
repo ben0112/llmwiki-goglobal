@@ -13,6 +13,8 @@ from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
+import asyncpg
+
 from llmwiki_core.rag import (
     MAX_GOAL_CHARS,
     MAX_PAGE_CHARS,
@@ -55,9 +57,31 @@ _JSON_COLUMN_BYTE_LIMITS = {
     "output_summary": 16_384,
     "citation_identities": 16_384,
 }
+_RUN_UUID_COLUMNS = (
+    "id",
+    "job_id",
+    "root_run_id",
+    "parent_run_id",
+    "user_id",
+    "knowledge_base_id",
+)
+_PAGE_UUID_COLUMNS = (
+    "id",
+    "run_id",
+    "user_id",
+    "knowledge_base_id",
+    "document_id",
+)
+_STEP_UUID_COLUMNS = (
+    "id",
+    "run_id",
+    "run_page_id",
+    "user_id",
+    "knowledge_base_id",
+)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class RagRunRecord:
     id: UUID
     job_id: UUID
@@ -82,7 +106,7 @@ class RagRunRecord:
     updated_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class RagPageRecord:
     id: UUID
     run_id: UUID
@@ -108,7 +132,7 @@ class RagPageRecord:
     updated_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class RagStepRecord:
     id: UUID
     run_id: UUID
@@ -135,7 +159,7 @@ class RagStepRecord:
 
 
 def _uuid(value: object, field: str) -> UUID:
-    if isinstance(value, UUID):
+    if type(value) is UUID:
         return value
     if type(value) is not str:
         raise TypeError(f"{field} must be a UUID")
@@ -283,16 +307,47 @@ def _adapt_db_json_columns(row: Mapping[str, object], columns: tuple[str, ...]) 
     return adapted
 
 
+def _adapt_db_uuid_columns(
+    row: Mapping[str, object],
+    columns: tuple[str, ...],
+) -> Mapping[str, object]:
+    adapted = dict(row)
+    if not isinstance(row, asyncpg.Record):
+        return adapted
+    for column in columns:
+        raw = adapted[column]
+        if raw is None:
+            continue
+        try:
+            text = str(raw)
+            parsed = UUID(text)
+        except (AttributeError, TypeError, ValueError):
+            raise TypeError(f"{column} must be a UUID") from None
+        if str(parsed) != text:
+            raise TypeError(f"{column} must be a canonical UUID")
+        adapted[column] = parsed
+    return adapted
+
+
 def _adapt_db_run_row(row: Mapping[str, object]) -> Mapping[str, object]:
-    return _adapt_db_json_columns(row, ("budget", "usage"))
+    return _adapt_db_json_columns(
+        _adapt_db_uuid_columns(row, _RUN_UUID_COLUMNS),
+        ("budget", "usage"),
+    )
 
 
 def _adapt_db_page_row(row: Mapping[str, object]) -> Mapping[str, object]:
-    return _adapt_db_json_columns(row, ("lint_summary",))
+    return _adapt_db_json_columns(
+        _adapt_db_uuid_columns(row, _PAGE_UUID_COLUMNS),
+        ("lint_summary",),
+    )
 
 
 def _adapt_db_step_row(row: Mapping[str, object]) -> Mapping[str, object]:
-    return _adapt_db_json_columns(row, ("output_summary", "citation_identities"))
+    return _adapt_db_json_columns(
+        _adapt_db_uuid_columns(row, _STEP_UUID_COLUMNS),
+        ("output_summary", "citation_identities"),
+    )
 
 
 def _freeze_json(value: object, field: str, *, depth: int = 1) -> object:

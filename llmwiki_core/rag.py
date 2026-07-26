@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from itertools import islice
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -72,6 +73,143 @@ class RagDomainError(RuntimeError):
         self.public_message = public_message
         self.retryable = retryable
         super().__init__(public_message)
+
+
+@dataclass(frozen=True, slots=True)
+class RagErrorContract:
+    """One immutable public RAG error shape."""
+
+    code: str
+    public_message: str
+    retryable: bool = False
+
+
+def _error_contract(
+    code: str,
+    public_message: str,
+    retryable: bool = False,
+) -> RagErrorContract:
+    return RagErrorContract(code, public_message, retryable)
+
+
+RAG_ERROR_CONTRACTS = MappingProxyType(
+    {
+        "attempt_limit_mismatch": _error_contract(
+            "rag_attempt_limit_mismatch",
+            "The page attempt limit exceeds the persisted run budget.",
+        ),
+        "boundary_conflict": _error_contract("rag_boundary_conflict", "The RAG boundary could not be advanced.", True),
+        "boundary_out_of_order": _error_contract(
+            "rag_boundary_out_of_order", "The RAG boundary update is out of order."
+        ),
+        "budget_exhausted": _error_contract("rag_budget_exhausted", "The RAG budget was exhausted."),
+        "budget_too_small_decrease": _error_contract("rag_budget_too_small", "The resume budget cannot decrease."),
+        "budget_too_small_worklist": _error_contract(
+            "rag_budget_too_small", "The resume budget is smaller than the worklist."
+        ),
+        "disabled": _error_contract("rag_disabled", "Server-side RAG is disabled."),
+        "document_not_found": _error_contract("rag_document_not_found", "The RAG document was not found."),
+        "document_version_mismatch_boundary": _error_contract(
+            "rag_document_version_mismatch",
+            "The committed document version does not match the RAG boundary.",
+            True,
+        ),
+        "document_version_mismatch_new": _error_contract(
+            "rag_document_version_mismatch",
+            "A new page must commit document version 1.",
+            True,
+        ),
+        "document_version_mismatch_read": _error_contract(
+            "rag_document_version_mismatch",
+            "The page read identity does not match the committed document version.",
+            True,
+        ),
+        "idempotency_conflict": _error_contract(
+            "rag_idempotency_conflict",
+            "The idempotency key was already used for a different request.",
+        ),
+        "internal_error": _error_contract("rag_internal_error", "The RAG request could not be completed."),
+        "invalid_completion_dry_run": _error_contract("rag_invalid_completion", "The dry RAG run is not complete."),
+        "invalid_completion_job_state": _error_contract(
+            "rag_invalid_completion",
+            "The completion reason does not match the terminal job state.",
+        ),
+        "invalid_completion_no_work": _error_contract(
+            "rag_invalid_completion", "A non-empty run cannot finish with no work."
+        ),
+        "invalid_completion_worklist": _error_contract(
+            "rag_invalid_completion", "The RAG worklist is not fully committed."
+        ),
+        "invalid_request": _error_contract("rag_invalid_request", "The RAG request is invalid."),
+        "job_binding_invalid_root": _error_contract("rag_job_binding_invalid", "The RAG job binding is invalid."),
+        "job_binding_invalid_resume": _error_contract(
+            "rag_job_binding_invalid", "The RAG resume job binding is invalid."
+        ),
+        "job_not_terminal": _error_contract("rag_job_not_terminal", "The RAG job is not terminal."),
+        "model_profile_unavailable": _error_contract(
+            "rag_model_profile_unavailable",
+            "The requested RAG model profile is unavailable.",
+        ),
+        "page_attempts_exhausted": _error_contract(
+            "rag_page_attempts_exhausted", "The page attempt limit was exhausted."
+        ),
+        "page_mismatch_run": _error_contract("rag_page_mismatch", "The RAG page does not belong to the run."),
+        "page_mismatch_stale": _error_contract("rag_page_mismatch", "The supplied RAG page is stale or mismatched."),
+        "page_not_attemptable": _error_contract("rag_page_not_attemptable", "The RAG page cannot be attempted."),
+        "page_not_found": _error_contract("rag_page_not_found", "The RAG page was not found."),
+        "page_not_running": _error_contract("rag_page_not_running", "The RAG page is not running."),
+        "page_scoped_step_not_running": _error_contract(
+            "rag_page_not_running", "Page-scoped steps require a running page."
+        ),
+        "parent_not_finished": _error_contract("rag_parent_not_finished", "The parent RAG run is not finished."),
+        "resume_boundary_lineage": _error_contract("rag_resume_boundary_invalid", "The RAG lineage is invalid."),
+        "resume_boundary_parent": _error_contract("rag_resume_boundary_invalid", "The parent RAG boundary is invalid."),
+        "resume_boundary_root": _error_contract("rag_resume_boundary_invalid", "The root RAG run is invalid."),
+        "resume_boundary_source": _error_contract("rag_resume_boundary_invalid", "The RAG resume source is invalid."),
+        "resume_boundary_worklist": _error_contract(
+            "rag_resume_boundary_invalid", "The RAG worklist identity is invalid."
+        ),
+        "resume_conflict_copy": _error_contract("rag_resume_conflict", "The RAG resume worklist copy was incomplete."),
+        "resume_conflict_create": _error_contract("rag_resume_conflict", "The RAG resume could not be created."),
+        "resume_not_allowed": _error_contract("rag_resume_not_allowed", "The RAG run cannot be resumed."),
+        "retrieval_profile_unavailable": _error_contract(
+            "rag_retrieval_profile_unavailable",
+            "The requested RAG retrieval profile is unavailable.",
+        ),
+        "run_already_finished": _error_contract("rag_run_already_finished", "The RAG run is already finished."),
+        "run_conflict": _error_contract("rag_run_conflict", "The RAG run could not be created."),
+        "run_finished": _error_contract("rag_run_finished", "The RAG run is already finished."),
+        "run_mismatch_identity": _error_contract(
+            "rag_run_mismatch", "The supplied RAG run does not match persisted identity."
+        ),
+        "run_mismatch_parent": _error_contract("rag_run_mismatch", "The supplied parent run is stale or mismatched."),
+        "run_mismatch_stale": _error_contract("rag_run_mismatch", "The supplied RAG run is stale or mismatched."),
+        "run_not_found": _error_contract("rag_run_not_found", "The RAG run was not found."),
+        "run_not_found_parent": _error_contract("rag_run_not_found", "The parent RAG run was not found."),
+        "step_already_running": _error_contract("rag_step_already_running", "A RAG step is already running.", True),
+        "step_already_running_conflict": _error_contract(
+            "rag_step_already_running", "The RAG step could not be started.", True
+        ),
+        "step_invalid": _error_contract("rag_step_invalid", "Persisted RAG step state is invalid."),
+        "step_not_running": _error_contract("rag_step_not_running", "The RAG step is not running."),
+        "step_sequence_conflict": _error_contract(
+            "rag_step_sequence_conflict", "The RAG step could not be started.", True
+        ),
+        "step_still_running": _error_contract("rag_step_still_running", "A RAG step is still running."),
+        "usage_mismatch": _error_contract(
+            "rag_usage_mismatch",
+            "The supplied RAG usage does not match persisted terminal steps.",
+        ),
+        "worklist_conflict": _error_contract("rag_worklist_conflict", "The RAG worklist could not be stored."),
+        "worklist_exists": _error_contract("rag_worklist_exists", "The RAG worklist already exists."),
+    }
+)
+
+
+def new_rag_error(contract_name: str) -> RagDomainError:
+    """Construct a fresh public error from the authoritative registry."""
+    contract = RAG_ERROR_CONTRACTS[contract_name]
+    return RagDomainError(contract.code, contract.public_message, contract.retryable)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,9 +284,7 @@ class RagRunConfig:
             raise ValueError("knowledge_base_id must be a UUID")
         normalized_goal = _normalize_bounded_text("goal", goal, MAX_GOAL_CHARS)
         normalized_target_path = _normalize_target_path_prefix(target_path_prefix)
-        normalized_model_profile = _normalize_bounded_text(
-            "model profile", model_profile, MAX_PROFILE_CHARS
-        )
+        normalized_model_profile = _normalize_bounded_text("model profile", model_profile, MAX_PROFILE_CHARS)
         if type(retrieval_profile) is not str or retrieval_profile not in {"lexical", "hybrid"}:
             raise ValueError("retrieval profile is unknown")
         if type(dry_run) is not bool:
@@ -261,9 +397,7 @@ class RagCitation:
             raise ValueError("page must be a positive integer or None")
 
 
-def validate_worklist(
-    items: Iterable[RagWorkItem], *, target_path_prefix: str, max_pages: int
-) -> None:
+def validate_worklist(items: Iterable[RagWorkItem], *, target_path_prefix: str, max_pages: int) -> None:
     normalized_target_path = _normalize_target_path_prefix(target_path_prefix)
     _validate_limit("max_pages", max_pages, MAX_PAGES)
 
@@ -285,9 +419,7 @@ def validate_worklist(
         paths.add(item.path)
 
 
-def remaining_work_items(
-    items: Iterable[RagWorkItem], last_committed_ordinal: int
-) -> tuple[RagWorkItem, ...]:
+def remaining_work_items(items: Iterable[RagWorkItem], last_committed_ordinal: int) -> tuple[RagWorkItem, ...]:
     if type(last_committed_ordinal) is not int:
         raise ValueError("last_committed_ordinal must be an integer")
     materialized = tuple(items)

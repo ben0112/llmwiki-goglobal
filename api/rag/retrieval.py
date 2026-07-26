@@ -49,9 +49,79 @@ _MAX_TAGS = 100
 _MAX_TAG_CHARS = 128
 _POSTGRES_INTEGER_MAX = 2_147_483_647
 _EMBEDDING_CLEANUP_FAILED = object()
+_HYBRID_SETTINGS_ERROR = "hybrid retrieval is unavailable"
+
+
+class _SettingsValidationRetriever:
+    async def retrieve(self, query: SearchQuery):  # pragma: no cover - validation-only port.
+        raise RuntimeError("settings validation retriever must not execute")
 
 
 @dataclass(frozen=True, slots=True)
+class HostedRagRetrievalSettings:
+    """One validated immutable view of stateful hosted hybrid settings."""
+
+    embedding_profile: EmbeddingProfile
+    lexical_limit: int
+    vector_limit: int
+    rrf_k: int
+
+
+def validate_hosted_rag_retrieval_settings(
+    settings: object,
+    *,
+    request_limit: int = 1,
+) -> HostedRagRetrievalSettings:
+    """Validate the pure hosted hybrid settings used by retrieval and RAG."""
+    failure: BaseException | None = None
+    try:
+        if type(request_limit) is not int or not 1 <= request_limit <= 100:
+            raise ValueError
+        profile = settings.embedding_profile  # type: ignore[attr-defined]
+        mode = settings.MODE  # type: ignore[attr-defined]
+        enabled = settings.HYBRID_SEARCH_ENABLED  # type: ignore[attr-defined]
+        helper = getattr(settings, "hybrid_candidate_limits", None)
+        if callable(helper):
+            limits = helper(request_limit)
+            if type(limits) is not tuple or len(limits) != 2:
+                raise ValueError
+            lexical_limit, vector_limit = limits
+        else:
+            lexical_limit = settings.HYBRID_LEXICAL_CANDIDATES  # type: ignore[attr-defined]
+            vector_limit = settings.HYBRID_VECTOR_CANDIDATES  # type: ignore[attr-defined]
+        rrf_k = settings.HYBRID_RRF_K  # type: ignore[attr-defined]
+        if (
+            mode != "hosted"
+            or enabled is not True
+            or type(profile) is not EmbeddingProfile
+            or type(lexical_limit) is not int
+            or type(vector_limit) is not int
+        ):
+            raise ValueError
+        SearchQuery("hybrid settings validation", limit=request_limit, candidate_limit=lexical_limit)
+        SearchQuery("hybrid settings validation", limit=request_limit, candidate_limit=vector_limit)
+        validator = _SettingsValidationRetriever()
+        HybridRetrievalService(
+            lexical=validator,
+            vector=validator,
+            rrf_k=rrf_k,
+        )
+        snapshot = HostedRagRetrievalSettings(
+            embedding_profile=profile,
+            lexical_limit=lexical_limit,
+            vector_limit=vector_limit,
+            rrf_k=rrf_k,
+        )
+    except BaseException as caught:  # noqa: BLE001 - hostile settings boundary.
+        failure = caught
+    if failure is not None:
+        if (signal := sanitized_boundary_signal_or_unknown(failure)) is not None and type(signal) is not BaseException:
+            raise signal from None
+        raise ValueError(_HYBRID_SETTINGS_ERROR) from None
+    return snapshot
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class RagEvidence:
     """Immutable, current-version evidence selected for a RAG prompt."""
 
@@ -102,7 +172,7 @@ class RagEvidence:
         object.__setattr__(self, "metadata", metadata)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class RagWikiPage:
     """Immutable projection of one exact current wiki page."""
 
@@ -283,52 +353,34 @@ class HostedRagRetrieval:
             ).retrieve(query)
         if profile != "hybrid":
             raise ValueError("unsupported retrieval profile")
-        embedding_profile = self._validated_hybrid_profile()
-        lexical_limit, vector_limit = self._candidate_limits(query.limit)
+        settings = validate_hosted_rag_retrieval_settings(
+            self._settings,
+            request_limit=query.limit,
+        )
         service_query = replace(
             query,
-            candidate_limit=max(lexical_limit, vector_limit),
+            candidate_limit=max(settings.lexical_limit, settings.vector_limit),
         )
         service = HybridRetrievalService(
             lexical=PostgresLexicalRetriever(
                 self._database,
                 user_id=self._user_id,
                 knowledge_base_id=self._knowledge_base_id,
-                candidate_limit=lexical_limit,
+                candidate_limit=settings.lexical_limit,
             ),
             vector=PostgresVectorRetriever(
                 self._database,
                 user_id=self._user_id,
                 knowledge_base_id=self._knowledge_base_id,
-                candidate_limit=vector_limit,
-                profile=embedding_profile,
-                embedding_client_factory=self._new_embedding_client,
+                candidate_limit=settings.vector_limit,
+                profile=settings.embedding_profile,
+                embedding_client_factory=lambda: self._new_embedding_client(settings.embedding_profile),
             ),
-            rrf_k=self._settings.HYBRID_RRF_K,
+            rrf_k=settings.rrf_k,
         )
         return await service.retrieve(service_query)
 
-    def _validated_hybrid_profile(self) -> EmbeddingProfile:
-        embedding_profile = getattr(self._settings, "embedding_profile", None)
-        if (
-            getattr(self._settings, "MODE", None) != "hosted"
-            or getattr(self._settings, "HYBRID_SEARCH_ENABLED", False) is not True
-            or not isinstance(embedding_profile, EmbeddingProfile)
-        ):
-            raise ValueError("hybrid retrieval is unavailable")
-        return embedding_profile
-
-    def _candidate_limits(self, request_limit: int) -> tuple[int, int]:
-        helper = getattr(self._settings, "hybrid_candidate_limits", None)
-        if callable(helper):
-            return helper(request_limit)
-        lexical_limit = self._settings.HYBRID_LEXICAL_CANDIDATES
-        vector_limit = self._settings.HYBRID_VECTOR_CANDIDATES
-        if request_limit > lexical_limit or request_limit > vector_limit:
-            raise ValueError("hybrid candidate limits must be at least the result limit")
-        return lexical_limit, vector_limit
-
-    def _new_embedding_client(self):
+    def _new_embedding_client(self, profile: EmbeddingProfile):
         if self._embedding_client_factory is not None:
             return self._embedding_client_factory()
         failure: BaseException | None = None
@@ -336,7 +388,7 @@ class HostedRagRetrieval:
         try:
             secret = self._settings.EMBEDDING_API_KEY
             client = OpenAIEmbeddingClient(
-                profile=self._validated_hybrid_profile(),
+                profile=profile,
                 base_url=self._settings.EMBEDDING_BASE_URL,
                 api_key=secret.get_secret_value(),
                 batch_size=self._settings.EMBEDDING_BATCH_SIZE,
@@ -1107,10 +1159,12 @@ def _freeze_json(value: object) -> Any:
 
 __all__ = [
     "HostedRagRetrieval",
+    "HostedRagRetrievalSettings",
     "PostgresEvidenceReader",
     "PostgresLexicalRetriever",
     "PostgresVectorRetriever",
     "PostgresWikiPageReader",
     "RagEvidence",
     "RagWikiPage",
+    "validate_hosted_rag_retrieval_settings",
 ]

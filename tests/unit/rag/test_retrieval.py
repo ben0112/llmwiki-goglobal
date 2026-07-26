@@ -34,6 +34,63 @@ def _settings(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_validate_hosted_rag_retrieval_settings_is_shared_strict_and_pure():
+    from rag.retrieval import HostedRagRetrievalSettings, validate_hosted_rag_retrieval_settings
+
+    snapshot = validate_hosted_rag_retrieval_settings(_settings(), request_limit=3)
+    assert snapshot == HostedRagRetrievalSettings(
+        embedding_profile=PROFILE,
+        lexical_limit=4,
+        vector_limit=5,
+        rrf_k=60,
+    )
+    with pytest.raises(FrozenInstanceError):
+        snapshot.rrf_k = 1  # type: ignore[misc]
+    invalid_settings = (
+        _settings(MODE="local"),
+        _settings(HYBRID_SEARCH_ENABLED=False),
+        _settings(embedding_profile=object()),
+        _settings(HYBRID_LEXICAL_CANDIDATES=True),
+        _settings(HYBRID_VECTOR_CANDIDATES=501),
+        _settings(HYBRID_RRF_K=True),
+        _settings(HYBRID_RRF_K=1_000_001),
+    )
+    for settings in invalid_settings:
+        with pytest.raises(ValueError, match="hybrid retrieval is unavailable") as exc_info:
+            validate_hosted_rag_retrieval_settings(settings, request_limit=3)
+        assert exc_info.value.__cause__ is exc_info.value.__context__ is None
+
+
+def test_validate_hosted_rag_retrieval_settings_checks_candidate_helper_result():
+    from rag.retrieval import validate_hosted_rag_retrieval_settings
+
+    for result in ([4, 5], (True, 5), (2, 5), (4, 501), (4,), (4, 5, 6)):
+        settings = _settings()
+        settings.hybrid_candidate_limits = lambda _limit, result=result: result
+        with pytest.raises(ValueError, match="hybrid retrieval is unavailable"):
+            validate_hosted_rag_retrieval_settings(settings, request_limit=3)
+
+    with pytest.raises(ValueError, match="hybrid retrieval is unavailable"):
+        validate_hosted_rag_retrieval_settings(_settings(), request_limit=True)
+
+
+def test_validate_hosted_rag_retrieval_settings_fails_closed_on_hostile_exception_graph():
+    from rag.retrieval import validate_hosted_rag_retrieval_settings
+
+    class HostileFailure(RuntimeError):
+        def __getattribute__(self, name):
+            if name in {"__cause__", "__context__"}:
+                raise RuntimeError("private settings graph secret")
+            return super().__getattribute__(name)
+
+    settings = _settings()
+    settings.hybrid_candidate_limits = lambda _limit: (_ for _ in ()).throw(HostileFailure("private settings secret"))
+
+    with pytest.raises(ValueError, match="hybrid retrieval is unavailable") as exc_info:
+        validate_hosted_rag_retrieval_settings(settings, request_limit=3)
+    assert exc_info.value.__cause__ is exc_info.value.__context__ is None
+
+
 def _row(document_id=DOCUMENT_ID, *, score=3.5, candidate_count=1):
     return {
         "document_id": document_id,
@@ -573,6 +630,96 @@ async def test_hosted_rag_defaults_to_lexical_without_constructing_embedding(mon
 
 
 @pytest.mark.asyncio
+async def test_hosted_lexical_retrieval_reads_no_hybrid_settings():
+    from rag.retrieval import HostedRagRetrieval
+
+    class UnreadableSettings:
+        def __getattribute__(self, name):
+            if not name.startswith("__"):
+                raise RuntimeError("private settings secret")
+            return super().__getattribute__(name)
+
+    result = await HostedRagRetrieval(
+        _RecordingDatabase([_row()]),
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        settings=UnreadableSettings(),
+    ).retrieve(SearchQuery.build(text="permit", limit=1), profile="lexical")
+
+    assert result.profile == "lexical"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_read_secret", ("helper", "profile", "rrf_k"))
+async def test_hosted_hybrid_consumes_one_frozen_settings_snapshot(monkeypatch, second_read_secret):
+    from rag.retrieval import HostedRagRetrieval
+
+    class StatefulSettings:
+        EMBEDDING_BASE_URL = "https://embedding.invalid/v1"
+        EMBEDDING_API_KEY = SimpleNamespace(get_secret_value=lambda: "secret")
+        EMBEDDING_BATCH_SIZE = 32
+        EMBEDDING_TIMEOUT_SECONDS = 15
+
+        def __init__(self):
+            self.reads = {name: 0 for name in ("mode", "enabled", "profile", "helper", "rrf_k")}
+
+        def _read(self, name, value):
+            self.reads[name] += 1
+            if name == second_read_secret and self.reads[name] > 1:
+                raise RuntimeError(f"private second {name} settings secret")
+            return value
+
+        @property
+        def MODE(self):
+            return self._read("mode", "hosted")
+
+        @property
+        def HYBRID_SEARCH_ENABLED(self):
+            return self._read("enabled", True)
+
+        @property
+        def embedding_profile(self):
+            return self._read("profile", PROFILE)
+
+        def hybrid_candidate_limits(self, _request_limit):
+            return self._read("helper", (4, 5))
+
+        @property
+        def HYBRID_RRF_K(self):
+            return self._read("rrf_k", 60)
+
+    class Store:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def search(self, **_kwargs):
+            return SearchResult(hits=(), candidate_count=0, profile="vector")
+
+    class Client:
+        def __init__(self, *, profile, **_kwargs):
+            self.profile = profile
+
+        async def embed(self, _texts):
+            return ((1.0, 0.0, 0.0),)
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr("rag.retrieval.PostgresVectorStore", Store)
+    monkeypatch.setattr("rag.retrieval.OpenAIEmbeddingClient", Client)
+    settings = StatefulSettings()
+    result = await HostedRagRetrieval(
+        _RecordingDatabase([_row()]),
+        user_id=USER_ID,
+        knowledge_base_id=KNOWLEDGE_BASE_ID,
+        settings=settings,
+    ).retrieve(SearchQuery.build(text="permit", limit=1), profile="hybrid")
+
+    assert result.profile == "hybrid"
+    assert settings.reads == {name: 1 for name in settings.reads}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("profile", "settings", "message"),
     [
@@ -888,6 +1035,42 @@ def test_frozen_rag_dtos_sanitize_malicious_metadata_and_tag_containers(dto, fie
     assert caught.value.args == (expected,)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert "secret" not in str(caught.value)
+
+
+def test_rag_read_dto_repr_and_str_do_not_expose_private_payloads():
+    from rag.retrieval import RagEvidence, RagWikiPage
+
+    marker = "private-content-metadata-path-marker"
+    evidence = RagEvidence(
+        document_id=DOCUMENT_ID,
+        document_version=2,
+        chunk_index=4,
+        page=5,
+        filename="private.pdf",
+        path=f"/corpus/{marker}/",
+        title=marker,
+        content=marker,
+        status="ready",
+        archived=False,
+        score=0.5,
+        tags=(marker,),
+        metadata={"private": marker},
+    )
+    page = RagWikiPage(
+        document_id=DOCUMENT_ID,
+        version=2,
+        path=f"/wiki/{marker}.md",
+        filename=f"{marker}.md",
+        content=marker,
+        title=marker,
+        tags=(marker,),
+        date=date(2026, 7, 27),
+        metadata={"private": marker},
+    )
+
+    for record in (evidence, page):
+        assert marker not in repr(record)
+        assert marker not in str(record)
 
 
 @pytest.mark.asyncio

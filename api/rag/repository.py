@@ -25,6 +25,7 @@ from llmwiki_core.rag import (
     RagStepType,
     RagUsage,
     RagWorkItem,
+    new_rag_error,
     validate_worklist,
 )
 
@@ -72,6 +73,31 @@ _RUN_IDENTITY_FIELDS = (
     "idempotency_key",
     "request_digest",
 )
+CREATE_ROOT_RAG_ERROR_CONTRACT_NAMES = frozenset(
+    {
+        "idempotency_conflict",
+        "job_binding_invalid_root",
+        "run_conflict",
+    }
+)
+CREATE_RESUME_RAG_ERROR_CONTRACT_NAMES = frozenset(
+    {
+        "budget_too_small_decrease",
+        "budget_too_small_worklist",
+        "idempotency_conflict",
+        "job_binding_invalid_resume",
+        "parent_not_finished",
+        "resume_boundary_lineage",
+        "resume_boundary_parent",
+        "resume_boundary_root",
+        "resume_boundary_source",
+        "resume_boundary_worklist",
+        "resume_conflict_copy",
+        "resume_conflict_create",
+        "run_mismatch_parent",
+        "run_not_found_parent",
+    }
+)
 _PAGE_SNAPSHOT_FIELDS = (
     "id",
     "run_id",
@@ -113,8 +139,8 @@ def _decode_db_step(row: Mapping[str, object]) -> RagStepRecord:
     return _decode_step(_adapt_db_step_row(row))
 
 
-def _error(code: str, message: str, *, retryable: bool = False) -> RagDomainError:
-    return RagDomainError(code, message, retryable)
+def _error(contract_name: str) -> RagDomainError:
+    return new_rag_error(contract_name)
 
 
 def _require_transaction(conn: asyncpg.Connection) -> None:
@@ -147,7 +173,7 @@ def _require_usage(usage: RagUsage, budget: RagBudget | None = None) -> None:
     if not isinstance(usage, RagUsage):
         raise ValueError("usage must be a RagUsage")
     if budget is not None and (usage.steps > budget.max_steps or usage.model_tokens > budget.max_model_tokens):
-        raise _error("rag_budget_exhausted", "The RAG budget was exhausted.")
+        raise _error("budget_exhausted")
 
 
 def _budget_json(budget: RagBudget) -> str:
@@ -228,10 +254,7 @@ async def _lock_idempotency(conn: asyncpg.Connection, user_id: UUID, key: str) -
 
 
 def _idempotency_conflict() -> RagDomainError:
-    return _error(
-        "rag_idempotency_conflict",
-        "The idempotency key was already used for a different request.",
-    )
+    return _error("idempotency_conflict")
 
 
 def _root_replay_matches(
@@ -337,9 +360,9 @@ async def create_root(
                 request_digest,
             )
         except asyncpg.ForeignKeyViolationError as exc:
-            raise _error("rag_job_binding_invalid", "The RAG job binding is invalid.") from exc
+            raise _error("job_binding_invalid_root") from exc
         except (asyncpg.UniqueViolationError, asyncpg.CheckViolationError) as exc:
-            raise _error("rag_run_conflict", "The RAG run could not be created.") from exc
+            raise _error("run_conflict") from exc
         if row is None:  # pragma: no cover
             raise RuntimeError("RAG root insert returned no row")
         created = _decode_db_run(row)
@@ -353,19 +376,19 @@ async def _validate_resume_source(  # noqa: C901 - validates a coupled durable s
     budget: RagBudget,
 ) -> tuple[RagRunRecord, tuple[RagPageRecord, ...], tuple[RagPageRecord, ...]]:
     if parent.completion_reason is None:
-        raise _error("rag_parent_not_finished", "The parent RAG run is not finished.")
+        raise _error("parent_not_finished")
     if any(getattr(budget, field) < getattr(parent.budget, field) for field in _BUDGET_FIELDS):
-        raise _error("rag_budget_too_small", "The resume budget cannot decrease.")
+        raise _error("budget_too_small_decrease")
     root_row = await conn.fetchrow(
         "SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE",
         parent.root_run_id,
     )
     if root_row is None:
-        raise _error("rag_resume_boundary_invalid", "The root RAG run is invalid.")
+        raise _error("resume_boundary_root")
     try:
         root = _decode_db_run(root_row)
     except (TypeError, ValueError) as exc:
-        raise _error("rag_resume_boundary_invalid", "The root RAG run is invalid.") from exc
+        raise _error("resume_boundary_root") from exc
     immutable_fields = (
         "root_run_id",
         "user_id",
@@ -384,7 +407,7 @@ async def _validate_resume_source(  # noqa: C901 - validates a coupled durable s
         or root.completion_reason is None
         or any(getattr(root, field) != getattr(parent, field) for field in immutable_fields)
     ):
-        raise _error("rag_resume_boundary_invalid", "The RAG lineage is invalid.")
+        raise _error("resume_boundary_lineage")
     root_rows = await conn.fetch(
         "SELECT * FROM rag_run_pages WHERE run_id=$1 ORDER BY ordinal FOR UPDATE",
         root.id,
@@ -397,7 +420,7 @@ async def _validate_resume_source(  # noqa: C901 - validates a coupled durable s
         root_pages = tuple(_decode_db_page(row) for row in root_rows)
         parent_pages = tuple(_decode_db_page(row) for row in parent_rows)
     except (TypeError, ValueError) as exc:
-        raise _error("rag_resume_boundary_invalid", "The RAG resume source is invalid.") from exc
+        raise _error("resume_boundary_source") from exc
     expected_ordinals = tuple(range(len(root_pages)))
     work_fields = ("ordinal", "path", "intent", "query", "user_id", "knowledge_base_id")
     if (
@@ -409,9 +432,9 @@ async def _validate_resume_source(  # noqa: C901 - validates a coupled durable s
             for root_page, parent_page in zip(root_pages, parent_pages, strict=True)
         )
     ):
-        raise _error("rag_resume_boundary_invalid", "The RAG worklist identity is invalid.")
+        raise _error("resume_boundary_worklist")
     if len(root_pages) > budget.max_pages:
-        raise _error("rag_budget_too_small", "The resume budget is smaller than the worklist.")
+        raise _error("budget_too_small_worklist")
     for page in parent_pages:
         if page.ordinal <= parent.last_committed_ordinal:
             valid = (
@@ -428,9 +451,9 @@ async def _validate_resume_source(  # noqa: C901 - validates a coupled durable s
                 RagPageState.DRY_RUN_COMPLETE,
             }
         if not valid:
-            raise _error("rag_resume_boundary_invalid", "The parent RAG boundary is invalid.")
+            raise _error("resume_boundary_parent")
     if parent.last_committed_ordinal >= len(parent_pages):
-        raise _error("rag_resume_boundary_invalid", "The parent RAG boundary is invalid.")
+        raise _error("resume_boundary_parent")
     return root, root_pages, parent_pages
 
 
@@ -534,11 +557,11 @@ async def _insert_resume_snapshot(
                 )
                 inserted += int(result.rsplit(" ", 1)[-1])
             if inserted != len(root_pages):
-                raise _error("rag_resume_conflict", "The RAG resume worklist copy was incomplete.")
+                raise _error("resume_conflict_copy")
         except asyncpg.ForeignKeyViolationError as exc:
-            raise _error("rag_job_binding_invalid", "The RAG resume job binding is invalid.") from exc
+            raise _error("job_binding_invalid_resume") from exc
         except (asyncpg.UniqueViolationError, asyncpg.CheckViolationError) as exc:
-            raise _error("rag_resume_conflict", "The RAG resume could not be created.") from exc
+            raise _error("resume_conflict_create") from exc
         if row is None:  # pragma: no cover
             raise RuntimeError("RAG resume insert returned no row")
         resumed = _decode_db_run(row)
@@ -561,7 +584,7 @@ async def create_resume(  # noqa: C901 - keeps the resume transaction atomic.
     if not isinstance(parent, RagRunRecord):
         raise ValueError("parent must be a RagRunRecord")
     if parent.completion_reason is None:
-        raise _error("rag_parent_not_finished", "The parent RAG run is not finished.")
+        raise _error("parent_not_finished")
     _budget_json(budget)
     _require_key(idempotency_key)
     _require_digest(request_digest, "request_digest")
@@ -583,7 +606,7 @@ async def create_resume(  # noqa: C901 - keeps the resume transaction atomic.
         parent.user_id,
     )
     if parent_identity is None:
-        raise _error("rag_run_not_found", "The parent RAG run was not found.")
+        raise _error("run_not_found_parent")
     await conn.fetchrow("SELECT id FROM rag_runs WHERE id=$1 FOR UPDATE", parent_identity["root_run_id"])
     locked_parent_row = await conn.fetchrow(
         "SELECT * FROM rag_runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
@@ -591,13 +614,13 @@ async def create_resume(  # noqa: C901 - keeps the resume transaction atomic.
         parent.user_id,
     )
     if locked_parent_row is None:  # pragma: no cover - locked lineage cannot disappear.
-        raise _error("rag_run_not_found", "The parent RAG run was not found.")
+        raise _error("run_not_found_parent")
     locked_parent = _decode_db_run(locked_parent_row)
     if any(getattr(parent, field) != getattr(locked_parent, field) for field in _RUN_IDENTITY_FIELDS) or (
         parent.completion_reason != locked_parent.completion_reason
         or parent.last_committed_ordinal != locked_parent.last_committed_ordinal
     ):
-        raise _error("rag_run_mismatch", "The supplied parent run is stale or mismatched.")
+        raise _error("run_mismatch_parent")
     _, root_pages, parent_pages = await _validate_resume_source(conn, parent=locked_parent, budget=budget)
     return await _insert_resume_snapshot(
         conn,
@@ -643,14 +666,14 @@ async def insert_worklist(
         run.user_id,
     )
     if locked_row is None:
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     locked = _decode_db_run(locked_row)
     if any(getattr(run, field) != getattr(locked, field) for field in _RUN_IDENTITY_FIELDS):
-        raise _error("rag_run_mismatch", "The supplied RAG run does not match persisted identity.")
+        raise _error("run_mismatch_identity")
     if locked.completion_reason is not None:
-        raise _error("rag_run_finished", "The RAG run is already finished.")
+        raise _error("run_finished")
     if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_run_pages WHERE run_id=$1)", run.id):
-        raise _error("rag_worklist_exists", "The RAG worklist already exists.")
+        raise _error("worklist_exists")
     async with conn.transaction():
         rows = []
         try:
@@ -677,7 +700,7 @@ async def insert_worklist(
             asyncpg.CheckViolationError,
             asyncpg.ForeignKeyViolationError,
         ) as exc:
-            raise _error("rag_worklist_conflict", "The RAG worklist could not be stored.") from exc
+            raise _error("worklist_conflict") from exc
         pages = tuple(_decode_db_page(row) for row in rows)
     return pages
 
@@ -705,10 +728,10 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
     _require_digest(input_digest, "input_digest")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run_id)
     if run_row is None:
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     run = _decode_db_run(run_row)
     if run.completion_reason is not None:
-        raise _error("rag_run_finished", "The RAG run is already finished.")
+        raise _error("run_finished")
     if page_id is not None:
         page_row = await conn.fetchrow(
             "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE",
@@ -716,15 +739,15 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
             run_id,
         )
         if page_row is None:
-            raise _error("rag_page_not_found", "The RAG page was not found.")
+            raise _error("page_not_found")
         page = _decode_db_page(page_row)
         if page.state is not RagPageState.RUNNING:
-            raise _error("rag_page_not_running", "Page-scoped steps require a running page.")
+            raise _error("page_scoped_step_not_running")
     if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_steps WHERE run_id=$1 AND status='running')", run_id):
-        raise _error("rag_step_already_running", "A RAG step is already running.", retryable=True)
+        raise _error("step_already_running")
     sequence = await conn.fetchval("SELECT COALESCE(max(sequence),0)+1 FROM rag_steps WHERE run_id=$1", run_id)
     if type(sequence) is not int or not 1 <= sequence <= run.budget.max_steps:
-        raise _error("rag_budget_exhausted", "The RAG budget was exhausted.")
+        raise _error("budget_exhausted")
     async with conn.transaction():
         try:
             row = await conn.fetchrow(
@@ -744,14 +767,14 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
                 run.model_profile_version,
             )
         except asyncpg.UniqueViolationError as exc:
-            code = (
-                "rag_step_already_running"
+            contract_name = (
+                "step_already_running_conflict"
                 if exc.constraint_name == "rag_steps_one_running_per_run"
-                else "rag_step_sequence_conflict"
+                else "step_sequence_conflict"
             )
-            raise _error(code, "The RAG step could not be started.", retryable=True) from exc
+            raise _error(contract_name) from exc
         except asyncpg.ForeignKeyViolationError as exc:
-            raise _error("rag_page_not_found", "The RAG page was not found.") from exc
+            raise _error("page_not_found") from exc
         if row is None:  # pragma: no cover
             raise RuntimeError("RAG step insert returned no row")
         step = _decode_db_step(row)
@@ -789,13 +812,13 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
         raise ValueError("failed steps require a normalized error_code")
     identity = await conn.fetchrow("SELECT run_id,run_page_id FROM rag_steps WHERE id=$1", step_id)
     if identity is None:
-        raise _error("rag_step_not_running", "The RAG step is not running.")
+        raise _error("step_not_running")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", identity["run_id"])
     if run_row is None:  # pragma: no cover - protected by the step foreign key.
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     run = _decode_db_run(run_row)
     if run.completion_reason is not None:
-        raise _error("rag_run_finished", "The RAG run is already finished.")
+        raise _error("run_finished")
     if identity["run_page_id"] is not None:
         page_row = await conn.fetchrow(
             "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE",
@@ -803,12 +826,12 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
             run.id,
         )
         if page_row is None:
-            raise _error("rag_page_not_found", "The RAG page was not found.")
+            raise _error("page_not_found")
         if _decode_db_page(page_row).state is not RagPageState.RUNNING:
-            raise _error("rag_page_not_running", "Page-scoped steps require a running page.")
+            raise _error("page_scoped_step_not_running")
     step_row = await conn.fetchrow("SELECT * FROM rag_steps WHERE id=$1 AND run_id=$2 FOR UPDATE", step_id, run.id)
     if step_row is None or _decode_db_step(step_row).status is not RagStepStatus.RUNNING:
-        raise _error("rag_step_not_running", "The RAG step is not running.")
+        raise _error("step_not_running")
     aggregate = await conn.fetchrow(
         "SELECT count(*) FILTER (WHERE status IN ('succeeded','failed')) AS terminal_steps,"
         "COALESCE(sum(total_tokens) FILTER (WHERE status IN ('succeeded','failed')),0) AS model_tokens "
@@ -838,7 +861,7 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
             error_code,
         )
         if row is None:
-            raise _error("rag_step_not_running", "The RAG step is not running.")
+            raise _error("step_not_running")
         finished = _decode_db_step(row)
     return finished
 
@@ -850,30 +873,30 @@ async def begin_page_attempt(conn: asyncpg.Connection, page_id: UUID, *, max_att
         raise ValueError(f"max_attempts must be between 1 and {MAX_PAGE_ATTEMPTS}")
     run_id = await conn.fetchval("SELECT run_id FROM rag_run_pages WHERE id=$1", page_id)
     if run_id is None:
-        raise _error("rag_page_not_found", "The RAG page was not found.")
+        raise _error("page_not_found")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run_id)
     if run_row is None:  # pragma: no cover - protected by the page foreign key.
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     run = _decode_db_run(run_row)
     if run.completion_reason is not None:
-        raise _error("rag_run_finished", "The RAG run is already finished.")
+        raise _error("run_finished")
     if max_attempts > run.budget.max_page_attempts:
-        raise _error("rag_attempt_limit_mismatch", "The page attempt limit exceeds the persisted run budget.")
+        raise _error("attempt_limit_mismatch")
     page_row = await conn.fetchrow("SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE", page_id, run.id)
     if page_row is None:
-        raise _error("rag_page_not_found", "The RAG page was not found.")
+        raise _error("page_not_found")
     page = _decode_db_page(page_row)
     if page.attempt_count >= max_attempts:
-        raise _error("rag_page_attempts_exhausted", "The page attempt limit was exhausted.")
+        raise _error("page_attempts_exhausted")
     if page.state not in {RagPageState.PLANNED, RagPageState.RUNNING, RagPageState.FAILED}:
-        raise _error("rag_page_not_attemptable", "The RAG page cannot be attempted.")
+        raise _error("page_not_attemptable")
     async with conn.transaction():
         row = await conn.fetchrow(
             "UPDATE rag_run_pages SET attempt_count=attempt_count+1,state='running' WHERE id=$1 RETURNING *",
             page.id,
         )
         if row is None:  # pragma: no cover - page is locked above.
-            raise _error("rag_page_not_found", "The RAG page was not found.")
+            raise _error("page_not_found")
         attempted = _decode_db_page(row)
     return attempted
 
@@ -892,13 +915,9 @@ async def _require_document_version(
         run.knowledge_base_id,
     )
     if persisted_version is None:
-        raise _error("rag_document_not_found", "The RAG document was not found.")
+        raise _error("document_not_found")
     if type(persisted_version) is not int or persisted_version != committed_version:
-        raise _error(
-            "rag_document_version_mismatch",
-            "The committed document version does not match the RAG boundary.",
-            retryable=True,
-        )
+        raise _error("document_version_mismatch_boundary")
 
 
 async def mark_boundary(  # noqa: C901 - validates one authoritative boundary snapshot.
@@ -920,29 +939,29 @@ async def mark_boundary(  # noqa: C901 - validates one authoritative boundary sn
     _require_usage(usage, run.budget)
     lint_json = _json_object(lint_summary, "lint_summary", max_bytes=16_384)
     if page.run_id != run.id or page.user_id != run.user_id or page.knowledge_base_id != run.knowledge_base_id:
-        raise _error("rag_page_mismatch", "The RAG page does not belong to the run.")
+        raise _error("page_mismatch_run")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 AND user_id=$2 FOR UPDATE", run.id, run.user_id)
     if run_row is None:
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     current_run = _decode_db_run(run_row)
     page_row = await conn.fetchrow("SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE", page.id, run.id)
     if page_row is None:
-        raise _error("rag_page_not_found", "The RAG page was not found.")
+        raise _error("page_not_found")
     current_page = _decode_db_page(page_row)
     if any(getattr(run, field) != getattr(current_run, field) for field in _RUN_IDENTITY_FIELDS) or (
         run.usage != current_run.usage
         or run.last_committed_ordinal != current_run.last_committed_ordinal
         or run.completion_reason != current_run.completion_reason
     ):
-        raise _error("rag_run_mismatch", "The supplied RAG run is stale or mismatched.")
+        raise _error("run_mismatch_stale")
     if any(getattr(page, field) != getattr(current_page, field) for field in _PAGE_SNAPSHOT_FIELDS):
-        raise _error("rag_page_mismatch", "The supplied RAG page is stale or mismatched.")
+        raise _error("page_mismatch_stale")
     if current_run.completion_reason is not None:
-        raise _error("rag_run_finished", "The RAG run is already finished.")
+        raise _error("run_finished")
     if current_page.ordinal != current_run.last_committed_ordinal + 1:
-        raise _error("rag_boundary_out_of_order", "The RAG boundary update is out of order.")
+        raise _error("boundary_out_of_order")
     if current_page.state is not RagPageState.RUNNING:
-        raise _error("rag_page_not_running", "The RAG page is not running.")
+        raise _error("page_not_running")
     step_rows = await conn.fetch(
         "SELECT * FROM rag_steps WHERE run_id=$1 ORDER BY sequence FOR UPDATE",
         current_run.id,
@@ -950,25 +969,21 @@ async def mark_boundary(  # noqa: C901 - validates one authoritative boundary sn
     try:
         steps = tuple(_decode_db_step(row) for row in step_rows)
     except (TypeError, ValueError) as exc:
-        raise _error("rag_step_invalid", "Persisted RAG step state is invalid.") from exc
+        raise _error("step_invalid") from exc
     if any(step.status is RagStepStatus.RUNNING for step in steps):
-        raise _error("rag_step_still_running", "A RAG step is still running.")
+        raise _error("step_still_running")
     authoritative = RagUsage(
         steps=len(steps),
         model_tokens=sum(step.total_tokens for step in steps),
     )
     _require_usage(authoritative, current_run.budget)
     if usage != authoritative:
-        raise _error("rag_usage_mismatch", "The supplied RAG usage does not match persisted terminal steps.")
+        raise _error("usage_mismatch")
     if current_page.document_id is None:
         if current_page.version_read is not None or committed_version != 1:
-            raise _error("rag_document_version_mismatch", "A new page must commit document version 1.", retryable=True)
+            raise _error("document_version_mismatch_new")
     elif current_page.document_id != document_id or current_page.version_read != committed_version - 1:
-        raise _error(
-            "rag_document_version_mismatch",
-            "The page read identity does not match the committed document version.",
-            retryable=True,
-        )
+        raise _error("document_version_mismatch_read")
     await _require_document_version(
         conn,
         document_id=document_id,
@@ -1006,7 +1021,7 @@ async def mark_boundary(  # noqa: C901 - validates one authoritative boundary sn
             _usage_json(usage),
         )
         if page_updated is None or run_updated is None:  # pragma: no cover - rows are locked above.
-            raise _error("rag_boundary_conflict", "The RAG boundary could not be advanced.", retryable=True)
+            raise _error("boundary_conflict")
         decoded_run = _decode_db_run(run_updated)
         decoded_page = _decode_db_page(page_updated)
     return decoded_run, decoded_page
@@ -1020,9 +1035,9 @@ async def _authoritative_usage(conn: asyncpg.Connection, run: RagRunRecord) -> R
     try:
         steps = tuple(_decode_db_step(row) for row in rows)
     except (TypeError, ValueError) as exc:
-        raise _error("rag_step_invalid", "Persisted RAG step state is invalid.") from exc
+        raise _error("step_invalid") from exc
     if any(step.status is RagStepStatus.RUNNING for step in steps):
-        raise _error("rag_step_still_running", "A RAG step is still running.")
+        raise _error("step_still_running")
     usage = RagUsage(
         steps=len(steps),
         model_tokens=sum(step.total_tokens for step in steps),
@@ -1040,10 +1055,7 @@ async def _finish_locked_run(
 ) -> RagRunRecord:
     authoritative = await _authoritative_usage(conn, run)
     if caller_usage is not None and caller_usage != authoritative:
-        raise _error(
-            "rag_usage_mismatch",
-            "The supplied RAG usage does not match persisted terminal steps.",
-        )
+        raise _error("usage_mismatch")
     page_counts = await conn.fetchrow(
         "SELECT count(*) AS total,count(*) FILTER (WHERE state='committed') AS committed,"
         "count(*) FILTER (WHERE state='dry_run_complete') AS dry_run_complete "
@@ -1052,13 +1064,13 @@ async def _finish_locked_run(
     )
     total = page_counts["total"]
     if completion_reason is RagCompletionReason.NO_WORK and total != 0:
-        raise _error("rag_invalid_completion", "A non-empty run cannot finish with no work.")
+        raise _error("invalid_completion_no_work")
     if completion_reason is RagCompletionReason.COMPLETED and (total == 0 or page_counts["committed"] != total):
-        raise _error("rag_invalid_completion", "The RAG worklist is not fully committed.")
+        raise _error("invalid_completion_worklist")
     if completion_reason is RagCompletionReason.DRY_RUN and (
         not run.dry_run or total == 0 or page_counts["dry_run_complete"] != total
     ):
-        raise _error("rag_invalid_completion", "The dry RAG run is not complete.")
+        raise _error("invalid_completion_dry_run")
     async with conn.transaction():
         updated = await conn.fetchrow(
             "UPDATE rag_runs SET completion_reason=$2,usage=$3::jsonb "
@@ -1068,7 +1080,7 @@ async def _finish_locked_run(
             _usage_json(authoritative),
         )
         if updated is None:  # pragma: no cover - row is locked.
-            raise _error("rag_run_already_finished", "The RAG run is already finished.")
+            raise _error("run_already_finished")
         finished = _decode_db_run(updated)
     return finished
 
@@ -1088,10 +1100,10 @@ async def finish_run(
         raise ValueError("usage must be a RagUsage")
     row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run_id)
     if row is None:
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     run = _decode_db_run(row)
     if run.completion_reason is not None:
-        raise _error("rag_run_already_finished", "The RAG run is already finished.")
+        raise _error("run_already_finished")
     return await _finish_locked_run(
         conn,
         run=run,
@@ -1116,9 +1128,9 @@ async def record_terminal_job_state(
         run_id,
     )
     if row is None:
-        raise _error("rag_run_not_found", "The RAG run was not found.")
+        raise _error("run_not_found")
     if row["job_state"] not in {"succeeded", "failed", "cancelled"}:
-        raise _error("rag_job_not_terminal", "The RAG job is not terminal.")
+        raise _error("job_not_terminal")
     run = _decode_db_run(row)
     if row["job_state"] == "cancelled":
         return run
@@ -1134,14 +1146,11 @@ async def record_terminal_job_state(
     if (row["job_state"] == "succeeded" and completion_reason not in successful_reasons) or (
         row["job_state"] == "failed" and completion_reason not in failure_reasons
     ):
-        raise _error(
-            "rag_invalid_completion",
-            "The completion reason does not match the terminal job state.",
-        )
+        raise _error("invalid_completion_job_state")
     if run.completion_reason is not None:
         if run.completion_reason is completion_reason:
             return run
-        raise _error("rag_run_already_finished", "The RAG run is already finished.")
+        raise _error("run_already_finished")
     return await _finish_locked_run(
         conn,
         run=run,
@@ -1178,6 +1187,8 @@ async def list_steps_for_user(
 
 
 __all__ = [
+    "CREATE_RESUME_RAG_ERROR_CONTRACT_NAMES",
+    "CREATE_ROOT_RAG_ERROR_CONTRACT_NAMES",
     "find_by_idempotency",
     "create_root",
     "create_resume",

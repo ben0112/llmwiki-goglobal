@@ -3,16 +3,19 @@ from uuid import UUID
 import pytest
 
 from llmwiki_core.rag import (
+    RAG_ERROR_CONTRACTS,
     RagBudget,
     RagCitation,
     RagCompletionReason,
     RagDomainError,
+    RagErrorContract,
     RagPageState,
     RagRunConfig,
     RagStepStatus,
     RagStepType,
     RagUsage,
     RagWorkItem,
+    new_rag_error,
     remaining_work_items,
     validate_worklist,
 )
@@ -330,13 +333,8 @@ def test_run_config_rejects_non_string_retrieval_profiles_without_type_error():
     ("last_committed_ordinal", "expected_ordinals"),
     [(-1, [0, 1, 2]), (0, [1, 2]), (2, [])],
 )
-def test_remaining_work_items_returns_only_uncommitted_boundary_items(
-    last_committed_ordinal, expected_ordinals
-):
-    items = tuple(
-        RagWorkItem.build(ordinal, f"/wiki/launch/{ordinal}.md", "intent", "query")
-        for ordinal in range(3)
-    )
+def test_remaining_work_items_returns_only_uncommitted_boundary_items(last_committed_ordinal, expected_ordinals):
+    items = tuple(RagWorkItem.build(ordinal, f"/wiki/launch/{ordinal}.md", "intent", "query") for ordinal in range(3))
 
     assert [item.ordinal for item in remaining_work_items(items, last_committed_ordinal)] == expected_ordinals
 
@@ -410,3 +408,23 @@ def test_citation_and_domain_error_are_immutable_public_contracts():
     assert error.retryable is False
     with pytest.raises(AttributeError):
         citation.page = 3
+
+
+def test_public_rag_error_registry_is_frozen_and_constructs_fresh_errors():
+    contract = RAG_ERROR_CONTRACTS["idempotency_conflict"]
+
+    assert contract == RagErrorContract(
+        code="rag_idempotency_conflict",
+        public_message="The idempotency key was already used for a different request.",
+        retryable=False,
+    )
+    first = new_rag_error("idempotency_conflict")
+    second = new_rag_error("idempotency_conflict")
+    assert first is not second
+    assert (first.code, first.public_message, first.retryable) == (
+        contract.code,
+        contract.public_message,
+        contract.retryable,
+    )
+    with pytest.raises(TypeError):
+        RAG_ERROR_CONTRACTS["private_future_error"] = contract  # type: ignore[index]

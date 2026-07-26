@@ -308,7 +308,9 @@ async def test_worklist_decoder_failure_rolls_back_all_pages_savepoint(pool, see
     items = tuple(RagWorkItem.build(i, f"/wiki/platform/save-{i}.md", f"Intent {i}", f"Query {i}") for i in range(2))
     async with pool.acquire() as conn, conn.transaction():
         with monkeypatch.context() as patch:
-            patch.setattr(repository, "_decode_db_page", lambda _row: (_ for _ in ()).throw(ValueError("decoder failure")))
+            patch.setattr(
+                repository, "_decode_db_page", lambda _row: (_ for _ in ()).throw(ValueError("decoder failure"))
+            )
             with pytest.raises(ValueError, match="decoder failure"):
                 await repository.insert_worklist(conn, run, items)
         assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_run_pages WHERE run_id=$1)", run.id)
@@ -380,7 +382,9 @@ async def test_start_step_decoder_failure_rolls_back_step_savepoint(pool, seeded
     run, _ = await _create_root(pool, seeded_kb, key="step-savepoint")
     async with pool.acquire() as conn, conn.transaction():
         with monkeypatch.context() as patch:
-            patch.setattr(repository, "_decode_db_step", lambda _row: (_ for _ in ()).throw(ValueError("decoder failure")))
+            patch.setattr(
+                repository, "_decode_db_step", lambda _row: (_ for _ in ()).throw(ValueError("decoder failure"))
+            )
             with pytest.raises(ValueError, match="decoder failure"):
                 await repository.start_step(
                     conn,
@@ -1100,7 +1104,9 @@ async def test_authoritative_usage_includes_failed_terminal_steps(pool, seeded_k
 @pytest.mark.asyncio
 async def test_finish_step_enforces_cumulative_persisted_budget_before_mutation(pool, seeded_kb):
     budget = replace(RagBudget(), max_model_tokens=10)
-    run, _ = await _create_root(pool, seeded_kb, key="cumulative-step-budget", config=_config(seeded_kb.id, budget=budget))
+    run, _ = await _create_root(
+        pool, seeded_kb, key="cumulative-step-budget", config=_config(seeded_kb.id, budget=budget)
+    )
     async with pool.acquire() as conn, conn.transaction():
         first = await repository.start_step(
             conn, run_id=run.id, page_id=None, step_type=RagStepType.PLAN, input_digest="1" * 64
@@ -1310,9 +1316,7 @@ async def test_resume_decoder_failure_rolls_back_run_and_all_pages_savepoint(poo
     async with pool.acquire() as conn, conn.transaction():
         job = await JobService(pool).create_in_transaction(
             conn,
-            _job_command(
-                _config(seeded_kb.id), run_id=resume_id, user_id=seeded_kb.user_id, key="resume-savepoint"
-            ),
+            _job_command(_config(seeded_kb.id), run_id=resume_id, user_id=seeded_kb.user_id, key="resume-savepoint"),
             authenticated_user_id=seeded_kb.user_id,
         )
         with monkeypatch.context() as patch:
@@ -1741,6 +1745,54 @@ def _valid_run_row() -> dict[str, object]:
 def test_run_decoder_accepts_a_strict_valid_mapping():
     row = _valid_run_row()
     assert records._decode_run(row).id == row["id"]
+
+
+def test_direct_mapping_decoder_rejects_uuid_subclasses_without_stringifying_them():
+    class HostileUUID(UUID):
+        def __str__(self):
+            raise RuntimeError("private uuid mapping secret")
+
+    row = _valid_run_row()
+    row["id"] = HostileUUID(int=UUID(int=1).int)
+    adapted = records._adapt_db_run_row(row)
+
+    assert type(adapted["id"]) is HostileUUID
+    with pytest.raises(TypeError, match="id must be a UUID") as exc_info:
+        records._decode_run(adapted)
+    assert "private uuid mapping secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_public_asyncpg_record_adapter_normalizes_uuid_columns_to_base_uuid(pool, seeded_kb):
+    run_id = uuid4()
+    async with pool.acquire() as conn, conn.transaction():
+        job = await JobService(pool).create_in_transaction(
+            conn,
+            _job_command(
+                _config(seeded_kb.id),
+                run_id=run_id,
+                user_id=seeded_kb.user_id,
+                key="record-adapter",
+            ),
+            authenticated_user_id=seeded_kb.user_id,
+        )
+        await repository.create_root(
+            conn,
+            run_id=run_id,
+            job_id=job.id,
+            user_id=seeded_kb.user_id,
+            config=_config(seeded_kb.id),
+            idempotency_key="record-adapter",
+            request_digest="a" * 64,
+            model_profile_version="profile-v1",
+        )
+        raw = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1", run_id)
+
+    assert raw is not None
+    adapted = records._adapt_db_run_row(raw)
+    for field in ("id", "job_id", "root_run_id", "user_id", "knowledge_base_id"):
+        assert type(adapted[field]) is UUID
+    assert records._decode_run(adapted).id == run_id
 
 
 @pytest.mark.parametrize(
