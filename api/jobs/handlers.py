@@ -1,4 +1,4 @@
-"""Transport-neutral worker handler contracts and initial placeholder registry."""
+"""Transport-neutral worker handler contracts and explicitly staged registry."""
 
 from __future__ import annotations
 
@@ -725,3 +725,6 @@ HANDLERS: Mapping[JobType, Handler] = MappingProxyType(
         JobType.UPLOAD_CLEANUP: handle_upload_cleanup,
     }
 )
+
+# Persisted job types intentionally awaiting a concrete business handler.
+RESERVED_JOB_TYPES = frozenset({JobType.BUILD_WIKI})

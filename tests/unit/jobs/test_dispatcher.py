@@ -250,13 +250,31 @@ async def test_dispatch_cron_reads_only_worker_context_resources(monkeypatch):
 
 
 def test_handler_registry_is_complete_read_only_and_transport_neutral():
-    from jobs.handlers import HANDLERS
+    from jobs.handlers import (
+        HANDLERS,
+        RESERVED_JOB_TYPES,
+        handle_document_embed,
+        handle_document_extract,
+        handle_graph_rebuild,
+        handle_upload_cleanup,
+    )
     from jobs.models import JobType
 
     assert isinstance(HANDLERS, MappingProxyType)
-    assert set(HANDLERS) == set(JobType)
+    assert {
+        JobType.DOCUMENT_EXTRACT: handle_document_extract,
+        JobType.DOCUMENT_EMBED: handle_document_embed,
+        JobType.GRAPH_REBUILD: handle_graph_rebuild,
+        JobType.UPLOAD_CLEANUP: handle_upload_cleanup,
+    } == HANDLERS
+    assert frozenset({JobType.BUILD_WIKI}) == RESERVED_JOB_TYPES
+    assert set(HANDLERS).isdisjoint(RESERVED_JOB_TYPES)
+    assert set(HANDLERS) | RESERVED_JOB_TYPES == set(JobType)
+    assert JobType.BUILD_WIKI not in HANDLERS
     with pytest.raises(TypeError):
         HANDLERS[JobType.DOCUMENT_EXTRACT] = object()
+    with pytest.raises(AttributeError):
+        RESERVED_JOB_TYPES.add(JobType.DOCUMENT_EXTRACT)  # type: ignore[attr-defined]
 
     handlers_module = inspect.getmodule(next(iter(HANDLERS.values())))
     assert handlers_module is not None

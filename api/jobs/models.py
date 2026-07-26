@@ -30,6 +30,7 @@ class JobType(StrEnum):
     DOCUMENT_EMBED = "document.embed"
     GRAPH_REBUILD = "graph.rebuild"
     UPLOAD_CLEANUP = "upload.cleanup"
+    BUILD_WIKI = "build_wiki"
 
 
 class JobState(StrEnum):
@@ -114,9 +115,13 @@ class JobCreate:
     run_after: datetime | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.job_type, JobType):
+            raise ValueError("job_type must be a JobType")
         object.__setattr__(self, "payload", _freeze_mapping(self.payload))
         if self.job_type is JobType.DOCUMENT_EMBED:
             _validate_document_embed_command(self)
+        elif self.job_type is JobType.BUILD_WIKI:
+            _validate_build_wiki_command(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +189,31 @@ def _validate_document_embed_command(command: JobCreate) -> None:
         raise ValueError("document embedding model is invalid")
     if type(dimensions) is not int or not 1 <= dimensions <= 4096:
         raise ValueError("document embedding dimensions must be between 1 and 4096")
+
+
+def _validate_build_wiki_command(command: JobCreate) -> None:
+    if set(command.payload) != {"run_id"}:
+        raise ValueError("build wiki payload must contain exactly run_id")
+    raw_run_id = command.payload.get("run_id")
+    try:
+        run_id = UUID(raw_run_id) if isinstance(raw_run_id, str) else None
+    except ValueError:
+        run_id = None
+    if run_id is None or str(run_id) != raw_run_id:
+        raise ValueError("build wiki payload must contain a canonical UUID run_id")
+    if command.knowledge_base_id is None:
+        raise ValueError("build wiki command requires a knowledge base")
+    if command.document_id is not None:
+        raise ValueError("build wiki command must not reference a document")
+    idempotency_key = command.idempotency_key
+    if (
+        type(idempotency_key) is not str
+        or not 1 <= len(idempotency_key) <= 200
+        or idempotency_key.strip() != idempotency_key
+    ):
+        raise ValueError("build wiki command requires a normalized idempotency key")
+    if type(command.max_attempts) is not int or not 1 <= command.max_attempts <= 20:
+        raise ValueError("build wiki max_attempts must be an integer between 1 and 20")
 
 
 def retry_delay_seconds(

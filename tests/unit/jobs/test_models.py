@@ -1,5 +1,5 @@
 import json
-from dataclasses import FrozenInstanceError, is_dataclass
+from dataclasses import FrozenInstanceError, is_dataclass, replace
 from datetime import UTC, datetime
 from math import inf, nan
 from uuid import UUID, uuid4
@@ -29,7 +29,77 @@ def test_job_type_values_are_stable():
         "document.embed",
         "graph.rebuild",
         "upload.cleanup",
+        "build_wiki",
     ]
+
+
+def test_build_wiki_job_requires_exact_public_payload():
+    run_id = uuid4()
+    command = JobCreate(
+        job_type=JobType.BUILD_WIKI,
+        user_id=uuid4(),
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        idempotency_key="rag:create:one",
+    )
+
+    assert command.payload == {"run_id": str(run_id)}
+    with pytest.raises(ValueError, match="build wiki payload"):
+        replace(command, payload={"run_id": str(run_id), "goal": "private"})
+
+
+def test_build_wiki_job_accepts_normalized_200_character_idempotency_key():
+    command = JobCreate(
+        job_type=JobType.BUILD_WIKI,
+        user_id=uuid4(),
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(uuid4())},
+        idempotency_key="x" * 200,
+    )
+
+    assert command.idempotency_key == "x" * 200
+
+
+@pytest.mark.parametrize("job_type", ["build_wiki", "document.extract", object()])
+def test_job_create_rejects_non_enum_job_types_before_specific_validation(job_type):
+    with pytest.raises(ValueError, match="job_type"):
+        JobCreate(job_type=job_type, user_id=uuid4())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"payload": {}}, "build wiki payload"),
+        ({"payload": {"run_id": "not-a-uuid"}}, "build wiki payload"),
+        (
+            {"payload": {"run_id": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"}},
+            "build wiki payload",
+        ),
+        ({"knowledge_base_id": None}, "knowledge base"),
+        ({"document_id": uuid4()}, "document"),
+        ({"idempotency_key": None}, "idempotency"),
+        ({"idempotency_key": ""}, "idempotency"),
+        ({"idempotency_key": "   "}, "idempotency"),
+        ({"idempotency_key": " not-normalized"}, "idempotency"),
+        ({"idempotency_key": "not-normalized "}, "idempotency"),
+        ({"idempotency_key": "x" * 201}, "idempotency"),
+        ({"idempotency_key": type("Key", (str,), {})("key")}, "idempotency"),
+        ({"max_attempts": True}, "max_attempts"),
+        ({"max_attempts": 0}, "max_attempts"),
+        ({"max_attempts": 21}, "max_attempts"),
+    ],
+)
+def test_build_wiki_job_rejects_invalid_command_scope(changes, message):
+    command = JobCreate(
+        job_type=JobType.DOCUMENT_EXTRACT,
+        user_id=uuid4(),
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(uuid4())},
+        idempotency_key="rag:create:scope",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        replace(command, job_type=JobType.BUILD_WIKI, **changes)
 
 
 def test_job_state_values_and_terminal_states_are_stable():
