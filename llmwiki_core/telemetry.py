@@ -9,7 +9,7 @@ from math import isfinite
 from re import compile as compile_pattern
 from uuid import UUID
 
-from .signals import sanitized_process_signal
+from .signals import sanitized_boundary_signal_or_unknown
 
 TELEMETRY_SCHEMA_VERSION = 1
 _MAX_STRING_CHARS = 256
@@ -232,10 +232,8 @@ def emit(logger: object, event: str, /, **fields: object) -> None:
         failure = caught
     if failure is None:
         return
-    if signal := sanitized_process_signal(failure):
+    if signal := sanitized_boundary_signal_or_unknown(failure):
         raise signal from None
-    if not isinstance(failure, Exception):
-        raise BaseException() from None
 
 
 __all__ = [

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import struct
 from collections.abc import Mapping, Sequence
@@ -23,7 +22,7 @@ from llmwiki_core.search import (
     SearchResult,
     SearchScope,
 )
-from llmwiki_core.signals import sanitized_process_signal
+from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 
 _MAX_EMBEDDINGS_PER_DOCUMENT = 10_000
 _POSTGRES_INTEGER_MAX = 2_147_483_647
@@ -111,14 +110,7 @@ class PostgresVectorStore:
                 )
         except (_VectorWriteRejected, RetrieverUnavailable):
             raise
-        except (
-            KeyboardInterrupt,
-            SystemExit,
-            asyncio.CancelledError,
-            GeneratorExit,
-            BaseExceptionGroup,
-            Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
-        ) as caught:
+        except BaseException as caught:  # noqa: BLE001 - sanitize the database adapter boundary.
             failure = caught
         if failure is not None:
             _raise_sanitized_boundary(failure, "vector store is unavailable")
@@ -321,7 +313,7 @@ class PostgresVectorStore:
 
 
 def _raise_sanitized_boundary(failure: BaseException, message: str) -> Never:
-    signal = sanitized_process_signal(failure)
+    signal = sanitized_boundary_signal_or_unknown(failure)
     if signal is not None:
         raise signal
     raise RetrieverUnavailable(message)
@@ -332,14 +324,7 @@ async def _fetch_rows(pool, sql: str, params: Sequence[object]):
     rows = ()
     try:
         rows = await pool.fetch(sql, *params)
-    except (
-        KeyboardInterrupt,
-        SystemExit,
-        asyncio.CancelledError,
-        GeneratorExit,
-        BaseExceptionGroup,
-        Exception,  # noqa: BLE001 - sanitize the database adapter boundary.
-    ) as caught:
+    except BaseException as caught:  # noqa: BLE001 - sanitize the database adapter boundary.
         failure = caught
     if failure is not None:
         _raise_sanitized_boundary(failure, "vector store is unavailable")
@@ -359,14 +344,7 @@ def _result_from_rows(rows, *, started_at: float) -> SearchResult:
             latency_ms=(perf_counter() - started_at) * 1000,
             profile="vector",
         )
-    except (
-        KeyboardInterrupt,
-        SystemExit,
-        asyncio.CancelledError,
-        GeneratorExit,
-        BaseExceptionGroup,
-        Exception,  # noqa: BLE001 - malformed backend rows are unavailable.
-    ) as caught:
+    except BaseException as caught:  # noqa: BLE001 - malformed backend rows are unavailable.
         failure = caught
     if failure is not None:
         _raise_sanitized_boundary(failure, "vector store is unavailable")

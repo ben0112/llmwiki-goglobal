@@ -5,51 +5,51 @@ from __future__ import annotations
 import asyncio
 
 
-def sanitized_process_signal(*failures: BaseException) -> BaseException | None:
-    """Select a fresh signal using KI > SystemExit > cancellation > GE priority."""
+def _fresh_control_signal(failure: BaseException) -> tuple[int, BaseException] | None:
+    if isinstance(failure, KeyboardInterrupt):
+        return 0, KeyboardInterrupt()
+    if isinstance(failure, SystemExit):
+        code = failure.code
+        safe_code = int(code) if isinstance(code, bool) else code if type(code) is int else 1
+        return 1, SystemExit(safe_code)
+    if isinstance(failure, asyncio.CancelledError):
+        return 2, asyncio.CancelledError()
+    if isinstance(failure, GeneratorExit):
+        return 3, GeneratorExit()
+    return None
+
+
+def sanitized_boundary_signal_or_unknown(
+    *failures: BaseException,
+) -> BaseException | None:
+    """Classify boundary failures without exposing provider-owned exceptions."""
     seen: set[int] = set()
     pending = list(reversed(failures))
-    system_exit_code = None
-    has_system_exit = False
-    has_cancellation = False
-    has_generator_exit = False
+    selected: tuple[int, BaseException] | None = None
+    has_unknown = False
     while pending:
         current = pending.pop()
         identity = id(current)
         if identity in seen:
             continue
         seen.add(identity)
-        if isinstance(current, KeyboardInterrupt):
-            return KeyboardInterrupt()
-        if isinstance(current, SystemExit):
-            if not has_system_exit:
-                code = current.code
-                system_exit_code = (
-                    int(code)
-                    if isinstance(code, bool)
-                    else code
-                    if type(code) is int
-                    else 1
-                )
-                has_system_exit = True
-        elif isinstance(current, asyncio.CancelledError):
-            has_cancellation = True
-        elif isinstance(current, GeneratorExit):
-            has_generator_exit = True
+        control = _fresh_control_signal(current)
+        if control is not None and (selected is None or control[0] < selected[0]):
+            selected = control
         if isinstance(current, BaseExceptionGroup):
             pending.extend(reversed(current.exceptions))
+        elif not isinstance(current, Exception):
+            has_unknown = True
         pending.extend(
             linked
             for linked in reversed((current.__cause__, current.__context__))
             if linked is not None
         )
-    if has_system_exit:
-        return SystemExit(system_exit_code)
-    if has_cancellation:
-        return asyncio.CancelledError()
-    if has_generator_exit:
-        return GeneratorExit()
+    if selected is not None:
+        return selected[1]
+    if has_unknown:
+        return BaseException()
     return None
 
 
-__all__ = ["sanitized_process_signal"]
+__all__ = ["sanitized_boundary_signal_or_unknown"]

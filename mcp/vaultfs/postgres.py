@@ -8,6 +8,7 @@ from datetime import date
 from math import isfinite
 from numbers import Real
 from time import perf_counter
+from typing import NoReturn
 
 import aioboto3
 import asyncpg
@@ -25,7 +26,7 @@ from llmwiki_core.search import (
     SearchResult,
     SearchScope,
 )
-from llmwiki_core.signals import sanitized_process_signal
+from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 
 from .base import (
@@ -191,6 +192,12 @@ def _postgres_document_filters(
     where.extend(facet_conds)
     params.extend(facet_params)
     return where
+
+
+def _raise_postgres_ordinary_boundary(failure: BaseException, message: str) -> NoReturn:
+    if isinstance(failure, (asyncpg.PostgresError, OSError, TimeoutError)):
+        raise RetrieverUnavailable(message) from None
+    raise failure
 
 
 class PostgresVaultFS(VaultFS):
@@ -646,12 +653,15 @@ class PostgresVaultFS(VaultFS):
                 profile.model,
                 profile.dimensions,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
             availability_failure = failure
         if availability_failure is not None:
-            if signal := sanitized_process_signal(availability_failure):
+            if signal := sanitized_boundary_signal_or_unknown(availability_failure):
                 raise signal from None
-            raise RetrieverUnavailable("vector store is unavailable") from None
+            _raise_postgres_ordinary_boundary(
+                availability_failure,
+                "vector store is unavailable",
+            )
         if not available or not available["available"]:
             raise RetrieverUnavailable("current embeddings are unavailable")
 
@@ -717,12 +727,15 @@ class PostgresVaultFS(VaultFS):
                 f"LIMIT {limit_param}",
                 *params,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
             search_failure = failure
         if search_failure is not None:
-            if signal := sanitized_process_signal(search_failure):
+            if signal := sanitized_boundary_signal_or_unknown(search_failure):
                 raise signal from None
-            raise RetrieverUnavailable("vector store is unavailable") from None
+            _raise_postgres_ordinary_boundary(
+                search_failure,
+                "vector store is unavailable",
+            )
         hits = tuple(_postgres_search_hit(row) for row in rows)
         candidate_count = int(rows[0]["candidate_count"]) if rows else 0
         return SearchResult(
@@ -795,12 +808,15 @@ class PostgresVaultFS(VaultFS):
                 f"ORDER BY direct_rank, document_id LIMIT {limit_parameter}",
                 *params,
             )
-        except (asyncpg.PostgresError, OSError, TimeoutError) as failure:
+        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
             expansion_failure = failure
         if expansion_failure is not None:
-            if signal := sanitized_process_signal(expansion_failure):
+            if signal := sanitized_boundary_signal_or_unknown(expansion_failure):
                 raise signal from None
-            raise RetrieverUnavailable("reference expansion is unavailable") from None
+            _raise_postgres_ordinary_boundary(
+                expansion_failure,
+                "reference expansion is unavailable",
+            )
         return tuple(_postgres_search_hit(row) for row in rows[:limit])
 
     async def search_chunks(

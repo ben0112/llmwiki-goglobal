@@ -622,6 +622,123 @@ async def _invoke_boundary(store, operation):
     )
 
 
+class _UnknownVectorBoundaryFailure(BaseException):
+    pass
+
+
+def _unknown_vector_failure(shape: str) -> BaseException:
+    unknown = _UnknownVectorBoundaryFailure("private unknown dsn=postgres://token")
+    if shape == "direct":
+        return unknown
+    wrapper = RuntimeError("private wrapper")
+    if shape == "cause":
+        wrapper.__cause__ = unknown
+        return wrapper
+    if shape == "context":
+        wrapper.__context__ = unknown
+        return wrapper
+    if shape == "nested-group":
+        return BaseExceptionGroup(
+            "private outer",
+            [RuntimeError("ordinary"), BaseExceptionGroup("private inner", [unknown])],
+        )
+    if shape == "mixed":
+        return BaseExceptionGroup(
+            "private mixed",
+            [ValueError("ordinary"), unknown, RuntimeError("ordinary two")],
+        )
+    if shape == "cycle":
+        wrapper.__cause__ = wrapper
+        wrapper.__context__ = unknown
+        return wrapper
+    raise AssertionError(f"unsupported shape: {shape}")
+
+
+class _UnknownRow:
+    def __init__(self, failure):
+        self._failure = failure
+
+    def keys(self):
+        raise self._failure
+
+
+class _RowsPool:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def fetch(self, *_args):
+        return self._rows
+
+
+class _CleanupTransaction:
+    def __init__(self, failure):
+        self._failure = failure
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        raise self._failure
+
+
+class _CleanupConnection:
+    def __init__(self, failure):
+        self._failure = failure
+
+    def transaction(self):
+        return _CleanupTransaction(self._failure)
+
+
+class _CleanupPool:
+    def __init__(self, failure):
+        self._connection = _CleanupConnection(failure)
+
+    def acquire(self):
+        return _ReturningAsyncContext(self._connection)
+
+
+_VECTOR_STORE_BOUNDARIES = ("search", "replace", "row", "cleanup")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", _VECTOR_STORE_BOUNDARIES)
+@pytest.mark.parametrize(
+    "shape",
+    ["direct", "cause", "context", "nested-group", "mixed", "cycle"],
+)
+async def test_vector_store_unknown_boundary_inventory_is_sanitized(
+    monkeypatch,
+    boundary,
+    shape,
+):
+    failure = _unknown_vector_failure(shape)
+    if boundary == "row":
+        store = _store(_RowsPool([_UnknownRow(failure)]))
+    elif boundary == "cleanup":
+        store = _store(_CleanupPool(failure))
+
+        async def replace_in_transaction(*_args, **_kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            store,
+            "replace_document_embeddings_in_transaction",
+            replace_in_transaction,
+        )
+    else:
+        store = _store(_GroupedFailurePool(failure))
+
+    with pytest.raises(BaseException) as raised:
+        await _invoke_boundary(
+            store,
+            "search" if boundary == "row" else "replace" if boundary == "cleanup" else boundary,
+        )
+
+    assert type(raised.value) is BaseException
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["search", "replace"])
 async def test_mixed_cancellation_group_preserves_only_sanitized_cancellation(
@@ -729,7 +846,7 @@ def _control_group(signal, shape):
     ],
     ids=lambda value: value if isinstance(value, str) else None,
 )
-async def test_control_flow_groups_preserve_only_sanitized_process_signal(
+async def test_control_flow_groups_preserve_only_sanitized_boundary_signal(
     operation, shape, kind, code, expected_type, expected_code
 ):
     failure = _control_group(_control_signal(kind, code), shape)

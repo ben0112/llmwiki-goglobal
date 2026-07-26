@@ -24,7 +24,7 @@ from llmwiki_core.search import (
     SearchQuery,
     SearchResult,
 )
-from llmwiki_core.signals import sanitized_process_signal
+from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 from llmwiki_core.telemetry import TELEMETRY_SCHEMA_VERSION, emit, validated_event
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,11 @@ class HostedRetrievalService:
     ) -> SearchResult:
         retrieval_id = uuid4()
         if profile == "lexical":
-            result = await self._vault.retrieve(self._knowledge_base_id, query)
+            result = await _LexicalRetriever(
+                self._vault,
+                self._knowledge_base_id,
+                query.candidate_limit,
+            ).retrieve(query)
             self._emit_retrieval_finished(retrieval_id, result)
             return result
         if profile != "hybrid":
@@ -110,11 +114,10 @@ class HostedRetrievalService:
                 )
             except BaseException as failure:  # noqa: BLE001 - sanitize hidden signals.
                 fallback_failure = failure
-            if fallback_failure is not None:
-                if signal := sanitized_process_signal(fallback_failure):
-                    raise signal from None
-                if not isinstance(fallback_failure, Exception):
-                    raise fallback_failure
+            if fallback_failure is not None and (
+                signal := sanitized_boundary_signal_or_unknown(fallback_failure)
+            ):
+                raise signal from None
             self._emit_telemetry(
                 "retrieval_fallback",
                 schema_version=TELEMETRY_SCHEMA_VERSION,
@@ -149,10 +152,8 @@ class HostedRetrievalService:
             failure = caught
         if failure is None:
             return
-        if signal := sanitized_process_signal(failure):
+        if signal := sanitized_boundary_signal_or_unknown(failure):
             raise signal from None
-        if not isinstance(failure, Exception):
-            raise BaseException() from None
 
     def _validated_hybrid_profile(self) -> EmbeddingProfile:
         profile = getattr(self._settings, "embedding_profile", None)
@@ -175,10 +176,11 @@ class HostedRetrievalService:
         return lexical, vector
 
     def _new_embedding_client(self):
-        if self._embedding_client_factory is not None:
-            return self._embedding_client_factory()
+        injected_factory = self._embedding_client_factory
         factory_failure = None
         try:
+            if injected_factory is not None:
+                return injected_factory()
             api_key = self._settings.EMBEDDING_API_KEY.get_secret_value()
             return _OpenAICompatibleQueryEmbeddingClient(
                 profile=self._validated_hybrid_profile(),
@@ -188,9 +190,9 @@ class HostedRetrievalService:
             )
         except BaseException as failure:  # noqa: BLE001 - sanitize provider construction.
             factory_failure = failure
-        if signal := sanitized_process_signal(factory_failure):
+        if signal := sanitized_boundary_signal_or_unknown(factory_failure):
             raise signal from None
-        if not isinstance(factory_failure, Exception):
+        if injected_factory is not None:
             raise factory_failure
         raise EmbeddingUnavailable("embedding provider unavailable") from None
 
@@ -202,10 +204,20 @@ class _LexicalRetriever:
         self._candidate_limit = candidate_limit
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
-        return await self._vault.retrieve(
-            self._knowledge_base_id,
-            _query_with_candidate_limit(query, self._candidate_limit),
-        )
+        failure = None
+        result = None
+        try:
+            result = await self._vault.retrieve(
+                self._knowledge_base_id,
+                _query_with_candidate_limit(query, self._candidate_limit),
+            )
+        except BaseException as caught:  # noqa: BLE001 - sanitize adapter signals.
+            failure = caught
+        if failure is not None:
+            if signal := sanitized_boundary_signal_or_unknown(failure):
+                raise signal from None
+            raise failure
+        return result
 
 
 class _VectorRetriever:
@@ -255,15 +267,9 @@ class _VectorRetriever:
             for failure in (main_failure, close_failure)
             if failure is not None
         )
-        if signal := sanitized_process_signal(*failures):
+        if signal := sanitized_boundary_signal_or_unknown(*failures):
             self.available = False
             raise signal from None
-        if nonordinary := next(
-            (failure for failure in failures if not isinstance(failure, Exception)),
-            None,
-        ):
-            self.available = False
-            raise nonordinary
         if main_failure is not None:
             self.available = False
             if isinstance(main_failure, (EmbeddingError, RetrieverUnavailable)):
@@ -302,7 +308,7 @@ class _GraphExpander:
         except BaseException as failure:  # noqa: BLE001 - sanitize graph callback signals.
             graph_failure = failure
         if graph_failure is not None:
-            if signal := sanitized_process_signal(graph_failure):
+            if signal := sanitized_boundary_signal_or_unknown(graph_failure):
                 raise signal from None
             if isinstance(graph_failure, RetrieverUnavailable):
                 return ()
@@ -333,10 +339,8 @@ class _PreservingReranker:
             return tuple(hits)
         except BaseException as failure:  # noqa: BLE001 - sanitize reranker signals.
             rerank_failure = failure
-        if signal := sanitized_process_signal(rerank_failure):
+        if signal := sanitized_boundary_signal_or_unknown(rerank_failure):
             raise signal from None
-        if not isinstance(rerank_failure, Exception):
-            raise rerank_failure
         return tuple(hits)
 
 

@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -277,7 +278,7 @@ async def test_invalid_query_embedding_fails_closed_to_lexical(vectors):
 
 
 def test_process_signal_sanitizer_recurses_with_fixed_priority_and_safe_exit_codes():
-    from llmwiki_core.signals import sanitized_process_signal
+    from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
 
     private = RuntimeError("private backend URL and key")
     private.__cause__ = asyncio.CancelledError("private cancellation")
@@ -286,19 +287,19 @@ def test_process_signal_sanitizer_recurses_with_fixed_priority_and_safe_exit_cod
     hidden_keyboard = RuntimeError("private wrapper")
     hidden_keyboard.__context__ = KeyboardInterrupt("private interrupt")
 
-    signal = sanitized_process_signal(group, hidden_keyboard)
+    signal = sanitized_boundary_signal_or_unknown(group, hidden_keyboard)
     assert type(signal) is KeyboardInterrupt
     assert signal.args == ()
     assert signal.__cause__ is None and signal.__context__ is None
 
-    assert sanitized_process_signal(SystemExit(True)).code == 1
-    assert sanitized_process_signal(SystemExit(False)).code == 0
-    assert sanitized_process_signal(SystemExit(17)).code == 17
-    assert sanitized_process_signal(SystemExit(None)).code == 1
-    assert sanitized_process_signal(SystemExit("private")).code == 1
+    assert sanitized_boundary_signal_or_unknown(SystemExit(True)).code == 1
+    assert sanitized_boundary_signal_or_unknown(SystemExit(False)).code == 0
+    assert sanitized_boundary_signal_or_unknown(SystemExit(17)).code == 17
+    assert sanitized_boundary_signal_or_unknown(SystemExit(None)).code == 1
+    assert sanitized_boundary_signal_or_unknown(SystemExit("private")).code == 1
     cycle = RuntimeError("private cycle")
     cycle.__cause__ = cycle
-    assert sanitized_process_signal(cycle) is None
+    assert sanitized_boundary_signal_or_unknown(cycle) is None
 
 
 @pytest.mark.asyncio
@@ -560,6 +561,204 @@ async def test_process_signals_are_never_downgraded_to_fallback(failure):
 
     with pytest.raises(type(failure)):
         await service.retrieve(SearchQuery.build(text="q", limit=1), profile="hybrid")
+
+
+class _UnknownBoundaryFailure(BaseException):
+    pass
+
+
+def _unknown_boundary_failure(shape: str) -> BaseException:
+    unknown = _UnknownBoundaryFailure("private unknown token")
+    if shape == "direct":
+        return unknown
+    wrapper = RuntimeError("private wrapper")
+    if shape == "cause":
+        wrapper.__cause__ = unknown
+        return wrapper
+    if shape == "context":
+        wrapper.__context__ = unknown
+        return wrapper
+    if shape == "nested-group":
+        return BaseExceptionGroup(
+            "private outer",
+            [RuntimeError("ordinary"), BaseExceptionGroup("private inner", [unknown])],
+        )
+    if shape == "mixed":
+        return BaseExceptionGroup(
+            "private mixed",
+            [ValueError("ordinary"), unknown, RuntimeError("ordinary two")],
+        )
+    if shape == "cycle":
+        wrapper.__cause__ = wrapper
+        wrapper.__context__ = unknown
+        return wrapper
+    raise AssertionError(f"unsupported shape: {shape}")
+
+
+_RETRIEVAL_BOUNDARIES = (
+    "lexical",
+    "fallback_signal",
+    "default_factory",
+    "injected_factory",
+    "embed",
+    "aclose",
+    "vector",
+    "graph",
+    "reranker",
+    "iterator",
+    "telemetry",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", _RETRIEVAL_BOUNDARIES)
+@pytest.mark.parametrize(
+    "shape",
+    ["direct", "cause", "context", "nested-group", "mixed", "cycle"],
+)
+async def test_retrieval_external_boundary_unknown_inventory_is_sanitized(
+    boundary,
+    shape,
+):
+    from services.retrieval import HostedRetrievalService
+
+    failure = _unknown_boundary_failure(shape)
+    vault = _Vault()
+    kwargs = {"telemetry_sink": lambda *_args, **_fields: None}
+    settings = _settings()
+    query = SearchQuery.build(text="private query", limit=1)
+    profile = "hybrid"
+
+    if boundary == "lexical":
+        async def retrieve(*_args, **_kwargs):
+            raise failure
+
+        vault.retrieve = retrieve
+        profile = "lexical"
+    elif boundary == "fallback_signal":
+        vault.vector = RetrieverUnavailable("ordinary unavailable")
+
+        def fallback_signal(**_fields):
+            raise failure
+
+        kwargs["fallback_signal"] = fallback_signal
+        kwargs["embedding_client_factory"] = _EmbeddingClient
+    elif boundary == "default_factory":
+        class Secret:
+            def get_secret_value(self):
+                raise failure
+
+        settings = _settings(EMBEDDING_API_KEY=Secret())
+    elif boundary == "injected_factory":
+        def factory():
+            raise failure
+
+        kwargs["embedding_client_factory"] = factory
+    elif boundary in ("embed", "aclose"):
+        kwargs["embedding_client_factory"] = lambda: _BoundaryEmbeddingClient(
+            embed_failure=failure if boundary == "embed" else None,
+            close_failure=failure if boundary == "aclose" else None,
+        )
+    elif boundary == "vector":
+        vault.vector = failure
+        kwargs["embedding_client_factory"] = _EmbeddingClient
+    elif boundary == "graph":
+        vault.lexical = SearchResult((_hit("direct"),), 1)
+        vault.vector = SearchResult((), 0)
+        query = SearchQuery.build(text="private query", limit=2)
+
+        async def expand(*_args, **_kwargs):
+            raise failure
+
+        vault.expand_references = expand
+        kwargs["embedding_client_factory"] = _EmbeddingClient
+    elif boundary == "reranker":
+        class Reranker:
+            async def rerank(self, _query, _hits):
+                raise failure
+
+        kwargs["reranker"] = Reranker()
+        kwargs["embedding_client_factory"] = _EmbeddingClient
+    elif boundary == "iterator":
+        class FailingIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise failure
+
+        class Reranker:
+            async def rerank(self, _query, _hits):
+                return FailingIterator()
+
+        kwargs["reranker"] = Reranker()
+        kwargs["embedding_client_factory"] = _EmbeddingClient
+    elif boundary == "telemetry":
+        def telemetry_sink(*_args, **_fields):
+            raise failure
+
+        kwargs["telemetry_sink"] = telemetry_sink
+        profile = "lexical"
+
+    service = HostedRetrievalService(vault, "kb-1", settings=settings, **kwargs)
+    with pytest.raises(BaseException) as raised:
+        await service.retrieve(query, profile=profile)
+
+    assert type(raised.value) is BaseException
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+_POSTGRES_RETRIEVAL_BOUNDARIES = ("availability", "vector_query", "graph_query")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", _POSTGRES_RETRIEVAL_BOUNDARIES)
+@pytest.mark.parametrize(
+    "shape",
+    ["direct", "cause", "context", "nested-group", "mixed", "cycle"],
+)
+async def test_postgres_retrieval_boundary_unknown_inventory_is_sanitized(
+    monkeypatch,
+    boundary,
+    shape,
+):
+    import vaultfs.postgres as postgres
+
+    failure = _unknown_boundary_failure(shape)
+    vault = postgres.PostgresVaultFS(str(uuid4()))
+
+    async def fail(*_args, **_kwargs):
+        raise failure
+
+    async def available(*_args, **_kwargs):
+        return {"available": True}
+
+    if boundary == "availability":
+        monkeypatch.setattr(postgres, "scoped_queryrow", fail)
+    else:
+        monkeypatch.setattr(postgres, "scoped_queryrow", available)
+        monkeypatch.setattr(postgres, "scoped_query", fail)
+
+    with pytest.raises(BaseException) as raised:
+        if boundary == "graph_query":
+            await vault.expand_references(
+                str(uuid4()),
+                SearchQuery.build(text="private query", limit=2),
+                (_hit("direct"),),
+                limit=1,
+            )
+        else:
+            await vault.retrieve_vector(
+                str(uuid4()),
+                SearchQuery.build(text="private query", limit=1),
+                embedding=(1.0, 0.0, 0.0),
+                profile=PROFILE,
+            )
+
+    assert type(raised.value) is BaseException
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
 @pytest.mark.asyncio
