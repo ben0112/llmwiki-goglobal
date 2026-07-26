@@ -49,7 +49,10 @@ class RagModelUnavailable(RagDomainError):
 class InvalidRagModelResponse(RagDomainError):
     """A sanitized provider response contract violation."""
 
-    def __init__(self) -> None:
+    def __init__(self, usage: RagTokenUsage | None = None) -> None:
+        if usage is not None and type(usage) is not RagTokenUsage:
+            raise ValueError(_INVALID_RESPONSE_MESSAGE)
+        self.usage = usage
         super().__init__("rag_model_invalid_response", _INVALID_RESPONSE_MESSAGE, retryable=False)
 
 
@@ -105,7 +108,7 @@ class RagTokenUsage:
 
     def __post_init__(self) -> None:
         values = (self.prompt_tokens, self.completion_tokens, self.total_tokens)
-        if any(type(value) is not int or value < 0 for value in values):
+        if any(type(value) is not int or not 0 <= value <= MAX_MODEL_TOKENS for value in values):
             raise ValueError(_INVALID_RESPONSE_MESSAGE)
         if self.prompt_tokens + self.completion_tokens != self.total_tokens:
             raise ValueError(_INVALID_RESPONSE_MESSAGE)
@@ -227,9 +230,7 @@ class OpenAICompatibleRagModel:
         self._closed = False
         self._close_lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
-        owned_transport = (
-            transport if transport is not None else httpx.AsyncHTTPTransport(trust_env=False)
-        )
+        owned_transport = transport if transport is not None else httpx.AsyncHTTPTransport(trust_env=False)
         self._transport = _RetryableCloseTransport(owned_transport)
         self._client = httpx.AsyncClient(
             transport=self._transport,
@@ -629,27 +630,31 @@ def _validate_json_depth(value: Any) -> None:
 def _parse_response(outer: Any) -> RagModelResponse:
     if not isinstance(outer, dict):
         raise InvalidRagModelResponse
+    token_usage = _parse_response_usage(outer)
     choices = outer.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
-        raise InvalidRagModelResponse
+        raise InvalidRagModelResponse(token_usage)
     choice = choices[0]
     if not isinstance(choice, dict):
-        raise InvalidRagModelResponse
+        raise InvalidRagModelResponse(token_usage)
     message = choice.get("message")
     if not isinstance(message, dict):
-        raise InvalidRagModelResponse
+        raise InvalidRagModelResponse(token_usage)
     content = message.get("content")
     if not isinstance(content, str):
-        raise InvalidRagModelResponse
+        raise InvalidRagModelResponse(token_usage)
     payload = _load_strict_json(content)
     if payload is _INVALID_JSON or not isinstance(payload, dict):
-        raise InvalidRagModelResponse
+        raise InvalidRagModelResponse(token_usage)
+    return RagModelResponse(payload=payload, usage=token_usage)
 
+
+def _parse_response_usage(outer: Mapping[str, object]) -> RagTokenUsage:
     usage = outer.get("usage")
     expected_usage = {"prompt_tokens", "completion_tokens", "total_tokens"}
     if not isinstance(usage, dict) or set(usage) != expected_usage:
         raise InvalidRagModelResponse
-    invalid_usage = False
+    invalid = False
     try:
         token_usage = RagTokenUsage(
             prompt_tokens=usage["prompt_tokens"],
@@ -657,11 +662,11 @@ def _parse_response(outer: Any) -> RagModelResponse:
             total_tokens=usage["total_tokens"],
         )
     except ValueError:
-        invalid_usage = True
+        invalid = True
         token_usage = None
-    if invalid_usage or token_usage is None:
-        raise InvalidRagModelResponse
-    return RagModelResponse(payload=payload, usage=token_usage)
+    if invalid or token_usage is None:
+        raise InvalidRagModelResponse from None
+    return token_usage
 
 
 def _raise_boundary_failure(failure: BaseException, replacement: Exception) -> NoReturn:

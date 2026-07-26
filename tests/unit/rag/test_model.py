@@ -14,6 +14,7 @@ from rag.model import (
     InvalidRagModelResponse,
     OpenAICompatibleRagModel,
     RagModelUnavailable,
+    RagTokenUsage,
     ResolvedRagModelProfile,
     resolve_model_profiles,
 )
@@ -96,9 +97,7 @@ def _profile_json(**overrides: object) -> str:
 
 
 def _resolved(*, profiles: str | None = None, keys: str | None = None):
-    return resolve_model_profiles(
-        _Settings(profiles or _profile_json(), keys or '{" primary ":"sk-private"}')
-    )
+    return resolve_model_profiles(_Settings(profiles or _profile_json(), keys or '{" primary ":"sk-private"}'))
 
 
 def test_profile_resolution_is_exact_normalized_and_secret_safe():
@@ -136,7 +135,10 @@ def test_profile_resolution_is_exact_normalized_and_secret_safe():
         ('{"a":{},"a":{}}', '{"a":"secret"}'),
         ('{"a":{"base_url":"https://x.test","model":"m","timeout_seconds":NaN,"version":"v"}}', '{"a":"secret"}'),
         (_profile_json(extra="no"), '{" primary ":"secret"}'),
-        (json.dumps({"": {"base_url": "https://x.test", "model": "m", "timeout_seconds": 1, "version": "v"}}), '{"":"secret"}'),
+        (
+            json.dumps({"": {"base_url": "https://x.test", "model": "m", "timeout_seconds": 1, "version": "v"}}),
+            '{"":"secret"}',
+        ),
         (_profile_json(), "[]"),
         (_profile_json(), '{" primary ":"one"," primary ":"two"}'),
         (_profile_json(), "{}"),
@@ -505,7 +507,9 @@ async def test_runtime_failures_are_sanitized_and_retryable(failure):
 
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=httpx.MockTransport(handler))
     with pytest.raises(RagModelUnavailable) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     assert caught.value.code == "rag_model_unavailable"
     assert caught.value.public_message == "The RAG model is temporarily unavailable."
@@ -529,7 +533,9 @@ async def test_timeout_and_ordinary_exception_groups_are_fully_detached(failure)
 
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=httpx.MockTransport(handler))
     with pytest.raises(RagModelUnavailable) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     _assert_detached_and_sanitized(caught.value)
     await client.aclose()
@@ -547,7 +553,9 @@ async def test_non_success_status_is_retryable_and_no_redirect_is_followed(statu
 
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=httpx.MockTransport(handler))
     with pytest.raises(RagModelUnavailable) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
     assert calls == 1
     assert caught.value.retryable is True
     _assert_detached_and_sanitized(caught.value)
@@ -598,7 +606,9 @@ async def test_invalid_or_oversized_content_length_rejects_before_iteration(cont
     )
 
     with pytest.raises(InvalidRagModelResponse):
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
     assert stream.yielded == 0
     assert stream.closed == 1
     await client.aclose()
@@ -617,7 +627,9 @@ async def test_gzip_response_is_rejected_without_decompression_or_iteration():
 
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=httpx.MockTransport(handler))
     with pytest.raises(InvalidRagModelResponse):
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     assert seen[0].headers["accept-encoding"] == "identity"
     assert stream.yielded == 0
@@ -809,7 +821,9 @@ async def test_response_is_streamed_and_stopped_at_256_kib_cap():
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=transport)
 
     with pytest.raises(InvalidRagModelResponse):
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     assert stream.yielded == 17
     assert stream.closed == 1
@@ -845,12 +859,53 @@ async def test_malformed_outer_content_and_usage_are_invalid(raw):
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=raw)),
     )
     with pytest.raises(InvalidRagModelResponse) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
     assert caught.value.code == "rag_model_invalid_response"
     assert caught.value.retryable is False
     assert raw.decode("utf-8", errors="ignore") not in str(caught.value)
     _assert_detached_and_sanitized(caught.value)
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_payload_preserves_only_exact_trusted_usage():
+    raw = (
+        b'{"choices":[{"message":{"content":"[]"}}],'
+        b'"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}'
+    )
+    client = OpenAICompatibleRagModel(
+        PROFILE,
+        api_key="secret",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=raw)),
+    )
+
+    with pytest.raises(InvalidRagModelResponse) as caught:
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=20, timeout_seconds=1
+        )
+
+    assert caught.value.usage == RagTokenUsage(prompt_tokens=10, completion_tokens=4, total_tokens=14)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (True, 0, 0),
+        (0, True, 0),
+        (0, 0, True),
+        (250_001, 0, 250_001),
+        (0, 250_001, 250_001),
+        (125_001, 125_000, 250_001),
+    ],
+)
+def test_token_usage_rejects_non_exact_or_over_hard_cap_values(values: tuple[object, object, object]):
+    with pytest.raises(ValueError):
+        RagTokenUsage(prompt_tokens=values[0], completion_tokens=values[1], total_tokens=values[2])  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -863,7 +918,9 @@ async def test_raw_private_response_json_decode_failure_is_fully_detached():
     )
 
     with pytest.raises(InvalidRagModelResponse) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     _assert_detached_and_sanitized(caught.value)
     await client.aclose()
@@ -885,7 +942,9 @@ async def test_strict_response_parser_sanitizes_linked_control_signal(monkeypatc
     monkeypatch.setattr(rag_model.json, "loads", fail_parse)
 
     with pytest.raises(KeyboardInterrupt) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
     _assert_detached_and_sanitized(caught.value)
     await client.aclose()
@@ -906,7 +965,9 @@ async def test_excessive_json_depth_is_invalid_at_both_layers():
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=outer)),
     )
     with pytest.raises(InvalidRagModelResponse):
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
     await client.aclose()
 
 
@@ -921,7 +982,9 @@ async def test_linked_and_grouped_control_signals_are_preserved_and_sanitized():
 
     client = OpenAICompatibleRagModel(PROFILE, api_key="secret", transport=httpx.MockTransport(handler))
     with pytest.raises(asyncio.CancelledError) as caught:
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
     assert caught.value.args == ()
     _assert_detached_and_sanitized(caught.value)
     await client.aclose()
@@ -967,7 +1030,9 @@ async def test_aclose_closes_once_and_after_close_calls_fail_safely():
     await client.aclose()
     assert transport.close_calls == 1
     with pytest.raises(RagModelUnavailable):
-        await client.complete_json(messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1)
+        await client.complete_json(
+            messages=({"role": "user", "content": "go"},), max_output_tokens=1, timeout_seconds=1
+        )
 
 
 @pytest.mark.asyncio
