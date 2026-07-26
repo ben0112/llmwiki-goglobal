@@ -1515,6 +1515,321 @@ async def test_pool_release_control_failure_has_priority_over_primary_ordinary_f
     assert factory._coverage_cache == {}
 
 
+class _ObligationPlan:
+    def __init__(
+        self,
+        *,
+        protocol="lease",
+        lease_exit="success",
+        pool_release="success",
+        codec_reset="success",
+        rollback="success",
+        partial_setup=None,
+        reset_failure_kind=None,
+    ):
+        self.protocol = protocol
+        self.lease_exit = lease_exit
+        self.pool_release = pool_release
+        self.codec_reset = codec_reset
+        self.rollback = rollback
+        self.partial_setup = partial_setup
+        self.reset_failure_kind = reset_failure_kind
+        self.events = []
+        self.leased = False
+        self.codec_active = False
+        self.transaction_active = False
+
+
+def _obligation_operation(plan, name, mode, call):
+    plan.events.append(f"{name}:get")
+    if mode == "missing":
+        return None
+    if mode == "noncallable":
+        return object()
+    return call
+
+
+class _ObligationTransaction:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def start(self):
+        self._plan.events.append("start")
+        self._plan.transaction_active = True
+        if self._plan.partial_setup == "transaction":
+            raise RuntimeError("private partial transaction start")
+
+    @property
+    def rollback(self):
+        async def call():
+            self._plan.events.append("rollback:call")
+            self._plan.transaction_active = False
+
+        return _obligation_operation(self._plan, "rollback", self._plan.rollback, call)
+
+
+class _ObligationConnection:
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def set_type_codec(self, *_args, **_kwargs):
+        self._plan.events.append("codec:set")
+        self._plan.codec_active = True
+        if self._plan.partial_setup == "codec":
+            raise RuntimeError("private partial codec setup")
+
+    @property
+    def reset_type_codec(self):
+        async def call(*_args, **_kwargs):
+            self._plan.events.append("codec:reset:call")
+            if self._plan.reset_failure_kind is not None:
+                raise _cleanup_failure(self._plan.reset_failure_kind)
+            self._plan.codec_active = False
+
+        return _obligation_operation(
+            self._plan,
+            "codec:reset",
+            self._plan.codec_reset,
+            call,
+        )
+
+    def transaction(self, **_options):
+        self._plan.events.append("transaction")
+        return _ObligationTransaction(self._plan)
+
+
+class _ObligationLease:
+    def __init__(self, plan, connection):
+        self._plan = plan
+        self._connection = connection
+
+    async def __aenter__(self):
+        self._plan.events.append("acquire")
+        self._plan.leased = True
+        return self._connection
+
+    @property
+    def __aexit__(self):
+        async def call(*_args):
+            self._plan.events.append("lease:exit:call")
+            self._plan.leased = False
+
+        return _obligation_operation(
+            self._plan,
+            "lease:exit",
+            self._plan.lease_exit,
+            call,
+        )
+
+
+class _ObligationPool:
+    def __init__(self, plan):
+        self.plan = plan
+        self.connection = _ObligationConnection(plan)
+        self.lease = _ObligationLease(plan, self.connection)
+
+    def acquire(self):
+        if self.plan.protocol == "direct":
+            self.plan.events.append("acquire")
+            self.plan.leased = True
+            return self.connection
+        return self.lease
+
+    @property
+    def release(self):
+        async def call(connection):
+            assert connection is self.connection
+            self.plan.events.append("pool:release:call")
+            self.plan.leased = False
+
+        return _obligation_operation(
+            self.plan,
+            "pool:release",
+            self.plan.pool_release,
+            call,
+        )
+
+
+def test_cleanup_obligation_validation_records_each_missing_proof():
+    obligations = retrieval_eval._CleanupObligations(  # noqa: SLF001
+        release=True,
+        codec_reset=True,
+        rollback=True,
+    )
+    proofs = retrieval_eval._CleanupProofs()  # noqa: SLF001
+    failures = []
+
+    retrieval_eval._validate_cleanup_obligations(  # noqa: SLF001
+        obligations,
+        proofs,
+        failures,
+    )
+
+    assert proofs == retrieval_eval._CleanupProofs()  # noqa: SLF001
+    assert [type(failure) for failure in failures] == [
+        retrieval_eval.RetrievalExecutionError,
+        retrieval_eval.RetrievalExecutionError,
+        retrieval_eval.RetrievalExecutionError,
+    ]
+    assert all(failure.args == () for failure in failures)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol", "lease_exit"),
+    [("lease", "missing"), ("lease", "noncallable"), ("direct", "success")],
+)
+async def test_missing_all_release_paths_fails_the_release_obligation(
+    protocol,
+    lease_exit,
+):
+    plan = _ObligationPlan(
+        protocol=protocol,
+        lease_exit=lease_exit,
+        pool_release="missing",
+    )
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "pool:release:get" in plan.events
+    assert plan.leased is True
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback", ["missing", "noncallable"])
+async def test_started_transaction_requires_completed_rollback_proof(rollback):
+    plan = _ObligationPlan(rollback=rollback)
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "rollback:get" in plan.events
+    assert "rollback:call" not in plan.events
+    assert plan.transaction_active is True
+    assert plan.codec_active is False
+    assert plan.leased is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec_reset", ["missing", "noncallable"])
+async def test_completed_codec_setup_requires_completed_reset_proof(codec_reset):
+    plan = _ObligationPlan(codec_reset=codec_reset)
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "codec:reset:get" in plan.events
+    assert "codec:reset:call" not in plan.events
+    assert plan.transaction_active is False
+    assert plan.codec_active is True
+    assert plan.leased is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_setup", ["codec", "transaction"])
+async def test_partially_applied_setup_still_establishes_cleanup_obligation(partial_setup):
+    plan = _ObligationPlan(partial_setup=partial_setup)
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalExecutionError) as raised:
+        async with factory.evaluation_session():
+            raise AssertionError("partial setup must not yield")
+
+    assert raised.value.args == ()
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert plan.codec_active is False
+    assert plan.transaction_active is False
+    assert plan.leased is False
+    if partial_setup == "codec":
+        assert "codec:reset:call" in plan.events
+        assert "transaction" not in plan.events
+    else:
+        assert "rollback:call" in plan.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", _CLEANUP_FAILURE_KINDS)
+async def test_missing_obligation_combines_with_cleanup_failure_signal(kind):
+    plan = _ObligationPlan(rollback="missing", reset_failure_kind=kind)
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(_expected_cleanup_failure(kind)) as raised:
+        async with factory.evaluation_session():
+            pass
+
+    assert raised.value.args == ((1,) if kind == "system_exit" else ())
+    assert raised.value.__cause__ is raised.value.__context__ is None
+    assert "private" not in str(raised.value)
+    assert plan.transaction_active is True
+    assert plan.codec_active is True
+    assert plan.leased is False
+    assert factory._session_active is False
+    assert factory._snapshot is None
+    assert factory._coverage_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_successful_lease_exit_is_a_release_proof_without_pool_release():
+    plan = _ObligationPlan(pool_release="missing")
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    async with factory.evaluation_session():
+        pass
+
+    assert "lease:exit:call" in plan.events
+    assert "pool:release:get" not in plan.events
+    assert plan.leased is plan.codec_active is plan.transaction_active is False
+
+
+@pytest.mark.asyncio
+async def test_pool_release_proof_remedies_missing_lease_exit_only():
+    plan = _ObligationPlan(lease_exit="missing")
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    async with factory.evaluation_session():
+        pass
+
+    assert plan.events[-3:] == [
+        "lease:exit:get",
+        "pool:release:get",
+        "pool:release:call",
+    ]
+    assert plan.leased is plan.codec_active is plan.transaction_active is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unproved",
+    ["rollback", "codec_reset"],
+)
+async def test_release_proof_cannot_remedy_an_unproved_rollback_or_reset(unproved):
+    plan = _ObligationPlan(**{unproved: "missing"})
+    factory = _fake_snapshot_factory(_ObligationPool(plan))
+
+    with pytest.raises(retrieval_eval.RetrievalExecutionError):
+        async with factory.evaluation_session():
+            pass
+
+    assert "lease:exit:call" in plan.events
+    assert plan.leased is False
+
+
 class _SetupBarrierPlan:
     def __init__(self, blocked_stage=None, *, fail_after_release=False):
         self.blocked_stage = blocked_stage

@@ -417,6 +417,20 @@ class _CleanupStatus(Enum):
     COMPLETED_SUCCESSFULLY = "completed_successfully"
 
 
+@dataclass
+class _CleanupObligations:
+    release: bool = False
+    codec_reset: bool = False
+    rollback: bool = False
+
+
+@dataclass
+class _CleanupProofs:
+    released: bool = False
+    codec_reset: bool = False
+    rolled_back: bool = False
+
+
 async def _guarded_async_cleanup(
     target: object,
     attribute: str,
@@ -443,6 +457,75 @@ async def _guarded_async_cleanup(
         failures.append(error)
         return _CleanupStatus.FAILED
     return _CleanupStatus.COMPLETED_SUCCESSFULLY
+
+
+def _validate_cleanup_obligations(
+    obligations: _CleanupObligations,
+    proofs: _CleanupProofs,
+    failures: list[BaseException],
+) -> None:
+    """Record one stable failure for every resource obligation without proof."""
+
+    if obligations.rollback and not proofs.rolled_back:
+        failures.append(RetrievalExecutionError())
+    if obligations.codec_reset and not proofs.codec_reset:
+        failures.append(RetrievalExecutionError())
+    if obligations.release and not proofs.released:
+        failures.append(RetrievalExecutionError())
+
+
+async def _settle_cleanup_obligations(
+    *,
+    pool: object,
+    lease: object | None,
+    lease_entered: bool,
+    connection: object | None,
+    transaction: object | None,
+    obligations: _CleanupObligations,
+    failures: list[BaseException],
+) -> _CleanupProofs:
+    """Attempt every required cleanup, then validate all resource proofs once."""
+
+    proofs = _CleanupProofs()
+    if obligations.rollback and transaction is not None:
+        status = await _guarded_async_cleanup(
+            transaction,
+            "rollback",
+            (),
+            {},
+            failures,
+        )
+        proofs.rolled_back = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
+    if obligations.codec_reset and connection is not None:
+        status = await _guarded_async_cleanup(
+            connection,
+            "reset_type_codec",
+            ("jsonb",),
+            {"schema": "pg_catalog"},
+            failures,
+        )
+        proofs.codec_reset = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
+    if obligations.release and connection is not None:
+        if lease_entered and lease is not None:
+            status = await _guarded_async_cleanup(
+                lease,
+                "__aexit__",
+                (None, None, None),
+                {},
+                failures,
+            )
+            proofs.released = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
+        if not proofs.released:
+            status = await _guarded_async_cleanup(
+                pool,
+                "release",
+                (connection,),
+                {},
+                failures,
+            )
+            proofs.released = status is _CleanupStatus.COMPLETED_SUCCESSFULLY
+    _validate_cleanup_obligations(obligations, proofs, failures)
+    return proofs
 
 
 def _raise_session_failure(error: BaseException) -> Never:
@@ -606,10 +689,9 @@ class _PostgresEvaluationFactory:
         self._coverage_cache.clear()
         lease: object | None = None
         lease_entered = False
-        direct_acquire = False
         connection: object | None = None
         transaction: object | None = None
-        json_codec_reset_required = False
+        obligations = _CleanupObligations()
         primary: BaseException | None = None
         cleanup_failures: list[BaseException] = []
         try:
@@ -623,13 +705,12 @@ class _PostgresEvaluationFactory:
                 lease_entered = True
             elif inspect.isawaitable(lease):
                 connection = await lease
-                direct_acquire = True
             else:
                 connection = lease
-                direct_acquire = True
+            obligations.release = True
             set_codec = getattr(connection, "set_type_codec", None)
             if callable(set_codec):
-                json_codec_reset_required = True
+                obligations.codec_reset = True
                 await set_codec(
                     "jsonb",
                     schema="pg_catalog",
@@ -643,6 +724,7 @@ class _PostgresEvaluationFactory:
             start = getattr(transaction, "start", None)
             if not callable(start):
                 raise RetrievalExecutionError
+            obligations.rollback = True
             await start()
             self._snapshot = _PostgresEvaluationSnapshot(connection)
             self._coverage_cache.clear()
@@ -655,49 +737,15 @@ class _PostgresEvaluationFactory:
                 snapshot.revoke()
             self._snapshot = None
             self._coverage_cache.clear()
-            if transaction is not None:
-                await _guarded_async_cleanup(
-                    transaction,
-                    "rollback",
-                    (),
-                    {},
-                    cleanup_failures,
-                )
-            if connection is not None and json_codec_reset_required:
-                await _guarded_async_cleanup(
-                    connection,
-                    "reset_type_codec",
-                    ("jsonb",),
-                    {"schema": "pg_catalog"},
-                    cleanup_failures,
-                )
-            if lease is not None and lease_entered:
-                exit_status = await _guarded_async_cleanup(
-                    lease,
-                    "__aexit__",
-                    (None, None, None),
-                    {},
-                    cleanup_failures,
-                )
-                if (
-                    exit_status is not _CleanupStatus.COMPLETED_SUCCESSFULLY
-                    and connection is not None
-                ):
-                    await _guarded_async_cleanup(
-                        self._pool,
-                        "release",
-                        (connection,),
-                        {},
-                        cleanup_failures,
-                    )
-            elif direct_acquire and connection is not None:
-                await _guarded_async_cleanup(
-                    self._pool,
-                    "release",
-                    (connection,),
-                    {},
-                    cleanup_failures,
-                )
+            await _settle_cleanup_obligations(
+                pool=self._pool,
+                lease=lease,
+                lease_entered=lease_entered,
+                connection=connection,
+                transaction=transaction,
+                obligations=obligations,
+                failures=cleanup_failures,
+            )
             self._session_active = False
 
         if primary is not None:
