@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,20 @@ def test_server_rag_has_a_dedicated_fresh_process_pgvector_segment():
     assert "env PYTHONPATH=api MODE=hosted pytest -v" in step
     assert "|| true" not in step
     assert "|" not in step
+
+
+def test_scaled_rag_profile_covers_the_default_run_timeout():
+    from llmwiki_core.rag import DEFAULT_PER_CALL_TIMEOUT_SECONDS
+
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    profile_line = next(
+        line.strip()
+        for line in workflow.splitlines()
+        if line.strip().startswith("RAG_MODEL_PROFILES_JSON=")
+    )
+    profiles = json.loads(profile_line.split("=", 1)[1])
+
+    assert profiles["primary"]["timeout_seconds"] >= DEFAULT_PER_CALL_TIMEOUT_SECONDS
 
 
 def test_retrieval_evaluation_has_a_dedicated_pgvector_segment():

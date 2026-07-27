@@ -167,6 +167,7 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert "old_owner" in source
     assert "graceful" in source
     assert "rag_kb_id" in source
+    assert '"Authoritative launch evidence for scaled RAG."' in source
     assert '"/v1/rag/build-wiki"' in source
     assert "rag_create_instance" in source
     assert "rag_observe_instance != rag_create_instance" in source
@@ -180,6 +181,9 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert 'f"/v1/jobs/{rag_cancel_job_id}/cancel"' in source
     assert 'f"/v1/rag/runs/{rag_failed_run_id}/resume"' in source
     assert "count(DISTINCT sequence)" in source
+    rag_cleanup_at = source.rindex("DELETE FROM rag_runs")
+    knowledge_base_cleanup_at = source.rindex("DELETE FROM knowledge_bases")
+    assert rag_cleanup_at < knowledge_base_cleanup_at
     rag_kill_at = source.index('_disable_restart_and_kill(rag_killed_container, "KILL")')
     rag_recovered_at = source.index("rag_recovered = await _wait_for_job", rag_kill_at)
     rag_restore_workers_at = source.index('"--scale", "worker=2", "worker"', rag_kill_at)
@@ -627,7 +631,7 @@ async def test_two_api_two_worker_recovery_smoke():
             "INSERT INTO documents "
             "(id,user_id,knowledge_base_id,filename,title,path,source_kind,file_type,status,"
             "content,metadata,version) VALUES($1,$2,$3,'scaled-rag.pdf','Scaled RAG source','/corpus/',"
-            "'source','pdf','ready','Authoritative scaled RAG launch evidence.',"
+            "'source','pdf','ready','Authoritative launch evidence for scaled RAG.',"
             '\'{"entry_id":"E-SCALED-RAG","stage":"S1"}\'::jsonb,1)',
             rag_source_id,
             user_id,
@@ -640,7 +644,7 @@ async def test_two_api_two_worker_recovery_smoke():
             rag_source_id,
             user_id,
             rag_kb_id,
-            "Authoritative scaled RAG launch evidence.",
+            "Authoritative launch evidence for scaled RAG.",
         )
 
         instance_ids = set()
@@ -1180,8 +1184,13 @@ async def test_two_api_two_worker_recovery_smoke():
                 check=False,
             )
         finally:
+            knowledge_base_ids = [kb_id, graceful_kb_id, draining_kb_id, rag_kb_id]
+            await pool.execute(
+                "DELETE FROM rag_runs WHERE knowledge_base_id = ANY($1::uuid[])",
+                knowledge_base_ids,
+            )
             await pool.execute(
                 "DELETE FROM knowledge_bases WHERE id = ANY($1::uuid[])",
-                [kb_id, graceful_kb_id, draining_kb_id, rag_kb_id],
+                knowledge_base_ids,
             )
             await pool.close()

@@ -252,7 +252,7 @@ jobs:
           python -m tests.helpers.scaled_ci_identity --jwks-root deploy/.ci-jwks --env-file deploy/.env.selfhost
           cat >> deploy/.env.selfhost <<'EOF'
           SERVER_RAG_ENABLED=true
-          RAG_MODEL_PROFILES_JSON={"primary":{"base_url":"http://fake-model:8000/v1","model":"deterministic-writer","timeout_seconds":5,"version":"fake-profile-v1"}}
+          RAG_MODEL_PROFILES_JSON={"primary":{"base_url":"http://fake-model:8000/v1","model":"deterministic-writer","timeout_seconds":60,"version":"fake-profile-v1"}}
           RAG_MODEL_API_KEYS_JSON={"primary":"fake-ci-provider-key"}
           EOF
 
