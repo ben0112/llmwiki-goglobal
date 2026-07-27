@@ -194,6 +194,69 @@ python3 -m corpus.import_annotations \
 
 账号须已注册;知识库不存在则自动创建;单事务、幂等。
 
+## 服务端 RAG CLI（托管模式）
+
+服务端 RAG 默认关闭；管理员需在 API 与 durable worker 上显式启用 `SERVER_RAG_ENABLED=true`，并配置服务端模型 profile。CLI 只调用 LLMWiki REST，不接受模型供应商的 API key 或 base URL。`LLMWIKI_ACCESS_TOKEN` 用于认证 LLMWiki REST，**不是**模型供应商密钥。
+
+从部署环境或 secret manager 加载 LLMWiki 地址和访问令牌，不要把令牌写入命令行或仓库：
+
+```bash
+export LLMWIKI_API_URL=https://api.example.com
+: "${LLMWIKI_ACCESS_TOKEN:?load the LLMWiki REST token from your secret store}"
+export LLMWIKI_ACCESS_TOKEN
+```
+
+创建并观察一次构建；`--json` 输出适合脚本消费的紧凑 JSON：
+
+```bash
+PYTHONPATH=api python -m scripts.rag build-wiki \
+  --knowledge-base 00000000-0000-0000-0000-000000000001 \
+  --goal "Build launch guidance" \
+  --target-prefix /wiki/launch/ \
+  --model-profile primary \
+  --idempotency-key launch-2026-07-26 \
+  --json
+
+PYTHONPATH=api python -m scripts.rag status \
+  00000000-0000-0000-0000-000000000002 --json
+
+PYTHONPATH=api python -m scripts.rag steps \
+  00000000-0000-0000-0000-000000000002 \
+  --after 0 --limit 50 --json
+```
+
+dry-run 仍创建持久 run，但不提交页面；预算参数均在发起网络请求前校验：
+
+```bash
+PYTHONPATH=api python -m scripts.rag build-wiki \
+  --knowledge-base 00000000-0000-0000-0000-000000000001 \
+  --goal "Preview launch guidance" \
+  --target-prefix /wiki/launch/ \
+  --model-profile primary \
+  --idempotency-key launch-preview-1 \
+  --dry-run --max-pages 3 --max-model-tokens 12000 --json
+```
+
+失败 run 可用更高预算显式续跑：
+
+```bash
+PYTHONPATH=api python -m scripts.rag resume \
+  00000000-0000-0000-0000-000000000002 \
+  --idempotency-key launch-resume-1 \
+  --max-pages 6 --max-model-tokens 24000 --json
+```
+
+取消仍由通用 durable job API 负责；使用 create 响应中的 `job_id`：
+
+```bash
+JOB_ID=00000000-0000-0000-0000-000000000003
+curl -fsS -X POST "$LLMWIKI_API_URL/v1/jobs/$JOB_ID/cancel" --config - <<CURL_CONFIG
+header = "Authorization: Bearer $LLMWIKI_ACCESS_TOKEN"
+CURL_CONFIG
+```
+
+CLI 退出码：`0` 成功，`2` 参数或本地配置错误，`3` REST/传输失败，`4` 输出失败。错误只输出稳定的 `code`/`category`，不会回显 bearer token、goal、供应商端点、响应正文或异常链。
+
 ---
 
 # 智能体能做什么(MCP 工具)
