@@ -19,6 +19,15 @@
 | **去 SaaS 化** | 移除 Google OAuth、Pydantic Logfire、OpenReplay;MCP/API 认证改为**平台内生成的 API 密钥**(`sv_` 前缀 Bearer),不再依赖 GoTrue 的 OAuth 2.1 服务;对象存储支持任意 S3 兼容端点(MinIO 等) |
 | **自部署** | `deploy/docker-compose.selfhost.yml` + [`docs/self-hosting.md`](docs/self-hosting.md) 完整部署指南(自托管 Supabase + MinIO + docker compose) |
 
+## 架构与运维文档
+
+- [总体架构](docs/architecture/overview.md)：分层、数据流、存储职责与部署拓扑。
+- [共享内核与数据不变量](docs/architecture/shared-kernel.md)
+- [持久任务与多副本 Hosted 部署](docs/architecture/durable-jobs.md)
+- [检索评测与混合召回](docs/architecture/retrieval.md)
+- [服务端 RAG](docs/architecture/server-rag.md)
+- [自托管指南](docs/self-hosting.md) · [智能体接入](docs/agent-integration.md)
+
 # 功能
 
 - **MCP 连接** — 任何 MCP 兼容客户端(桌面端、CLI、网页端智能体)读写、检索语料与维基
