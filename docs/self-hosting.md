@@ -20,6 +20,13 @@ and the Railway/Netlify config files are inert.
 > skeleton — review resource limits, secrets handling, and networking for your
 > environment before production use.
 
+For system boundaries and storage ownership, start with the
+[platform architecture overview](architecture/overview.md). The canonical
+runtime contracts are [durable jobs](architecture/durable-jobs.md),
+[retrieval](architecture/retrieval.md), and
+[server-side RAG](architecture/server-rag.md); this guide keeps only deployable
+operator steps.
+
 ---
 
 ## Architecture
@@ -36,12 +43,15 @@ and the Railway/Netlify config files are inert.
         gateway ──► api:8000 (two or more independent FastAPI replicas)
         api/worker ──► redis:6379 (internal only; AOF enabled)
         worker ──► converter:8000 (internal only; bearer-authenticated)
-        api/worker/mcp ──► Supabase Postgres (RLS + LISTEN/NOTIFY + PGroonga)
+        api/worker/mcp ──► Supabase Postgres (RLS + LISTEN/NOTIFY + PGroonga + pgvector)
         api/mcp ──► MinIO (S3 API)
 ```
 
 Five public hostnames (subpaths behind one hostname also work if you adjust
 the URLs consistently). The converter must **not** be exposed publicly.
+The shown two-API/two-worker shape is the required recovery-smoke topology, not
+a production replica mandate; size each role independently and keep the gateway
+as the only published API listener.
 
 ---
 
