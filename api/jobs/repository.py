@@ -44,6 +44,12 @@ def _validate_error(error_code: str, error_message: str) -> None:
         raise ValueError(f"error_message must not exceed {ERROR_MESSAGE_MAX_CHARS} characters")
 
 
+def _require_transaction(conn: asyncpg.Connection) -> None:
+    checker = getattr(conn, "is_in_transaction", None)
+    if not callable(checker) or not checker():
+        raise RuntimeError("background job recovery requires an explicit transaction")
+
+
 def _uuid(value: object, field: str) -> UUID:
     try:
         return value if isinstance(value, UUID) else UUID(str(value))
@@ -537,6 +543,160 @@ WHERE job.id = candidates.id
   AND job.lease_expires_at <= lease_clock.checked_at
 RETURNING job.*
 """
+
+_LOCK_EXPIRED_FOR_REAP = """
+WITH candidates AS MATERIALIZED (
+    SELECT job.id
+    FROM background_jobs AS job
+    WHERE job.state = 'running'
+    ORDER BY job.lease_expires_at, job.id
+    FOR UPDATE OF job SKIP LOCKED
+    LIMIT $1
+), lease_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM candidates LIMIT 1
+)
+SELECT job.*
+FROM background_jobs AS job
+JOIN candidates ON candidates.id=job.id
+CROSS JOIN lease_clock
+WHERE job.lease_expires_at <= lease_clock.checked_at
+ORDER BY job.lease_expires_at,job.id
+"""
+
+_REAP_LOCKED = """
+WITH selected AS MATERIALIZED (
+    SELECT job.id
+    FROM background_jobs AS job
+    WHERE job.id = ANY($1::uuid[]) AND job.state='running'
+    FOR UPDATE OF job
+), reap_clock AS MATERIALIZED (
+    SELECT clock_timestamp() AS checked_at FROM selected LIMIT 1
+)
+UPDATE background_jobs AS job
+SET
+    state = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN 'cancelled'
+        WHEN job.attempt_count < job.max_attempts THEN 'retry_wait'
+        ELSE 'failed'
+    END,
+    run_after = CASE
+        WHEN job.cancel_requested_at IS NULL AND job.attempt_count < job.max_attempts
+        THEN reap_clock.checked_at
+        ELSE job.run_after
+    END,
+    error_code = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN job.attempt_count < job.max_attempts THEN 'lease_expired'
+        ELSE 'attempts_exhausted'
+    END,
+    error_message = CASE
+        WHEN job.cancel_requested_at IS NOT NULL THEN NULL
+        WHEN job.attempt_count < job.max_attempts THEN 'Worker lease expired.'
+        ELSE $2
+    END,
+    result = NULL,
+    progress = NULL,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    heartbeat_at = NULL
+FROM selected,reap_clock
+WHERE job.id=selected.id
+RETURNING job.*
+"""
+
+_RECOVER_EXPIRED_SUCCESS = """
+UPDATE background_jobs AS job
+SET
+    state='succeeded',
+    result=$11::jsonb,
+    progress=NULL,
+    error_code=NULL,
+    error_message=NULL,
+    lease_owner=NULL,
+    lease_expires_at=NULL,
+    heartbeat_at=NULL
+WHERE job.id=$1
+  AND job.state='running'
+  AND job.job_type=$2
+  AND job.user_id=$3
+  AND job.knowledge_base_id IS NOT DISTINCT FROM $4
+  AND job.document_id IS NOT DISTINCT FROM $5
+  AND job.payload=$6::jsonb
+  AND job.attempt_count=$7
+  AND job.max_attempts=$8
+  AND job.lease_owner IS NOT DISTINCT FROM $9
+  AND job.lease_expires_at IS NOT DISTINCT FROM $10
+  AND job.cancel_requested_at IS NULL
+RETURNING job.*
+"""
+
+
+async def lock_expired_for_reap(
+    conn: asyncpg.Connection,
+    *,
+    limit: int = 100,
+) -> list[JobRecord]:
+    """Lock and expose a bounded expired batch before deciding terminal state."""
+    _require_transaction(conn)
+    _validate_positive(limit, "limit")
+    rows = await conn.fetch(_LOCK_EXPIRED_FOR_REAP, limit)
+    return [_row_to_record(row) for row in rows]
+
+
+async def reap_locked(
+    conn: asyncpg.Connection,
+    jobs: tuple[JobRecord, ...] | list[JobRecord],
+    *,
+    include_transitions: bool = False,
+) -> list[UUID] | list[JobRecord]:
+    """Apply the ordinary lease-expiry state machine to an already locked batch."""
+    _require_transaction(conn)
+    if type(jobs) not in {tuple, list} or any(type(job) is not JobRecord for job in jobs):
+        raise ValueError("jobs must contain exact JobRecord values")
+    identities = [job.id for job in jobs]
+    if len(set(identities)) != len(identities) or any(job.state is not JobState.RUNNING for job in jobs):
+        raise ValueError("jobs must be unique running records")
+    if not identities:
+        return []
+    rows = await conn.fetch(_REAP_LOCKED, identities, _ATTEMPTS_EXHAUSTED_MESSAGE)
+    records = [_row_to_record(row) for row in rows]
+    if {record.id for record in records} != set(identities):
+        raise LeaseLost("background job recovery snapshot changed")
+    if include_transitions:
+        return records
+    return [record.id for record in records]
+
+
+async def recover_expired_success(
+    conn: asyncpg.Connection,
+    job: JobRecord,
+    result: Mapping[str, JSONValue],
+) -> JobRecord:
+    """Restore one locked expired RUNNING job from authoritative durable output."""
+    _require_transaction(conn)
+    if type(job) is not JobRecord or job.state is not JobState.RUNNING:
+        raise ValueError("job must be an exact running JobRecord")
+    serialized_result = json.dumps(to_json_value(result), separators=(",", ":"), sort_keys=True)
+    row = await conn.fetchrow(
+        _RECOVER_EXPIRED_SUCCESS,
+        job.id,
+        job.job_type.value,
+        job.user_id,
+        job.knowledge_base_id,
+        job.document_id,
+        json.dumps(to_json_value(job.payload), separators=(",", ":"), sort_keys=True),
+        job.attempt_count,
+        job.max_attempts,
+        job.lease_owner,
+        job.lease_expires_at,
+        serialized_result,
+    )
+    if row is None:
+        raise LeaseLost("background job recovery snapshot changed")
+    recovered = _row_to_record(row)
+    if recovered.state is not JobState.SUCCEEDED or dict(recovered.result or {}) != dict(result):
+        raise RuntimeError("background job success recovery returned an invalid transition")
+    return recovered
 
 
 async def reap_expired(

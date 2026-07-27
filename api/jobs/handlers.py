@@ -52,6 +52,17 @@ _VETTED_ERROR_MESSAGES = MappingProxyType(
         "invalid_upload_job": "The upload cleanup job is invalid.",
         "knowledge_base_not_found": "The requested knowledge base was not found.",
         "quota_exceeded": "The account quota was exceeded.",
+        "rag_budget_exhausted": "The RAG budget was exhausted.",
+        "rag_disabled": "Server-side RAG is disabled.",
+        "rag_internal_error": "The RAG request could not be completed.",
+        "rag_invalid_draft": "The generated draft was invalid.",
+        "rag_invalid_plan": "The generated plan was invalid.",
+        "rag_job_binding_invalid": "The RAG job binding is invalid.",
+        "rag_model_unavailable": "The RAG model is temporarily unavailable.",
+        "rag_prompt_invalid": "The RAG prompt inputs were invalid.",
+        "rag_retrieval_failed": "RAG retrieval is temporarily unavailable.",
+        "rag_run_not_found": "The RAG run was not found.",
+        "rag_version_conflict": "The conflict retry limit was exhausted.",
         "upload_cleanup_transient": "Upload cleanup will be retried.",
         "unsupported_document_type": "This document type is not supported.",
         "unsupported_job_type": "This job type is not supported.",
@@ -66,6 +77,7 @@ class WorkerContext:
     converter_url: str
     converter_secret: str
     tus_cleanup: object | None = None
+    rag_orchestrator_factory: Callable[[], object] | None = None
 
 
 Handler = Callable[
@@ -128,7 +140,9 @@ def _validate_embedding_job_shape(job: JobRecord) -> tuple[int, EmbeddingProfile
     provider = job.payload.get("provider")
     model = job.payload.get("model")
     dimensions = job.payload.get("dimensions")
-    invalid = invalid or not isinstance(provider, str) or not provider or provider.strip() != provider or len(provider) > 100
+    invalid = (
+        invalid or not isinstance(provider, str) or not provider or provider.strip() != provider or len(provider) > 100
+    )
     invalid = invalid or not isinstance(model, str) or not model or model.strip() != model or len(model) > 200
     invalid = invalid or type(dimensions) is not int or not 1 <= dimensions <= 4096
     if invalid:
@@ -411,8 +425,7 @@ async def _request_embedding_vectors(
             dimensions=profile.dimensions,
         )
         indexed_vectors.extend(
-            (source[offset + local_index][0], vector)
-            for local_index, (_ignored, vector) in enumerate(vectors)
+            (source[offset + local_index][0], vector) for local_index, (_ignored, vector) in enumerate(vectors)
         )
         offset += len(batch)
     return tuple(indexed_vectors)
@@ -430,10 +443,7 @@ def _embedding_request_batches(texts: tuple[str, ...]) -> tuple[tuple[str, ...],
                 "invalid_embedding_input",
                 "Document content cannot be embedded.",
             )
-        if current and (
-            len(current) >= DEFAULT_MAX_INPUTS
-            or current_chars + len(text) > DEFAULT_MAX_TOTAL_CHARS
-        ):
+        if current and (len(current) >= DEFAULT_MAX_INPUTS or current_chars + len(text) > DEFAULT_MAX_TOTAL_CHARS):
             batches.append(tuple(current))
             current = []
             current_chars = 0
@@ -717,14 +727,26 @@ async def handle_upload_cleanup(
     return {"upload_id": str(upload_id), "status": status}
 
 
+async def handle_build_wiki(
+    job: JobRecord,
+    lease: JobLease,
+    context: WorkerContext,
+) -> Mapping[str, JSONValue]:
+    """Lazy RAG adapter boundary so ordinary job imports need no RAG config."""
+    from rag.handler import handle_build_wiki as rag_handler
+
+    return await rag_handler(job, lease, context)
+
+
 HANDLERS: Mapping[JobType, Handler] = MappingProxyType(
     {
         JobType.DOCUMENT_EXTRACT: handle_document_extract,
         JobType.DOCUMENT_EMBED: handle_document_embed,
         JobType.GRAPH_REBUILD: handle_graph_rebuild,
         JobType.UPLOAD_CLEANUP: handle_upload_cleanup,
+        JobType.BUILD_WIKI: handle_build_wiki,
     }
 )
 
-# Persisted job types intentionally awaiting a concrete business handler.
-RESERVED_JOB_TYPES = frozenset({JobType.BUILD_WIKI})
+# Compatibility surface retained for callers that inspected staged job types.
+RESERVED_JOB_TYPES: frozenset[JobType] = frozenset()

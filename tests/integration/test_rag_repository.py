@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from jobs import repository as jobs_repository
+from jobs import worker as jobs_worker
 from jobs.models import JobCreate, JobType
 from jobs.service import JobService
 from rag import records, repository
@@ -301,6 +303,169 @@ async def test_worklist_is_validated_inserted_in_order_and_rolls_back(pool, seed
             await repository.insert_worklist(conn, rollback_run, items)
             raise RuntimeError("rollback marker")
     assert await repository.list_pages(pool, rollback_run.id) == ()
+
+
+@pytest.mark.asyncio
+async def test_terminal_worker_snapshot_is_exact_bound_and_page_bounded(pool, seeded_kb):
+    run, job = await _create_root(
+        pool,
+        seeded_kb,
+        key="terminal-worker-snapshot",
+        config=_config(seeded_kb.id, budget=replace(RagBudget(), max_pages=2)),
+    )
+    pages = await _insert_pages(pool, run, 2)
+    async with pool.acquire() as conn, conn.transaction():
+        claimed = await jobs_repository.claim(conn, job.id, "snapshot-worker", 120)
+        assert claimed is not None
+        assert await repository.get_terminal_snapshot_for_worker(conn, job=claimed, run_id=run.id) == (run, pages)
+        assert (
+            await repository.get_terminal_snapshot_for_worker(
+                conn,
+                job=replace(claimed, user_id=uuid4()),
+                run_id=run.id,
+            )
+            is None
+        )
+        with pytest.raises(RagDomainError) as malformed:
+            await repository.get_terminal_snapshot_for_worker(
+                conn,
+                job=replace(claimed, payload={"run_id": str(uuid4())}),
+                run_id=run.id,
+            )
+        assert malformed.value.code == "rag_job_binding_invalid"
+        await conn.execute(
+            "UPDATE rag_runs SET budget=jsonb_set(budget,'{max_pages}','1'::jsonb) WHERE id=$1",
+            run.id,
+        )
+        with pytest.raises(RagDomainError) as over_bound:
+            await repository.get_terminal_snapshot_for_worker(conn, job=claimed, run_id=run.id)
+        assert over_bound.value.code == "rag_job_binding_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["completed", "no_work", "dry_run"])
+async def test_reaper_recovers_rag_success_crash_window_from_authoritative_snapshot(
+    pool,
+    seeded_kb,
+    caplog,
+    reason,
+):
+    dry_run = reason == "dry_run"
+    config = RagRunConfig.build(
+        knowledge_base_id=seeded_kb.id,
+        goal=f"Recover {reason}",
+        target_path_prefix="/wiki/platform/",
+        model_profile="balanced",
+        retrieval_profile="hybrid",
+        dry_run=dry_run,
+        budget=replace(RagBudget(), max_pages=1),
+    )
+    run, job = await _create_root(pool, seeded_kb, key=f"recover-{reason}", config=config)
+    async with pool.acquire() as conn, conn.transaction():
+        claimed = await jobs_repository.claim(conn, job.id, "crashed-rag-worker", 120)
+        assert claimed is not None
+        if reason == "completed":
+            page = (
+                await repository.insert_worklist(
+                    conn,
+                    run,
+                    (RagWorkItem.build(0, "/wiki/platform/page-0.md", "Explain", "Evidence"),),
+                )
+            )[0]
+            attempt = await repository.begin_page_attempt(conn, page.id, max_attempts=1)
+            document_id = await _seed_document(conn, seeded_kb)
+            run, _ = await repository.mark_boundary(
+                conn,
+                run=run,
+                page=attempt,
+                document_id=document_id,
+                committed_version=1,
+                usage=RagUsage(),
+                lint_summary={},
+            )
+        elif reason == "dry_run":
+            page = (
+                await repository.insert_worklist(
+                    conn,
+                    run,
+                    (RagWorkItem.build(0, "/wiki/platform/page-0.md", "Explain", "Evidence"),),
+                )
+            )[0]
+            attempt = await repository.begin_page_attempt(conn, page.id, max_attempts=1)
+            preview = "dry preview"
+            run, _ = await repository.mark_dry_run_complete(
+                conn,
+                run=run,
+                page=attempt,
+                usage=RagUsage(),
+                preview=preview,
+                preview_digest=hashlib.sha256(preview.encode()).hexdigest(),
+                preview_full_char_count=len(preview),
+                preview_truncated=False,
+            )
+        run = await repository.finish_run(
+            conn,
+            run_id=run.id,
+            completion_reason=RagCompletionReason(reason),
+            usage=RagUsage(),
+        )
+        await conn.execute(
+            "UPDATE background_jobs SET lease_expires_at=clock_timestamp()-interval '1 second',"
+            "attempt_count=max_attempts WHERE id=$1",
+            job.id,
+        )
+
+    with caplog.at_level("INFO"):
+        await jobs_worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    recovered = await jobs_repository.get_for_user(pool, job.id, seeded_kb.user_id)
+    assert recovered is not None
+    assert recovered.state.value == "succeeded"
+    assert recovered.error_code is None
+    assert recovered.result == {
+        "run_id": str(run.id),
+        "completion_reason": reason,
+        "pages_committed": 1 if reason == "completed" else 0,
+        **({"pages_dry_run": 1} if reason == "dry_run" else {}),
+    }
+    assert "rag_run_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reaper_pending_cancel_wins_over_terminal_rag_success_crash_window(
+    pool,
+    seeded_kb,
+    caplog,
+):
+    run, job = await _create_root(pool, seeded_kb, key="recover-cancelled-success")
+    async with pool.acquire() as conn, conn.transaction():
+        assert await jobs_repository.claim(conn, job.id, "crashed-cancelled-worker", 120)
+        run = await repository.finish_run(
+            conn,
+            run_id=run.id,
+            completion_reason=RagCompletionReason.NO_WORK,
+            usage=RagUsage(),
+        )
+        pending = await jobs_repository.request_cancel(conn, job.id, seeded_kb.user_id)
+        assert pending is not None and pending.cancel_requested_at is not None
+        await conn.execute(
+            "UPDATE background_jobs SET lease_expires_at=clock_timestamp()-interval '1 second',"
+            "attempt_count=max_attempts WHERE id=$1",
+            job.id,
+        )
+
+    with caplog.at_level("INFO"):
+        await jobs_worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    cancelled = await jobs_repository.get_for_user(pool, job.id, seeded_kb.user_id)
+    assert cancelled is not None
+    assert cancelled.state.value == "cancelled"
+    assert cancelled.result is None
+    assert cancelled.cancel_requested_at is not None
+    assert (await repository.get_for_user(pool, run.id, seeded_kb.user_id)).completion_reason is (
+        RagCompletionReason.NO_WORK
+    )
+    assert "rag_run_failed" not in caplog.text
 
 
 @pytest.mark.asyncio

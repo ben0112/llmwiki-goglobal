@@ -160,9 +160,7 @@ class JobRecord:
             object.__setattr__(self, "result", _freeze_mapping(self.result))
 
 
-_DOCUMENT_EMBED_PAYLOAD_KEYS = frozenset(
-    {"document_id", "document_version", "provider", "model", "dimensions"}
-)
+_DOCUMENT_EMBED_PAYLOAD_KEYS = frozenset({"document_id", "document_version", "provider", "model", "dimensions"})
 
 
 def _validate_document_embed_command(command: JobCreate) -> None:
@@ -262,6 +260,14 @@ _PUBLIC_ERROR_MESSAGES = {
     "quota_exceeded": "The account quota was exceeded.",
     "attempts_exhausted": "The job could not be completed after retrying.",
     "cancelled": "The job was cancelled.",
+    "rag_budget_exhausted": "The RAG budget was exhausted.",
+    "rag_disabled": "Server-side RAG is disabled.",
+    "rag_invalid_draft": "The generated draft was invalid.",
+    "rag_invalid_plan": "The generated plan was invalid.",
+    "rag_job_binding_invalid": "The RAG job binding is invalid.",
+    "rag_prompt_invalid": "The RAG prompt inputs were invalid.",
+    "rag_run_not_found": "The RAG run was not found.",
+    "rag_version_conflict": "The conflict retry limit was exhausted.",
 }
 
 

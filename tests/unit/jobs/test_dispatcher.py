@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -33,6 +34,7 @@ def _runtime_settings(**changes):
         "JOB_HEARTBEAT_SECONDS": 15,
         "JOB_DISPATCH_BATCH_SIZE": 100,
         "JOB_REDELIVER_SECONDS": 30,
+        "SERVER_RAG_ENABLED": False,
     }
     values.update(changes)
     return SimpleNamespace(**values)
@@ -252,7 +254,6 @@ async def test_dispatch_cron_reads_only_worker_context_resources(monkeypatch):
 def test_handler_registry_is_complete_read_only_and_transport_neutral():
     from jobs.handlers import (
         HANDLERS,
-        RESERVED_JOB_TYPES,
         handle_document_embed,
         handle_document_extract,
         handle_graph_rebuild,
@@ -261,20 +262,16 @@ def test_handler_registry_is_complete_read_only_and_transport_neutral():
     from jobs.models import JobType
 
     assert isinstance(HANDLERS, MappingProxyType)
-    assert {
-        JobType.DOCUMENT_EXTRACT: handle_document_extract,
-        JobType.DOCUMENT_EMBED: handle_document_embed,
-        JobType.GRAPH_REBUILD: handle_graph_rebuild,
-        JobType.UPLOAD_CLEANUP: handle_upload_cleanup,
-    } == HANDLERS
-    assert frozenset({JobType.BUILD_WIKI}) == RESERVED_JOB_TYPES
-    assert set(HANDLERS).isdisjoint(RESERVED_JOB_TYPES)
-    assert set(HANDLERS) | RESERVED_JOB_TYPES == set(JobType)
-    assert JobType.BUILD_WIKI not in HANDLERS
+    assert set(HANDLERS) == set(JobType)
+    assert HANDLERS[JobType.DOCUMENT_EXTRACT] is handle_document_extract
+    assert HANDLERS[JobType.DOCUMENT_EMBED] is handle_document_embed
+    assert HANDLERS[JobType.GRAPH_REBUILD] is handle_graph_rebuild
+    assert HANDLERS[JobType.UPLOAD_CLEANUP] is handle_upload_cleanup
+    assert HANDLERS[JobType.BUILD_WIKI].__name__ == "handle_build_wiki"
     with pytest.raises(TypeError):
         HANDLERS[JobType.DOCUMENT_EXTRACT] = object()
-    with pytest.raises(AttributeError):
-        RESERVED_JOB_TYPES.add(JobType.DOCUMENT_EXTRACT)  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        HANDLERS[JobType.BUILD_WIKI] = object()
 
     handlers_module = inspect.getmodule(next(iter(HANDLERS.values())))
     assert handlers_module is not None
@@ -584,6 +581,40 @@ def _job(job_type=None, **changes):
     return replace(record, **changes)
 
 
+def _rag_run_for_job(job, **changes):
+    from rag.records import RagRunRecord
+
+    from llmwiki_core.rag import RagBudget, RagUsage
+
+    run_id = uuid4()
+    if set(job.payload) == {"run_id"}:
+        run_id = UUID(job.payload["run_id"])
+    record = RagRunRecord(
+        id=run_id,
+        job_id=job.id,
+        root_run_id=run_id,
+        parent_run_id=None,
+        user_id=job.user_id,
+        knowledge_base_id=job.knowledge_base_id,
+        goal="private goal",
+        goal_digest=hashlib.sha256(b"private goal").hexdigest(),
+        target_path_prefix="/wiki/private/",
+        model_profile="primary",
+        model_profile_version="primary-v1",
+        retrieval_profile="lexical",
+        dry_run=False,
+        budget=RagBudget(),
+        usage=RagUsage(),
+        idempotency_key="private-key",
+        request_digest="a" * 64,
+        completion_reason=None,
+        last_committed_ordinal=-1,
+        created_at=datetime(2026, 7, 27, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    return replace(record, **changes)
+
+
 def _failed_transition(job, error_code: str):
     from jobs.models import JobState
 
@@ -651,6 +682,40 @@ class PoolWithConnectionTransaction(FakeWorkerPool):
     def __init__(self):
         super().__init__()
         self.connection = self
+
+
+def _install_legacy_reaper_mock(monkeypatch, worker, reap_expired):
+    """Adapt pre-decision reaper tests to the lock-then-transition protocol."""
+    from jobs.models import JobState
+
+    state = {}
+
+    async def lock_expired(conn, *, limit):
+        transitions = await reap_expired(conn, limit=limit, include_transitions=True)
+        state["transitions"] = transitions
+        return [
+            replace(
+                transition,
+                state=JobState.RUNNING,
+                result=None,
+                error_code=None,
+                error_message=None,
+                lease_owner="expired-worker",
+            )
+            for transition in transitions
+        ]
+
+    async def reap_locked(_conn, jobs, *, include_transitions):
+        transitions = state.get("transitions", [])
+        assert {job.id for job in jobs} == {transition.id for transition in transitions}
+        return transitions if include_transitions else [transition.id for transition in transitions]
+
+    async def unfinished_rag(*_args):
+        return None
+
+    monkeypatch.setattr(worker.repository, "lock_expired_for_reap", lock_expired)
+    monkeypatch.setattr(worker.repository, "reap_locked", reap_locked)
+    monkeypatch.setattr(worker, "_recover_terminal_rag_success", unfinished_rag)
 
 
 class FakeLease:
@@ -1242,6 +1307,443 @@ async def test_run_job_returns_lost_if_failure_transition_loses_lease(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_disabled_build_wiki_job_fails_terminal_without_retry_wait(monkeypatch):
+    from jobs import worker
+    from jobs.handlers import HANDLERS, WorkerContext
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    run = _rag_run_for_job(job)
+    recorded = []
+
+    async def claim(*_args):
+        return job
+
+    async def get_for_worker(*_args):
+        return run
+
+    async def fail_or_retry(_conn, _job_id, _owner, **kwargs):
+        recorded.append(kwargs)
+        state = JobState.RETRY_WAIT if kwargs["retryable"] else JobState.FAILED
+        return replace(job, state=state, error_code=kwargs["error_code"], attempt_count=1)
+
+    async def record_terminal(_conn, _transition):
+        return run
+
+    monkeypatch.setattr(worker.repository, "claim", claim)
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler.repository, "get_for_worker", get_for_worker)
+    monkeypatch.setattr(worker, "JobLease", FakeLease)
+    context = WorkerContext(
+        pool=pool,
+        s3=None,
+        converter_url="https://converter.invalid",
+        converter_secret="secret",
+        rag_orchestrator_factory=None,
+    )
+    ctx = _ctx(pool, HANDLERS)
+    ctx["worker_context"] = context
+
+    outcome = await worker.run_job(ctx, str(job.id))
+
+    assert outcome == {"status": "failed", "job_id": str(job.id)}
+    assert recorded == [
+        {
+            "error_code": "rag_disabled",
+            "error_message": "Server-side RAG is disabled.",
+            "retryable": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "error_code", "expected_completion"),
+    [
+        ("retry_wait", "rag_model_unavailable", None),
+        ("cancelled", None, None),
+        ("failed", "rag_budget_exhausted", "budget_exhausted"),
+        ("failed", "rag_invalid_plan", "partial_failure"),
+    ],
+)
+async def test_rag_failure_transition_updates_run_only_for_terminal_failure_in_same_transaction(
+    monkeypatch,
+    state,
+    error_code,
+    expected_completion,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    transition = replace(job, state=JobState(state), error_code=error_code)
+    calls = []
+
+    async def fail_or_retry(conn, *_args, **_kwargs):
+        assert pool.active_transactions == 1
+        calls.append(("job", conn))
+        return transition
+
+    async def record_terminal(conn, record):
+        assert pool.active_transactions == 1
+        calls.append(("run", conn, record))
+
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+
+    recorded = await worker._record_failure(
+        pool,
+        job.id,
+        "worker-safe",
+        error_code=error_code or "cancelled",
+        error_message="safe",
+        retryable=state == "retry_wait",
+    )
+
+    assert recorded is transition
+    expected = [("job", pool.connection)]
+    if expected_completion is not None:
+        expected.append(("run", pool.connection, transition))
+    assert calls == expected
+    assert pool.transactions == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_rag_failure_emits_once_after_commit_with_authoritative_counters(
+    monkeypatch,
+    caplog,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    from llmwiki_core.rag import RagCompletionReason, RagUsage
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    transition = replace(
+        job,
+        state=JobState.FAILED,
+        attempt_count=3,
+        error_code="attempts_exhausted",
+    )
+    authoritative = _rag_run_for_job(
+        job,
+        completion_reason=RagCompletionReason.PARTIAL_FAILURE,
+        usage=RagUsage(steps=11, model_tokens=29),
+        last_committed_ordinal=2,
+    )
+    order = []
+
+    async def fail_or_retry(*_args, **_kwargs):
+        assert pool.active_transactions == 1
+        order.append("job")
+        return transition
+
+    async def record_terminal(*_args):
+        assert pool.active_transactions == 1
+        order.append("run")
+        return authoritative
+
+    original_emit = rag_handler.emit_rag_run_failed
+
+    def post_commit_emit(selected_transition, selected_run):
+        assert pool.active_transactions == 0
+        order.append("event")
+        original_emit(selected_transition, selected_run)
+
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", post_commit_emit)
+
+    with caplog.at_level(logging.INFO, logger="rag.handler"):
+        recorded = await worker._record_failure(
+            pool,
+            job.id,
+            "worker-safe",
+            error_code="rag_model_unavailable",
+            error_message="safe",
+            retryable=True,
+        )
+
+    assert recorded is transition
+    assert order == ["job", "run", "event"]
+    assert_telemetry_event(
+        caplog,
+        "rag_run_failed",
+        count=1,
+        expected={
+            "run_id": str(run_id),
+            "job_id": str(job.id),
+            "page_count": 3,
+            "step_count": 11,
+            "model_token_count": 29,
+            "error_code": "attempts_exhausted",
+        },
+        sensitive=("private goal", "/wiki/private/", "private-key"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "requested_code"),
+    [
+        ("retry_wait", "rag_model_unavailable"),
+        ("cancelled", "cancelled"),
+        ("failed", "worker_shutdown"),
+    ],
+)
+async def test_nonterminal_and_shutdown_rag_failures_emit_no_failed_event(
+    monkeypatch,
+    state,
+    requested_code,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    transition = replace(job, state=JobState(state), error_code=requested_code)
+    events = []
+
+    async def fail_or_retry(*_args, **_kwargs):
+        return transition
+
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", lambda *_args: events.append("event"))
+    if state == "failed":
+
+        async def record_terminal(*_args):
+            return _rag_run_for_job(job)
+
+        monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+
+    await worker._record_failure(
+        pool,
+        job.id,
+        "worker-safe",
+        error_code=requested_code,
+        error_message="safe",
+        retryable=state == "retry_wait",
+    )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["terminal_sync", "transaction_commit"])
+async def test_rolled_back_rag_failure_transition_emits_no_failed_event(
+    monkeypatch,
+    failure_point,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    class CommitFailingPool(PoolWithConnectionTransaction):
+        @asynccontextmanager
+        async def transaction(self):
+            self.transactions += 1
+            self.active_transactions += 1
+            try:
+                yield
+            finally:
+                self.active_transactions -= 1
+            raise RuntimeError("TOP_SECRET_COMMIT_FAILURE")
+
+    pool = CommitFailingPool() if failure_point == "transaction_commit" else PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    transition = replace(job, state=JobState.FAILED, error_code="rag_invalid_plan")
+    events = []
+
+    async def fail_or_retry(*_args, **_kwargs):
+        return transition
+
+    async def record_terminal(*_args):
+        if failure_point == "terminal_sync":
+            raise RuntimeError("TOP_SECRET_SYNC_FAILURE")
+        return _rag_run_for_job(job)
+
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", lambda *_args: events.append("event"))
+
+    with pytest.raises(RuntimeError):
+        await worker._record_failure(
+            pool,
+            job.id,
+            "worker-safe",
+            error_code="rag_invalid_plan",
+            error_message="safe",
+            retryable=False,
+        )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_post_commit_rag_telemetry_failure_does_not_change_committed_transition(monkeypatch, caplog):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    job = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+    transition = replace(job, state=JobState.FAILED, error_code="rag_invalid_plan")
+
+    async def fail_or_retry(*_args, **_kwargs):
+        return transition
+
+    async def record_terminal(*_args):
+        return _rag_run_for_job(job)
+
+    def fail_telemetry(*_args):
+        assert pool.active_transactions == 0
+        raise RuntimeError("TOP_SECRET_TELEMETRY_FAILURE")
+
+    monkeypatch.setattr(worker.repository, "fail_or_retry", fail_or_retry)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", fail_telemetry)
+
+    with caplog.at_level(logging.ERROR, logger="jobs.worker"):
+        assert (
+            await worker._record_failure(
+                pool,
+                job.id,
+                "worker-safe",
+                error_code="rag_invalid_plan",
+                error_message="safe",
+                retryable=False,
+            )
+            is transition
+        )
+    assert "TOP_SECRET_TELEMETRY_FAILURE" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "completion"),
+    [
+        ("rag_budget_exhausted", "budget_exhausted"),
+        ("rag_invalid_draft", "partial_failure"),
+    ],
+)
+async def test_terminal_rag_run_completion_uses_exact_payload_binding(monkeypatch, error_code, completion):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import repository as rag_repository
+
+    run_id = uuid4()
+    transition = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.FAILED,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        error_code=error_code,
+    )
+    from llmwiki_core.rag import RagCompletionReason
+
+    run = _rag_run_for_job(transition)
+    terminal_run = replace(run, completion_reason=RagCompletionReason(completion))
+    calls = []
+
+    async def get_for_worker(conn, selected_run_id, selected_job_id):
+        assert conn is connection
+        assert selected_run_id == run_id
+        assert selected_job_id == transition.id
+        return run
+
+    async def record_terminal_job_state(conn, **kwargs):
+        calls.append((conn, kwargs))
+        return terminal_run
+
+    connection = object()
+    monkeypatch.setattr(rag_repository, "get_for_worker", get_for_worker)
+    monkeypatch.setattr(rag_repository, "record_terminal_job_state", record_terminal_job_state)
+    recorded = await worker._record_terminal_rag_run(connection, transition)
+
+    assert recorded is terminal_run
+    assert calls[0][0] is connection
+    assert calls[0][1]["run_id"] == run_id
+    assert calls[0][1]["completion_reason"].value == completion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ["budget_exhausted", "partial_failure"])
+async def test_terminal_rag_run_reuses_existing_authoritative_failure_completion(monkeypatch, completion):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import repository as rag_repository
+
+    from llmwiki_core.rag import RagCompletionReason
+
+    run_id = uuid4()
+    transition = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.FAILED,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        error_code="attempts_exhausted",
+    )
+    terminal_run = _rag_run_for_job(
+        transition,
+        completion_reason=RagCompletionReason(completion),
+    )
+
+    async def get_for_worker(*_args):
+        return terminal_run
+
+    async def record_terminal_job_state(*_args, **_kwargs):
+        raise AssertionError("an already terminal failure run must not be rewritten")
+
+    monkeypatch.setattr(rag_repository, "get_for_worker", get_for_worker)
+    monkeypatch.setattr(rag_repository, "record_terminal_job_state", record_terminal_job_state)
+
+    assert await worker._record_terminal_rag_run(object(), transition) is terminal_run
+
+
+@pytest.mark.asyncio
 async def test_run_job_propagates_worker_cancellation(monkeypatch, caplog):
     from jobs import worker
     from jobs.models import JobState
@@ -1270,9 +1772,7 @@ async def test_run_job_propagates_worker_cancellation(monkeypatch, caplog):
     monkeypatch.setattr(worker, "JobLease", FakeLease)
     monkeypatch.setattr(worker, "_record_failure", record_failure)
 
-    with caplog.at_level(logging.INFO, logger="jobs.worker"), pytest.raises(
-        asyncio.CancelledError
-    ):
+    with caplog.at_level(logging.INFO, logger="jobs.worker"), pytest.raises(asyncio.CancelledError):
         await worker.run_job(_ctx(pool, {job.job_type: handler}), str(job.id))
 
     assert recorded[0][1] == {
@@ -1334,13 +1834,473 @@ async def test_reap_cron_uses_short_transaction_and_propagates_failures(monkeypa
         assert include_transitions is True
         raise failure
 
-    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
     with pytest.raises(RuntimeError, match="reaper database unavailable") as raised:
         await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
     assert raised.value is failure
     assert pool.transactions == 1
     assert pool.active_connections == 0
     assert pool.active_transactions == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["completed", "no_work", "dry_run"])
+async def test_reap_cron_recovers_terminal_successful_rag_run_without_failure_event(
+    monkeypatch,
+    caplog,
+    reason,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    from llmwiki_core.rag import RagCompletionReason
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    candidate = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        attempt_count=3,
+        max_attempts=3,
+        lease_owner="dead-worker",
+    )
+    canonical = {
+        "run_id": str(run_id),
+        "completion_reason": reason,
+        "pages_committed": 1 if reason == "completed" else 0,
+    }
+    if reason == "dry_run":
+        canonical["pages_dry_run"] = 1
+    succeeded = replace(
+        candidate,
+        state=JobState.SUCCEEDED,
+        result=canonical,
+        lease_owner=None,
+    )
+    terminal_run = _rag_run_for_job(
+        candidate,
+        dry_run=reason == "dry_run",
+        completion_reason=RagCompletionReason(reason),
+        last_committed_ordinal=-1 if reason == "no_work" else 0,
+    )
+    calls = []
+
+    async def lock_expired(conn, *, limit):
+        calls.append(("lock", conn, limit))
+        return [candidate]
+
+    async def recover(conn, job):
+        calls.append(("recover", conn, job.id))
+        return succeeded, terminal_run
+
+    async def reap_locked(conn, jobs, *, include_transitions):
+        calls.append(("reap", conn, tuple(job.id for job in jobs), include_transitions))
+        return []
+
+    failure_events = []
+    monkeypatch.setattr(worker.repository, "lock_expired_for_reap", lock_expired, raising=False)
+    monkeypatch.setattr(worker.repository, "reap_locked", reap_locked, raising=False)
+    monkeypatch.setattr(worker, "_recover_terminal_rag_success", recover, raising=False)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", lambda *_args: failure_events.append("failed"))
+
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 7})
+
+    assert calls == [
+        ("lock", pool.connection, 7),
+        ("recover", pool.connection, candidate.id),
+        ("reap", pool.connection, (), True),
+    ]
+    assert failure_events == []
+    assert_telemetry_event(
+        caplog,
+        "durable_job_lease_reaped",
+        expected={"job_id": str(candidate.id), "state": "succeeded", "error_code": None},
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_pending_cancel_wins_over_terminal_rag_success_recovery(monkeypatch, caplog):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    candidate = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        attempt_count=3,
+        max_attempts=3,
+        lease_owner="dead-worker",
+        cancel_requested_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    cancelled = replace(
+        candidate,
+        state=JobState.CANCELLED,
+        lease_owner=None,
+        error_code=None,
+    )
+    calls = []
+
+    async def lock_expired(*_args, **_kwargs):
+        return [candidate]
+
+    async def recover(*_args):
+        raise AssertionError("pending cancellation must bypass terminal success recovery")
+
+    async def reap_locked(_conn, jobs, *, include_transitions):
+        calls.append(tuple(job.id for job in jobs))
+        assert include_transitions is True
+        return [cancelled]
+
+    failure_events = []
+    monkeypatch.setattr(worker.repository, "lock_expired_for_reap", lock_expired)
+    monkeypatch.setattr(worker.repository, "reap_locked", reap_locked)
+    monkeypatch.setattr(worker, "_recover_terminal_rag_success", recover)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", lambda *_args: failure_events.append("failed"))
+
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
+
+    assert calls == [(candidate.id,)]
+    assert failure_events == []
+    assert_telemetry_event(
+        caplog,
+        "durable_job_lease_reaped",
+        expected={"job_id": str(candidate.id), "state": "cancelled", "error_code": None},
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_malformed_rag_candidate_fails_closed_without_blocking_batch(monkeypatch, caplog):
+    from jobs import worker
+    from jobs.handlers import TerminalJobError
+    from jobs.models import JobState, JobType
+
+    pool = PoolWithConnectionTransaction()
+    malformed_run_id = uuid4()
+    malformed = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(malformed_run_id)},
+        attempt_count=3,
+        max_attempts=3,
+    )
+    ordinary = _job(state=JobState.RUNNING, attempt_count=3, max_attempts=3)
+    failed_malformed = replace(malformed, state=JobState.FAILED, error_code="attempts_exhausted")
+    failed_ordinary = replace(ordinary, state=JobState.FAILED, error_code="attempts_exhausted")
+    synced = []
+
+    async def lock_expired(*_args, **_kwargs):
+        return [malformed, ordinary]
+
+    async def recover(*_args):
+        raise TerminalJobError("rag_job_binding_invalid", "The RAG job binding is invalid.")
+
+    async def reap_locked(_conn, jobs, *, include_transitions):
+        assert tuple(job.id for job in jobs) == (malformed.id, ordinary.id)
+        assert include_transitions is True
+        return [failed_malformed, failed_ordinary]
+
+    async def record_terminal(_conn, transition):
+        synced.append(transition.id)
+        raise AssertionError("malformed RAG run must not be failure-synchronized")
+
+    monkeypatch.setattr(worker.repository, "lock_expired_for_reap", lock_expired, raising=False)
+    monkeypatch.setattr(worker.repository, "reap_locked", reap_locked, raising=False)
+    monkeypatch.setattr(worker, "_recover_terminal_rag_success", recover, raising=False)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+
+    with caplog.at_level(logging.INFO, logger="jobs.worker"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 2})
+
+    assert synced == []
+    assert_telemetry_event(caplog, "durable_job_lease_reaped", count=2)
+
+
+@pytest.mark.asyncio
+async def test_terminal_rag_success_recovery_maps_malformed_repository_snapshot_fail_closed(monkeypatch):
+    from jobs import worker
+    from jobs.handlers import TerminalJobError
+    from jobs.models import JobState, JobType
+    from rag import repository as rag_repository
+
+    from llmwiki_core.rag import RagDomainError
+
+    run_id = uuid4()
+    candidate = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.RUNNING,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+    )
+
+    async def malformed_snapshot(*_args, **_kwargs):
+        raise RagDomainError("rag_job_binding_invalid", "TOP_SECRET_MALFORMED")
+
+    monkeypatch.setattr(rag_repository, "get_terminal_snapshot_for_worker", malformed_snapshot)
+
+    with pytest.raises(TerminalJobError) as raised:
+        await worker._recover_terminal_rag_success(object(), candidate)
+
+    assert (raised.value.error_code, raised.value.error_message) == (
+        "rag_job_binding_invalid",
+        "The RAG job binding is invalid.",
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "TOP_SECRET" not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_atomically_syncs_failed_rag_batch_then_emits_authoritative_runs(
+    monkeypatch,
+    caplog,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    from llmwiki_core.rag import RagCompletionReason, RagUsage
+
+    class StrictPool(PoolWithConnectionTransaction):
+        @asynccontextmanager
+        async def transaction(self):
+            self.transactions += 1
+            self.active_transactions += 1
+            self.events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.events.append("rollback")
+                raise
+            else:
+                self.events.append("commit")
+            finally:
+                self.active_transactions -= 1
+
+    def rag_transition(state, *, error_code=None):
+        run_id = uuid4()
+        return _job(
+            job_type=JobType.BUILD_WIKI,
+            state=JobState(state),
+            knowledge_base_id=uuid4(),
+            payload={"run_id": str(run_id)},
+            error_code=error_code,
+        )
+
+    pool = StrictPool()
+    first = rag_transition("failed", error_code="attempts_exhausted")
+    retry = rag_transition("retry_wait", error_code="lease_expired")
+    non_rag = _job(state=JobState.FAILED, error_code="attempts_exhausted")
+    cancelled = rag_transition("cancelled")
+    second = rag_transition("failed", error_code="attempts_exhausted")
+    transitions = [first, retry, non_rag, cancelled, second]
+    terminal_runs = {
+        first.id: _rag_run_for_job(
+            first,
+            completion_reason=RagCompletionReason.PARTIAL_FAILURE,
+            usage=RagUsage(steps=5, model_tokens=13),
+            last_committed_ordinal=0,
+        ),
+        second.id: _rag_run_for_job(
+            second,
+            completion_reason=RagCompletionReason.PARTIAL_FAILURE,
+            usage=RagUsage(steps=9, model_tokens=31),
+            last_committed_ordinal=2,
+        ),
+    }
+
+    async def reap_expired(conn, *, limit, include_transitions):
+        assert conn is pool.connection
+        assert limit == 10
+        assert include_transitions is True
+        assert pool.active_transactions == 1
+        pool.events.append("reap")
+        return transitions
+
+    async def record_terminal(conn, transition):
+        assert conn is pool.connection
+        assert pool.active_transactions == 1
+        pool.events.append(("sync", transition.id))
+        return terminal_runs[transition.id]
+
+    original_emit = rag_handler.emit_rag_run_failed
+
+    def emit_failed(transition, run):
+        assert pool.active_transactions == 0
+        pool.events.append(("rag_event", transition.id))
+        original_emit(transition, run)
+
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", emit_failed)
+
+    with caplog.at_level(logging.INFO):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 10})
+
+    assert pool.events[:5] == [
+        "begin",
+        "reap",
+        ("sync", first.id),
+        ("sync", second.id),
+        "commit",
+    ]
+    assert pool.events[5:] == [
+        ("rag_event", first.id),
+        ("rag_event", second.id),
+    ]
+    assert retry.id not in terminal_runs
+    assert cancelled.id not in terminal_runs
+    assert_telemetry_event(
+        caplog,
+        "rag_run_failed",
+        count=2,
+        expected={
+            "run_id": str(terminal_runs[second.id].id),
+            "job_id": str(second.id),
+            "page_count": 3,
+            "step_count": 9,
+            "model_token_count": 31,
+            "error_code": "attempts_exhausted",
+        },
+    )
+    assert_telemetry_event(caplog, "durable_job_lease_reaped", count=len(transitions))
+
+
+@pytest.mark.asyncio
+async def test_reap_cron_terminal_rag_sync_failure_rolls_back_batch_and_emits_nothing(
+    monkeypatch,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    class StrictPool(PoolWithConnectionTransaction):
+        @asynccontextmanager
+        async def transaction(self):
+            self.transactions += 1
+            self.active_transactions += 1
+            self.events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.events.append("rollback")
+                raise
+            else:
+                self.events.append("commit")
+            finally:
+                self.active_transactions -= 1
+
+    def failed_rag():
+        run_id = uuid4()
+        return _job(
+            job_type=JobType.BUILD_WIKI,
+            state=JobState.FAILED,
+            knowledge_base_id=uuid4(),
+            payload={"run_id": str(run_id)},
+            error_code="attempts_exhausted",
+        )
+
+    pool = StrictPool()
+    first, second = failed_rag(), failed_rag()
+    events = []
+
+    async def reap_expired(*_args, **_kwargs):
+        return [first, second]
+
+    async def record_terminal(_conn, transition):
+        pool.events.append(("sync", transition.id))
+        if transition is second:
+            raise RuntimeError("TOP_SECRET_TERMINAL_SYNC")
+        return _rag_run_for_job(first)
+
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", lambda *_args: events.append("event"))
+
+    with pytest.raises(RuntimeError, match="TOP_SECRET_TERMINAL_SYNC"):
+        await worker.reap_cron({"pool": pool, "reap_batch_size": 10})
+
+    assert pool.events == [
+        "begin",
+        ("sync", first.id),
+        ("sync", second.id),
+        "rollback",
+    ]
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sink_failure",
+    [
+        RuntimeError("TOP_SECRET_TELEMETRY"),
+        KeyboardInterrupt("TOP_SECRET_TELEMETRY"),
+        asyncio.CancelledError("TOP_SECRET_TELEMETRY"),
+    ],
+)
+async def test_reap_cron_isolates_ordinary_rag_sink_failure_and_sanitizes_controls(
+    monkeypatch,
+    caplog,
+    sink_failure,
+):
+    from jobs import worker
+    from jobs.models import JobState, JobType
+    from rag import handler as rag_handler
+
+    from llmwiki_core.rag import RagCompletionReason
+
+    pool = PoolWithConnectionTransaction()
+    run_id = uuid4()
+    transition = _job(
+        job_type=JobType.BUILD_WIKI,
+        state=JobState.FAILED,
+        knowledge_base_id=uuid4(),
+        payload={"run_id": str(run_id)},
+        error_code="attempts_exhausted",
+    )
+    terminal_run = _rag_run_for_job(
+        transition,
+        completion_reason=RagCompletionReason.PARTIAL_FAILURE,
+    )
+
+    async def reap_expired(*_args, **_kwargs):
+        return [transition]
+
+    async def record_terminal(*_args):
+        return terminal_run
+
+    def fail_sink(*_args):
+        assert pool.active_transactions == 0
+        raise sink_failure
+
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
+    monkeypatch.setattr(worker, "_record_terminal_rag_run", record_terminal)
+    monkeypatch.setattr(rag_handler, "emit_rag_run_failed", fail_sink)
+
+    with caplog.at_level(logging.INFO):
+        if isinstance(sink_failure, Exception):
+            await worker.reap_cron({"pool": pool, "reap_batch_size": 10})
+            assert_telemetry_event(caplog, "durable_job_lease_reaped", count=1)
+        else:
+            with pytest.raises(type(sink_failure)) as raised:
+                await worker.reap_cron({"pool": pool, "reap_batch_size": 10})
+            assert raised.value is not sink_failure
+            assert str(raised.value) == ""
+            assert raised.value.__cause__ is None
+            assert raised.value.__context__ is None
+            assert_telemetry_event(caplog, "durable_job_lease_reaped", count=0)
+
+    assert pool.active_transactions == 0
+    assert "TOP_SECRET_TELEMETRY" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1374,7 +2334,7 @@ async def test_reap_cron_emits_persisted_transition_for_each_expired_lease(
         assert include_transitions is True
         return [transition]
 
-    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
     with caplog.at_level(logging.INFO, logger="jobs.worker"):
         await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
 
@@ -1444,7 +2404,7 @@ async def test_reap_cron_emits_embedding_outcome_once_after_transaction(
         assert pool.active_transactions == 0
         emit_embedding_finished(record, duration_ms=duration_ms)
 
-    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
     monkeypatch.setattr(worker, "_emit_embedding_finished", emit_after_commit)
     with caplog.at_level(logging.INFO, logger="jobs.worker"):
         await worker.reap_cron({"pool": pool, "reap_batch_size": 23})
@@ -1506,7 +2466,7 @@ async def test_reap_cron_embedding_sink_failure_never_masks_committed_transition
                 raise RuntimeError("private sink")
 
     sink = FailingEmbeddingSink()
-    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
     monkeypatch.setattr(worker, "logger", sink)
 
     await worker.reap_cron({"pool": pool, "reap_batch_size": 1})
@@ -1568,9 +2528,7 @@ class _UnknownReaperSignal(BaseException):
             None,
         ),
         (
-            BaseExceptionGroup(
-                "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
-            ),
+            BaseExceptionGroup("private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]),
             KeyboardInterrupt,
             None,
         ),
@@ -1611,7 +2569,7 @@ async def test_reap_cron_embedding_sink_controls_propagate_sanitized(
             if '"event":"embedding_finished"' in serialized:
                 raise signal
 
-    monkeypatch.setattr(worker.repository, "reap_expired", reap_expired)
+    _install_legacy_reaper_mock(monkeypatch, worker, reap_expired)
     monkeypatch.setattr(worker, "logger", SignalEmbeddingSink())
 
     with pytest.raises(expected) as raised:
@@ -1688,6 +2646,83 @@ async def test_startup_builds_only_durable_worker_resources_and_shutdown_preserv
     assert ctx["redis"] is redis
     assert "pool" not in ctx
     assert "worker_context" not in ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_startup_constructs_rag_factory_only_when_enabled(monkeypatch, enabled):
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+
+    class Redis:
+        async def ping(self):
+            return True
+
+    factory = object()
+    calls = []
+
+    async def create_pool(_database_url):
+        return pool
+
+    def build_factory(shared_pool, runtime_settings):
+        calls.append((shared_pool, runtime_settings))
+        return factory
+
+    async def readiness(**_kwargs):
+        return None
+
+    monkeypatch.setattr(worker, "_create_pool", create_pool)
+    monkeypatch.setattr(worker, "_build_rag_orchestrator_factory", build_factory)
+    monkeypatch.setattr(worker, "_check_worker_readiness", readiness)
+    runtime_settings = _runtime_settings(SERVER_RAG_ENABLED=enabled)
+    ctx = {"redis": Redis(), "runtime_settings": runtime_settings}
+
+    await worker.startup(ctx)
+
+    assert calls == ([(pool, runtime_settings)] if enabled else [])
+    assert ctx["worker_context"].rag_orchestrator_factory is (factory if enabled else None)
+    await worker.shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_startup_disabled_does_not_import_rag_adapters_or_resolve_profiles(monkeypatch):
+    import builtins
+
+    from jobs import worker
+
+    pool = PoolWithConnectionTransaction()
+
+    class Redis:
+        async def ping(self):
+            return True
+
+    async def create_pool(_database_url):
+        return pool
+
+    async def readiness(**_kwargs):
+        return None
+
+    imported = []
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "rag" or name.startswith("rag."):
+            imported.append(name)
+            raise AssertionError("disabled startup imported a RAG adapter")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "_create_pool", create_pool)
+    monkeypatch.setattr(worker, "_check_worker_readiness", readiness)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    runtime_settings = _runtime_settings(SERVER_RAG_ENABLED=False)
+    ctx = {"redis": Redis(), "runtime_settings": runtime_settings}
+
+    await worker.startup(ctx)
+
+    assert imported == []
+    assert ctx["worker_context"].rag_orchestrator_factory is None
+    await worker.shutdown(ctx)
 
 
 @pytest.mark.asyncio

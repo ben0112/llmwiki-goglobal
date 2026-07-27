@@ -84,6 +84,15 @@ def _make_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
 
 
+def _build_rag_orchestrator_factory(pool: asyncpg.Pool, runtime_settings: object):
+    """Resolve private model profiles and compose lazy, run-scoped adapters."""
+    from rag.handler import build_rag_orchestrator_factory
+    from rag.model import resolve_model_profiles
+
+    profiles = resolve_model_profiles(runtime_settings)
+    return build_rag_orchestrator_factory(pool, runtime_settings, profiles)
+
+
 def _s3_is_configured(runtime_settings: object) -> bool:
     return bool(
         getattr(runtime_settings, "S3_BUCKET", None)
@@ -172,12 +181,16 @@ async def startup(ctx: dict) -> None:
                     stale_seconds=runtime_settings.TUS_STALE_SECONDS,
                     lock_seconds=runtime_settings.TUS_LOCK_SECONDS,
                 )
+            rag_orchestrator_factory = None
+            if getattr(runtime_settings, "SERVER_RAG_ENABLED", False) is True:
+                rag_orchestrator_factory = _build_rag_orchestrator_factory(pool, runtime_settings)
             worker_context = WorkerContext(
                 pool=pool,
                 s3=s3,
                 converter_url=runtime_settings.CONVERTER_URL,
                 converter_secret=runtime_settings.CONVERTER_SECRET,
                 tus_cleanup=tus_cleanup,
+                rag_orchestrator_factory=rag_orchestrator_factory,
             )
             ctx.update(
                 {
@@ -258,8 +271,9 @@ async def _record_failure(
     retryable: bool,
 ) -> JobRecord | None:
     try:
+        terminal_rag_run = None
         async with pool.acquire() as conn, conn.transaction():
-            return await repository.fail_or_retry(
+            transition = await repository.fail_or_retry(
                 conn,
                 job_id,
                 worker_id,
@@ -267,8 +281,96 @@ async def _record_failure(
                 error_message=error_message,
                 retryable=retryable,
             )
+            if transition.job_type is JobType.BUILD_WIKI and transition.state is JobState.FAILED:
+                terminal_rag_run = await _record_terminal_rag_run(conn, transition)
     except LeaseLost:
         return None
+    if terminal_rag_run is not None and error_code != _SHUTDOWN_CODE:
+        _emit_terminal_rag_failure(transition, terminal_rag_run)
+    return transition
+
+
+def _emit_terminal_rag_failure(transition: JobRecord, run: object) -> None:
+    """Isolate one post-commit RAG failure telemetry boundary."""
+    telemetry_failure: BaseException | None = None
+    try:
+        from rag.handler import emit_rag_run_failed
+
+        emit_rag_run_failed(transition, run)
+    except BaseException as failure:  # noqa: BLE001 - post-commit telemetry is isolated.
+        telemetry_failure = failure
+    if telemetry_failure is None:
+        return
+    from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
+
+    signal = sanitized_boundary_signal_or_unknown(telemetry_failure)
+    if signal is not None and type(signal) is not BaseException:
+        raise signal from None
+    logger.error("rag failure telemetry emit failed job_id=%s", transition.id)
+
+
+async def _record_terminal_rag_run(
+    conn: asyncpg.Connection,
+    transition: JobRecord,
+) -> object:
+    """Finish the exact failed run inside the job failure transaction."""
+    from rag import repository as rag_repository
+    from rag.records import RagRunRecord
+
+    from llmwiki_core.rag import RagCompletionReason
+
+    if (
+        type(transition) is not JobRecord
+        or transition.job_type is not JobType.BUILD_WIKI
+        or transition.state is not JobState.FAILED
+        or transition.knowledge_base_id is None
+        or transition.document_id is not None
+        or set(transition.payload) != {"run_id"}
+    ):
+        raise RuntimeError("failed RAG job transition is invalid")
+    raw_run_id = transition.payload.get("run_id")
+    try:
+        run_id = UUID(raw_run_id) if isinstance(raw_run_id, str) else None
+    except ValueError:
+        run_id = None
+    if run_id is None or str(run_id) != raw_run_id:
+        raise RuntimeError("failed RAG job transition is invalid")
+    run = await rag_repository.get_for_worker(conn, run_id, transition.id)
+    if (
+        type(run) is not RagRunRecord
+        or run.job_id != transition.id
+        or run.user_id != transition.user_id
+        or run.knowledge_base_id != transition.knowledge_base_id
+    ):
+        raise RuntimeError("failed RAG job transition is invalid")
+    failure_completions = {
+        RagCompletionReason.BUDGET_EXHAUSTED,
+        RagCompletionReason.PARTIAL_FAILURE,
+    }
+    if run.completion_reason in failure_completions:
+        completion = run.completion_reason
+        terminal_run = run
+    else:
+        completion = (
+            RagCompletionReason.BUDGET_EXHAUSTED
+            if transition.error_code == "rag_budget_exhausted"
+            else RagCompletionReason.PARTIAL_FAILURE
+        )
+        terminal_run = await rag_repository.record_terminal_job_state(
+            conn,
+            run_id=run_id,
+            completion_reason=completion,
+        )
+    if (
+        type(terminal_run) is not RagRunRecord
+        or terminal_run.id != run_id
+        or terminal_run.job_id != transition.id
+        or terminal_run.user_id != transition.user_id
+        or terminal_run.knowledge_base_id != transition.knowledge_base_id
+        or terminal_run.completion_reason is not completion
+    ):
+        raise RuntimeError("failed RAG job transition is invalid")
+    return terminal_run
 
 
 def _emit_finished(
@@ -543,15 +645,97 @@ async def run_job(ctx: dict, job_id_text: str) -> dict[str, str]:
     )
 
 
-async def reap_cron(ctx: dict) -> None:
+async def _recover_terminal_rag_success(conn, job: JobRecord):
+    """Recover the crash window after durable RAG success but before job success."""
+    from rag import handler as rag_handler
+    from rag import repository as rag_repository
+
+    from llmwiki_core.rag import RagCompletionReason, RagDomainError
+
+    run_id = rag_handler._shape_run_id(job)
+    malformed_snapshot = False
+    try:
+        snapshot = await rag_repository.get_terminal_snapshot_for_worker(conn, job=job, run_id=run_id)
+    except RagDomainError as exc:
+        if type(exc) is RagDomainError and exc.code == "rag_job_binding_invalid":
+            malformed_snapshot = True
+            snapshot = None
+        else:
+            raise
+    if malformed_snapshot:
+        raise TerminalJobError("rag_job_binding_invalid", "The RAG job binding is invalid.")
+    if snapshot is None:
+        raise TerminalJobError("rag_job_binding_invalid", "The RAG job binding is invalid.")
+    run, pages = snapshot
+    if run.completion_reason not in {
+        RagCompletionReason.COMPLETED,
+        RagCompletionReason.NO_WORK,
+        RagCompletionReason.DRY_RUN,
+    }:
+        return None
+    canonical = rag_handler._authoritative_success_result(run, pages)
+    recovered = await repository.recover_expired_success(conn, job, canonical)
+    if (
+        type(recovered) is not JobRecord
+        or recovered.id != job.id
+        or recovered.job_type is not JobType.BUILD_WIKI
+        or recovered.user_id != job.user_id
+        or recovered.knowledge_base_id != job.knowledge_base_id
+        or recovered.state is not JobState.SUCCEEDED
+        or dict(recovered.payload) != dict(job.payload)
+        or dict(recovered.result or {}) != canonical
+    ):
+        raise RuntimeError("terminal RAG success recovery returned an invalid transition")
+    return recovered, run
+
+
+async def reap_cron(ctx: dict) -> None:  # noqa: C901 - coordinates one coupled transactional state decision.
     """Recover a bounded batch of jobs whose PostgreSQL leases expired."""
+    terminal_rag_runs: list[tuple[JobRecord, object]] = []
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        reaped = await repository.reap_expired(
+        candidates = await repository.lock_expired_for_reap(conn, limit=ctx["reap_batch_size"])
+        recovered: dict[UUID, JobRecord] = {}
+        malformed_rag_jobs: set[UUID] = set()
+        ordinary_candidates: list[JobRecord] = []
+        for candidate in candidates:
+            if candidate.job_type is not JobType.BUILD_WIKI:
+                ordinary_candidates.append(candidate)
+                continue
+            if candidate.cancel_requested_at is not None:
+                ordinary_candidates.append(candidate)
+                continue
+            try:
+                recovery = await _recover_terminal_rag_success(conn, candidate)
+            except TerminalJobError as exc:
+                if type(exc) is not TerminalJobError or exc.error_code != "rag_job_binding_invalid":
+                    raise
+                malformed_rag_jobs.add(candidate.id)
+                ordinary_candidates.append(candidate)
+                continue
+            if recovery is None:
+                ordinary_candidates.append(candidate)
+                continue
+            transition, _terminal_run = recovery
+            recovered[transition.id] = transition
+        reaped = await repository.reap_locked(
             conn,
-            limit=ctx["reap_batch_size"],
+            ordinary_candidates,
             include_transitions=True,
         )
-    for transition in reaped:
+        persisted = {transition.id: transition for transition in reaped}
+        persisted.update(recovered)
+        if set(persisted) != {candidate.id for candidate in candidates}:
+            raise RuntimeError("lease reaper returned an incomplete transition batch")
+        transitions = [persisted[candidate.id] for candidate in candidates]
+        for transition in transitions:
+            if transition.job_type is JobType.BUILD_WIKI and transition.state is JobState.FAILED:
+                if transition.id in malformed_rag_jobs:
+                    continue
+                terminal_run = await _record_terminal_rag_run(conn, transition)
+                terminal_rag_runs.append((transition, terminal_run))
+    for transition, terminal_run in terminal_rag_runs:
+        _emit_terminal_rag_failure(transition, terminal_run)
+    for transition in transitions:
         emit(
             logger,
             "durable_job_lease_reaped",

@@ -721,6 +721,71 @@ async def test_concurrent_reapers_return_disjoint_ids_with_skip_locked(pool):
 
 
 @pytest.mark.asyncio
+async def test_split_reaper_holds_candidate_lock_through_final_state_decision(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="dead-worker",
+        lease_expires_at=(await _db_now(pool)) - timedelta(minutes=1),
+    )
+    conn_a = await pool.acquire()
+    conn_b = await pool.acquire()
+    try:
+        async with conn_a.transaction():
+            locked = await repository.lock_expired_for_reap(conn_a, limit=1)
+            assert [record.id for record in locked] == [job["id"]]
+            async with conn_b.transaction():
+                assert await repository.lock_expired_for_reap(conn_b, limit=1) == []
+            transitions = await repository.reap_locked(conn_a, locked, include_transitions=True)
+            assert len(transitions) == 1
+            assert transitions[0].state is JobState.RETRY_WAIT
+            assert transitions[0].error_code == "lease_expired"
+    finally:
+        await pool.release(conn_b)
+        await pool.release(conn_a)
+
+    assert await pool.fetchval("SELECT state FROM background_jobs WHERE id=$1", job["id"]) == "retry_wait"
+
+
+@pytest.mark.asyncio
+async def test_expired_success_cas_rejects_locked_job_with_pending_cancel(pool):
+    await pool.execute("DELETE FROM background_jobs")
+    user_id = await _seed_user(pool)
+    job = await _insert_job(
+        pool,
+        user_id,
+        state="running",
+        attempt_count=3,
+        max_attempts=3,
+        lease_owner="dead-worker",
+        lease_expires_at=(await _db_now(pool)) - timedelta(minutes=1),
+        cancel_requested_at=await _db_now(pool),
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        locked = await repository.lock_expired_for_reap(conn, limit=1)
+        assert [record.id for record in locked] == [job["id"]]
+        with pytest.raises(LeaseLost, match="snapshot changed"):
+            await repository.recover_expired_success(conn, locked[0], {"recovered": True})
+        transitions = await repository.reap_locked(conn, locked, include_transitions=True)
+        assert len(transitions) == 1
+        assert transitions[0].state is JobState.CANCELLED
+        assert transitions[0].result is None
+
+    persisted = await pool.fetchrow(
+        "SELECT state,result,cancel_requested_at FROM background_jobs WHERE id=$1",
+        job["id"],
+    )
+    assert persisted["state"] == "cancelled"
+    assert persisted["result"] is None
+    assert persisted["cancel_requested_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_transaction_fences_concurrent_reaper(pool):
     await pool.execute("DELETE FROM background_jobs")
     user_id = await _seed_user(pool)

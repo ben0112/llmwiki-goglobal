@@ -81,6 +81,116 @@ def test_retrieval_events_have_exact_versioned_allowlisted_contract(caplog):
     ("event", "fields"),
     [
         (
+            "rag_run_started",
+            {
+                "schema_version": 1,
+                "run_id": uuid4(),
+                "job_id": uuid4(),
+                "model_profile": "primary",
+                "model_profile_version": "primary-v1",
+                "page_count": 0,
+                "step_count": 0,
+                "model_token_count": 0,
+                "duration_ms": 0,
+            },
+        ),
+        (
+            "rag_step_finished",
+            {
+                "schema_version": 1,
+                "run_id": uuid4(),
+                "job_id": uuid4(),
+                "step_id": uuid4(),
+                "page_id": None,
+                "model_profile": "primary",
+                "model_profile_version": "primary-v1",
+                "step_type": "plan",
+                "outcome": "succeeded",
+                "model_token_count": 12,
+                "latency_ms": 1.5,
+                "error_code": None,
+            },
+        ),
+        (
+            "rag_page_committed",
+            {
+                "schema_version": 1,
+                "run_id": uuid4(),
+                "job_id": uuid4(),
+                "page_id": uuid4(),
+                "document_id": uuid4(),
+                "model_profile": "primary",
+                "model_profile_version": "primary-v1",
+                "page_count": 1,
+                "step_count": 6,
+                "model_token_count": 12,
+                "latency_ms": 2.0,
+            },
+        ),
+        (
+            "rag_run_finished",
+            {
+                "schema_version": 1,
+                "run_id": uuid4(),
+                "job_id": uuid4(),
+                "model_profile": "primary",
+                "model_profile_version": "primary-v1",
+                "page_count": 1,
+                "step_count": 6,
+                "model_token_count": 12,
+                "duration_ms": 3,
+            },
+        ),
+        (
+            "rag_run_failed",
+            {
+                "schema_version": 1,
+                "run_id": uuid4(),
+                "job_id": uuid4(),
+                "model_profile": "primary",
+                "model_profile_version": "primary-v1",
+                "page_count": 0,
+                "step_count": 1,
+                "model_token_count": 12,
+                "duration_ms": 3,
+                "error_code": "rag_invalid_plan",
+            },
+        ),
+    ],
+)
+def test_rag_events_have_exact_bounded_shared_contract(caplog, event, fields):
+    from telemetry import emit
+
+    with caplog.at_level(logging.INFO):
+        emit(logging.getLogger("test.telemetry.rag"), event, **fields)
+    assert_telemetry_event(caplog, event)
+
+    first_key = next(key for key in fields if key.endswith("_count"))
+    with pytest.raises(ValueError):
+        emit(
+            logging.getLogger("test.telemetry.rag"),
+            event,
+            **(fields | {first_key: -1}),
+        )
+    with pytest.raises(ValueError):
+        emit(
+            logging.getLogger("test.telemetry.rag"),
+            event,
+            **(fields | {"goal": "private"}),
+        )
+
+
+def test_generic_telemetry_still_rejects_token_named_fields():
+    from telemetry import emit
+
+    with pytest.raises(ValueError):
+        emit(logging.getLogger("test.telemetry.generic"), "generic_event", model_token_count=1)
+
+
+@pytest.mark.parametrize(
+    ("event", "fields"),
+    [
+        (
             "retrieval_finished",
             {
                 "schema_version": 1,

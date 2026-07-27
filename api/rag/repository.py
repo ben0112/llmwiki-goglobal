@@ -11,7 +11,7 @@ from math import isfinite
 from uuid import UUID
 
 import asyncpg
-from jobs.models import JobRecord, JobType
+from jobs.models import JobRecord, JobState, JobType
 
 from llmwiki_core.rag import (
     MAX_MODEL_TOKENS,
@@ -122,6 +122,8 @@ _PAGE_SNAPSHOT_FIELDS = (
     "preview_truncated",
     "lint_summary",
 )
+_PAGE_RECORD_FIELDS = _PAGE_SNAPSHOT_FIELDS + ("created_at", "updated_at")
+_PAGE_RECORD_PROJECTION = ",".join(f"page.{field}" for field in _PAGE_RECORD_FIELDS)
 
 # Global mutation lock hierarchy: resolve identifiers without row locks, then
 # acquire run -> page -> step/document locks. Resume lineage locks the true root
@@ -653,6 +655,79 @@ async def get_for_worker(conn: asyncpg.Connection, run_id: UUID, job_id: UUID) -
     _require_uuid(job_id, "job_id")
     row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 AND job_id=$2", run_id, job_id)
     return None if row is None else _decode_db_run(row)
+
+
+async def get_terminal_snapshot_for_worker(
+    conn: asyncpg.Connection,
+    *,
+    job: JobRecord,
+    run_id: UUID,
+) -> tuple[RagRunRecord, tuple[RagPageRecord, ...]] | None:
+    """Lock one exact worker/job/run binding and return its bounded page snapshot."""
+    _require_transaction(conn)
+    _require_uuid(run_id, "run_id")
+    if (
+        type(job) is not JobRecord
+        or job.job_type is not JobType.BUILD_WIKI
+        or job.state is not JobState.RUNNING
+        or job.knowledge_base_id is None
+        or job.document_id is not None
+        or dict(job.payload) != {"run_id": str(run_id)}
+    ):
+        raise _job_binding_error()
+    payload_json = json.dumps({"run_id": str(run_id)}, separators=(",", ":"), sort_keys=True)
+    locked_job_id = await conn.fetchval(
+        "SELECT job.id FROM background_jobs AS job "
+        "WHERE job.id=$1 AND job.user_id=$2 AND job.knowledge_base_id=$3 AND job.document_id IS NULL "
+        "AND job.job_type='build_wiki' AND job.state='running' AND job.payload=$4::jsonb "
+        "AND job.lease_owner IS NOT DISTINCT FROM $5 AND job.attempt_count=$6 FOR UPDATE OF job",
+        job.id,
+        job.user_id,
+        job.knowledge_base_id,
+        payload_json,
+        job.lease_owner,
+        job.attempt_count,
+    )
+    if locked_job_id != job.id:
+        return None
+    row = await conn.fetchrow(
+        "SELECT run.* FROM rag_runs AS run "
+        "WHERE run.id=$1 AND run.job_id=$2 AND run.user_id=$3 AND run.knowledge_base_id=$4 FOR UPDATE OF run",
+        run_id,
+        job.id,
+        job.user_id,
+        job.knowledge_base_id,
+    )
+    if row is None:
+        return None
+    try:
+        run = _decode_db_run(row)
+    except (TypeError, ValueError) as exc:
+        raise _job_binding_error() from exc
+    rows = await conn.fetch(
+        f"SELECT {_PAGE_RECORD_PROJECTION} FROM rag_run_pages AS page "
+        "WHERE page.run_id=$1 AND page.user_id=$2 AND page.knowledge_base_id=$3 "
+        "ORDER BY page.ordinal LIMIT $4 FOR UPDATE OF page",
+        run.id,
+        run.user_id,
+        run.knowledge_base_id,
+        run.budget.max_pages + 1,
+    )
+    if len(rows) > run.budget.max_pages:
+        raise _job_binding_error()
+    try:
+        pages = tuple(_decode_db_page(page_row) for page_row in rows)
+    except (TypeError, ValueError) as exc:
+        raise _job_binding_error() from exc
+    if any(
+        page.run_id != run.id
+        or page.user_id != run.user_id
+        or page.knowledge_base_id != run.knowledge_base_id
+        or page.ordinal != ordinal
+        for ordinal, page in enumerate(pages)
+    ):
+        raise _job_binding_error()
+    return run, pages
 
 
 async def insert_worklist(
@@ -1552,6 +1627,7 @@ __all__ = [
     "create_resume",
     "get_for_user",
     "get_for_worker",
+    "get_terminal_snapshot_for_worker",
     "insert_worklist",
     "list_pages",
     "start_step",
