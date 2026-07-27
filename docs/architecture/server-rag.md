@@ -13,6 +13,11 @@ The feature is off unless both API and worker receive
 `SERVER_RAG_ENABLED=true`. Local mode remains unchanged. Clients select a
 server-owned profile name and never submit a provider URL, model id, or key.
 
+The [platform overview](overview.md) owns the end-to-end topology. RAG reuses
+the [shared write invariants](shared-kernel.md), executes through the
+[durable-job ledger](durable-jobs.md), and consumes the independently gated
+[retrieval contract](retrieval.md).
+
 ## Configuration and secrets
 
 Keep profile metadata and provider credentials in separate secret-manager

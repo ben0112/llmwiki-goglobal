@@ -1,10 +1,11 @@
 # 共享内核与数据不变量
 
-本文记录共享内核里程碑完成后的实际边界。它覆盖当前 API、MCP、SQLite、
-Postgres 和本地文件系统实现，不定义后续持久任务、混合检索或服务端 RAG
-接口。
+本文定义 API、MCP、SQLite、Postgres 与本地文件系统共同遵守的现行领域
+合同。它拥有跨运行时的数据身份、状态、版本、引用和写入不变量；持久任务、
+检索与服务端 RAG 的运行合同分别由其他专题文档拥有。整体依赖方向与部署关系
+见[总体架构](overview.md)。
 
-## 依赖方向
+## Scope and dependency rule
 
 允许的依赖方向是：API 路由和 MCP 工具依赖各自的应用服务与存储适配器；
 应用服务和存储适配器可以依赖 `llmwiki_core`；`llmwiki_core` 不得反向依赖
@@ -15,7 +16,15 @@ Postgres 和本地文件系统实现，不定义后续持久任务、混合检�
 本地文件 I/O、认证和进程生命周期仍分别属于 `api/` 与 `mcp/`。这一边界由
 `tests/unit/core/test_import_boundaries.py` 和所有 Python 镜像的安装测试约束。
 
-## 内核职责
+## Identities, paths, hashes, and citations
+
+文档的 Hosted 身份范围始终是
+`(user_id, knowledge_base_id, document_id)`；搜索命中还必须携带
+`(document_version, chunk_index)`。逻辑路径在进入适配器前规范化，内容与
+提示身份使用稳定摘要，引用保存来源文档、版本与块序号，不能退化为仅含展示
+文本的松散字符串。
+
+共享模块的职责是：
 
 - `llmwiki_core.documents`：文档种类、状态迁移、三元身份范围
   `(user_id, knowledge_base_id, document_id)` 和逻辑路径规范化。
@@ -32,7 +41,7 @@ Postgres 和本地文件系统实现，不定义后续持久任务、混合检�
 
 内核只表达可在各运行时一致执行的值和规则，不负责持久化策略。
 
-## 生命周期与归档语义
+## Lifecycle and version invariants
 
 普通处理路径只允许以下状态迁移：
 
@@ -53,7 +62,7 @@ failed -> pending
 事实来源，不保留归档历史；“归档”会删除文档及级联/显式删除的派生行。两种
 适配器可以采用不同保存策略，但对调用者都表现为文档不再出现在活动集合中。
 
-## `ready` 与 `document_version` 不变量
+### `ready` 与 `document_version`
 
 `documents.version` 表示已发布的文档修订。每个 `document_pages` 和
 `document_chunks` 行都携带 `document_version`，且可检索命中必须保留该版本。
@@ -69,7 +78,9 @@ failed -> pending
 `api/infra/db/derived_documents.py` 会扫描已就绪但版本不一致或缺失必要分块的
 Hosted 文档，并在恢复处理开始前原子重置为 `pending`。
 
-## 本地文件系统修复
+## Local and Hosted transaction boundaries
+
+### Local 文件系统修复
 
 本地源文件由工作区文件系统提供原始内容，SQLite 保存索引和派生状态。
 `api/domain/local_processor.py` 在启动对账时处理四类中断：派生版本漂移、卡在
@@ -84,7 +95,7 @@ Hosted 文档，并在恢复处理开始前原子重置为 `pending`。
 为准，通过新的 `WikiWriteBundle` 重建内容、版本、分块、内容派生引用和 facet
 rollup，使索引最终收敛。
 
-## Hosted 事务边界
+### Hosted 事务边界
 
 Hosted 文档提取由 `api/infra/db/derived_documents.replace_derived_content` 在一个
 Postgres 事务中锁定文档，替换页面、分块和派生 asset，递增版本，最后发布
@@ -100,7 +111,7 @@ Hosted wiki 写入由 `mcp.vaultfs.postgres.PostgresVaultFS.write_wiki_bundle` �
 对象字节写入不属于上述 Postgres 事务；数据库事务只发布已经准备好的派生
 数据和引用关系。
 
-## 兼容门面退出条件
+## Compatibility facades
 
 `api/services/chunker.py`、`mcp/services/chunker.py`、
 `api/services/references.py`、`mcp/tools/references.py` 和
@@ -111,3 +122,16 @@ Hosted wiki 写入由 `mcp.vaultfs.postgres.PostgresVaultFS.write_wiki_bundle` �
 导入 `llmwiki_core`；所有已发布入口和镜像都安装共享包；没有仍受支持的外部
 插件或调用方依赖旧路径；删除经过一次明确的弃用周期并有回归测试覆盖。删除
 门面不得把数据库或框架依赖迁入共享内核。
+
+## Verification evidence
+
+共享内核的导入边界、状态迁移、分块、引用、facet、搜索值对象和 wiki bundle
+合同由 `tests/unit/core/` 及 API/MCP 适配器回归共同覆盖。当前文档重写前的
+发布基线是提交 `0173f560c6fec03b87ce4f6803f663d2d6983ead`；其
+[GitHub Actions run 30251808426](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30251808426)
+六个 jobs 全部通过。该运行是历史基线，文档重写的最终精确 SHA 仍以交付时的
+Actions 为准。
+
+持久执行、检索和服务端生成的专属验证分别见
+[durable-jobs.md](durable-jobs.md)、[retrieval.md](retrieval.md) 与
+[server-rag.md](server-rag.md)。

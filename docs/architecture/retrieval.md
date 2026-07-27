@@ -9,6 +9,11 @@ Callers opt in per search with `retrieval_profile="hybrid"`; setting
 `HYBRID_SEARCH_ENABLED=true` makes that profile available but does not change
 the default argument.
 
+The [platform overview](overview.md) owns the end-to-end data flow. Hosted
+embedding work follows the [durable-job contract](durable-jobs.md), and
+server-side generation consumes this same retrieval contract as described in
+[server-rag.md](server-rag.md).
+
 For `scope=all`, hosted hybrid retrieval applies path, tag, document-kind,
 annotated-only, area, and corpus-facet filters inside both lexical and vector
 database candidate queries before their limits. It retrieves the bounded
@@ -211,6 +216,25 @@ deployment decision. It never changes configuration, never changes the search
 tool's default, and never enables hybrid automatically. Re-run the same private
 cohort after model, dimensions, chunking, filters, candidate limits, RRF,
 reranker, graph-expansion, or representative corpus changes.
+
+## Verification evidence
+
+The closing retrieval candidate is
+`66337e5c949220c8d167af46a0ad0e4e7519128c`. Its
+[GitHub Actions run 30191640099](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30191640099)
+passed all six jobs, and independent specification and quality reviews both
+concluded Critical `0`, Important `0`, Minor `0`, `Ready: Yes`.
+
+The representative real-Postgres cohort has dataset digest
+`d45bf89f5b28694afe2b4af1d03d15e3ba59e02d3bc20129eff77b58ab39ab7f`.
+Lexical Recall@10 and p95 are `0.5` and `10.0 ms`; hybrid reports `1.0` and
+`20.0 ms`. The result passes at recall ratio `2.0` and the inclusive latency
+boundary `2.0`. This evidence makes only that exact profile eligible for
+operator promotion and does not change the lexical default.
+
+The later platform publication baseline
+`0173f560c6fec03b87ce4f6803f663d2d6983ead` also passed all six jobs in
+[run 30251808426](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30251808426).
 
 ## Rollout and rollback
 
