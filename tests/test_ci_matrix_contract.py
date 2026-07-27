@@ -61,9 +61,7 @@ def test_scaled_rag_profile_covers_the_default_run_timeout():
 
     workflow = WORKFLOW.read_text(encoding="utf-8")
     profile_line = next(
-        line.strip()
-        for line in workflow.splitlines()
-        if line.strip().startswith("RAG_MODEL_PROFILES_JSON=")
+        line.strip() for line in workflow.splitlines() if line.strip().startswith("RAG_MODEL_PROFILES_JSON=")
     )
     profiles = json.loads(profile_line.split("=", 1)[1])
 
