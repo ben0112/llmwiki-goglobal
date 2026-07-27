@@ -158,6 +158,20 @@ async def _start_hosted_listener(app: FastAPI):
     return listener
 
 
+def _initialize_hosted_rag_service(app: FastAPI, pool) -> None:
+    """Attach RAG only after the canonical durable job service exists."""
+    app.state.rag_service = None
+    if not settings.SERVER_RAG_ENABLED:
+        return
+    from rag.service import RagService
+
+    app.state.rag_service = RagService(
+        pool,
+        settings,
+        job_service=app.state.job_service,
+    )
+
+
 async def _finish_hosted_startup(app: FastAPI, pool):
     """Build Hosted services and background tasks after core infra is ready."""
     await _repair_hosted_derived_drift(pool)
@@ -210,81 +224,130 @@ async def _finish_hosted_startup(app: FastAPI, pool):
     return listener, None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if settings.MODE == "local":
-        async with _local_lifespan(app):
-            yield
-        return
+async def _close_hosted_resources(
+    app: FastAPI,
+    *,
+    pool,
+    quota_redis,
+    listener,
+    cleanup_task,
+) -> tuple[BaseException, ...]:
+    """Attempt every hosted close exactly once and return bounded failures."""
+    failures: list[BaseException] = []
+    app.state.rag_service = None
+    if cleanup_task is not None:
+        try:
+            cleanup_task.cancel()
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        except BaseException as failure:  # noqa: BLE001 - preserve until all resources close.
+            failures.append(failure)
+    for resource, close_name in (
+        (listener, "close"),
+        (quota_redis, "aclose"),
+        (pool, "close"),
+    ):
+        if resource is None:
+            continue
+        try:
+            await getattr(resource, close_name)()
+        except BaseException as failure:  # noqa: BLE001 - later resources must still close.
+            failures.append(failure)
+    return tuple(failures)
 
+
+def _raise_lifespan_failure(
+    primary: BaseException | None,
+    cleanup_failures: tuple[BaseException, ...],
+) -> None:
+    from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
+
+    failures = (() if primary is None else (primary,)) + cleanup_failures
+    signal = sanitized_boundary_signal_or_unknown(*failures)
+    if signal is not None and type(signal) is not BaseException:
+        raise signal from None
+    if primary is not None:
+        raise primary from None
+    if cleanup_failures:
+        raise cleanup_failures[0] from None
+
+
+@asynccontextmanager
+async def _hosted_lifespan(app: FastAPI):
     # ── Hosted mode ──
     # Prefetch the Supabase JWKS so the first authenticated request doesn't
     # pay the cold-cache cost and so a JWKS outage at boot is visible
     # immediately rather than masked behind the first auth error.
+    import asyncpg
     from auth import prefetch_jwks
 
-    await prefetch_jwks()
-
-    import asyncpg
-
-    pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=2, max_size=10)
-    app.state.pool = pool
-    app.state.mode = "hosted"
-    app.state.readiness_requires_redis = bool(settings.DURABLE_JOBS_ENABLED)
-    app.state.readiness_requires_s3 = bool(
-        settings.TUS_MULTIPART_ENABLED or (settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET)
-    )
-    app.state.readiness_requires_listener = True
-
-    app.state.job_service = None
-    app.state.quota_service = None
-    app.state.redis = None
+    pool = None
     quota_redis = None
-    if settings.DURABLE_JOBS_ENABLED:
-        from jobs.service import JobService
+    listener = None
+    cleanup_task = None
+    startup_failure: BaseException | None = None
+    try:
+        await prefetch_jwks()
+        pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=2, max_size=10)
+        app.state.pool = pool
+        app.state.mode = "hosted"
+        app.state.readiness_requires_redis = bool(settings.DURABLE_JOBS_ENABLED)
+        app.state.readiness_requires_s3 = bool(
+            settings.TUS_MULTIPART_ENABLED or (settings.AWS_ACCESS_KEY_ID and settings.S3_BUCKET)
+        )
+        app.state.readiness_requires_listener = True
+        app.state.job_service = None
+        app.state.quota_service = None
+        app.state.redis = None
+        if settings.DURABLE_JOBS_ENABLED:
+            from jobs.service import JobService
 
-        app.state.job_service = JobService(pool)
-        try:
+            app.state.job_service = JobService(pool)
+            _initialize_hosted_rag_service(app, pool)
             quota_redis, app.state.quota_service = await _start_hosted_quota_runtime(
                 pool,
                 settings.REDIS_URL,
             )
             app.state.redis = quota_redis
-        except BaseException:
-            await pool.close()
-            raise
-
-    try:
         listener, cleanup_task = await _finish_hosted_startup(app, pool)
-    except BaseException:
-        try:
-            if quota_redis is not None:
-                await quota_redis.aclose()
-        finally:
-            await pool.close()
-        raise
+    except BaseException as failure:  # noqa: BLE001 - close every established startup resource.
+        startup_failure = failure
+    if startup_failure is not None:
+        cleanup_failures = await _close_hosted_resources(
+            app,
+            pool=pool,
+            quota_redis=quota_redis,
+            listener=listener,
+            cleanup_task=cleanup_task,
+        )
+        _raise_lifespan_failure(startup_failure, cleanup_failures)
 
+    body_failure: BaseException | None = None
     try:
         yield
-    finally:
-        # 关停:cancel 后 await,确保取消真正生效、异常不在 GC 时无声丢失
-        if cleanup_task is not None:
-            cleanup_task.cancel()
-        for task in (cleanup_task,):
-            if task is None:
-                continue
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:  # noqa: BLE001 - continue closing shared infrastructure.
-                logger.error("Hosted shutdown task failed error_type=%s", type(exc).__name__)
-        await listener.close()
-        try:
-            if quota_redis is not None:
-                await quota_redis.aclose()
-        finally:
-            await pool.close()
+    except BaseException as failure:  # noqa: BLE001 - preserve until every resource closes.
+        body_failure = failure
+    cleanup_failures = await _close_hosted_resources(
+        app,
+        pool=pool,
+        quota_redis=quota_redis,
+        listener=listener,
+        cleanup_task=cleanup_task,
+    )
+    if body_failure is not None or cleanup_failures:
+        _raise_lifespan_failure(body_failure, cleanup_failures)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.rag_service = None
+    if settings.MODE == "local":
+        async with _local_lifespan(app):
+            yield
+        return
+    async with _hosted_lifespan(app):
+        yield
 
 
 async def _local_lifespan_inner(app: FastAPI):
@@ -327,6 +390,7 @@ async def _local_lifespan_inner(app: FastAPI):
     app.state.storage_service = storage
     app.state.ocr_service = None
     app.state.job_service = None
+    app.state.rag_service = None
     app.state.quota_service = None
     app.state.redis = None
     app.state.readiness_requires_redis = False
@@ -486,6 +550,7 @@ else:
     from routes.graph import router as graph_router
     from routes.jobs import router as jobs_router
     from routes.public import router as public_router
+    from routes.rag import router as rag_router
     from routes.ws import router as ws_router
 
     app.include_router(api_keys_router)
@@ -494,3 +559,4 @@ else:
     app.include_router(ws_router)
     app.include_router(public_router)
     app.include_router(jobs_router)
+    app.include_router(rag_router)

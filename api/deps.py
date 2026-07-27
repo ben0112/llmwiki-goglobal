@@ -23,10 +23,41 @@ async def get_job_service(request: Request):
 
     from jobs.service import JobService
 
-    if not isinstance(service, JobService):
+    if type(service) is not JobService:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Durable job service unavailable",
+        )
+    return service
+
+
+async def get_rag_service(request: Request):
+    """Return the hosted durable RAG service, failing closed when unavailable."""
+    from config import settings
+
+    if (
+        getattr(request.app.state, "mode", settings.MODE) != "hosted"
+        or not settings.DURABLE_JOBS_ENABLED
+        or not settings.SERVER_RAG_ENABLED
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "rag_disabled",
+                "message": "Server-side RAG is disabled.",
+            },
+        )
+
+    service = getattr(request.app.state, "rag_service", None)
+    from rag.service import RagService
+
+    if type(service) is not RagService:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "rag_internal_error",
+                "message": "The RAG request could not be completed.",
+            },
         )
     return service
 
