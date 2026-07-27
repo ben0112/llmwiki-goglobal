@@ -544,6 +544,35 @@ async def test_step_append_is_ordered_and_only_one_can_be_running(pool, seeded_k
 
 
 @pytest.mark.asyncio
+async def test_plan_step_persists_prompt_identity_at_creation(pool, seeded_kb):
+    run, _ = await _create_root(pool, seeded_kb, key="plan-prompt-identity")
+    async with pool.acquire() as conn, conn.transaction():
+        with pytest.raises(ValueError, match="both be present"):
+            await repository.start_step(
+                conn,
+                run_id=run.id,
+                page_id=None,
+                step_type=RagStepType.PLAN,
+                input_digest="1" * 64,
+                prompt_version="plan-v1",
+            )
+        assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_steps WHERE run_id=$1)", run.id)
+
+        step = await repository.start_step(
+            conn,
+            run_id=run.id,
+            page_id=None,
+            step_type=RagStepType.PLAN,
+            input_digest="2" * 64,
+            prompt_version="plan-v1",
+            prompt_digest="3" * 64,
+        )
+
+    assert step.prompt_version == "plan-v1"
+    assert step.prompt_digest == "3" * 64
+
+
+@pytest.mark.asyncio
 async def test_start_and_finish_step_enforce_dedicated_draft_reservation(pool, seeded_kb):
     run, _ = await _create_root(pool, seeded_kb, key="draft-reservation")
     page = (await _insert_pages(pool, run, 1))[0]

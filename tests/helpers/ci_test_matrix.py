@@ -31,6 +31,7 @@ integration_mcp_postgres = {
 integration_redis = {INTEGRATION / "test_tus_sessions_redis.py"}
 integration_minio = {INTEGRATION / "test_s3_multipart.py"}
 integration_scaled = {INTEGRATION / "test_scaled_compose.py"}
+integration_rag = set(INTEGRATION.glob("test_rag_*.py")) | {INTEGRATION / "isolation/test_rag_api_isolation.py"}
 integration_retrieval = {
     INTEGRATION / "test_chunk_embeddings_schema.py",
     INTEGRATION / "test_durable_embeddings.py",
@@ -50,8 +51,10 @@ SEGMENTS: dict[str, tuple[str, ...]] = {
         - integration_redis
         - integration_minio
         - integration_scaled
+        - integration_rag
         - integration_retrieval
     ),
+    "integration-rag": _relative(integration_rag),
     "integration-mcp": _relative(integration_mcp - integration_mcp_postgres),
     "integration-mcp-postgres": _relative(integration_mcp_postgres),
     "integration-retrieval": _relative(integration_retrieval),
@@ -60,7 +63,7 @@ SEGMENTS: dict[str, tuple[str, ...]] = {
     "integration-scaled": _relative(integration_scaled),
 }
 
-ISOLATED_SEGMENTS = frozenset({"integration-api", "integration-mcp-postgres"})
+ISOLATED_SEGMENTS = frozenset({"integration-api", "integration-mcp-postgres", "integration-rag"})
 
 
 def _segment_files(segment: str) -> tuple[str, ...]:
@@ -81,11 +84,7 @@ def _run(segment: str, command: Sequence[str]) -> int:
         print("CI test command must not be empty", file=sys.stderr)
         return 2
 
-    commands = (
-        ((*command, test_file) for test_file in files)
-        if segment in ISOLATED_SEGMENTS
-        else ((*command, *files),)
-    )
+    commands = ((*command, test_file) for test_file in files) if segment in ISOLATED_SEGMENTS else ((*command, *files),)
     for child_command in commands:
         completed = subprocess.run(list(child_command), check=False)
         if completed.returncode != 0:

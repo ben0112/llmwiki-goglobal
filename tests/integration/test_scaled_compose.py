@@ -64,6 +64,17 @@ def test_scaled_compose_declares_private_replicas_and_gateway():
     converter_block = _service_block(text, "converter")
     assert "ports:" not in converter_block
 
+    for service in ("api", "worker"):
+        block = _service_block(text, service)
+        assert "SERVER_RAG_ENABLED: ${SERVER_RAG_ENABLED:-false}" in block
+        assert "RAG_MODEL_PROFILES_JSON: ${RAG_MODEL_PROFILES_JSON:-}" in block
+        assert "RAG_MODEL_API_KEYS_JSON: ${RAG_MODEL_API_KEYS_JSON:-}" in block
+    fake_model_block = _service_block(text, "fake-model")
+    assert 'profiles: ["ci"]' in fake_model_block
+    assert "context: ../tests/fixtures/fake_rag_model" in fake_model_block
+    assert "dockerfile: Dockerfile" in fake_model_block
+    assert "ports:" not in fake_model_block
+
 
 def test_gateway_configuration_supports_dynamic_http_and_websocket_proxying():
     text = NGINX.read_text(encoding="utf-8")
@@ -155,6 +166,24 @@ def test_live_scaled_smoke_exercises_cross_replica_and_sigkill_recovery_paths():
     assert 'subprocess.run(["docker", "kill", "--signal", "TERM"' in source
     assert "old_owner" in source
     assert "graceful" in source
+    assert "rag_kb_id" in source
+    assert '"/v1/rag/build-wiki"' in source
+    assert "rag_create_instance" in source
+    assert "rag_observe_instance != rag_create_instance" in source
+    assert "rag_worker_owners" in source
+    assert "rag_draft_running" in source
+    assert "rag_recovered" in source
+    assert 'rag_pre_kill["last_committed_ordinal"] == -1' in source
+    assert "rag_recovered_owner != rag_killed_owner" in source
+    assert "rag_cancel_commits == 0" in source
+    assert "rag_resume_sequence_counts" in source
+    assert 'f"/v1/jobs/{rag_cancel_job_id}/cancel"' in source
+    assert 'f"/v1/rag/runs/{rag_failed_run_id}/resume"' in source
+    assert "count(DISTINCT sequence)" in source
+    rag_kill_at = source.index('_disable_restart_and_kill(rag_killed_container, "KILL")')
+    rag_recovered_at = source.index("rag_recovered = await _wait_for_job", rag_kill_at)
+    rag_restore_workers_at = source.index('"--scale", "worker=2", "worker"', rag_kill_at)
+    assert rag_kill_at < rag_recovered_at < rag_restore_workers_at
     term_at = source.index('subprocess.run(["docker", "kill", "--signal", "TERM"')
     next_job_at = source.index("draining_response = await client.post", term_at)
     guarded_exit_at = source.index("await _wait_for_exit_without_old_owner_claim", next_job_at)
@@ -205,8 +234,7 @@ def test_scaled_pdf_fixture_is_a_complete_multipart_sized_document():
 def test_compose_recovery_reuses_explicit_scaled_env_file(monkeypatch, tmp_path):
     env_file = tmp_path / "scaled.env"
     env_file.write_text(
-        "DATABASE_URL=postgresql://postgres@ci-postgres/postgres\n"
-        "AWS_SECRET_ACCESS_KEY=scaled-secret\n"
+        "DATABASE_URL=postgresql://postgres@ci-postgres/postgres\nAWS_SECRET_ACCESS_KEY=scaled-secret\n"
     )
     monkeypatch.setenv("SCALED_COMPOSE_ENV_FILE", str(env_file))
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres@localhost:5434/postgres")
@@ -360,14 +388,62 @@ async def _wait_for_running_job(pool, job_id: UUID, timeout: float = 40):
     last = None
     while time.monotonic() < deadline:
         last = await pool.fetchrow(
-            "SELECT state::text, lease_owner, lease_expires_at, attempt_count "
-            "FROM background_jobs WHERE id = $1",
+            "SELECT state::text, lease_owner, lease_expires_at, attempt_count FROM background_jobs WHERE id = $1",
             job_id,
         )
         if last and last["state"] == "running" and last["lease_owner"]:
             return last
         await asyncio.sleep(0.25)
     pytest.fail(f"job {job_id} was not claimed within {timeout}s; last={dict(last) if last else None}")
+
+
+async def _wait_for_job_state(
+    client: httpx.AsyncClient,
+    job_id: str,
+    expected: set[str],
+    timeout: float = 240,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        response = await client.get(f"/v1/jobs/{job_id}", headers={"Connection": "close"})
+        if response.status_code >= 500:
+            await asyncio.sleep(0.5)
+            continue
+        response.raise_for_status()
+        last = response.json()
+        if last["state"] in expected:
+            return last
+        if last["state"] in {"succeeded", "failed", "cancelled"} - expected:
+            pytest.fail(f"job {job_id} ended in unexpected state {last['state']}: {last.get('error')}")
+        await asyncio.sleep(0.5)
+    pytest.fail(f"job {job_id} did not reach {sorted(expected)} within {timeout}s; last={last}")
+
+
+async def _wait_for_rag_step(
+    pool,
+    run_id: UUID,
+    step_type: str,
+    status: str,
+    timeout: float = 40,
+):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = await pool.fetchrow(
+            "SELECT step.id,job.lease_owner FROM rag_steps AS step "
+            "JOIN rag_runs AS run ON run.id=step.run_id "
+            "JOIN background_jobs AS job ON job.id=run.job_id "
+            "WHERE step.run_id=$1 AND step.step_type=$2 AND step.status=$3 "
+            "ORDER BY step.sequence DESC LIMIT 1",
+            run_id,
+            step_type,
+            status,
+        )
+        if last and last["lease_owner"]:
+            return last
+        await asyncio.sleep(0.05)
+    pytest.fail(f"RAG run {run_id} did not reach {step_type}/{status}; last={dict(last) if last else None}")
 
 
 def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -436,9 +512,7 @@ def _restart_redis_and_wait(timeout: float = 40) -> None:
         local_fsync_count = int(response_lines[0])
     except (IndexError, ValueError):
         pytest.fail("Redis WAITAOF returned an invalid local fsync count")
-    assert local_fsync_count >= 1, (
-        f"Redis WAITAOF local AOF fsync count must be at least 1; got {local_fsync_count}"
-    )
+    assert local_fsync_count >= 1, f"Redis WAITAOF local AOF fsync count must be at least 1; got {local_fsync_count}"
     _compose("restart", "redis")
     deadline = time.monotonic() + timeout
     last = None
@@ -494,9 +568,7 @@ async def _wait_for_exit_without_old_owner_claim(
             job_id,
         )
         if last_job and last_job["lease_owner"]:
-            assert last_job["lease_owner"] != old_owner, (
-                "SIGTERM-draining worker claimed a new durable job"
-            )
+            assert last_job["lease_owner"] != old_owner, "SIGTERM-draining worker claimed a new durable job"
             replacement_owner = last_job["lease_owner"]
         last_container = _container_state(container_id)
         if not last_container["Running"]:
@@ -525,17 +597,50 @@ async def test_two_api_two_worker_recovery_smoke():
     kb_id = uuid4()
     graceful_kb_id = uuid4()
     draining_kb_id = uuid4()
+    rag_kb_id = uuid4()
+    rag_source_id = uuid4()
     filename = f"scaled-{uuid4()}.pdf"
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=3)
 
     try:
+        if not await pool.fetchval("SELECT to_regoperator('&@~(text,text)') IS NOT NULL"):
+            await pool.execute(
+                "CREATE FUNCTION scaled_rag_text_search(text,text) RETURNS boolean "
+                "LANGUAGE sql IMMUTABLE STRICT AS 'SELECT strpos(lower($1),lower($2)) > 0'"
+            )
+            await pool.execute("CREATE OPERATOR &@~ (LEFTARG=text,RIGHTARG=text,FUNCTION=scaled_rag_text_search)")
+        if not await pool.fetchval("SELECT to_regprocedure('pgroonga_score(oid,tid)') IS NOT NULL"):
+            await pool.execute(
+                "CREATE FUNCTION pgroonga_score(oid,tid) RETURNS double precision "
+                "LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 0.0::double precision'"
+            )
         await pool.executemany(
             "INSERT INTO knowledge_bases (id, user_id, name, slug) VALUES ($1, $2, $3, $4)",
             (
                 (kb_id, user_id, "Scaled compose smoke", f"scaled-{kb_id}"),
                 (graceful_kb_id, user_id, "Graceful worker smoke", f"graceful-{graceful_kb_id}"),
                 (draining_kb_id, user_id, "Draining worker smoke", f"draining-{draining_kb_id}"),
+                (rag_kb_id, user_id, "Scaled RAG smoke", f"scaled-rag-{rag_kb_id}"),
             ),
+        )
+        await pool.execute(
+            "INSERT INTO documents "
+            "(id,user_id,knowledge_base_id,filename,title,path,source_kind,file_type,status,"
+            "content,metadata,version) VALUES($1,$2,$3,'scaled-rag.pdf','Scaled RAG source','/corpus/',"
+            "'source','pdf','ready','Authoritative scaled RAG launch evidence.',"
+            '\'{"entry_id":"E-SCALED-RAG","stage":"S1"}\'::jsonb,1)',
+            rag_source_id,
+            user_id,
+            rag_kb_id,
+        )
+        await pool.execute(
+            "INSERT INTO document_chunks "
+            "(document_id,document_version,user_id,knowledge_base_id,chunk_index,content,"
+            "source_content,page,token_count) VALUES($1,1,$2,$3,0,$4,$4,1,6)",
+            rag_source_id,
+            user_id,
+            rag_kb_id,
+            "Authoritative scaled RAG launch evidence.",
         )
 
         instance_ids = set()
@@ -694,6 +799,221 @@ async def test_two_api_two_worker_recovery_smoke():
                 await asyncio.sleep(0.25)
         assert len(restored_api_instances) == 2
 
+        rag_worker_owners = {
+            subprocess.run(
+                ["docker", "inspect", "--format", "{{.Config.Hostname}}", container_id],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            for container_id in _compose("ps", "-q", "worker").stdout.split()
+        }
+        assert len(rag_worker_owners) == 2
+        rag_request = {
+            "knowledge_base_id": str(rag_kb_id),
+            "goal": "Build scaled wiki [FAKE_MODEL_TIMEOUT]",
+            "target_path_prefix": "/wiki/scaled/",
+            "model_profile": "primary",
+            "dry_run": False,
+        }
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            rag_created = await client.post(
+                "/v1/rag/build-wiki",
+                headers={"Idempotency-Key": "scaled-rag-success", "Connection": "close"},
+                json=rag_request,
+            )
+        rag_created.raise_for_status()
+        rag_create_instance = rag_created.headers.get("x-api-instance-id")
+        assert rag_create_instance in restored_api_instances
+        rag_accepted = rag_created.json()
+        rag_run_id = UUID(rag_accepted["run_id"])
+        rag_job_id = UUID(rag_accepted["job_id"])
+        rag_observe_instance = None
+        rag_owner = None
+        rag_observed = None
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            job_row = await pool.fetchrow(
+                "SELECT state::text,lease_owner FROM background_jobs WHERE id=$1",
+                rag_job_id,
+            )
+            if job_row and job_row["lease_owner"]:
+                rag_owner = job_row["lease_owner"]
+            async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+                observed = await client.get(
+                    f"/v1/rag/runs/{rag_run_id}",
+                    headers={"Connection": "close"},
+                )
+            observed.raise_for_status()
+            observed_instance = observed.headers.get("x-api-instance-id")
+            if observed_instance != rag_create_instance:
+                rag_observe_instance = observed_instance
+                rag_observed = observed.json()
+            if rag_observed and rag_observed["completion_reason"] == "completed" and rag_owner:
+                break
+            await asyncio.sleep(0.1)
+        assert rag_observe_instance != rag_create_instance
+        assert rag_observed and rag_observed["completion_reason"] == "completed"
+        assert rag_owner and rag_owner.split(":", 1)[0] in rag_worker_owners
+        rag_success_counts = await pool.fetchrow(
+            "SELECT count(*) AS steps,count(DISTINCT sequence) AS unique_steps,"
+            "count(*) FILTER (WHERE status='running') AS running_steps "
+            "FROM rag_steps WHERE run_id=$1",
+            rag_run_id,
+        )
+        assert tuple(rag_success_counts) == (7, 7, 0)
+
+        rag_recovery_request = {
+            **rag_request,
+            "goal": "Build recovery wiki [FAKE_MODEL_BLOCK_DRAFT]",
+            "target_path_prefix": "/wiki/scaled-recovery/",
+        }
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            rag_recovery_created = await client.post(
+                "/v1/rag/build-wiki",
+                headers={"Idempotency-Key": "scaled-rag-recovery"},
+                json=rag_recovery_request,
+            )
+        rag_recovery_created.raise_for_status()
+        rag_recovery = rag_recovery_created.json()
+        rag_recovery_run_id = UUID(rag_recovery["run_id"])
+        rag_recovery_job_id = UUID(rag_recovery["job_id"])
+        rag_draft_running = await _wait_for_rag_step(
+            pool,
+            rag_recovery_run_id,
+            "draft",
+            "running",
+        )
+        rag_killed_owner = rag_draft_running["lease_owner"]
+        assert rag_killed_owner.split(":", 1)[0] in rag_worker_owners
+        rag_pre_kill = await pool.fetchrow(
+            "SELECT run.last_committed_ordinal,"
+            "EXISTS(SELECT 1 FROM documents WHERE user_id=run.user_id "
+            "AND knowledge_base_id=run.knowledge_base_id AND path='/wiki/scaled-recovery/') "
+            "AS document_exists FROM rag_runs AS run WHERE run.id=$1",
+            rag_recovery_run_id,
+        )
+        assert rag_pre_kill["last_committed_ordinal"] == -1
+        assert not rag_pre_kill["document_exists"]
+        rag_killed_container = _worker_container_for_owner(rag_killed_owner)
+        _disable_restart_and_kill(rag_killed_container, "KILL")
+        rag_recovered_owner = None
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            recovery_job = await pool.fetchrow(
+                "SELECT state::text,lease_owner,attempt_count FROM background_jobs WHERE id=$1",
+                rag_recovery_job_id,
+            )
+            if (
+                recovery_job
+                and recovery_job["state"] == "running"
+                and recovery_job["attempt_count"] >= 2
+                and recovery_job["lease_owner"]
+            ):
+                rag_recovered_owner = recovery_job["lease_owner"]
+                break
+            await asyncio.sleep(0.05)
+        assert rag_recovered_owner != rag_killed_owner
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            rag_recovered = await _wait_for_job(client, str(rag_recovery_job_id), timeout=240)
+        assert rag_recovered["attempt_count"] >= 2
+        _compose("up", "-d", "--no-deps", "--scale", "worker=2", "worker")
+        rag_recovery_counts = await pool.fetchrow(
+            "SELECT count(*) AS steps,count(DISTINCT sequence) AS unique_steps,"
+            "count(*) FILTER (WHERE status='running') AS running_steps,"
+            "count(*) FILTER (WHERE step_type='draft' AND error_code='rag_attempt_interrupted') "
+            "AS interrupted_drafts FROM rag_steps WHERE run_id=$1",
+            rag_recovery_run_id,
+        )
+        assert rag_recovery_counts["steps"] == rag_recovery_counts["unique_steps"]
+        assert rag_recovery_counts["running_steps"] == 0
+        assert rag_recovery_counts["interrupted_drafts"] == 1
+        rag_recovery_page = await pool.fetchrow(
+            "SELECT document_id,version_committed,attempt_count FROM rag_run_pages WHERE run_id=$1",
+            rag_recovery_run_id,
+        )
+        assert rag_recovery_page["version_committed"] == 1
+        assert rag_recovery_page["attempt_count"] == 2
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM documents WHERE id=$1 AND version=1",
+                rag_recovery_page["document_id"],
+            )
+            == 1
+        )
+
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            rag_cancel_created = await client.post(
+                "/v1/rag/build-wiki",
+                headers={"Idempotency-Key": "scaled-rag-cancel"},
+                json={
+                    **rag_request,
+                    "goal": "Cancel scaled wiki [FAKE_MODEL_TIMEOUT]",
+                    "target_path_prefix": "/wiki/scaled-cancel/",
+                },
+            )
+            rag_cancel_created.raise_for_status()
+            rag_cancel_accepted = rag_cancel_created.json()
+            rag_cancel_job_id = rag_cancel_accepted["job_id"]
+            rag_cancelled = await client.post(f"/v1/jobs/{rag_cancel_job_id}/cancel")
+            rag_cancelled.raise_for_status()
+            rag_cancelled_job = await _wait_for_job_state(
+                client,
+                rag_cancel_job_id,
+                {"cancelled"},
+            )
+        assert rag_cancelled_job["state"] == "cancelled"
+        rag_cancel_commits = await pool.fetchval(
+            "SELECT count(*) FROM rag_run_pages WHERE run_id=$1 AND state='committed'",
+            UUID(rag_cancel_accepted["run_id"]),
+        )
+        assert rag_cancel_commits == 0
+
+        async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
+            rag_failed_created = await client.post(
+                "/v1/rag/build-wiki",
+                headers={"Idempotency-Key": "scaled-rag-bounded"},
+                json={
+                    **rag_request,
+                    "goal": "Build bounded scaled wiki [FAKE_MODEL_TWO_PAGES]",
+                    "target_path_prefix": "/wiki/scaled-resume/",
+                    "budget": {"max_pages": 2, "max_steps": 7},
+                },
+            )
+            rag_failed_created.raise_for_status()
+            rag_failed = rag_failed_created.json()
+            rag_failed_run_id = rag_failed["run_id"]
+            rag_failed_job = await _wait_for_job_state(
+                client,
+                rag_failed["job_id"],
+                {"failed"},
+            )
+            assert rag_failed_job["error"]["code"] == "rag_budget_exhausted"
+            rag_resume_created = await client.post(
+                f"/v1/rag/runs/{rag_failed_run_id}/resume",
+                headers={"Idempotency-Key": "scaled-rag-resume"},
+                json={"budget": {"max_steps": 14}},
+            )
+            rag_resume_created.raise_for_status()
+            rag_resumed = rag_resume_created.json()
+            rag_resume_job = await _wait_for_job(client, rag_resumed["job_id"], timeout=120)
+        assert rag_resume_job["result"]["pages_committed"] == 2
+        assert rag_resume_job["result"]["pages_skipped"] == 1
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM rag_run_pages WHERE run_id=$1 AND state='committed'",
+                UUID(rag_resumed["run_id"]),
+            )
+            == 2
+        )
+        rag_resume_sequence_counts = await pool.fetch(
+            "SELECT run_id,count(*) AS steps,count(DISTINCT sequence) AS unique_steps "
+            "FROM rag_steps WHERE run_id=ANY($1::uuid[]) GROUP BY run_id",
+            [UUID(rag_failed_run_id), UUID(rag_resumed["run_id"])],
+        )
+        assert len(rag_resume_sequence_counts) == 2
+        assert all(row["steps"] == row["unique_steps"] for row in rag_resume_sequence_counts)
+
         async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
             graph = await client.post(f"/v1/knowledge-bases/{kb_id}/graph/rebuild")
             graph.raise_for_status()
@@ -709,9 +1029,7 @@ async def test_two_api_two_worker_recovery_smoke():
             graceful_transaction_started = True
             await graceful_lock_connection.execute("LOCK TABLE document_references IN ACCESS EXCLUSIVE MODE")
             async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
-                graceful_response = await client.post(
-                    f"/v1/knowledge-bases/{graceful_kb_id}/graph/rebuild"
-                )
+                graceful_response = await client.post(f"/v1/knowledge-bases/{graceful_kb_id}/graph/rebuild")
                 graceful_response.raise_for_status()
                 graceful_job_id = UUID(graceful_response.json()["job_id"])
 
@@ -722,29 +1040,24 @@ async def test_two_api_two_worker_recovery_smoke():
             subprocess.run(["docker", "kill", "--signal", "TERM", graceful_worker_container], check=True)
 
             async with httpx.AsyncClient(base_url=api_url, headers=auth_headers, timeout=20) as client:
-                draining_response = await client.post(
-                    f"/v1/knowledge-bases/{draining_kb_id}/graph/rebuild"
-                )
+                draining_response = await client.post(f"/v1/knowledge-bases/{draining_kb_id}/graph/rebuild")
                 draining_response.raise_for_status()
                 draining_job_id = UUID(draining_response.json()["job_id"])
             assert _container_state(graceful_worker_container)["Running"], (
                 "signalled worker exited before the new job entered the drain window"
             )
-            graceful_exit, observed_replacement_owner = (
-                await _wait_for_exit_without_old_owner_claim(
-                    pool,
-                    draining_job_id,
-                    old_owner,
-                    graceful_worker_container,
-                )
+            graceful_exit, observed_replacement_owner = await _wait_for_exit_without_old_owner_claim(
+                pool,
+                draining_job_id,
+                old_owner,
+                graceful_worker_container,
             )
 
             deadline = time.monotonic() + 40
             graceful_transition = None
             while time.monotonic() < deadline:
                 graceful_transition = await pool.fetchrow(
-                    "SELECT state::text, lease_owner, lease_expires_at, error_code "
-                    "FROM background_jobs WHERE id = $1",
+                    "SELECT state::text, lease_owner, lease_expires_at, error_code FROM background_jobs WHERE id = $1",
                     graceful_job_id,
                 )
                 if (
@@ -774,8 +1087,7 @@ async def test_two_api_two_worker_recovery_smoke():
             if observed_replacement_owner is not None:
                 assert draining_running["lease_owner"] == observed_replacement_owner
             old_owner_claims = await pool.fetchval(
-                "SELECT count(*) FROM background_jobs "
-                "WHERE state = 'running' AND lease_owner = $1",
+                "SELECT count(*) FROM background_jobs WHERE state = 'running' AND lease_owner = $1",
                 old_owner,
             )
             assert old_owner_claims == 0
@@ -870,6 +1182,6 @@ async def test_two_api_two_worker_recovery_smoke():
         finally:
             await pool.execute(
                 "DELETE FROM knowledge_bases WHERE id = ANY($1::uuid[])",
-                [kb_id, graceful_kb_id, draining_kb_id],
+                [kb_id, graceful_kb_id, draining_kb_id, rag_kb_id],
             )
             await pool.close()

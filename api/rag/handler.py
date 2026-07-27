@@ -447,6 +447,8 @@ class _PostgresRunStore:
                 page_id=None,
                 step_type=RagStepType.PLAN,
                 input_digest=spec.input_digest,
+                prompt_version=spec.prompt_version,
+                prompt_digest=spec.prompt_digest,
             )
             return PlanAttempt(state.run, step, spec, False)
 
@@ -498,6 +500,8 @@ class _PostgresRunStore:
                     page_id=None,
                     step_type=RagStepType.PLAN,
                     input_digest=input_digest,
+                    prompt_version=attempt.spec.prompt_version,
+                    prompt_digest=attempt.spec.prompt_digest,
                 )
                 result = PlanAttemptBinding(current, PlanAttempt(current, replacement, attempt.spec, False), False)
         if finished_to_emit is not None:

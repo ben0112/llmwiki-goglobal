@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from jobs import repository
@@ -448,10 +448,12 @@ async def test_service_creates_and_delegates_scoped_get_and_cancel(pool):
 
 
 def test_row_mapper_handles_nullable_columns_and_rejects_non_object_json():
+    from asyncpg.pgproto.pgproto import UUID as AsyncpgUUID
+
     row = {
-        "id": str(uuid4()),
+        "id": AsyncpgUUID(str(uuid4())),
         "job_type": "document.extract",
-        "user_id": str(uuid4()),
+        "user_id": AsyncpgUUID(str(uuid4())),
         "state": "queued",
         "knowledge_base_id": None,
         "document_id": None,
@@ -476,8 +478,17 @@ def test_row_mapper_handles_nullable_columns_and_rejects_non_object_json():
 
     record = repository._row_to_record(row)
 
+    assert type(record.id) is UUID
+    assert type(record.user_id) is UUID
     assert record.knowledge_base_id is None
     assert record.progress is None
     assert record.payload == {"nested": (1,)}
     with pytest.raises(TypeError, match="JSON object"):
         repository._row_to_record({**row, "payload": "[]"})
+
+    class HostileUUID(UUID):
+        def __str__(self):
+            raise AssertionError("hostile UUID coercion must not run")
+
+    with pytest.raises(TypeError, match="id must be a UUID"):
+        repository._row_to_record({**row, "id": HostileUUID(int=1)})

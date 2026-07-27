@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 import asyncpg
+from asyncpg.pgproto.pgproto import UUID as AsyncpgUUID
 
 from jobs.models import (
     ERROR_CODE_MAX_CHARS,
@@ -52,8 +53,16 @@ def _require_transaction(conn: asyncpg.Connection) -> None:
 
 def _uuid(value: object, field: str) -> UUID:
     try:
-        return value if isinstance(value, UUID) else UUID(str(value))
-    except (TypeError, ValueError) as exc:
+        if type(value) is UUID:
+            return value
+        if type(value) is AsyncpgUUID:
+            return UUID(bytes=value.bytes)
+        if type(value) is str:
+            parsed = UUID(value)
+            if str(parsed) == value:
+                return parsed
+        raise TypeError
+    except (AttributeError, TypeError, ValueError) as exc:
         raise TypeError(f"{field} must be a UUID") from exc
 
 

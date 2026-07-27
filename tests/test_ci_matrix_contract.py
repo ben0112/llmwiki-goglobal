@@ -18,6 +18,7 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
         "unit-mcp",
         "unit-corpus",
         "integration-api",
+        "integration-rag",
         "integration-mcp",
         "integration-mcp-postgres",
         "integration-retrieval",
@@ -27,6 +28,31 @@ def test_workflow_uses_complete_isolated_test_matrix_segments():
     ):
         command = f"python -m tests.helpers.ci_test_matrix run {segment} --"
         assert command in workflow
+
+
+def test_server_rag_has_a_dedicated_fresh_process_pgvector_segment():
+    from tests.helpers.ci_test_matrix import ISOLATED_SEGMENTS, SEGMENTS
+
+    assert SEGMENTS["integration-rag"] == (
+        "tests/integration/isolation/test_rag_api_isolation.py",
+        "tests/integration/test_rag_atomic_write.py",
+        "tests/integration/test_rag_e2e.py",
+        "tests/integration/test_rag_repository.py",
+        "tests/integration/test_rag_retrieval.py",
+        "tests/integration/test_rag_schema.py",
+        "tests/integration/test_rag_service.py",
+    )
+    assert "integration-rag" in ISOLATED_SEGMENTS
+    assert not set(SEGMENTS["integration-rag"]) & set(SEGMENTS["integration-api"])
+
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step = workflow.split("- name: Run server RAG integration matrix", 1)[1]
+    step = step.split("- name:", 1)[0]
+    assert "pgvector/pgvector:0.8.0-pg16" in workflow
+    assert "python -m tests.helpers.ci_test_matrix run integration-rag --" in step
+    assert "env PYTHONPATH=api MODE=hosted pytest -v" in step
+    assert "|| true" not in step
+    assert "|" not in step
 
 
 def test_retrieval_evaluation_has_a_dedicated_pgvector_segment():
@@ -115,12 +141,7 @@ def test_run_command_propagates_child_failure_and_preserves_segment_strategy(mon
 
     monkeypatch.setattr(ci_test_matrix.subprocess, "run", launch)
 
-    assert (
-        ci_test_matrix.main(
-            ["run", "integration-api", "--", "env", "PYTHONPATH=api", "pytest", "-v"]
-        )
-        == 7
-    )
+    assert ci_test_matrix.main(["run", "integration-api", "--", "env", "PYTHONPATH=api", "pytest", "-v"]) == 7
     assert calls == [
         (["env", "PYTHONPATH=api", "pytest", "-v", "tests/one.py"], False),
         (["env", "PYTHONPATH=api", "pytest", "-v", "tests/two.py"], False),

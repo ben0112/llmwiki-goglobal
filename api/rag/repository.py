@@ -875,6 +875,8 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
     step_type: RagStepType,
     input_digest: str,
     reserved_tokens: int = 0,
+    prompt_version: str | None = None,
+    prompt_digest: str | None = None,
 ) -> RagStepRecord:
     _require_transaction(conn)
     _require_uuid(run_id, "run_id")
@@ -889,6 +891,11 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
     ):
         raise ValueError("reserved_tokens is inconsistent with step_type")
     _require_digest(input_digest, "input_digest")
+    if (prompt_version is None) is not (prompt_digest is None):
+        raise ValueError("prompt version and digest must both be present or absent")
+    if prompt_version is not None:
+        _require_profile_version(prompt_version)
+        _require_digest(prompt_digest, "prompt_digest")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run_id)
     if run_row is None:
         raise _error("run_not_found")
@@ -925,8 +932,8 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
                 """
                 INSERT INTO rag_steps (
                     run_id,run_page_id,user_id,knowledge_base_id,sequence,step_type,status,
-                    input_digest,model_profile_version,reserved_tokens
-                ) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9) RETURNING *
+                    input_digest,model_profile_version,reserved_tokens,prompt_version,prompt_digest
+                ) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,$10,$11) RETURNING *
                 """,
                 run.id,
                 page_id,
@@ -937,6 +944,8 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
                 input_digest,
                 run.model_profile_version,
                 reserved_tokens,
+                prompt_version,
+                prompt_digest,
             )
         except asyncpg.UniqueViolationError as exc:
             contract_name = (

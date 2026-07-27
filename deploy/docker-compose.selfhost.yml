@@ -43,6 +43,14 @@ services:
     environment:
       CI_JWKS_B64: ${CI_JWKS_B64}
 
+  fake-model:
+    profiles: ["ci"]
+    build:
+      context: ../tests/fixtures/fake_rag_model
+      dockerfile: Dockerfile
+    expose:
+      - "8000"
+
   redis:
     image: redis:7.4.2-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
@@ -116,6 +124,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
       TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
+      SERVER_RAG_ENABLED: ${SERVER_RAG_ENABLED:-false}
+      RAG_MODEL_PROFILES_JSON: ${RAG_MODEL_PROFILES_JSON:-}
+      RAG_MODEL_API_KEYS_JSON: ${RAG_MODEL_API_KEYS_JSON:-}
       STAGE: ${STAGE:-prod}
       LLMWIKI_REPLICA_ROLE: api
     expose:
@@ -159,6 +170,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       DURABLE_JOBS_ENABLED: ${DURABLE_JOBS_ENABLED:-true}
       TUS_MULTIPART_ENABLED: ${TUS_MULTIPART_ENABLED:-true}
+      SERVER_RAG_ENABLED: ${SERVER_RAG_ENABLED:-false}
+      RAG_MODEL_PROFILES_JSON: ${RAG_MODEL_PROFILES_JSON:-}
+      RAG_MODEL_API_KEYS_JSON: ${RAG_MODEL_API_KEYS_JSON:-}
       STAGE: ${STAGE:-prod}
       LLMWIKI_REPLICA_ROLE: worker
     depends_on:
