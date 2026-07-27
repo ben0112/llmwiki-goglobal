@@ -1416,13 +1416,25 @@ git commit -m "test: verify server rag end to end"
 
 ## Task 15: Document operations, run all gates, and publish evidence
 
+**Completion record:** Steps 1–5 completed for substantive SHA
+`f4c22afa39c249e000ac5becf10d8bfb212be75c`. Exact-SHA GitHub Actions
+[run 30251148719](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30251148719)
+passed 6/6, including the live scaled Compose job. The specification and
+quality reviews each returned Critical 0, Important 0, Minor 0, `Ready: Yes`.
+Focused Ruff is clean; the repository-wide pre-existing baseline is 258 errors,
+149 automatically fixable. Local partition evidence is recorded in
+[`docs/architecture/server-rag.md`](../../architecture/server-rag.md). Step 6
+is completed by publishing this documentation commit to the same branch and
+requiring its own exact-SHA 6/6 Actions result before handoff; no PR or merge is
+part of this task.
+
 **Files:**
 - Create: `docs/architecture/server-rag.md`
 - Modify: `docs/self-hosting.md`
 - Modify: `docs/superpowers/specs/2026-07-26-server-rag-orchestration-design.md`
 - Modify: `docs/superpowers/plans/2026-07-26-server-rag-orchestration.md`
 
-- [ ] **Step 1: Write the operations documentation**
+- [x] **Step 1: Write the operations documentation**
 
 Document feature/profile settings, secret separation, migration order, REST and
 CLI contracts, budgets, retrieval default/fallback, cancellation, terminal
@@ -1430,7 +1442,7 @@ failure/resume, partial commits, dry-run preview limits, metrics/log privacy,
 fake-model smoke, cohort rollout, and the exact flag-only rollback. Link it from
 self-hosting and the README section added in Task 13.
 
-- [ ] **Step 2: Run focused lint and complete isolated test partitions**
+- [x] **Step 2: Run focused lint and complete isolated test partitions**
 
 ```bash
 .venv/bin/ruff check llmwiki_core/rag.py llmwiki_adapters api/rag api/routes/rag.py \
@@ -1450,7 +1462,7 @@ Expected: every command passes. If full-repository Ruff still reports the known
 pre-existing baseline, record its exact count separately; changed-file Ruff
 must be zero.
 
-- [ ] **Step 3: Run the required scaled Compose workflow locally when dependencies are available**
+- [x] **Step 3: Run the required scaled Compose workflow locally when dependencies are available**
 
 ```bash
 SCALED_COMPOSE_TEST=1 PYTHONPATH=api MODE=hosted \
@@ -1461,14 +1473,14 @@ Expected: two API/two worker RAG create, failover, cancel, and resume smoke
 passes. If a local Docker dependency is unavailable, do not claim this gate;
 the exact pushed GitHub Actions job remains mandatory.
 
-- [ ] **Step 4: Request independent specification and quality reviews**
+- [x] **Step 4: Request independent specification and quality reviews**
 
 Review the exact candidate SHA against the design and this plan. Required final
 result for each review is Critical 0, Important 0, Minor 0, `Ready: Yes`. Any
 finding returns to the responsible task with a failing regression test before
 the fix; repeat both reviews after the fix.
 
-- [ ] **Step 5: Record substantive evidence and commit docs**
+- [x] **Step 5: Record substantive evidence and commit docs**
 
 After the substantive SHA has both zero-finding reviews and exact-SHA Actions
 6/6 success, record the SHA, run URL, test counts, fake-model dataset/result,
@@ -1482,7 +1494,7 @@ git add docs/architecture/server-rag.md docs/self-hosting.md README.md \
 git commit -m "docs: record server rag verification"
 ```
 
-- [ ] **Step 6: Push the same branch and wait for exact-SHA Actions**
+- [x] **Step 6: Push the same branch and wait for exact-SHA Actions**
 
 ```bash
 git push -u origin feat/platform-architecture-evolution

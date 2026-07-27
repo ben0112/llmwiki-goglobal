@@ -197,6 +197,8 @@ python3 -m corpus.import_annotations \
 ## 服务端 RAG CLI（托管模式）
 
 服务端 RAG 默认关闭；管理员需在 API 与 durable worker 上显式启用 `SERVER_RAG_ENABLED=true`，并配置服务端模型 profile。CLI 只调用 LLMWiki REST，不接受模型供应商的 API key 或 base URL。`LLMWIKI_ACCESS_TOKEN` 用于认证 LLMWiki REST，**不是**模型供应商密钥。
+完整的迁移顺序、预算、恢复、隐私、灰度与 flag-only 回滚合同见
+[`docs/architecture/server-rag.md`](docs/architecture/server-rag.md)。
 
 从部署环境或 secret manager 加载 LLMWiki 地址和访问令牌，不要把令牌写入命令行或仓库：
 

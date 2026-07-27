@@ -21,6 +21,31 @@ The accepted product decisions are:
 - resume only from the last committed page boundary; and
 - keep the entire capability disabled by default.
 
+### Implementation and verification status
+
+Implemented on `feat/platform-architecture-evolution`. Substantive candidate
+`f4c22afa39c249e000ac5becf10d8bfb212be75c` passed all six jobs in GitHub
+Actions [run 30251148719](https://github.com/ben0112/llmwiki-goglobal/actions/runs/30251148719),
+including the fresh-process Postgres RAG matrix and required live scaled
+Compose smoke. Independent specification and quality reviews both reported
+Critical 0, Important 0, Minor 0, `Ready: Yes` for that exact SHA.
+
+Local evidence includes 74 core tests, 926 RAG/job unit tests, 180 MCP/wiki
+invariant tests, 212 fresh-process RAG integration tests, 402 API integration
+tests with 36 skips, 391 retrieval integration tests, and 19 scaled/CI static
+contract tests with only the live opt-in case skipped locally. The
+deterministic E2E dataset verified seven scenarios and an exact successful
+usage of seven steps and 42 model tokens. A separate local live scaled recovery
+smoke passed in 361.66 seconds. Focused Ruff is clean; the unrelated
+repository-wide baseline remains 258 errors, 149 automatically fixable.
+
+Operational details and the rollout boundary are recorded in
+[`docs/architecture/server-rag.md`](../../architecture/server-rag.md). The
+feature stays off by default: deploy migration and matched API/worker code
+first, then enable one internal allowlisted profile for a bounded tenant
+cohort. Rollback is `SERVER_RAG_ENABLED=false` on both roles without removing
+migration `015` or committed/audit state.
+
 ## Goals
 
 The first release must:

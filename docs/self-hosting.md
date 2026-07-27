@@ -77,7 +77,7 @@ self-hosting compose — you do **not** need most of its services.
 
 ### Apply the migrations
 
-Run `supabase/migrations/001…014` in order against the stack's database:
+Run `supabase/migrations/001…015` in order against the stack's database:
 
 ```bash
 for f in supabase/migrations/*.sql; do
@@ -86,7 +86,7 @@ done
 ```
 
 They create the schema, RLS policies, PGroonga full-text indexes, versioned
-pgvector chunk storage and durable embedding jobs, the
+pgvector chunk storage, durable embedding jobs, server-side RAG runs, the
 `document_changes` NOTIFY trigger, and the `auth.users` trigger that
 provisions a `public.users` row (with page/storage quotas) on signup — which
 is why this must run on the Supabase database, not a bare Postgres.
@@ -138,6 +138,22 @@ docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.self
 docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost \
   restart gateway
 ```
+
+### Optional server-side RAG
+
+Server-side RAG is Hosted-only and defaults off. Apply migration `015`, then
+inject the same non-secret profile mapping and separate provider-key mapping
+into API and worker. Start with `SERVER_RAG_ENABLED=false`; enable it only after
+the deterministic fake-model and scaled smoke gates pass. The LLMWiki REST
+token used by operators is not a provider key.
+
+The Compose example forwards `SERVER_RAG_ENABLED`,
+`RAG_MODEL_PROFILES_JSON`, and `RAG_MODEL_API_KEYS_JSON` to API and worker. The
+example env file intentionally leaves the mappings empty. Load real values
+from your deployment secret manager rather than committing them. Migration,
+profile schema, budgets, REST/CLI usage, recovery, privacy, cohort rollout, and
+the exact flag-only rollback are documented in
+[`docs/architecture/server-rag.md`](architecture/server-rag.md).
 
 Restarting `gateway` after every replica-count change drops cached upstream
 connections and makes the new Docker DNS task set effective immediately.
@@ -323,6 +339,12 @@ Hybrid retrieval has an independent, data-preserving rollback: set
 roles. All callers return to lexical behavior; leave migrations `013`/`014`,
 embedding rows, and job history in place. Passing the promotion gate never
 flips this flag or changes the default profile automatically.
+
+Server-side RAG has a separate flag-only rollback: set
+`SERVER_RAG_ENABLED=false` for API and worker and roll/restart both roles. New
+create/resume work is rejected and running work stops at the next page
+boundary. Leave migration `015`, committed wiki versions, partial-run rows, and
+step traces intact; do not disable durable jobs as part of this rollback.
 
 Copyable incident rollback (set `ROLLBACK_REF` to a tested tag or commit):
 
