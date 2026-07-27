@@ -297,10 +297,16 @@ CREATE TABLE rag_steps (
     model_profile_version TEXT NOT NULL CHECK (
         char_length(model_profile_version) BETWEEN 1 AND 128
     ),
+    reserved_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+        reserved_tokens BETWEEN 0 AND 250000
+        AND ((step_type = 'draft' AND reserved_tokens > 0)
+            OR (step_type <> 'draft' AND reserved_tokens = 0))
+    ),
     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
         total_tokens >= 0 AND total_tokens = input_tokens + output_tokens
+        AND (step_type <> 'draft' OR total_tokens <= reserved_tokens)
     ),
     latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (
         latency_ms >= 0

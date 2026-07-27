@@ -17,6 +17,7 @@ import asyncpg
 
 from llmwiki_core.rag import (
     MAX_GOAL_CHARS,
+    MAX_MODEL_TOKENS,
     MAX_PAGE_CHARS,
     MAX_PAGES,
     MAX_PROFILE_CHARS,
@@ -148,6 +149,7 @@ class RagStepRecord:
     prompt_version: str | None
     prompt_digest: str | None
     model_profile_version: str
+    reserved_tokens: int
     input_tokens: int
     output_tokens: int
     total_tokens: int
@@ -702,8 +704,9 @@ def _citations(value: object) -> tuple[RagCitation, ...]:
     return tuple(citations)
 
 
-def _decode_step(row: Mapping[str, object]) -> RagStepRecord:
+def _decode_step(row: Mapping[str, object]) -> RagStepRecord:  # noqa: C901 - validates one strict row contract.
     status = _enum(RagStepStatus, row["status"], "status")
+    step_type = _enum(RagStepType, row["step_type"], "step_type")
     summary = _json_object(row["output_summary"], "output_summary", max_bytes=16_384)
     citations = _citations(row["citation_identities"])
     sequence = _integer(row["sequence"], "sequence", minimum=1)
@@ -712,8 +715,17 @@ def _decode_step(row: Mapping[str, object]) -> RagStepRecord:
     input_tokens = _integer(row["input_tokens"], "input_tokens")
     output_tokens = _integer(row["output_tokens"], "output_tokens")
     total_tokens = _integer(row["total_tokens"], "total_tokens")
+    reserved_tokens = _integer(row["reserved_tokens"], "reserved_tokens")
+    if reserved_tokens > MAX_MODEL_TOKENS:
+        raise ValueError("reserved_tokens exceeds the core model token cap")
+    if (step_type is RagStepType.DRAFT and reserved_tokens < 1) or (
+        step_type is not RagStepType.DRAFT and reserved_tokens != 0
+    ):
+        raise ValueError("step reservation is inconsistent with its type")
     if total_tokens != input_tokens + output_tokens or total_tokens > 250_000:
         raise ValueError("step token totals are inconsistent")
+    if step_type is RagStepType.DRAFT and total_tokens > reserved_tokens:
+        raise ValueError("draft usage exceeds its reservation")
     latency_raw = row["latency_ms"]
     if type(latency_raw) not in {int, float}:
         raise TypeError("latency_ms must be a number")
@@ -746,7 +758,7 @@ def _decode_step(row: Mapping[str, object]) -> RagStepRecord:
         user_id=_uuid(row["user_id"], "user_id"),
         knowledge_base_id=_uuid(row["knowledge_base_id"], "knowledge_base_id"),
         sequence=sequence,
-        step_type=_enum(RagStepType, row["step_type"], "step_type"),
+        step_type=step_type,
         status=status,
         input_digest=_digest(row["input_digest"], "input_digest"),
         output_summary=summary,
@@ -754,6 +766,7 @@ def _decode_step(row: Mapping[str, object]) -> RagStepRecord:
         prompt_version=prompt_version,
         prompt_digest=prompt_digest,
         model_profile_version=_text(row["model_profile_version"], "model_profile_version", max_chars=128),
+        reserved_tokens=reserved_tokens,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,

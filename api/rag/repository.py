@@ -11,6 +11,7 @@ from math import isfinite
 from uuid import UUID
 
 import asyncpg
+from jobs.models import JobRecord, JobType
 
 from llmwiki_core.rag import (
     MAX_MODEL_TOKENS,
@@ -29,6 +30,7 @@ from llmwiki_core.rag import (
     validate_worklist,
 )
 
+from .model import RagTokenUsage
 from .records import (
     RagPageRecord,
     RagRunRecord,
@@ -141,6 +143,10 @@ def _decode_db_step(row: Mapping[str, object]) -> RagStepRecord:
 
 def _error(contract_name: str) -> RagDomainError:
     return new_rag_error(contract_name)
+
+
+def _job_binding_error() -> RagDomainError:
+    return RagDomainError("rag_job_binding_invalid", "The RAG job binding was invalid.")
 
 
 def _require_transaction(conn: asyncpg.Connection) -> None:
@@ -711,6 +717,81 @@ async def list_pages(conn: asyncpg.Connection, run_id: UUID) -> tuple[RagPageRec
     return tuple(_decode_db_page(row) for row in rows)
 
 
+async def assert_page_job_binding(  # noqa: C901 - validates one complete locked binding.
+    conn: asyncpg.Connection,
+    *,
+    job: JobRecord,
+    run: RagRunRecord,
+    page: RagPageRecord | None = None,
+    step: RagStepRecord | None = None,
+) -> tuple[RagRunRecord, RagPageRecord | None, RagStepRecord | None]:
+    """Lock and verify the complete worker/job/run/page/step tenant binding."""
+    _require_transaction(conn)
+    if type(job) is not JobRecord or type(run) is not RagRunRecord:
+        raise _job_binding_error()
+    if page is not None and type(page) is not RagPageRecord:
+        raise _job_binding_error()
+    if step is not None and type(step) is not RagStepRecord:
+        raise _job_binding_error()
+    if (
+        job.job_type is not JobType.BUILD_WIKI
+        or job.id != run.job_id
+        or job.user_id != run.user_id
+        or job.knowledge_base_id != run.knowledge_base_id
+        or job.document_id is not None
+        or dict(job.payload) != {"run_id": str(run.id)}
+    ):
+        raise _job_binding_error()
+    run_row = await conn.fetchrow(
+        "SELECT * FROM rag_runs WHERE id=$1 AND job_id=$2 AND user_id=$3 AND knowledge_base_id=$4 FOR UPDATE",
+        run.id,
+        job.id,
+        job.user_id,
+        job.knowledge_base_id,
+    )
+    if run_row is None:
+        raise _job_binding_error()
+    current_run = _decode_db_run(run_row)
+    if current_run != run:
+        raise _job_binding_error()
+    current_page: RagPageRecord | None = None
+    if page is not None:
+        page_row = await conn.fetchrow(
+            "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 AND user_id=$3 AND knowledge_base_id=$4 FOR UPDATE",
+            page.id,
+            run.id,
+            run.user_id,
+            run.knowledge_base_id,
+        )
+        if (
+            page_row is None
+            or page.run_id != run.id
+            or page.user_id != run.user_id
+            or page.knowledge_base_id != run.knowledge_base_id
+        ):
+            raise _job_binding_error()
+        current_page = _decode_db_page(page_row)
+    current_step: RagStepRecord | None = None
+    if step is not None:
+        if page is None or step.run_id != run.id or step.run_page_id != page.id:
+            raise _job_binding_error()
+        step_row = await conn.fetchrow(
+            "SELECT * FROM rag_steps WHERE id=$1 AND run_id=$2 AND run_page_id=$3 "
+            "AND user_id=$4 AND knowledge_base_id=$5 FOR UPDATE",
+            step.id,
+            run.id,
+            page.id,
+            run.user_id,
+            run.knowledge_base_id,
+        )
+        if step_row is None:
+            raise _job_binding_error()
+        current_step = _decode_db_step(step_row)
+        if current_step != step:
+            raise _job_binding_error()
+    return current_run, current_page, current_step
+
+
 async def start_step(  # noqa: C901 - validates the complete locked step context.
     conn: asyncpg.Connection,
     *,
@@ -718,6 +799,7 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
     page_id: UUID | None,
     step_type: RagStepType,
     input_digest: str,
+    reserved_tokens: int = 0,
 ) -> RagStepRecord:
     _require_transaction(conn)
     _require_uuid(run_id, "run_id")
@@ -725,6 +807,12 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
         _require_uuid(page_id, "page_id")
     if not isinstance(step_type, RagStepType):
         raise ValueError("step_type must be a RagStepType")
+    if type(reserved_tokens) is not int or not 0 <= reserved_tokens <= MAX_MODEL_TOKENS:
+        raise ValueError(f"reserved_tokens must be between 0 and {MAX_MODEL_TOKENS}")
+    if (step_type is RagStepType.DRAFT and reserved_tokens < 1) or (
+        step_type is not RagStepType.DRAFT and reserved_tokens != 0
+    ):
+        raise ValueError("reserved_tokens is inconsistent with step_type")
     _require_digest(input_digest, "input_digest")
     run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run_id)
     if run_row is None:
@@ -745,6 +833,14 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
             raise _error("page_scoped_step_not_running")
     if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_steps WHERE run_id=$1 AND status='running')", run_id):
         raise _error("step_already_running")
+    if step_type is RagStepType.DRAFT:
+        charged_tokens = await conn.fetchval(
+            "SELECT COALESCE(sum(total_tokens) FILTER (WHERE status IN ('succeeded','failed')),0) "
+            "FROM rag_steps WHERE run_id=$1",
+            run.id,
+        )
+        if type(charged_tokens) is not int or charged_tokens + reserved_tokens > run.budget.max_model_tokens:
+            raise _error("budget_exhausted")
     sequence = await conn.fetchval("SELECT COALESCE(max(sequence),0)+1 FROM rag_steps WHERE run_id=$1", run_id)
     if type(sequence) is not int or not 1 <= sequence <= run.budget.max_steps:
         raise _error("budget_exhausted")
@@ -754,8 +850,8 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
                 """
                 INSERT INTO rag_steps (
                     run_id,run_page_id,user_id,knowledge_base_id,sequence,step_type,status,
-                    input_digest,model_profile_version
-                ) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8) RETURNING *
+                    input_digest,model_profile_version,reserved_tokens
+                ) VALUES ($1,$2,$3,$4,$5,$6,'running',$7,$8,$9) RETURNING *
                 """,
                 run.id,
                 page_id,
@@ -765,6 +861,7 @@ async def start_step(  # noqa: C901 - validates the complete locked step context
                 step_type.value,
                 input_digest,
                 run.model_profile_version,
+                reserved_tokens,
             )
         except asyncpg.UniqueViolationError as exc:
             contract_name = (
@@ -791,6 +888,9 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
     usage: RagUsage,
     latency_ms: float,
     error_code: str | None = None,
+    token_usage: RagTokenUsage | None = None,
+    prompt_version: str | None = None,
+    prompt_digest: str | None = None,
 ) -> RagStepRecord:
     _require_transaction(conn)
     _require_uuid(step_id, "step_id")
@@ -810,6 +910,19 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
             raise ValueError("succeeded steps cannot have an error_code")
     elif type(error_code) is not str or _ERROR_CODE.fullmatch(error_code) is None:
         raise ValueError("failed steps require a normalized error_code")
+    if token_usage is None:
+        input_tokens, output_tokens, total_tokens = usage.model_tokens, 0, usage.model_tokens
+    elif type(token_usage) is not RagTokenUsage or token_usage.total_tokens != usage.model_tokens:
+        raise ValueError("token_usage must match the step usage")
+    else:
+        input_tokens = token_usage.prompt_tokens
+        output_tokens = token_usage.completion_tokens
+        total_tokens = token_usage.total_tokens
+    if (prompt_version is None) is not (prompt_digest is None):
+        raise ValueError("prompt version and digest must both be present or absent")
+    if prompt_version is not None:
+        _require_profile_version(prompt_version)
+        _require_digest(prompt_digest, "prompt_digest")
     identity = await conn.fetchrow("SELECT run_id,run_page_id FROM rag_steps WHERE id=$1", step_id)
     if identity is None:
         raise _error("step_not_running")
@@ -830,8 +943,11 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
         if _decode_db_page(page_row).state is not RagPageState.RUNNING:
             raise _error("page_scoped_step_not_running")
     step_row = await conn.fetchrow("SELECT * FROM rag_steps WHERE id=$1 AND run_id=$2 FOR UPDATE", step_id, run.id)
-    if step_row is None or _decode_db_step(step_row).status is not RagStepStatus.RUNNING:
+    current_step = None if step_row is None else _decode_db_step(step_row)
+    if current_step is None or current_step.status is not RagStepStatus.RUNNING:
         raise _error("step_not_running")
+    if current_step.step_type is RagStepType.DRAFT and total_tokens > current_step.reserved_tokens:
+        raise RagDomainError("rag_invalid_model_usage", "The model response was invalid.")
     aggregate = await conn.fetchrow(
         "SELECT count(*) FILTER (WHERE status IN ('succeeded','failed')) AS terminal_steps,"
         "COALESCE(sum(total_tokens) FILTER (WHERE status IN ('succeeded','failed')),0) AS model_tokens "
@@ -848,7 +964,8 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
             """
             UPDATE rag_steps SET
                 status=$2,output_summary=$3::jsonb,citation_identities=$4::jsonb,
-                input_tokens=$5,output_tokens=0,total_tokens=$5,latency_ms=$6,error_code=$7
+                input_tokens=$5,output_tokens=$6,total_tokens=$7,latency_ms=$8,error_code=$9,
+                prompt_version=$10,prompt_digest=$11
             WHERE id=$1 AND status='running'
             RETURNING *
             """,
@@ -856,9 +973,13 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
             status.value,
             summary_json,
             citations_json,
-            usage.model_tokens,
+            input_tokens,
+            output_tokens,
+            total_tokens,
             float(latency_ms),
             error_code,
+            prompt_version,
+            prompt_digest,
         )
         if row is None:
             raise _error("step_not_running")
@@ -866,7 +987,12 @@ async def finish_step(  # noqa: C901 - validates before the single terminal writ
     return finished
 
 
-async def begin_page_attempt(conn: asyncpg.Connection, page_id: UUID, *, max_attempts: int) -> RagPageRecord:
+async def begin_page_attempt(  # noqa: C901 - validates and recovers one locked attempt boundary.
+    conn: asyncpg.Connection,
+    page_id: UUID,
+    *,
+    max_attempts: int,
+) -> RagPageRecord | None:
     _require_transaction(conn)
     _require_uuid(page_id, "page_id")
     if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_PAGE_ATTEMPTS:
@@ -886,11 +1012,40 @@ async def begin_page_attempt(conn: asyncpg.Connection, page_id: UUID, *, max_att
     if page_row is None:
         raise _error("page_not_found")
     page = _decode_db_page(page_row)
-    if page.attempt_count >= max_attempts:
-        raise _error("page_attempts_exhausted")
     if page.state not in {RagPageState.PLANNED, RagPageState.RUNNING, RagPageState.FAILED}:
         raise _error("page_not_attemptable")
+    running_step = await conn.fetchrow(
+        "SELECT id,run_page_id,step_type,reserved_tokens FROM rag_steps "
+        "WHERE run_id=$1 AND status='running' FOR UPDATE",
+        run.id,
+    )
+    if running_step is not None and (page.state is not RagPageState.RUNNING or running_step["run_page_id"] != page.id):
+        raise _error("step_already_running")
+    attempts_exhausted = page.attempt_count >= max_attempts
+    if attempts_exhausted and running_step is None:
+        raise _error("page_attempts_exhausted")
     async with conn.transaction():
+        if running_step is not None:
+            interrupted_tokens = (
+                running_step["reserved_tokens"] if running_step["step_type"] == RagStepType.DRAFT.value else 0
+            )
+            recovered = await conn.fetchrow(
+                """
+                UPDATE rag_steps SET
+                    status='failed',output_summary=$2::jsonb,citation_identities='[]'::jsonb,
+                    input_tokens=$3,output_tokens=0,total_tokens=$3,latency_ms=0,
+                    error_code='rag_attempt_interrupted',prompt_version=NULL,prompt_digest=NULL
+                WHERE id=$1 AND status='running'
+                RETURNING *
+                """,
+                running_step["id"],
+                json.dumps({"outcome": "interrupted", "usage_trusted": False}, separators=(",", ":")),
+                interrupted_tokens,
+            )
+            if recovered is None:  # pragma: no cover - row remains locked by this transaction.
+                raise _error("step_not_running")
+        if attempts_exhausted:
+            return None
         row = await conn.fetchrow(
             "UPDATE rag_run_pages SET attempt_count=attempt_count+1,state='running' WHERE id=$1 RETURNING *",
             page.id,
@@ -899,6 +1054,209 @@ async def begin_page_attempt(conn: asyncpg.Connection, page_id: UUID, *, max_att
             raise _error("page_not_found")
         attempted = _decode_db_page(row)
     return attempted
+
+
+async def record_page_read(
+    conn: asyncpg.Connection,
+    *,
+    run: RagRunRecord,
+    page: RagPageRecord,
+    document_id: UUID | None,
+    version: int | None,
+) -> RagPageRecord:
+    """Bind one running attempt to the exact current target-page identity."""
+    _require_transaction(conn)
+    if not isinstance(run, RagRunRecord) or not isinstance(page, RagPageRecord):
+        raise ValueError("run and page must be durable RAG records")
+    if (document_id is None) is not (version is None):
+        raise ValueError("document_id and version must both be present or absent")
+    if document_id is not None:
+        _require_uuid(document_id, "document_id")
+    if version is not None and (type(version) is not int or version < 1):
+        raise ValueError("version must be a positive integer")
+    run_row = await conn.fetchrow(
+        "SELECT * FROM rag_runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
+        run.id,
+        run.user_id,
+    )
+    page_row = await conn.fetchrow(
+        "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE",
+        page.id,
+        run.id,
+    )
+    if run_row is None:
+        raise _error("run_not_found")
+    if page_row is None:
+        raise _error("page_not_found")
+    current_run = _decode_db_run(run_row)
+    current_page = _decode_db_page(page_row)
+    if any(getattr(run, field) != getattr(current_run, field) for field in _RUN_IDENTITY_FIELDS):
+        raise _error("run_mismatch_identity")
+    if current_run.completion_reason is not None:
+        raise _error("run_finished")
+    if any(getattr(page, field) != getattr(current_page, field) for field in _PAGE_SNAPSHOT_FIELDS):
+        raise _error("page_mismatch_stale")
+    if current_page.state is not RagPageState.RUNNING:
+        raise _error("page_not_running")
+    row = await conn.fetchrow(
+        "UPDATE rag_run_pages SET document_id=$2,version_read=$3 "
+        "WHERE id=$1 AND run_id=$4 AND state='running' RETURNING *",
+        page.id,
+        document_id,
+        version,
+        run.id,
+    )
+    if row is None:  # pragma: no cover - locked above.
+        raise _error("page_not_running")
+    return _decode_db_page(row)
+
+
+async def record_page_conflict(
+    conn: asyncpg.Connection,
+    *,
+    run: RagRunRecord,
+    page: RagPageRecord,
+    max_conflict_retries: int,
+) -> RagPageRecord:
+    """Consume one durable conflict retry after the publication transaction rolled back."""
+    _require_transaction(conn)
+    if not isinstance(run, RagRunRecord) or not isinstance(page, RagPageRecord):
+        raise ValueError("run and page must be durable RAG records")
+    if type(max_conflict_retries) is not int or not 1 <= max_conflict_retries <= run.budget.max_conflict_retries:
+        raise ValueError("max_conflict_retries exceeds the persisted run budget")
+    run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run.id)
+    page_row = await conn.fetchrow(
+        "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE",
+        page.id,
+        run.id,
+    )
+    if run_row is None:
+        raise _error("run_not_found")
+    if page_row is None:
+        raise _error("page_not_found")
+    current_run = _decode_db_run(run_row)
+    current_page = _decode_db_page(page_row)
+    if any(getattr(run, field) != getattr(current_run, field) for field in _RUN_IDENTITY_FIELDS):
+        raise _error("run_mismatch_identity")
+    if any(getattr(page, field) != getattr(current_page, field) for field in _PAGE_SNAPSHOT_FIELDS):
+        raise _error("page_mismatch_stale")
+    if current_page.state is not RagPageState.RUNNING:
+        raise _error("page_not_running")
+    if current_page.conflict_retry_count >= max_conflict_retries:
+        raise RagDomainError("rag_version_conflict", "The conflict retry limit was exhausted.")
+    row = await conn.fetchrow(
+        "UPDATE rag_run_pages SET conflict_retry_count=conflict_retry_count+1 "
+        "WHERE id=$1 AND state='running' RETURNING *",
+        page.id,
+    )
+    if row is None:  # pragma: no cover - locked above.
+        raise _error("page_not_running")
+    return _decode_db_page(row)
+
+
+async def mark_dry_run_complete(  # noqa: C901 - validates one complete preview boundary.
+    conn: asyncpg.Connection,
+    *,
+    run: RagRunRecord,
+    page: RagPageRecord,
+    usage: RagUsage,
+    preview: str,
+    preview_digest: str,
+    preview_full_char_count: int,
+    preview_truncated: bool,
+) -> tuple[RagRunRecord, RagPageRecord]:
+    """Persist one bounded preview and usage without touching wiki documents."""
+    _require_transaction(conn)
+    if not isinstance(run, RagRunRecord) or not isinstance(page, RagPageRecord):
+        raise ValueError("run and page must be durable RAG records")
+    _require_usage(usage, run.budget)
+    _require_digest(preview_digest, "preview_digest")
+    if type(preview) is not str or len(preview.encode("utf-8")) > 16_384:
+        raise ValueError("preview exceeds its byte limit")
+    if (
+        type(preview_full_char_count) is not int
+        or not len(preview) <= preview_full_char_count <= run.budget.max_page_chars
+        or type(preview_truncated) is not bool
+        or preview_truncated is not (preview_full_char_count > len(preview))
+    ):
+        raise ValueError("preview metadata is inconsistent")
+    if not preview_truncated and hashlib.sha256(preview.encode("utf-8")).hexdigest() != preview_digest:
+        raise ValueError("preview digest does not match")
+    run_row = await conn.fetchrow("SELECT * FROM rag_runs WHERE id=$1 FOR UPDATE", run.id)
+    page_row = await conn.fetchrow(
+        "SELECT * FROM rag_run_pages WHERE id=$1 AND run_id=$2 FOR UPDATE",
+        page.id,
+        run.id,
+    )
+    if run_row is None:
+        raise _error("run_not_found")
+    if page_row is None:
+        raise _error("page_not_found")
+    current_run = _decode_db_run(run_row)
+    current_page = _decode_db_page(page_row)
+    if any(getattr(run, field) != getattr(current_run, field) for field in _RUN_IDENTITY_FIELDS) or (
+        run.usage != current_run.usage
+        or run.last_committed_ordinal != current_run.last_committed_ordinal
+        or run.completion_reason != current_run.completion_reason
+    ):
+        raise _error("run_mismatch_stale")
+    if any(getattr(page, field) != getattr(current_page, field) for field in _PAGE_SNAPSHOT_FIELDS):
+        raise _error("page_mismatch_stale")
+    if not current_run.dry_run or current_page.state is not RagPageState.RUNNING:
+        raise _error("page_not_running")
+    if current_run.last_committed_ordinal != -1:
+        raise _error("boundary_out_of_order")
+    ordered_rows = await conn.fetch(
+        "SELECT ordinal,state FROM rag_run_pages WHERE run_id=$1 ORDER BY ordinal FOR UPDATE",
+        run.id,
+    )
+    if (
+        len(ordered_rows) <= current_page.ordinal
+        or ordered_rows[current_page.ordinal]["ordinal"] != current_page.ordinal
+        or ordered_rows[current_page.ordinal]["state"] != RagPageState.RUNNING.value
+        or any(row["state"] != RagPageState.DRY_RUN_COMPLETE.value for row in ordered_rows[: current_page.ordinal])
+        or any(
+            row["state"] in {RagPageState.RUNNING.value, RagPageState.DRY_RUN_COMPLETE.value}
+            for row in ordered_rows[current_page.ordinal + 1 :]
+        )
+    ):
+        raise _error("boundary_out_of_order")
+    step_rows = await conn.fetch(
+        "SELECT * FROM rag_steps WHERE run_id=$1 ORDER BY sequence FOR UPDATE",
+        run.id,
+    )
+    steps = tuple(_decode_db_step(row) for row in step_rows)
+    if any(step.status is RagStepStatus.RUNNING for step in steps):
+        raise _error("step_still_running")
+    authoritative = RagUsage(
+        steps=len(steps),
+        model_tokens=sum(step.total_tokens for step in steps),
+    )
+    if authoritative != usage:
+        raise _error("usage_mismatch")
+    last_sequence = max(
+        (step.sequence for step in steps if step.run_page_id == current_page.id),
+        default=0,
+    )
+    page_updated = await conn.fetchrow(
+        "UPDATE rag_run_pages SET state='dry_run_complete',document_id=NULL,version_read=NULL,"
+        "version_committed=NULL,last_completed_step_sequence=$2,preview=$3,preview_digest=$4,"
+        "preview_full_char_count=$5,preview_truncated=$6 WHERE id=$1 AND state='running' RETURNING *",
+        page.id,
+        last_sequence,
+        preview,
+        preview_digest,
+        preview_full_char_count,
+        preview_truncated,
+    )
+    run_updated = await conn.fetchrow(
+        "UPDATE rag_runs SET usage=$2::jsonb WHERE id=$1 AND completion_reason IS NULL RETURNING *",
+        run.id,
+        _usage_json(usage),
+    )
+    if page_updated is None or run_updated is None:  # pragma: no cover - locked above.
+        raise _error("boundary_conflict")
+    return _decode_db_run(run_updated), _decode_db_page(page_updated)
 
 
 async def _require_document_version(
@@ -1199,6 +1557,9 @@ __all__ = [
     "start_step",
     "finish_step",
     "begin_page_attempt",
+    "record_page_read",
+    "record_page_conflict",
+    "mark_dry_run_complete",
     "mark_boundary",
     "finish_run",
     "record_terminal_job_state",

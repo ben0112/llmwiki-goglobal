@@ -33,8 +33,7 @@ async def _seed_scope(pool):
         f"{user_id}@rag.test",
     )
     await pool.execute(
-        "INSERT INTO knowledge_bases (id, user_id, name, slug) "
-        "VALUES ($1, $2, 'RAG schema', $3)",
+        "INSERT INTO knowledge_bases (id, user_id, name, slug) VALUES ($1, $2, 'RAG schema', $3)",
         knowledge_base_id,
         user_id,
         f"rag-{knowledge_base_id}",
@@ -110,9 +109,7 @@ async def _insert_run(
         "model_profile_version": "profile-v1",
         "retrieval_profile": "lexical",
         "budget": json.dumps(_budget() if budget is ... else budget),
-        "usage": json.dumps(
-            {"steps": 0, "model_tokens": 0} if usage is ... else usage
-        ),
+        "usage": json.dumps({"steps": 0, "model_tokens": 0} if usage is ... else usage),
         "idempotency_key": f"rag-run:{run_id}",
         "request_digest": "b" * 64,
     }
@@ -124,8 +121,7 @@ async def _insert_run(
         cast = "::jsonb" if column in {"budget", "usage"} else ""
         placeholders.append(f"${index}{cast}")
     return await pool.fetchval(
-        f"INSERT INTO rag_runs ({', '.join(columns)}) "
-        f"VALUES ({', '.join(placeholders)}) RETURNING id",
+        f"INSERT INTO rag_runs ({', '.join(columns)}) VALUES ({', '.join(placeholders)}) RETURNING id",
         *parameters,
     )
 
@@ -148,8 +144,7 @@ async def _insert_page(pool, run_id, user_id, knowledge_base_id, *, ordinal=0, *
         cast = "::jsonb" if column == "lint_summary" else ""
         placeholders.append(f"${index}{cast}")
     return await pool.fetchval(
-        f"INSERT INTO rag_run_pages ({', '.join(columns)}) "
-        f"VALUES ({', '.join(placeholders)}) RETURNING id",
+        f"INSERT INTO rag_run_pages ({', '.join(columns)}) VALUES ({', '.join(placeholders)}) RETURNING id",
         *parameters,
     )
 
@@ -183,8 +178,7 @@ async def _insert_step(
         cast = "::jsonb" if column in {"output_summary", "citation_identities"} else ""
         placeholders.append(f"${index}{cast}")
     return await pool.fetchval(
-        f"INSERT INTO rag_steps ({', '.join(columns)}) "
-        f"VALUES ({', '.join(placeholders)}) RETURNING id",
+        f"INSERT INTO rag_steps ({', '.join(columns)}) VALUES ({', '.join(placeholders)}) RETURNING id",
         *parameters,
     )
 
@@ -291,22 +285,21 @@ async def test_build_wiki_jobs_require_normalized_bounded_database_idempotency_k
 async def test_rag_run_id_trigger_derives_identity_and_ignores_lease_only_updates(pool):
     user_id, knowledge_base_id, _ = await _seed_scope(pool)
     job_id, run_id = await _insert_job(pool, user_id, knowledge_base_id)
-    assert await pool.fetchval(
-        "SELECT rag_run_id FROM background_jobs WHERE id=$1", job_id
-    ) == run_id
+    assert await pool.fetchval("SELECT rag_run_id FROM background_jobs WHERE id=$1", job_id) == run_id
 
-    assert await pool.fetchval(
-        "UPDATE background_jobs SET rag_run_id=$2 WHERE id=$1 RETURNING rag_run_id",
-        job_id,
-        uuid4(),
-    ) == run_id
+    assert (
+        await pool.fetchval(
+            "UPDATE background_jobs SET rag_run_id=$2 WHERE id=$1 RETURNING rag_run_id",
+            job_id,
+            uuid4(),
+        )
+        == run_id
+    )
     await pool.execute(
         "UPDATE background_jobs SET heartbeat_at=clock_timestamp(), state='running' WHERE id=$1",
         job_id,
     )
-    assert await pool.fetchval(
-        "SELECT rag_run_id FROM background_jobs WHERE id=$1", job_id
-    ) == run_id
+    assert await pool.fetchval("SELECT rag_run_id FROM background_jobs WHERE id=$1", job_id) == run_id
 
     legacy_job_id, _ = await _insert_job(
         pool,
@@ -315,11 +308,14 @@ async def test_rag_run_id_trigger_derives_identity_and_ignores_lease_only_update
         job_type="document.extract",
         payload={"run_id": "not-a-uuid"},
     )
-    assert await pool.fetchval(
-        "UPDATE background_jobs SET rag_run_id=$2 WHERE id=$1 RETURNING rag_run_id",
-        legacy_job_id,
-        uuid4(),
-    ) is None
+    assert (
+        await pool.fetchval(
+            "UPDATE background_jobs SET rag_run_id=$2 WHERE id=$1 RETURNING rag_run_id",
+            legacy_job_id,
+            uuid4(),
+        )
+        is None
+    )
 
     trigger_definition = await pool.fetchval(
         "SELECT pg_get_triggerdef(oid) FROM pg_trigger "
@@ -745,6 +741,10 @@ async def test_rag_steps_reject_invalid_fields_and_duplicate_running_step(pool):
         {"input_tokens": -1},
         {"output_tokens": -1},
         {"total_tokens": -1},
+        {"reserved_tokens": -1},
+        {"reserved_tokens": 250_001},
+        {"reserved_tokens": 1},
+        {"step_type": "draft", "reserved_tokens": 3, "input_tokens": 4, "total_tokens": 4},
         {"input_tokens": 1, "output_tokens": 2, "total_tokens": 4},
         {"latency_ms": -1},
         {"error_code": "UPPER CASE"},
@@ -853,16 +853,12 @@ async def test_rag_rls_is_select_only_and_tenant_scoped(pool):
     step_b = await _insert_step(pool, run_b, user_b, kb_b, run_page_id=page_b)
 
     for table in ("rag_runs", "rag_run_pages", "rag_steps"):
-        assert await pool.fetchval(
-            "SELECT relrowsecurity FROM pg_class WHERE oid=$1::regclass", table
-        )
+        assert await pool.fetchval("SELECT relrowsecurity FROM pg_class WHERE oid=$1::regclass", table)
         policies = await pool.fetch(
             "SELECT cmd, roles FROM pg_policies WHERE schemaname='public' AND tablename=$1",
             table,
         )
-        assert [dict(policy) for policy in policies] == [
-            {"cmd": "SELECT", "roles": ["authenticated"]}
-        ]
+        assert [dict(policy) for policy in policies] == [{"cmd": "SELECT", "roles": ["authenticated"]}]
 
     async with _authenticated_session(pool, user_a) as conn:
         assert [row["id"] for row in await conn.fetch("SELECT id FROM rag_runs")] == [run_a]
@@ -908,9 +904,7 @@ async def test_rag_owner_indexes_running_index_and_updated_at_triggers_exist(poo
     assert "UNIQUE INDEX rag_steps_one_running_per_run" in indexes["rag_steps_one_running_per_run"]
     assert "WHERE (status = 'running'::text)" in indexes["rag_steps_one_running_per_run"]
     assert "rag_steps_run_sequence_idx" not in indexes
-    assert "(id, user_id, knowledge_base_id, rag_run_id)" in indexes[
-        "background_jobs_rag_run_ref"
-    ]
+    assert "(id, user_id, knowledge_base_id, rag_run_id)" in indexes["background_jobs_rag_run_ref"]
 
     triggers = {
         row["tgname"]
@@ -927,11 +921,9 @@ async def test_rag_owner_indexes_running_index_and_updated_at_triggers_exist(poo
 
     step_columns = {
         row["column_name"]
-        for row in await pool.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name='rag_steps'"
-        )
+        for row in await pool.fetch("SELECT column_name FROM information_schema.columns WHERE table_name='rag_steps'")
     }
-    assert {"prompt_version", "prompt_digest", "model_profile_version"} <= step_columns
+    assert {"prompt_version", "prompt_digest", "model_profile_version", "reserved_tokens"} <= step_columns
     assert not ({"prompt", "credentials", "api_key"} & step_columns)
 
 
@@ -955,9 +947,7 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
             await conn.execute("DELETE FROM background_jobs WHERE job_type='build_wiki'")
             await conn.execute("DROP INDEX IF EXISTS background_jobs_rag_run_ref")
             await conn.execute("DROP INDEX background_jobs_rag_owner_ref")
-            await conn.execute(
-                "DROP TRIGGER IF EXISTS set_background_job_rag_run_id ON background_jobs"
-            )
+            await conn.execute("DROP TRIGGER IF EXISTS set_background_job_rag_run_id ON background_jobs")
             await conn.execute("DROP FUNCTION IF EXISTS set_background_job_rag_run_id()")
             await conn.execute(
                 "ALTER TABLE background_jobs "
@@ -965,8 +955,7 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
                 "DROP CONSTRAINT IF EXISTS background_jobs_kb_owner_fk"
             )
             await conn.execute(
-                "ALTER TABLE background_jobs DROP COLUMN IF EXISTS rag_run_id, "
-                "DROP COLUMN IF EXISTS build_wiki_run_id"
+                "ALTER TABLE background_jobs DROP COLUMN IF EXISTS rag_run_id, DROP COLUMN IF EXISTS build_wiki_run_id"
             )
             await conn.execute(
                 "ALTER TABLE background_jobs DROP CONSTRAINT background_jobs_job_type_check;"
@@ -980,8 +969,7 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
                 f"{user_id}@rag-upgrade.test",
             )
             await conn.execute(
-                "INSERT INTO knowledge_bases(id,user_id,name,slug) "
-                "VALUES($1,$2,'RAG upgrade',$3)",
+                "INSERT INTO knowledge_bases(id,user_id,name,slug) VALUES($1,$2,'RAG upgrade',$3)",
                 knowledge_base_id,
                 user_id,
                 f"rag-upgrade-{knowledge_base_id}",
@@ -1001,8 +989,7 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
                 )
 
             before = {
-                (row["id"], row["job_type"])
-                for row in await conn.fetch("SELECT id,job_type FROM background_jobs")
+                (row["id"], row["job_type"]) for row in await conn.fetch("SELECT id,job_type FROM background_jobs")
             }
             relfilenode_before = await conn.fetchval(
                 "SELECT relfilenode FROM pg_class WHERE oid='background_jobs'::regclass"
@@ -1012,17 +999,19 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
                 "SELECT relfilenode FROM pg_class WHERE oid='background_jobs'::regclass"
             )
             after = {
-                (row["id"], row["job_type"])
-                for row in await conn.fetch("SELECT id,job_type FROM background_jobs")
+                (row["id"], row["job_type"]) for row in await conn.fetch("SELECT id,job_type FROM background_jobs")
             }
 
             assert relfilenode_after == relfilenode_before
             assert after == before
             assert legacy_types <= {job_type for _, job_type in after}
-            assert await conn.fetchval(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_name='background_jobs' AND column_name='rag_run_id'"
-            ) == 1
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name='background_jobs' AND column_name='rag_run_id'"
+                )
+                == 1
+            )
             assert all(
                 value is None
                 for value in await conn.fetchval(
@@ -1032,14 +1021,17 @@ async def test_migration_015_upgrades_populated_014_schema_additively(pool):
             )
 
             run_id = uuid4()
-            assert await conn.fetchval(
-                "INSERT INTO background_jobs "
-                "(job_type,user_id,knowledge_base_id,payload,idempotency_key) "
-                "VALUES('build_wiki',$1,$2,$3::jsonb,'upgrade-build') RETURNING rag_run_id",
-                user_id,
-                knowledge_base_id,
-                json.dumps({"run_id": str(run_id)}),
-            ) == run_id
+            assert (
+                await conn.fetchval(
+                    "INSERT INTO background_jobs "
+                    "(job_type,user_id,knowledge_base_id,payload,idempotency_key) "
+                    "VALUES('build_wiki',$1,$2,$3::jsonb,'upgrade-build') RETURNING rag_run_id",
+                    user_id,
+                    knowledge_base_id,
+                    json.dumps({"run_id": str(run_id)}),
+                )
+                == run_id
+            )
             with pytest.raises(asyncpg.CheckViolationError):
                 async with conn.transaction():
                     await conn.execute(

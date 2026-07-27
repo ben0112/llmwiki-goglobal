@@ -14,9 +14,6 @@ from types import MappingProxyType
 from typing import Any, NoReturn
 from uuid import UUID
 
-from services.embeddings import OpenAIEmbeddingClient
-from services.vector_store import PostgresVectorStore
-
 from llmwiki_core.documents import (
     DocumentKind,
     DocumentStatus,
@@ -50,6 +47,11 @@ _MAX_TAG_CHARS = 128
 _POSTGRES_INTEGER_MAX = 2_147_483_647
 _EMBEDDING_CLEANUP_FAILED = object()
 _HYBRID_SETTINGS_ERROR = "hybrid retrieval is unavailable"
+
+# Retain the public monkeypatch seams without importing the top-level
+# ``services`` package merely to use immutable retrieval projections.
+PostgresVectorStore = None
+OpenAIEmbeddingClient = None
 
 
 class _SettingsValidationRetriever:
@@ -275,12 +277,16 @@ class PostgresVectorRetriever:
         embedding_client_factory,
         candidate_limit: int | None = None,
     ) -> None:
+        store_type = PostgresVectorStore
+        if store_type is None:
+            from services.vector_store import PostgresVectorStore as store_type
+
         self._user_id = user_id
         self._knowledge_base_id = knowledge_base_id
         self._profile = profile
         self._embedding_client_factory = embedding_client_factory
         self._candidate_limit = candidate_limit
-        self._store = PostgresVectorStore(database, profile=profile)
+        self._store = store_type(database, profile=profile)
 
     async def retrieve(self, query: SearchQuery) -> SearchResult:
         if query.scope is not SearchScope.ALL:
@@ -386,8 +392,12 @@ class HostedRagRetrieval:
         failure: BaseException | None = None
         client = None
         try:
+            client_type = OpenAIEmbeddingClient
+            if client_type is None:
+                from services.embeddings import OpenAIEmbeddingClient as client_type
+
             secret = self._settings.EMBEDDING_API_KEY
-            client = OpenAIEmbeddingClient(
+            client = client_type(
                 profile=profile,
                 base_url=self._settings.EMBEDDING_BASE_URL,
                 api_key=secret.get_secret_value(),

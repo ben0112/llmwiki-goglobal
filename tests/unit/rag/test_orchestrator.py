@@ -39,12 +39,13 @@ from llmwiki_adapters.postgres.wiki import WikiWriteResult
 from llmwiki_core.rag import (
     RagBudget,
     RagCompletionReason,
+    RagDomainError,
     RagPageState,
     RagStepStatus,
     RagStepType,
     RagUsage,
 )
-from llmwiki_core.search import SearchResult
+from llmwiki_core.search import RetrieverUnavailable, SearchResult
 
 RUN_ID = UUID("00000000-0000-0000-0000-000000000901")
 JOB_ID = UUID("00000000-0000-0000-0000-000000000902")
@@ -231,6 +232,7 @@ class FakeStore:
             prompt_version=spec.prompt_version,
             prompt_digest=spec.prompt_digest,
             model_profile_version="primary-v1",
+            reserved_tokens=0,
             input_tokens=0,
             output_tokens=0,
             total_tokens=0,
@@ -1537,6 +1539,105 @@ async def test_crash_reconstructs_the_same_running_page_before_retry():
     assert result["completion_reason"] == "completed"
     assert runner.calls == [0, 0]
     assert model.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            RagDomainError("rag_budget_exhausted", "private budget detail", True),
+            RagRunFailure("rag_budget_exhausted", "The RAG budget was exhausted.", False),
+        ),
+        (
+            RagDomainError("rag_invalid_draft", "private draft output", True),
+            RagRunFailure("rag_invalid_draft", "The generated draft was invalid.", False),
+        ),
+        (
+            RagDomainError("rag_invalid_model_usage", "private token accounting", True),
+            RagRunFailure("rag_invalid_draft", "The generated draft was invalid.", False),
+        ),
+        (
+            InvalidRagModelResponse(RagTokenUsage(10, 4, 14)),
+            RagRunFailure("rag_invalid_draft", "The generated draft was invalid.", False),
+        ),
+        (
+            RagDomainError("rag_version_conflict", "private current version", True),
+            RagRunFailure("rag_version_conflict", "The conflict retry limit was exhausted.", False),
+        ),
+    ],
+)
+async def test_page_runner_exact_domain_allowlist_maps_to_fixed_terminal_failure(failure, expected):
+    ports, _, _, runner, _, _ = _ports(pages=(_page(0, "/wiki/launch/overview.md"),))
+    runner.failure = failure
+
+    with pytest.raises(RagRunFailure) as raised:
+        await BuildWikiOrchestrator(ports).run(RUN_ID, FakeLease())
+
+    assert raised.value == expected
+    assert str(failure) not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RagDomainError("rag_invalid_plan", "cross-operation secret"),
+        RagDomainError("rag_page_not_found", "private page identity"),
+        RagDomainError("attacker_code", "attacker public message"),
+        RuntimeError("ordinary private failure"),
+    ],
+)
+async def test_page_runner_cannot_escape_with_cross_operation_or_unknown_failures(failure):
+    ports, _, _, runner, _, _ = _ports(pages=(_page(0, "/wiki/launch/overview.md"),))
+    runner.failure = failure
+
+    with pytest.raises(RagRunFailure) as raised:
+        await BuildWikiOrchestrator(ports).run(RUN_ID, FakeLease())
+
+    assert raised.value == RagRunFailure(
+        "rag_internal_error",
+        "The RAG request could not be completed.",
+        True,
+    )
+    assert str(failure) not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            RagModelUnavailable(),
+            RagRunFailure("rag_model_unavailable", "The RAG model is temporarily unavailable.", True),
+        ),
+        (
+            RetrieverUnavailable("private retrieval endpoint"),
+            RagRunFailure("rag_retrieval_failed", "RAG retrieval is temporarily unavailable.", True),
+        ),
+    ],
+)
+async def test_page_runner_provider_failures_retain_existing_retryable_mapping(failure, expected):
+    ports, _, _, runner, _, _ = _ports(pages=(_page(0, "/wiki/launch/overview.md"),))
+    runner.failure = failure
+
+    with pytest.raises(RagRunFailure) as raised:
+        await BuildWikiOrchestrator(ports).run(RUN_ID, FakeLease())
+
+    assert raised.value == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [JobCancelled("cancel requested"), LeaseLost("lease expired"), asyncio.CancelledError("worker stopped")],
+)
+async def test_page_runner_control_signals_propagate_without_domain_mapping(failure):
+    ports, _, _, runner, _, _ = _ports(pages=(_page(0, "/wiki/launch/overview.md"),))
+    runner.failure = failure
+
+    with pytest.raises(type(failure)):
+        await BuildWikiOrchestrator(ports).run(RUN_ID, FakeLease())
 
 
 @pytest.mark.asyncio

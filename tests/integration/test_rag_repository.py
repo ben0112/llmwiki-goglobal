@@ -11,6 +11,7 @@ import pytest
 from jobs.models import JobCreate, JobType
 from jobs.service import JobService
 from rag import records, repository
+from rag.model import RagTokenUsage
 
 from llmwiki_core.rag import (
     RagBudget,
@@ -375,6 +376,64 @@ async def test_step_append_is_ordered_and_only_one_can_be_running(pool, seeded_k
     assert completed.output_summary == {"matches": 3}
     assert completed.total_tokens == 7
     assert second.sequence == first.sequence + 1
+
+
+@pytest.mark.asyncio
+async def test_start_and_finish_step_enforce_dedicated_draft_reservation(pool, seeded_kb):
+    run, _ = await _create_root(pool, seeded_kb, key="draft-reservation")
+    page = (await _insert_pages(pool, run, 1))[0]
+    async with pool.acquire() as conn, conn.transaction():
+        page = await repository.begin_page_attempt(conn, page.id, max_attempts=2)
+        for step_type, reservation in (
+            (RagStepType.DRAFT, True),
+            (RagStepType.DRAFT, -1),
+            (RagStepType.DRAFT, run.budget.max_model_tokens + 1),
+            (RagStepType.READ, 1),
+        ):
+            with pytest.raises((ValueError, RagDomainError)):
+                await repository.start_step(
+                    conn,
+                    run_id=run.id,
+                    page_id=page.id,
+                    step_type=step_type,
+                    input_digest="9" * 64,
+                    reserved_tokens=reservation,
+                )
+        assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM rag_steps WHERE run_id=$1)", run.id)
+
+        draft = await repository.start_step(
+            conn,
+            run_id=run.id,
+            page_id=page.id,
+            step_type=RagStepType.DRAFT,
+            input_digest="8" * 64,
+            reserved_tokens=100,
+        )
+        assert draft.reserved_tokens == 100
+        with pytest.raises((ValueError, RagDomainError)):
+            await repository.finish_step(
+                conn,
+                step_id=draft.id,
+                status=RagStepStatus.FAILED,
+                summary={"outcome": "failed"},
+                citations=(),
+                usage=RagUsage(steps=1, model_tokens=101),
+                latency_ms=0,
+                error_code="rag_invalid_model_usage",
+                token_usage=RagTokenUsage(50, 51, 101),
+            )
+        finished = await repository.finish_step(
+            conn,
+            step_id=draft.id,
+            status=RagStepStatus.SUCCEEDED,
+            summary={"outcome": "drafted"},
+            citations=(),
+            usage=RagUsage(steps=1, model_tokens=90),
+            latency_ms=0,
+            token_usage=RagTokenUsage(50, 40, 90),
+        )
+    assert finished.total_tokens == 90
+    assert finished.reserved_tokens == 100
 
 
 @pytest.mark.asyncio
@@ -1992,6 +2051,7 @@ def test_step_decoder_rejects_invalid_json_tokens_and_citations():
         "prompt_version": None,
         "prompt_digest": None,
         "model_profile_version": "profile-v1",
+        "reserved_tokens": 0,
         "input_tokens": 2,
         "output_tokens": 3,
         "total_tokens": 5,
@@ -2021,6 +2081,56 @@ def test_step_decoder_rejects_invalid_json_tokens_and_citations():
         records._decode_step(over_cap_sequence)
 
 
+def test_step_decoder_enforces_exact_draft_reservation_contract():
+    now = datetime.now(UTC)
+    row = {
+        "id": uuid4(),
+        "run_id": uuid4(),
+        "run_page_id": uuid4(),
+        "user_id": uuid4(),
+        "knowledge_base_id": uuid4(),
+        "sequence": 1,
+        "step_type": "draft",
+        "status": "failed",
+        "input_digest": "a" * 64,
+        "output_summary": {"outcome": "failed"},
+        "citation_identities": [],
+        "prompt_version": "writer-v1",
+        "prompt_digest": "b" * 64,
+        "model_profile_version": "profile-v1",
+        "reserved_tokens": 10,
+        "input_tokens": 6,
+        "output_tokens": 4,
+        "total_tokens": 10,
+        "latency_ms": 0.0,
+        "error_code": "rag_invalid_draft",
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    assert records._decode_step(row).reserved_tokens == 10
+
+    for field, value in (
+        ("reserved_tokens", True),
+        ("reserved_tokens", -1),
+        ("reserved_tokens", 250_001),
+    ):
+        invalid = dict(row)
+        invalid[field] = value
+        with pytest.raises((TypeError, ValueError)):
+            records._decode_step(invalid)
+
+    over_reservation = dict(row)
+    over_reservation.update(reserved_tokens=9)
+    with pytest.raises((TypeError, ValueError)):
+        records._decode_step(over_reservation)
+
+    wrong_step_type = dict(row)
+    wrong_step_type.update(step_type="read")
+    with pytest.raises((TypeError, ValueError)):
+        records._decode_step(wrong_step_type)
+
+
 def test_direct_decoders_reject_stringified_json_boundaries():
     run = _valid_run_row()
     run["budget"] = json.dumps(run["budget"])
@@ -2048,6 +2158,7 @@ def test_direct_decoders_reject_stringified_json_boundaries():
         "prompt_version": None,
         "prompt_digest": None,
         "model_profile_version": "profile-v1",
+        "reserved_tokens": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
@@ -2107,6 +2218,7 @@ def test_json_boundaries_reject_excessive_nesting_for_wire_and_direct_values():
         "prompt_version": None,
         "prompt_digest": None,
         "model_profile_version": "profile-v1",
+        "reserved_tokens": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,

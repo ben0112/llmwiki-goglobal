@@ -90,6 +90,14 @@ _ZERO_TOKEN_USAGE = RagTokenUsage(prompt_tokens=0, completion_tokens=0, total_to
 _INTERNAL_CODE = "rag_internal_error"
 _INTERNAL_MESSAGE = "The RAG request could not be completed."
 _INVALID_PLAN_MESSAGE = "The generated plan was invalid."
+_PAGE_RUNNER_DOMAIN_CODES = frozenset(
+    {
+        "rag_budget_exhausted",
+        "rag_invalid_draft",
+        "rag_invalid_model_usage",
+        "rag_version_conflict",
+    }
+)
 
 
 class RagRunFailure(Exception):
@@ -555,7 +563,17 @@ class BuildWikiOrchestrator:
             if page.state not in {RagPageState.PLANNED, RagPageState.RUNNING, RagPageState.FAILED}:
                 raise _internal_failure()
             _require_page_budget(state.run)
-            outcome = await _boundary_call(self._ports.page_runner, "run", state.run, page, lease)
+            try:
+                outcome = await _boundary_call(
+                    self._ports.page_runner,
+                    "run",
+                    state.run,
+                    page,
+                    lease,
+                    _allowed_domain_codes=_PAGE_RUNNER_DOMAIN_CODES,
+                )
+            except BaseException as failure:  # noqa: BLE001 - detach the page trust boundary.
+                raise _map_failure(failure, operation="page") from None
             if type(outcome) is not PageExecutionResult:
                 raise _internal_failure()
             _validate_page_outcome(state.run, page, outcome)
@@ -1293,6 +1311,8 @@ def _map_failure(failure: BaseException, *, operation: str) -> RagRunFailure:
     if isinstance(failure, RagModelUnavailable):
         return RagRunFailure("rag_model_unavailable", "The RAG model is temporarily unavailable.", True)
     if isinstance(failure, InvalidRagModelResponse):
+        if operation == "page":
+            return RagRunFailure("rag_invalid_draft", "The generated draft was invalid.", False)
         return RagRunFailure("rag_invalid_plan", _INVALID_PLAN_MESSAGE, False)
     if isinstance(failure, RetrieverUnavailable):
         return RagRunFailure("rag_retrieval_failed", "RAG retrieval is temporarily unavailable.", True)
@@ -1308,6 +1328,16 @@ def _map_failure(failure: BaseException, *, operation: str) -> RagRunFailure:
                 "rag_invalid_plan": ("rag_invalid_plan", _INVALID_PLAN_MESSAGE, False),
                 "rag_invalid_model_usage": ("rag_invalid_plan", _INVALID_PLAN_MESSAGE, False),
                 "rag_prompt_invalid": ("rag_prompt_invalid", "The RAG prompt inputs were invalid.", False),
+            },
+            "page": {
+                "rag_budget_exhausted": ("rag_budget_exhausted", "The RAG budget was exhausted.", False),
+                "rag_invalid_draft": ("rag_invalid_draft", "The generated draft was invalid.", False),
+                "rag_invalid_model_usage": ("rag_invalid_draft", "The generated draft was invalid.", False),
+                "rag_version_conflict": (
+                    "rag_version_conflict",
+                    "The conflict retry limit was exhausted.",
+                    False,
+                ),
             },
         }
         safe = safe_by_operation.get(operation, {}).get(failure.code)
