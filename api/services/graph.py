@@ -33,6 +33,7 @@ def _build_node(r: dict) -> dict:
     tags = _parse_json(r.get("tags"), [])
     return {
         "id": str(r["id"]),
+        "filename": r["filename"],
         "title": r["title"] or r["filename"].removesuffix(".md").replace("-", " ").replace("_", " "),
         "description": meta.get("description") if isinstance(meta, dict) else None,
         "path": r["path"],

@@ -7,6 +7,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2 } from 'lucide-react'
 import { useUserStore, useUploadStore } from '@/stores'
 import { readDocumentToListItem, useDocumentBrowse } from '@/hooks/useDocumentBrowse'
+import { useDocumentResolver } from '@/hooks/useDocumentResolver'
 import { useWikiPages } from '@/hooks/useWikiPages'
 import { apiFetch } from '@/lib/api'
 import { apiUrl } from '@/lib/runtime-env'
@@ -213,12 +214,12 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   // ─── Document splits ─────────────────────────────────────────
   const wikiDocs = React.useMemo(
-    () => documents.filter((d) => (d.path === '/wiki/' || d.path.startsWith('/wiki/')) && !d.archived && d.file_type === 'md'),
-    [documents],
+    () => wiki.documents.filter((d) => !d.archived && d.file_type === 'md'),
+    [wiki.documents],
   )
   const sourceDocs = React.useMemo(
-    () => documents.filter((d) => !d.path.startsWith('/wiki/') && !d.archived),
-    [documents],
+    () => browse.items.filter((d) => !d.archived),
+    [browse.items],
   )
 
   // ─── View state ──────────────────────────────────────────────
@@ -236,18 +237,29 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   const [wikiActivePath, setWikiActivePath] = React.useState<string | null>(null)
   const lastWikiDocNumberRef = React.useRef<number | null>(urlWikiDocNumber)
+  const { resolve: resolveDocument } = useDocumentResolver({
+    kbId,
+    token,
+    revision: wiki.revision ?? browse.revision,
+    navigationKey: `${activeView}|${wikiActivePath ?? ''}`,
+  })
+  const resolveLogicalDocument = React.useCallback(
+    (logicalReference: string, signal?: AbortSignal) =>
+      resolveDocument({ logicalReference }, signal),
+    [resolveDocument],
+  )
 
   // Initialize wikiActivePath from ?p= on mount and when ?p= changes
   React.useEffect(() => {
     if (urlWikiDocNumber == null) return
-    if (!documents.length) return
-    const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
+    if (!wikiDocs.length) return
+    const doc = wikiDocs.find((d) => d.document_number === urlWikiDocNumber)
     if (doc) {
       const path = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
       setWikiActivePath(path)
       lastWikiDocNumberRef.current = urlWikiDocNumber
     }
-  }, [urlWikiDocNumber, documents])
+  }, [urlWikiDocNumber, wikiDocs])
 
   // ─── Source doc selection ────────────────────────────────────
   // Read ?doc= only on mount (for bookmarked URLs / browser back-forward)
@@ -261,17 +273,14 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   React.useEffect(() => {
     if (initialDocNumber == null || activeSourceDocId || !token) return
     const controller = new AbortController()
-    apiFetch<ReadDocument>(
-      `/v1/knowledge-bases/${kbId}/documents/resolve?document_number=${initialDocNumber}`,
-      token,
-      { signal: controller.signal },
-    ).then((document) => {
+    resolveDocument({ documentNumber: initialDocNumber }, controller.signal).then((document) => {
+      if (!document) return
       setActiveSourceDocId(document.id)
       setActiveSourceDocument(readDocumentToListItem(document))
       setActiveView('doc')
     }).catch(() => undefined)
     return () => controller.abort()
-  }, [initialDocNumber, activeSourceDocId, kbId, token])
+  }, [initialDocNumber, activeSourceDocId, token, resolveDocument])
 
   const [filesInitialPage, setFilesInitialPage] = React.useState<number | undefined>()
 
@@ -560,21 +569,24 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     }
   }, [graphViewActive, navigateToView])
 
-  const handleGraphNodeClick = React.useCallback((docId: string, sourceKind: string) => {
-    const doc = documents.find((d) => d.id === docId)
-    if (!doc) return
-    if (sourceKind === 'wiki') {
-      const wikiPath = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
-      setActiveView('wiki')
-      setWikiActivePath(wikiPath)
-      lastWikiDocNumberRef.current = doc.document_number
-      navigateToView('wiki', { searchParams: doc.document_number != null ? { p: String(doc.document_number) } : undefined })
-      return
-    }
-    setActiveSourceDocId(doc.id)
-    setActiveView('doc')
-    navigateToView('files', { searchParams: doc.document_number != null ? { doc: String(doc.document_number) } : undefined })
-  }, [documents, navigateToView])
+  const handleGraphNodeClick = React.useCallback((logicalReference: string, sourceKind: string) => {
+    void resolveLogicalDocument(logicalReference).then((document) => {
+      if (!document) return
+      const doc = readDocumentToListItem(document)
+      if (sourceKind === 'wiki') {
+        const wikiPath = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
+        setActiveView('wiki')
+        setWikiActivePath(wikiPath)
+        lastWikiDocNumberRef.current = doc.document_number
+        navigateToView('wiki', { searchParams: doc.document_number != null ? { p: String(doc.document_number) } : undefined })
+        return
+      }
+      setActiveSourceDocId(doc.id)
+      setActiveSourceDocument(doc)
+      setActiveView('doc')
+      navigateToView('files', { searchParams: doc.document_number != null ? { doc: String(doc.document_number) } : undefined })
+    }).catch(() => undefined)
+  }, [navigateToView, resolveLogicalDocument])
 
   const handleOpenSourceDoc = React.useCallback((doc: ReadDocument) => {
     setActiveSourceDocId(doc.id)
@@ -586,20 +598,20 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   }, [navigateToView])
 
   const handleCitationSourceClick = React.useCallback((filename: string, page?: number) => {
-    const lower = filename.toLowerCase()
-    const match = sourceDocs.find((d) => {
-      const fn = d.filename.toLowerCase()
-      const title = (d.title || '').toLowerCase()
-      return fn === lower || title === lower || fn === lower + '.md' || fn.replace(/\.md$/, '') === lower
-    })
-    if (!match) return
-    setActiveSourceDocId(match.id)
-    setActiveView('doc')
-    setFilesInitialPage(page)
-    if (match.document_number != null) {
-      navigateToView('files', { searchParams: { doc: String(match.document_number) } })
-    }
-  }, [sourceDocs, navigateToView])
+    void (async () => {
+      const document = await resolveLogicalDocument(filename) ??
+        (!/\.[^/]+$/.test(filename) ? await resolveLogicalDocument(`${filename}.md`) : null)
+      if (!document) return
+      const match = readDocumentToListItem(document)
+      setActiveSourceDocId(match.id)
+      setActiveSourceDocument(match)
+      setActiveView('doc')
+      setFilesInitialPage(page)
+      if (match.document_number != null) {
+        navigateToView('files', { searchParams: { doc: String(match.document_number) } })
+      }
+    })().catch(() => undefined)
+  }, [navigateToView, resolveLogicalDocument])
 
   const handlePageGraphClick = React.useCallback(() => {
     if (!activeWikiDocId) return
@@ -1049,11 +1061,11 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     }
 
     // Navigate to files view after first upload
-    if (sourceDocs.length === 0 && okCount > 0) {
+    if (browse.sourceCount === 0 && okCount > 0) {
       setActiveView('files')
       navigateToView('files')
     }
-  }, [kbId, kbSlug, userId, tusUploadFile, sourceDocs.length, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadReady, markUploadFailed, refreshReadModels])
+  }, [kbId, kbSlug, userId, tusUploadFile, browse.sourceCount, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadReady, markUploadFailed, refreshReadModels])
 
   React.useEffect(() => {
     if (!processingUploadIds || !token) return
@@ -1094,11 +1106,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   React.useEffect(() => {
     if (!openRequest || openRequest.kbId !== kbId || !token) return
     const controller = new AbortController()
-    apiFetch<ReadDocument>(
-      `/v1/knowledge-bases/${kbId}/documents/resolve?document_number=${openRequest.documentNumber}`,
-      token,
-      { signal: controller.signal },
-    ).then((document) => {
+    resolveDocument({ documentNumber: openRequest.documentNumber }, controller.signal).then((document) => {
+      if (!document) return
       setActiveSourceDocId(document.id)
       setActiveSourceDocument(readDocumentToListItem(document))
       setActiveView('doc')
@@ -1106,7 +1115,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       consumeOpenRequest()
     }).catch(() => undefined)
     return () => controller.abort()
-  }, [openRequest, kbId, token, navigateToView, consumeOpenRequest])
+  }, [openRequest, kbId, token, navigateToView, consumeOpenRequest, resolveDocument])
 
   // ─── Drag-and-drop ───────────────────────────────────────────
   const [fileDragOver, setFileDragOver] = React.useState(false)
@@ -1310,7 +1319,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                   onNavigate={handleWikiNavigate}
                   onSourceClick={handleCitationSourceClick}
                   onGraphClick={handlePageGraphClick}
-                  documents={documents}
+                  activeDocument={activeWikiDoc}
+                  resolveDocument={resolveLogicalDocument}
                 />
               </motion.div>
             ) : (

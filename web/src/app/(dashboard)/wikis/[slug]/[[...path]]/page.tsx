@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import { useKBStore, useUserStore } from '@/stores'
-import { useKBDocuments } from '@/hooks/useKBDocuments'
+import { useWikiPages } from '@/hooks/useWikiPages'
 import { WikiOnlyDetail } from '@/components/kb/WikiOnlyDetail'
 import { Loader2 } from 'lucide-react'
 
@@ -14,6 +14,7 @@ export default function KBPage() {
   const knowledgeBases = useKBStore((s) => s.knowledgeBases)
   const kbLoading = useKBStore((s) => s.loading)
   const user = useUserStore((s) => s.user)
+  const token = useUserStore((s) => s.accessToken)
 
   const kb = React.useMemo(
     () => knowledgeBases.find((k) => k.slug === params.slug),
@@ -23,8 +24,8 @@ export default function KBPage() {
   // ── Legacy ?page= redirect (old URL format) ─────────────────
   const legacyPage = searchParams.get('page')
   const needsDocLookup = !!legacyPage
-  const { documents: legacyDocs, loading: legacyLoading } = useKBDocuments(
-    needsDocLookup ? (kb?.id ?? '') : '',
+  const { documents: legacyDocs, loading: legacyLoading } = useWikiPages(
+    needsDocLookup ? (kb?.id ?? '') : '', token,
   )
 
   React.useEffect(() => {

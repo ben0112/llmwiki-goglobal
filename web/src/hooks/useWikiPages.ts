@@ -35,5 +35,5 @@ export function useWikiPages(kbId: string, token: string | null) {
     revisionRef.current = null
   }, [kbId])
 
-  return { ...read, documents }
+  return { ...read, documents, setDocuments }
 }
