@@ -197,7 +197,24 @@ export function useReadPage<T>({
   const loadNext = React.useCallback(() => {
     const latest = stateRef.current
     const active = latest.pages[latest.currentIndex]
-    if (active?.page.next_cursor) void fetchPage(active.page.next_cursor)
+    const nextCursor = active?.page.next_cursor
+    if (!nextCursor) return
+    const cachedIndex = latest.pages.findIndex((page) => page.cursor === nextCursor)
+    if (cachedIndex >= 0) {
+      dispatch({ type: 'navigate', index: cachedIndex })
+      return
+    }
+    void fetchPage(nextCursor)
+  }, [fetchPage])
+  const loadPrevious = React.useCallback(() => {
+    const latest = stateRef.current
+    if (latest.currentIndex > 0) {
+      dispatch({ type: 'navigate', index: latest.currentIndex - 1 })
+      return
+    }
+    const active = latest.pages[latest.currentIndex]
+    const historyIndex = latest.cursorHistory.lastIndexOf(active?.cursor ?? null)
+    if (historyIndex > 0) void fetchPage(latest.cursorHistory[historyIndex - 1])
   }, [fetchPage])
   const reload = React.useCallback(() => {
     const latest = stateRef.current
@@ -212,9 +229,16 @@ export function useReadPage<T>({
     refreshing,
     error,
     hasNext: Boolean(current?.page.next_cursor),
+    hasPrevious: (() => {
+      if (state.currentIndex > 0) return true
+      const historyIndex = state.cursorHistory.lastIndexOf(current?.cursor ?? null)
+      return historyIndex > 0
+    })(),
     loadNext,
+    loadPrevious,
     reload,
     revision: state.staleRevision ?? current?.page.revision ?? null,
     totalCount: current?.page.total_count ?? 0,
+    cachedPageCount: state.pages.length,
   }
 }

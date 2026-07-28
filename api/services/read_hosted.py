@@ -411,7 +411,7 @@ class HostedReadService:
         params.append(limit + 1)
         order = "DESC" if direction == "desc" else "ASC"
         rows = await self.database.fetch(
-            "SELECT d.id::text,d.filename,d.title,d.path,d.metadata,"
+            "SELECT d.id::text,d.filename,d.title,d.path,d.metadata,d.document_number,"
             + sort_sql
             + " AS _sort_key FROM documents d WHERE "
             + " AND ".join(conditions)
@@ -427,6 +427,7 @@ class HostedReadService:
                 "title": row["title"],
                 "path": row["path"],
                 "metadata": row["metadata"],
+                "document_number": row["document_number"],
             }
             for row in rows
         ]

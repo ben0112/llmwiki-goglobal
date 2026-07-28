@@ -74,6 +74,7 @@ async def test_corpus_entries_summary_graph_and_cache_invalidation(corpus_servic
     service, db = corpus_service
     page = await service.corpus_entries("ws1", {"stage": "S2"}, limit=1, cursor=None)
     assert len(page.items) == 1 and page.next_cursor
+    assert "document_number" in page.items[0]
     second = await service.corpus_entries("ws1", {"stage": "S2"}, limit=1, cursor=page.next_cursor)
     assert {page.items[0]["id"], second.items[0]["id"]} == {"d1", "d2"}
     queried = await service.corpus_entries(

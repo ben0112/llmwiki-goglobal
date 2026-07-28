@@ -157,6 +157,7 @@ async def test_hosted_corpus_entries_summary_and_graph_are_db_filtered_and_kb_sc
     )
     assert page.total_count == 1
     assert [item["id"] for item in page.items] == [str(doc_ids[1])]
+    assert "document_number" in page.items[0]
     summary = await service.corpus_summary(str(kb_id), {"stage": "S2", "state": "待复核"})
     assert summary.filtered_count == 2
     assert summary.kpis["cited"] == 1

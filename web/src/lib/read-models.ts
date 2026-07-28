@@ -25,6 +25,7 @@ export type ReadPageAction<T> =
   | { type: 'not_modified' }
   | { type: 'stale'; revision: number }
   | { type: 'query_changed'; queryKey: string }
+  | { type: 'navigate'; index: number }
 
 export function createReadPageState<T>(queryKey: string): ReadPageState<T> {
   return {
@@ -42,6 +43,11 @@ export function readPageReducer<T>(
   action: ReadPageAction<T>,
 ): ReadPageState<T> {
   if (action.type === 'not_modified') return state
+
+  if (action.type === 'navigate') {
+    if (action.index < 0 || action.index >= state.pages.length) return state
+    return { ...state, currentIndex: action.index }
+  }
 
   if (action.type === 'stale') {
     return {

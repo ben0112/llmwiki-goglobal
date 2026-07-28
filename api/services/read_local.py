@@ -414,7 +414,7 @@ class LocalReadService:
             params.extend(decoded.key)
         order = "DESC" if direction == "desc" else "ASC"
         cursor_result = await self.db.execute(
-            "SELECT d.id,d.filename,d.title,d.path,d.metadata," + sort_sql + " AS _sort_key "
+            "SELECT d.id,d.filename,d.title,d.path,d.metadata,d.document_number," + sort_sql + " AS _sort_key "
             "FROM documents d WHERE " + " AND ".join(conditions) + f" ORDER BY {sort_sql} {order},d.id {order} LIMIT ?",
             [*params, limit + 1],
         )
@@ -427,7 +427,10 @@ class LocalReadService:
                 metadata = json.loads(row[4])
             except (TypeError, json.JSONDecodeError):
                 continue
-            page.append({"id": row[0], "filename": row[1], "title": row[2], "path": row[3], "metadata": metadata})
+            page.append({
+                "id": row[0], "filename": row[1], "title": row[2], "path": row[3],
+                "metadata": metadata, "document_number": row[5],
+            })
         next_cursor = None
         if has_next and page:
             next_cursor = encode_cursor(
@@ -436,7 +439,7 @@ class LocalReadService:
                     revision,
                     sort,
                     direction,
-                    (str(rows[-1][5] or ""), str(rows[-1][0])),
+                    (str(rows[-1][6] or ""), str(rows[-1][0])),
                 )
             )
         count_cursor = await self.db.execute(

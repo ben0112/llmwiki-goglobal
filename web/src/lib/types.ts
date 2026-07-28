@@ -92,10 +92,23 @@ export interface CorpusSummary {
   total_count: number
   filtered_count: number
   facets: Record<string, Record<string, number>>
-  coverage: Record<string, unknown>
+  coverage: {
+    counts?: Record<string, Record<string, number>>
+    total?: number
+    [key: string]: unknown
+  }
   business_classes: Record<string, number>
   business_scenes: Record<string, number>
   kpis: Record<string, number | null>
+}
+
+export interface CorpusEntryRecord {
+  id: string
+  filename: string
+  title: string | null
+  path: string
+  document_number: number | null
+  metadata: Record<string, unknown> | null
 }
 
 export interface GraphSummary {
