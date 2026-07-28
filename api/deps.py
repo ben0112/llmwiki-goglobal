@@ -92,6 +92,11 @@ async def get_document_service(request: Request):
     return request.app.state.factory.document_service(user_id)
 
 
+async def get_read_service(request: Request):
+    user_id = await get_user_id(request)
+    return request.app.state.factory.read_service(user_id)
+
+
 async def get_scoped_db(
     request: Request,
     pool: Annotated = Depends(get_pool),

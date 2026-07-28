@@ -1055,5 +1055,10 @@ class HostedServiceFactory(ServiceFactory):
     def document_service(self, user_id: str) -> HostedDocumentService:
         return HostedDocumentService(self.pool, user_id, self.s3)
 
+    def read_service(self, user_id: str):
+        from .read_hosted import HostedReadService
+
+        return HostedReadService(self.pool, user_id)
+
     def public_wiki_service(self) -> HostedPublicWikiService:
         return HostedPublicWikiService(self.pool, self.s3)

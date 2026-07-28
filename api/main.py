@@ -66,6 +66,7 @@ from routes.documents import router as documents_router  # noqa: E402
 from routes.health import router as health_router  # noqa: E402
 from routes.knowledge_bases import router as knowledge_bases_router  # noqa: E402
 from routes.me import router as me_router  # noqa: E402
+from routes.read_models import router as read_models_router  # noqa: E402
 from routes.usage import router as usage_router  # noqa: E402
 
 
@@ -533,6 +534,7 @@ app.include_router(me_router)
 app.include_router(usage_router)
 app.include_router(knowledge_bases_router)
 app.include_router(documents_router)
+app.include_router(read_models_router)
 
 if settings.MODE == "local":
     from routes.files import router as files_router

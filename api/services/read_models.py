@@ -24,6 +24,14 @@ class SortDirection(StrEnum):
     DESC = "desc"
 
 
+class StaleReadCursor(ValueError):
+    """A cursor was issued for an older authoritative read revision."""
+
+    def __init__(self, revision: int):
+        super().__init__("stale read cursor")
+        self.revision = revision
+
+
 class ResolvedDocument(BaseModel):
     """Lightweight document projection shared by browse and resolver reads."""
 
@@ -108,13 +116,16 @@ class UploadPreflightItem(BaseModel):
     size: int = Field(ge=0)
     sha256: str | None = Field(default=None, min_length=64, max_length=64)
     accepted: bool | None = None
-    code: Literal[
-        "accepted",
-        "duplicate_name",
-        "duplicate_content",
-        "unsupported",
-        "too_large",
-    ] | None = None
+    code: (
+        Literal[
+            "accepted",
+            "duplicate_name",
+            "duplicate_content",
+            "unsupported",
+            "too_large",
+        ]
+        | None
+    ) = None
     existing_document_id: str | None = Field(default=None, max_length=64)
 
 
@@ -160,6 +171,7 @@ __all__ = [
     "ReadSort",
     "ResolvedDocument",
     "SortDirection",
+    "StaleReadCursor",
     "UploadPreflightItem",
     "UploadPreflightRequest",
     "UploadPreflightResponse",

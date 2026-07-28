@@ -50,12 +50,18 @@ _MAX_INLINE_TEXT_BYTES = 50 * 1024 * 1024
 
 async def _ingest_bytes(db, relative: str, content_bytes: bytes) -> dict:
     """把一份文件字节落盘到工作区并建立索引(小文件上传与解压共用)。"""
-    dest = _safe_resolve(relative)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    mark_written(str(dest))
-    dest.write_bytes(content_bytes)
-    return await _index_file_on_disk(db, relative, dest,
-                                     hashlib.sha256(content_bytes).hexdigest())
+    part = _parts_dir() / f"{uuid.uuid4().hex}.part"
+    part.write_bytes(content_bytes)
+    try:
+        return await _index_file_on_disk(
+            db,
+            relative,
+            part,
+            hashlib.sha256(content_bytes).hexdigest(),
+            move_into_place=True,
+        )
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def _hash_file(path: Path) -> str:
@@ -73,7 +79,14 @@ async def _store_chunks_for_upload(db, doc_id: str, chunks: list, document_versi
     await _store_chunks(db, doc_id, chunks, document_version)
 
 
-async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) -> dict:
+async def _index_file_on_disk(
+    db,
+    relative: str,
+    source: Path,
+    content_hash: str,
+    *,
+    move_into_place: bool = False,
+) -> dict:
     """为已落盘的文件建立索引(哈希由调用方提供,大文件流式计算不进内存)。"""
     filename = relative.rsplit("/", 1)[-1]
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -82,14 +95,15 @@ async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) 
 
     dir_path = "/" + "/".join(relative.split("/")[:-1]) + "/" if "/" in relative else "/"
     source_kind = "wiki" if relative.startswith("wiki/") else "source"
-    size = dest.stat().st_size
+    dest = _safe_resolve(relative)
+    size = source.stat().st_size
 
     # HTML is excluded from inline text — it goes through webmd in process_document.
     text_content = None
     needs_processing = ext in EXTRACTION_TYPES
     if ext in SIMPLE_TEXT_TYPES and size <= _MAX_INLINE_TEXT_BYTES:
         try:
-            text_content = dest.read_text(encoding="utf-8", errors="replace")
+            text_content = source.read_text(encoding="utf-8", errors="replace")
         except Exception:
             pass
 
@@ -104,43 +118,77 @@ async def _index_file_on_disk(db, relative: str, dest: Path, content_hash: str) 
 
         chunks = chunk_text(text_content)
 
-    async with serialized_write(db):
-        cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
-        row = await cursor.fetchone()
-        doc_number = row[0]
-        await db.execute(
-            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
-            "source_kind, file_type, file_size, status, content, tags, version, "
-            "content_hash, mtime_ns, last_indexed_at, document_number) "
-            "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "'[]', 0, ?, ?, datetime('now'), ?)",
-            (
-                doc_id,
-                filename,
-                title,
-                dir_path,
-                relative,
-                source_kind,
-                ext or "bin",
-                size,
-                "processing" if is_simple_text else "pending",
-                text_content,
-                content_hash,
-                int(dest.stat().st_mtime_ns),
-                doc_number,
-            ),
-        )
-        if is_simple_text:
-            from domain.local_processor import _replace_text_content_on_connection
+    moved = False
+    try:
+        async with serialized_write(db):
+            duplicate = await (
+                await db.execute(
+                    "SELECT id FROM documents WHERE relative_path=? LIMIT 1",
+                    (relative,),
+                )
+            ).fetchone()
+            if duplicate or (move_into_place and dest.exists()):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "duplicate_path", "message": "Destination already exists."},
+                )
+            duplicate = await (
+                await db.execute(
+                    "SELECT id FROM documents WHERE content_hash=? AND status!='failed' LIMIT 1",
+                    (content_hash,),
+                )
+            ).fetchone()
+            if duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "duplicate_content", "message": "Content already exists."},
+                )
+            if move_into_place:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                mark_written(str(dest))
+                os.replace(source, dest)
+                moved = True
 
-            await _replace_text_content_on_connection(
-                db,
-                doc_id,
-                text_content,
-                chunks,
-                store_chunks=_store_chunks_for_upload,
+            cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
+            row = await cursor.fetchone()
+            doc_number = row[0]
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                "source_kind, file_type, file_size, status, content, tags, version, "
+                "content_hash, mtime_ns, last_indexed_at, document_number) "
+                "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'[]', 0, ?, ?, datetime('now'), ?)",
+                (
+                    doc_id,
+                    filename,
+                    title,
+                    dir_path,
+                    relative,
+                    source_kind,
+                    ext or "bin",
+                    size,
+                    "processing" if is_simple_text else "pending",
+                    text_content,
+                    content_hash,
+                    int(dest.stat().st_mtime_ns),
+                    doc_number,
+                ),
             )
-        await db.commit()
+            if is_simple_text:
+                from domain.local_processor import _replace_text_content_on_connection
+
+                await _replace_text_content_on_connection(
+                    db,
+                    doc_id,
+                    text_content,
+                    chunks,
+                    store_chunks=_store_chunks_for_upload,
+                )
+            await db.commit()
+    except Exception:
+        if moved:
+            dest.unlink(missing_ok=True)
+        raise
 
     if needs_processing:
         from domain.local_processor import process_document_isolated
@@ -280,13 +328,16 @@ async def resumable_complete(
         return JSONResponse(status_code=409, content={"offset": part.stat().st_size})
 
     relative = (meta["path"].rstrip("/") + "/" + meta["filename"]).lstrip("/")
-    dest = _safe_resolve(relative)
-    dest.parent.mkdir(parents=True, exist_ok=True)
     content_hash = await asyncio.to_thread(_hash_file, part)
-    mark_written(str(dest))
-    os.replace(part, dest)
+    result = await _index_file_on_disk(
+        request.app.state.sqlite_db,
+        relative,
+        part,
+        content_hash,
+        move_into_place=True,
+    )
     meta_path.unlink(missing_ok=True)
-    return await _index_file_on_disk(request.app.state.sqlite_db, relative, dest, content_hash)
+    return result
 
 
 @router.post("/v1/upload/archive", status_code=201)

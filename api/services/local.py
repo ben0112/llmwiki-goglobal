@@ -383,5 +383,10 @@ class LocalServiceFactory(ServiceFactory):
     def document_service(self, user_id: str) -> LocalDocumentService:
         return LocalDocumentService(self.db, user_id)
 
+    def read_service(self, user_id: str):
+        from .read_local import LocalReadService
+
+        return LocalReadService(self.db, user_id)
+
     def public_wiki_service(self):
         raise HTTPException(status_code=404, detail="Public wikis aren't available in local mode.")
