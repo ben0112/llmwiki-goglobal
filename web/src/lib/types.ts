@@ -82,6 +82,9 @@ export interface ReadFolder {
 
 export interface DocumentBrowsePage extends ReadPage<ReadDocument> {
   folders: ReadFolder[]
+  source_count: number
+  failed_count: number
+  corpus_count: number
 }
 
 export interface CorpusSummary {

@@ -4,22 +4,19 @@ import * as React from 'react'
 import { useParams, usePathname, useRouter } from 'next/navigation'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  ChevronRight, FileText, NotepadText, Library,
+  ChevronRight, FileText, Library,
   Upload, BookOpen, ArrowUpRight, Search as SearchIcon,
   Lightbulb, Box, ScrollText, Network, Folder, Check, Lock,
   PanelLeftClose, PanelLeftOpen, LayoutGrid,
 } from 'lucide-react'
-import {
-  CommandDialog, CommandInput, CommandList, CommandItem,
-  CommandEmpty, CommandGroup, CommandSeparator,
-} from '@/components/ui/command'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { DocumentSearchDialog } from '@/components/kb/DocumentSearchDialog'
 import { cn } from '@/lib/utils'
 import { WikiSelector } from '@/components/kb/WikiSelector'
 import { SidenavUserMenu } from '@/components/kb/SidenavUserMenu'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
-import type { DocumentListItem, WikiNode } from '@/lib/types'
+import type { DocumentListItem, ReadDocument, WikiNode } from '@/lib/types'
 
 interface Usage {
   total_pages: number
@@ -44,7 +41,9 @@ interface KBSidenavProps {
   wikiTree: WikiNode[]
   wikiActivePath: string | null
   onWikiNavigate: (path: string, docNumber?: number | null) => void
-  sourceDocs: DocumentListItem[]
+  sourceCount: number
+  failedCount: number
+  corpusCount: number
   wikiDocs?: DocumentListItem[]
   hasWiki: boolean
   loading: boolean
@@ -53,7 +52,7 @@ interface KBSidenavProps {
   onFilesToggle: () => void
   graphViewActive: boolean
   onGraphToggle: () => void
-  onOpenSourceDoc: (docId: string) => void
+  onOpenSourceDoc: (document: ReadDocument) => void
   courseMode?: boolean
   courseCurrentPath?: string | null
   courseProgress?: { completed: number; total: number }
@@ -65,7 +64,9 @@ export function KBSidenav({
   wikiTree,
   wikiActivePath,
   onWikiNavigate,
-  sourceDocs,
+  sourceCount,
+  failedCount,
+  corpusCount,
   wikiDocs,
   hasWiki,
   loading,
@@ -81,6 +82,7 @@ export function KBSidenav({
 }: KBSidenavProps) {
   const [searchOpen, setSearchOpen] = React.useState(false)
   const [collapsed, setCollapsed] = React.useState(false)
+  const token = useUserStore((state) => state.accessToken)
 
   // ─── 分面过滤:按页面 facet_rollup(引用条目聚合的八维)过滤维基树 ───
   const rollupByPath = React.useMemo(() => {
@@ -130,16 +132,8 @@ export function KBSidenav({
   // 语料库 entry shows when classified entries exist, or (local mode) when the
   // classification pipeline has pending documents — otherwise a fresh workspace
   // full of unclassified files has no way to reach the 立即分类 button.
-  const hasEntries = React.useMemo(
-    () =>
-      sourceDocs.some((d) => {
-        const meta = d.metadata as Record<string, unknown> | null
-        return meta && typeof meta === 'object' && 'spec_version' in meta && 'stage' in meta
-      }),
-    [sourceDocs],
-  )
   const pipelinePending = usePipelinePending()
-  const hasCorpus = hasEntries || pipelinePending > 0
+  const hasCorpus = corpusCount > 0 || pipelinePending > 0
   const corpusViewActive = pathname?.endsWith('/corpus') ?? false
   const onCorpusToggle = React.useCallback(() => {
     if (params.slug) router.push(`/wikis/${params.slug}/corpus`)
@@ -169,47 +163,6 @@ export function KBSidenav({
   const isMac = React.useMemo(() =>
     typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent),
   [])
-
-  const allSearchableItems = React.useMemo(() => {
-    const items: { type: 'wiki' | 'source'; title: string; keywords: string; tags: string[]; path?: string; docNumber?: number | null; doc?: DocumentListItem }[] = []
-    const addWikiNodes = (nodes: WikiNode[], parentPath = '') => {
-      for (const node of nodes) {
-        if (node.path) {
-          const matchingDoc = sourceDocs.find((d) => d.path === '/wiki/' && d.filename === node.path?.split('/').pop())
-          const tags = matchingDoc?.tags ?? []
-          items.push({
-            type: 'wiki',
-            title: node.title,
-            keywords: [node.title, node.path, parentPath, ...tags].filter(Boolean).join(' '),
-            tags,
-            path: node.path,
-            docNumber: node.docNumber,
-          })
-        }
-        if (node.children) addWikiNodes(node.children, node.title)
-      }
-    }
-    addWikiNodes(wikiTree)
-    for (const doc of sourceDocs) {
-      const tags = doc.tags ?? []
-      items.push({
-        type: 'source',
-        title: doc.title || doc.filename,
-        keywords: [doc.title, doc.filename, doc.path, doc.file_type, ...tags].filter(Boolean).join(' '),
-        tags,
-        doc,
-      })
-    }
-    return items
-  }, [wikiTree, sourceDocs])
-
-  // 计数只算原始文件:corpus/ 下由分类流水线生成的语料条目不计入,
-  // 避免与语料库视图的条目数口径混淆(条目文件在文件网格中仍可浏览)
-  const rawDocs = sourceDocs.filter(
-    (d) => !(d.relative_path?.startsWith('corpus/') || d.path.startsWith('/corpus/')),
-  )
-  const sourceCount = rawDocs.length
-  const failedCount = rawDocs.filter((d) => d.status === 'failed').length
 
   return (
     <div
@@ -352,77 +305,17 @@ export function KBSidenav({
       )}
 
       {/* Search palette */}
-      <CommandDialog open={searchOpen} onOpenChange={setSearchOpen}>
-        <CommandInput placeholder="跳转到页面、源文件或操作..." aria-label="搜索页面与源文件" />
-        <CommandList>
-          <CommandEmpty>未找到结果。</CommandEmpty>
-          {allSearchableItems.some((i) => i.type === 'wiki') && (
-            <CommandGroup heading="维基">
-              {allSearchableItems.filter((i) => i.type === 'wiki').map((item) => (
-                <CommandItem
-                  key={`wiki-${item.path}`}
-                  value={item.keywords}
-                  onSelect={() => {
-                    setSearchOpen(false)
-                    if (item.path) onWikiNavigate(item.path, item.docNumber)
-                  }}
-                  className="flex items-center"
-                >
-                  <FileText className="size-3.5 mr-2 opacity-50 shrink-0" />
-                  <span className="truncate">{toDisplayTitle(item.title)}</span>
-                  {item.tags.length > 0 && (
-                    <span className="ml-auto flex items-center gap-1 shrink-0 pl-2">
-                      {item.tags.slice(0, 3).map((tag) => (
-                        <span key={tag} className="text-[10px] text-muted-foreground/50 bg-muted px-1.5 py-0.5 rounded">
-                          {tag}
-                        </span>
-                      ))}
-                    </span>
-                  )}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          )}
-          {allSearchableItems.some((i) => i.type === 'source') && (
-            <CommandGroup heading="源文件">
-              {allSearchableItems.filter((i) => i.type === 'source').map((item) => (
-                <CommandItem
-                  key={`source-${item.doc?.id}`}
-                  value={item.keywords}
-                  onSelect={() => {
-                    setSearchOpen(false)
-                    if (item.doc) onOpenSourceDoc(item.doc.id)
-                  }}
-                  className="flex items-center"
-                >
-                  <NotepadText className="size-3.5 mr-2 opacity-50 shrink-0" />
-                  <span className="truncate">{item.title}</span>
-                  {item.tags.length > 0 && (
-                    <span className="ml-auto flex items-center gap-1 shrink-0 pl-2">
-                      {item.tags.slice(0, 3).map((tag) => (
-                        <span key={tag} className="text-[10px] text-muted-foreground/50 bg-muted px-1.5 py-0.5 rounded">
-                          {tag}
-                        </span>
-                      ))}
-                    </span>
-                  )}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          )}
-          <CommandSeparator />
-          <CommandGroup heading="操作">
-            <CommandItem onSelect={() => { setSearchOpen(false); onFilesToggle() }}>
-              <Folder className="size-3.5 mr-2 opacity-50" />
-              浏览文件
-            </CommandItem>
-            <CommandItem onSelect={() => { setSearchOpen(false); onUpload() }}>
-              <Upload className="size-3.5 mr-2 opacity-50" />
-              上传文件
-            </CommandItem>
-          </CommandGroup>
-        </CommandList>
-      </CommandDialog>
+      <DocumentSearchDialog
+        open={searchOpen}
+        onOpenChange={setSearchOpen}
+        kbId={kbId}
+        token={token}
+        wikiTree={wikiTree}
+        onWikiNavigate={onWikiNavigate}
+        onOpenSourceDoc={onOpenSourceDoc}
+        onFilesToggle={onFilesToggle}
+        onUpload={onUpload}
+      />
 
       {/* Wiki tree — top-level folders render as sections; pages grouped beneath a guide */}
       {!collapsed && (

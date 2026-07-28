@@ -141,6 +141,16 @@ class LocalReadService:
             count_params,
         )
         count_row = await count_cursor.fetchone()
+        summary_cursor = await self.db.execute(
+            "SELECT count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%'),"
+            "count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%' AND status='failed'),"
+            "count(*) FILTER (WHERE source_kind='source' AND json_extract("
+            "CASE WHEN typeof(metadata)='text' AND json_valid(metadata) "
+            "THEN metadata ELSE '{}' END,'$.spec_version') IS NOT NULL) "
+            "FROM documents WHERE user_id=?",
+            (self.user_id,),
+        )
+        summary_row = await summary_cursor.fetchone()
         folders = await self._folders(path) if path is not None and cursor is None else []
         return BrowsePage(
             revision=revision,
@@ -148,6 +158,9 @@ class LocalReadService:
             next_cursor=next_cursor,
             total_count=int(count_row[0]) if count_row else 0,
             folders=folders,
+            source_count=int(summary_row[0]) if summary_row else 0,
+            failed_count=int(summary_row[1]) if summary_row else 0,
+            corpus_count=int(summary_row[2]) if summary_row else 0,
         )
 
     @staticmethod

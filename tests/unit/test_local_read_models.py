@@ -51,6 +51,7 @@ async def test_browse_uses_stable_bounded_keyset_and_narrow_projection(read_serv
     assert len({item.id for item in items}) == 4
     assert all("content" not in item.model_dump() for item in items)
     assert [folder.path for folder in first.folders] == ["/folder/", "/wiki/"]
+    assert (first.source_count, first.failed_count, first.corpus_count) == (6, 1, 0)
 
 
 @pytest.mark.asyncio

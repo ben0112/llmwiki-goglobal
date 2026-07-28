@@ -206,6 +206,7 @@ export function useReadPage<T>({
   }, [fetchPage])
 
   return {
+    page: current?.page ?? null,
     items,
     loading,
     refreshing,
@@ -214,5 +215,6 @@ export function useReadPage<T>({
     loadNext,
     reload,
     revision: state.staleRevision ?? current?.page.revision ?? null,
+    totalCount: current?.page.total_count ?? 0,
   }
 }

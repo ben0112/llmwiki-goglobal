@@ -13,12 +13,14 @@ class FakeReadService:
         self.corpus_calls = 0
         self.current_revision = 7
         self.stale = False
+        self.last_browse_kwargs = None
 
     async def revision(self, kb_id):
         return self.current_revision
 
     async def browse(self, *args, **kwargs):
         self.browse_calls += 1
+        self.last_browse_kwargs = kwargs
         if kwargs.get("cursor") == "malformed":
             raise CursorError("private decoder detail")
         if self.stale:
@@ -119,3 +121,15 @@ def test_corpus_routes_use_etag_and_short_circuit_before_summary_reads():
     )
     assert response.status_code == 304
     assert service.corpus_calls == 1
+
+
+def test_browse_without_path_is_workspace_wide_search():
+    service = FakeReadService()
+    client = _client(service)
+    response = client.get(
+        "/v1/knowledge-bases/00000000-0000-0000-0000-000000000001/documents/browse",
+        params={"query": "permit"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_browse_kwargs["path"] is None

@@ -6,6 +6,7 @@ import { ArrowUpRight, BookOpen, Loader2, Upload as UploadIcon } from 'lucide-re
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { WikiContent } from '@/components/wiki/WikiContent'
 import { useKBDocuments } from '@/hooks/useKBDocuments'
+import { readDocumentToListItem } from '@/hooks/useDocumentBrowse'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
@@ -387,7 +388,9 @@ export function WikiOnlyDetail({
             wikiTree={displayTree}
             wikiActivePath={wikiActivePath}
             onWikiNavigate={handleWikiSelect}
-            sourceDocs={sourceDocs}
+            sourceCount={sourceDocs.length}
+            failedCount={sourceDocs.filter((document) => document.status === 'failed').length}
+            corpusCount={sourceDocs.filter((document) => document.metadata?.spec_version).length}
             wikiDocs={wikiDocs}
             hasWiki={hasNavigableWiki}
             loading={loading}
@@ -396,10 +399,7 @@ export function WikiOnlyDetail({
             onFilesToggle={() => router.push(`/wikis/${kbSlug}/files`)}
             graphViewActive={false}
             onGraphToggle={() => router.push(`/wikis/${kbSlug}/graph`)}
-            onOpenSourceDoc={(docId) => {
-              const doc = documents.find((d) => d.id === docId)
-              if (doc) openSourceDoc(doc)
-            }}
+            onOpenSourceDoc={(document) => openSourceDoc(readDocumentToListItem(document))}
             courseMode={courseMode}
             courseCurrentPath={currentLessonPath}
             courseProgress={courseMode ? { completed: completedCount, total: lessons.length } : undefined}

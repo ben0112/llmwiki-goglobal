@@ -73,6 +73,9 @@ class FolderItem(BaseModel):
 class BrowsePage(ReadPage):
     items: list[ResolvedDocument] = Field(default_factory=list, max_length=MAX_READ_ITEMS)
     folders: list[FolderItem] = Field(default_factory=list, max_length=MAX_READ_ITEMS)
+    source_count: int = Field(default=0, ge=0)
+    failed_count: int = Field(default=0, ge=0)
+    corpus_count: int = Field(default=0, ge=0)
 
 
 class CorpusSummary(BaseModel):

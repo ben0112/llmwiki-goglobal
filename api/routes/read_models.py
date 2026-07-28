@@ -52,7 +52,7 @@ async def browse_documents(
     kb_id: UUID,
     response: Response,
     service: Annotated[object, Depends(get_read_service)],
-    path: str | None = Query(default="/"),
+    path: str | None = Query(default=None),
     query: str | None = Query(default=None),
     sort: str = Query(default="name"),
     direction: str = Query(default="asc"),

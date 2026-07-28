@@ -138,12 +138,23 @@ class HostedReadService:
             *count_params,
         )
         folders = await self._folders(kb_id, path) if path is not None and cursor is None else []
+        summary = await self.database.fetchrow(
+            "SELECT count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%') AS source_count,"
+            "count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%' AND status='failed') AS failed_count,"
+            "count(*) FILTER (WHERE source_kind='source' AND metadata ? 'spec_version') AS corpus_count "
+            "FROM documents WHERE knowledge_base_id=$1 AND user_id=$2 AND NOT archived",
+            kb_id,
+            self.user_id,
+        )
         return BrowsePage(
             revision=revision,
             items=items,
             next_cursor=next_cursor,
             total_count=int(total or 0),
             folders=folders,
+            source_count=int(summary["source_count"] or 0),
+            failed_count=int(summary["failed_count"] or 0),
+            corpus_count=int(summary["corpus_count"] or 0),
         )
 
     async def _folders(self, kb_id: str, path: str) -> list[FolderItem]:

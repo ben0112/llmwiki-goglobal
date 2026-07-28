@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { DocumentListItem } from '@/lib/types'
+import type { ReadDocumentStatus } from '@/lib/types'
 
 export type UploadPhase = 'uploading' | 'processing' | 'ready' | 'failed'
 
@@ -9,6 +9,7 @@ export interface UploadItem {
   kbId: string
   kbSlug: string
   path: string
+  documentId: string | null
   progress: number
   phase: UploadPhase
   documentNumber: number | null
@@ -34,19 +35,14 @@ interface UploadState {
   openRequest: OpenDocRequest | null
   addUpload: (upload: NewUpload) => void
   setProgress: (id: string, progress: number) => void
-  markProcessing: (id: string) => void
+  markProcessing: (id: string, documentId?: string | null) => void
   markReady: (id: string) => void
   markFailed: (id: string, error?: string | null) => void
-  reconcileDocuments: (kbId: string, documents: DocumentListItem[]) => void
+  reconcileStatuses: (kbId: string, statuses: ReadDocumentStatus[]) => void
   dismiss: (id: string) => void
   clearFinished: () => void
   requestOpenDocument: (kbId: string, documentNumber: number) => void
   consumeOpenRequest: () => void
-}
-
-function matchDocument(item: UploadItem, documents: DocumentListItem[]): DocumentListItem | undefined {
-  const name = item.filename.toLowerCase()
-  return documents.find((d) => !d.archived && d.path === item.path && d.filename.toLowerCase() === name)
 }
 
 export const useUploadStore = create<UploadState>((set) => ({
@@ -56,7 +52,14 @@ export const useUploadStore = create<UploadState>((set) => ({
   addUpload: (upload) =>
     set((state) => ({
       items: [
-        { ...upload, progress: 0, phase: 'uploading', documentNumber: null, error: null },
+        {
+          ...upload,
+          progress: 0,
+          phase: 'uploading',
+          documentId: null,
+          documentNumber: null,
+          error: null,
+        },
         ...state.items,
       ],
     })),
@@ -68,10 +71,12 @@ export const useUploadStore = create<UploadState>((set) => ({
       ),
     })),
 
-  markProcessing: (id) =>
+  markProcessing: (id, documentId = null) =>
     set((state) => ({
       items: state.items.map((item) =>
-        item.id === id ? { ...item, phase: 'processing', progress: 1 } : item,
+        item.id === id
+          ? { ...item, phase: 'processing', progress: 1, documentId }
+          : item,
       ),
     })),
 
@@ -90,12 +95,19 @@ export const useUploadStore = create<UploadState>((set) => ({
       ),
     })),
 
-  reconcileDocuments: (kbId, documents) =>
+  reconcileStatuses: (kbId, statuses) =>
     set((state) => {
+      const byId = new Map(
+        statuses.flatMap((status) => status.id ? [[status.id, status] as const] : []),
+      )
       let changed = false
       const items = state.items.map((item) => {
-        if (item.kbId !== kbId || item.phase !== 'processing') return item
-        const doc = matchDocument(item, documents)
+        if (
+          item.kbId !== kbId ||
+          item.phase !== 'processing' ||
+          !item.documentId
+        ) return item
+        const doc = byId.get(item.documentId)
         if (!doc) return item
         const phase: UploadPhase =
           doc.status === 'ready' ? 'ready' : doc.status === 'failed' ? 'failed' : 'processing'
