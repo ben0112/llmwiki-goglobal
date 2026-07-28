@@ -19,6 +19,7 @@ from llmwiki_core.search import SearchArea, SearchQuery
 logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_schema.sql"
+_READ_SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_read_models.sql"
 
 _DOC_COLUMNS = (
     "id, user_id, filename, title, path, relative_path, source_kind, "
@@ -130,6 +131,7 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         cur = await db.execute("PRAGMA table_info(workspace)")
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
+        await _ensure_read_model_schema(db)
         cur = await db.execute("PRAGMA table_info(documents)")
         if "extraction_attempts" not in {row[1] for row in await cur.fetchall()}:
             await db.execute(
@@ -139,6 +141,18 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         await _migrate_reference_types(db, schema)
         await db.commit()
     return db
+
+
+async def _ensure_read_model_schema(db: aiosqlite.Connection) -> None:
+    """Backfill durable read state before installing triggers and indexes."""
+    cursor = await db.execute("PRAGMA table_info(workspace)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "read_revision" not in columns:
+        await db.execute(
+            "ALTER TABLE workspace ADD COLUMN read_revision "
+            "INTEGER NOT NULL DEFAULT 1 CHECK (read_revision > 0)"
+        )
+    await db.executescript(_READ_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
 async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:

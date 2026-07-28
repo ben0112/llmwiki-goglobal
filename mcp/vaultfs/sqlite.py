@@ -37,6 +37,7 @@ from .facets import sqlite_facet_conditions, validate_facets
 logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_schema.sql"
+_READ_SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_read_models.sql"
 
 _db: aiosqlite.Connection | None = None
 _workspace_root: Path | None = None
@@ -217,6 +218,18 @@ async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _ensure_read_model_schema(db: aiosqlite.Connection) -> None:
+    """Backfill durable read state before installing triggers and indexes."""
+    cursor = await db.execute("PRAGMA table_info(workspace)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "read_revision" not in columns:
+        await db.execute(
+            "ALTER TABLE workspace ADD COLUMN read_revision "
+            "INTEGER NOT NULL DEFAULT 1 CHECK (read_revision > 0)"
+        )
+    await db.executescript(_READ_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
 def _build_fts_match(query: str) -> str | None:
     """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
 
@@ -262,6 +275,7 @@ class SqliteVaultFS(VaultFS):
         if _SCHEMA_PATH.exists():
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)
+            await _ensure_read_model_schema(_db)
             await _ensure_derived_version_columns(_db)
             await _migrate_fts_tokenizer(_db, schema)
             await _migrate_reference_types(_db, schema)

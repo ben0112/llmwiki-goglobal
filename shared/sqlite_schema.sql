@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS workspace (
     description TEXT DEFAULT '',
     kind TEXT NOT NULL DEFAULT 'wiki',
     user_id TEXT NOT NULL,
+    read_revision INTEGER NOT NULL DEFAULT 1 CHECK (read_revision > 0),
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(user_id)
 );
