@@ -1,7 +1,22 @@
 import ast
 from pathlib import Path
 
-FORBIDDEN = {"fastapi", "mcp", "asyncpg", "aiosqlite", "aioboto3", "boto3"}
+FORBIDDEN = {
+    "aioboto3",
+    "aiosqlite",
+    "asyncpg",
+    "boto3",
+    "fastapi",
+    "mcp",
+    "pydantic",
+    "psycopg",
+    "psycopg2",
+    "redis",
+    "s3fs",
+    "sqlalchemy",
+    "sqlite3",
+    "supabase",
+}
 
 
 def test_core_imports_without_service_dependencies():
@@ -22,6 +37,6 @@ def test_core_source_does_not_import_infrastructure_packages():
                 names = {node.module.split(".")[0]}
             else:
                 continue
-            if names & FORBIDDEN:
-                offenders.append(f"{path.name}:{node.lineno}")
+            for name in names & FORBIDDEN:
+                offenders.append(f"{path.name}:{node.lineno}:{name}")
     assert offenders == []
