@@ -14,6 +14,10 @@ embedding work follows the [durable-job contract](durable-jobs.md), and
 server-side generation consumes this same retrieval contract as described in
 [server-rag.md](server-rag.md).
 
+Search result retrieval is separate from Web list transport. Large-workspace
+file/Wiki/corpus paging, conditional refresh, and the 75,000-row structural
+performance gate are documented in [read-models.md](read-models.md).
+
 For `scope=all`, hosted hybrid retrieval applies path, tag, document-kind,
 annotated-only, area, and corpus-facet filters inside both lexical and vector
 database candidate queries before their limits. It retrieves the bounded

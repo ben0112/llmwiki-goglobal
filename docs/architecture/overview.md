@@ -43,6 +43,11 @@ object storage; API replicas are stateless and workers execute accepted work
 durably. Server-side RAG is Hosted-only. MCP retains the offline Local workflow
 and does not require server-side RAG.
 
+Both modes expose the same [bounded read-model contract](read-models.md).
+File, Wiki, and corpus screens use cursor pages, fixed-size summaries, ETags,
+and one-document resolution rather than transferring or polling the complete
+document array. The legacy array endpoint remains compatibility-only.
+
 ## Storage ownership
 
 | Store | Owner and role |
@@ -91,6 +96,7 @@ authorization, lexical, and unexpected errors remain visible.
 - [Durable Hosted jobs and resumable uploads](durable-jobs.md)
 - [Retrieval architecture and hybrid rollout](retrieval.md)
 - [Server-side RAG operations](server-rag.md)
+- [Bounded read models and large-workspace performance](read-models.md)
 - [Self-hosting guide](../self-hosting.md)
 - [Agent integration guide](../agent-integration.md)
 - [Platform architecture evolution design](../superpowers/specs/2026-07-24-platform-architecture-evolution-design.md)

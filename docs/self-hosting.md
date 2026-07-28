@@ -24,7 +24,8 @@ For system boundaries and storage ownership, start with the
 [platform architecture overview](architecture/overview.md). The canonical
 runtime contracts are [durable jobs](architecture/durable-jobs.md),
 [retrieval](architecture/retrieval.md), and
-[server-side RAG](architecture/server-rag.md); this guide keeps only deployable
+[server-side RAG](architecture/server-rag.md), and
+[bounded read models](architecture/read-models.md); this guide keeps only deployable
 operator steps.
 
 ---
@@ -87,7 +88,7 @@ self-hosting compose — you do **not** need most of its services.
 
 ### Apply the migrations
 
-Run `supabase/migrations/001…015` in order against the stack's database:
+Run `supabase/migrations/001…016` in order against the stack's database:
 
 ```bash
 for f in supabase/migrations/*.sql; do
@@ -96,7 +97,8 @@ done
 ```
 
 They create the schema, RLS policies, PGroonga full-text indexes, versioned
-pgvector chunk storage, durable embedding jobs, server-side RAG runs, the
+pgvector chunk storage, durable embedding jobs, server-side RAG runs, bounded
+read revisions/indexes, the
 `document_changes` NOTIFY trigger, and the `auth.users` trigger that
 provisions a `public.users` row (with page/storage quotas) on signup — which
 is why this must run on the Supabase database, not a bare Postgres.
@@ -220,6 +222,13 @@ without a page reload (exercises LISTEN/NOTIFY → WebSocket) → search for a
 term from the PDF (exercises PGroonga) → connect an MCP agent and run the
 `guide` tool.
 
+For large Local workspaces, never benchmark the live database in place. Make a
+copy-on-write clone, start an isolated Local API on another port, and run
+`scripts/benchmark_read_models.py` against that copy. The acceptance thresholds
+are 200 items, 1 MiB, 200 ms for warm pages, 50 ms for ETag `304`, and no
+temporary SQLite ORDER BY sort; the full safe procedure is in
+[`architecture/read-models.md`](architecture/read-models.md).
+
 ### Optional hybrid retrieval
 
 Lexical search remains the default and needs no embedding service. To make the
@@ -331,7 +340,7 @@ operational and promotion contract is in
 
 ### Zero-downtime rollout and rollback
 
-Apply migrations through `014` before deploying application code; these
+Apply migrations through `016` before deploying application code; these
 migrations are additive for the rollout. Then update Redis/MinIO/converter,
 roll workers, roll API replicas one at a time, and update/restart the gateway
 last. Confirm `/ready`, one real upload, and one graph rebuild before removing

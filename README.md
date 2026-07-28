@@ -26,6 +26,7 @@
 - [持久任务与多副本 Hosted 部署](docs/architecture/durable-jobs.md)
 - [检索评测与混合召回](docs/architecture/retrieval.md)
 - [服务端 RAG](docs/architecture/server-rag.md)
+- [大规模工作区有界读模型](docs/architecture/read-models.md)
 - [自托管指南](docs/self-hosting.md) · [智能体接入](docs/agent-integration.md)
 
 # 功能
@@ -33,7 +34,7 @@
 - **MCP 连接** — 任何 MCP 兼容客户端(桌面端、CLI、网页端智能体)读写、检索语料与维基
 - **八维语料库** — 每条语料一张"身份证"(阶段×大类主/副 + 六分面),按货架落位,分面检索、覆盖率账本、业务视图 7 类 27 场景导航
 - **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等
-- **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)
+- **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)；文件/Wiki/语料主屏采用最多 200 条的游标分页、服务端摘要和 ETag 条件刷新，不轮询全量文档数组
 - **治理闭环** — `lint` 八维检查、复审到期工作清单、KPI 仪表盘(分面完备率/货架覆盖率/时效达标率/引用溯源率)
 
 # 两种运行模式
@@ -83,6 +84,8 @@
 > **端口**:API 宿主机默认 `9000`(容器内固定 8000,避开本机 LLM 推理栈常占的 8000)、Web `3000`、MCP `8080`。换端口:`LLMWIKI_API_PORT=9100 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认只绑定 127.0.0.1(本地实例无鉴权),局域网访问设 `LLMWIKI_BIND=0.0.0.0`。
 >
 > 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
+
+> **大工作区**:文件夹上传没有 200 文件总量上限；清单会按每批最多 200 个描述符、最多 2 个并发请求做预检。Web 列表只保留 3 页窄记录。旧版数万条数据库首次升级会在 readiness 前创建新索引，可能持续数分钟并占用一个 CPU 核，完成后不会每次重建。请按 [`docs/architecture/read-models.md`](docs/architecture/read-models.md) 在数据库副本上运行性能门禁，不要直接改动在线 `index.db`。
 
 **1. 安装**
 

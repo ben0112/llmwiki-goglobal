@@ -36,6 +36,16 @@ _PROJECTION = (
 _SUPPORTED_UPLOAD_TYPES = SIMPLE_TEXT_TYPES | EXTRACTION_TYPES | IMAGE_TYPES
 _MAX_UPLOAD_BYTES = 1_073_741_824
 _SUMMARY_CACHE: OrderedDict[tuple, CorpusSummary] = OrderedDict()
+_BROWSE_SUMMARY_CACHE: OrderedDict[tuple[str, str, int], tuple[int, int, int]] = OrderedDict()
+_FOLDER_CACHE: OrderedDict[tuple[str, str, int, str], tuple[FolderItem, ...]] = OrderedDict()
+
+
+def _remember(cache: OrderedDict, key: tuple, value: Any) -> Any:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > 256:
+        cache.popitem(last=False)
+    return value
 
 
 def _row_dict(cursor: aiosqlite.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
@@ -141,26 +151,44 @@ class LocalReadService:
             count_params,
         )
         count_row = await count_cursor.fetchone()
-        summary_cursor = await self.db.execute(
-            "SELECT count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%'),"
-            "count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%' AND status='failed'),"
-            "count(*) FILTER (WHERE source_kind='source' AND json_extract("
-            "CASE WHEN typeof(metadata)='text' AND json_valid(metadata) "
-            "THEN metadata ELSE '{}' END,'$.spec_version') IS NOT NULL) "
-            "FROM documents WHERE user_id=?",
-            (self.user_id,),
-        )
-        summary_row = await summary_cursor.fetchone()
-        folders = await self._folders(path) if path is not None and cursor is None else []
+        summary_key = (self.user_id, kb_id, revision)
+        summary = _BROWSE_SUMMARY_CACHE.get(summary_key)
+        if summary is None:
+            summary_cursor = await self.db.execute(
+                "SELECT count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%'),"
+                "count(*) FILTER (WHERE source_kind='source' AND path NOT LIKE '/corpus/%' AND status='failed'),"
+                "count(*) FILTER (WHERE source_kind='source' AND json_extract("
+                "CASE WHEN typeof(metadata)='text' AND json_valid(metadata) "
+                "THEN metadata ELSE '{}' END,'$.spec_version') IS NOT NULL) "
+                "FROM documents WHERE user_id=?",
+                (self.user_id,),
+            )
+            summary_row = await summary_cursor.fetchone()
+            summary = _remember(
+                _BROWSE_SUMMARY_CACHE,
+                summary_key,
+                tuple(int(value or 0) for value in (summary_row or (0, 0, 0))),
+            )
+        else:
+            _BROWSE_SUMMARY_CACHE.move_to_end(summary_key)
+        folders: list[FolderItem] = []
+        if path is not None and cursor is None:
+            folder_key = (self.user_id, kb_id, revision, path)
+            cached_folders = _FOLDER_CACHE.get(folder_key)
+            if cached_folders is None:
+                cached_folders = _remember(_FOLDER_CACHE, folder_key, tuple(await self._folders(path)))
+            else:
+                _FOLDER_CACHE.move_to_end(folder_key)
+            folders = list(cached_folders)
         return BrowsePage(
             revision=revision,
             items=items,
             next_cursor=next_cursor,
             total_count=int(count_row[0]) if count_row else 0,
             folders=folders,
-            source_count=int(summary_row[0]) if summary_row else 0,
-            failed_count=int(summary_row[1]) if summary_row else 0,
-            corpus_count=int(summary_row[2]) if summary_row else 0,
+            source_count=summary[0],
+            failed_count=summary[1],
+            corpus_count=summary[2],
         )
 
     @staticmethod
