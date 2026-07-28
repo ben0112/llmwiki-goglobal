@@ -1,3 +1,4 @@
+import subprocess
 import sys
 from pathlib import Path
 
@@ -93,19 +94,44 @@ async def test_api_initializer_backfills_old_schema_idempotently(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mcp_initializer_backfills_old_schema_idempotently(tmp_path):
-    sys.path.insert(0, str(ROOT / "mcp"))
-    from vaultfs.sqlite import SqliteVaultFS
-
     workspace = tmp_path / "workspace"
     database_dir = workspace / ".llmwiki"
     database_dir.mkdir(parents=True)
     await _seed_old_database(database_dir / "index.db")
+    probe = """
+import asyncio
+import sys
 
+sys.path.insert(0, sys.argv[1])
+from vaultfs.sqlite import SqliteVaultFS
+
+async def main():
     for _ in range(2):
-        await SqliteVaultFS.init(str(workspace))
+        await SqliteVaultFS.init(sys.argv[2])
         try:
             db = SqliteVaultFS._db_or_raise()
-            await _assert_read_schema(db)
-            assert await _revision(db) == 1
+            columns = {row[1] for row in await db.execute_fetchall('PRAGMA table_info(workspace)')}
+            assert 'read_revision' in columns
+            triggers = {row[0] for row in await db.execute_fetchall(
+                \"SELECT name FROM sqlite_master WHERE type='trigger'\"
+            )}
+            assert {
+                'documents_read_revision_insert',
+                'documents_read_revision_update',
+                'documents_read_revision_delete',
+            } <= triggers
+            assert await db.execute_fetchall(
+                \"SELECT read_revision FROM workspace WHERE id='ws1'\"
+            ) == [(1,)]
         finally:
             await SqliteVaultFS.close()
+
+asyncio.run(main())
+"""
+    subprocess.run(
+        [sys.executable, "-c", probe, str(ROOT / "mcp"), str(workspace)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
