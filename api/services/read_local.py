@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import json
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Any
 
 import aiosqlite
 from domain.file_types import EXTRACTION_TYPES, IMAGE_TYPES, SIMPLE_TEXT_TYPES
 
+from llmwiki_core.facets import sqlite_facet_conditions, validate_facets
 from llmwiki_core.read_cursor import ReadCursor, decode_cursor, encode_cursor
 
+from .corpus_summary import build_summary
 from .read_models import (
     BrowsePage,
+    CorpusSummary,
     DocumentStatus,
     DocumentStatusPage,
     FolderItem,
+    GraphSummary,
+    ReadPage,
     ResolvedDocument,
     StaleReadCursor,
     UploadPreflightItem,
@@ -28,6 +35,7 @@ _PROJECTION = (
 )
 _SUPPORTED_UPLOAD_TYPES = SIMPLE_TEXT_TYPES | EXTRACTION_TYPES | IMAGE_TYPES
 _MAX_UPLOAD_BYTES = 1_073_741_824
+_SUMMARY_CACHE: OrderedDict[tuple, CorpusSummary] = OrderedDict()
 
 
 def _row_dict(cursor: aiosqlite.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
@@ -35,8 +43,6 @@ def _row_dict(cursor: aiosqlite.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
     for field, fallback in (("tags", []), ("metadata", None)):
         value = result.get(field)
         if isinstance(value, str):
-            import json
-
             try:
                 result[field] = json.loads(value)
             except (TypeError, json.JSONDecodeError):
@@ -304,6 +310,239 @@ class LocalReadService:
                 payload.update(accepted=True, code="accepted")
             decisions.append(UploadPreflightItem.model_validate(payload))
         return UploadPreflightResponse(revision=revision, items=decisions)
+
+    async def _corpus_rows(self, query: str | None = None) -> list[dict[str, Any]]:
+        conditions = [
+            "user_id=?",
+            "source_kind='source'",
+            "status!='failed'",
+            "json_valid(metadata)",
+            "json_type(metadata)='object'",
+            "json_extract(metadata,'$.spec_version') IS NOT NULL",
+        ]
+        params: list[Any] = [self.user_id]
+        if query:
+            conditions.append(
+                "(filename LIKE ? OR COALESCE(title,'') LIKE ? OR json_extract(metadata,'$.entry_id') LIKE ?)"
+            )
+            pattern = f"%{query}%"
+            params.extend([pattern, pattern, pattern])
+        cursor = await self.db.execute(
+            f"SELECT id,filename,title,path,metadata FROM documents WHERE {' AND '.join(conditions)}",
+            params,
+        )
+        rows = []
+        for row in await cursor.fetchall():
+            try:
+                metadata = json.loads(row[4])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(metadata, dict) and isinstance(metadata.get("stage"), str):
+                rows.append({"id": row[0], "filename": row[1], "title": row[2], "path": row[3], "metadata": metadata})
+        return rows
+
+    async def corpus_entries(
+        self,
+        kb_id: str,
+        filters: dict[str, str] | None,
+        *,
+        query: str | None = None,
+        sort: str = "name",
+        direction: str = "asc",
+        limit: int,
+        cursor: str | None,
+    ) -> ReadPage:
+        revision = await self.revision(kb_id)
+        clean = validate_facets(filters)
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        query = query.strip() if query else None
+        safe_meta = "CASE WHEN typeof(d.metadata)='text' AND json_valid(d.metadata) THEN d.metadata ELSE '{}' END"
+        sorts = {
+            "name": "lower(COALESCE(NULLIF(d.title,''),d.filename))",
+            "stage": f"COALESCE(json_extract({safe_meta},'$.stage'),'')",
+            "domain": f"COALESCE(json_extract({safe_meta},'$.domain'),'')",
+            "review_due": f"COALESCE(json_extract({safe_meta},'$.review_due'),'')",
+            "updated": "d.updated_at",
+        }
+        if sort not in sorts or direction not in {"asc", "desc"}:
+            raise ValueError("invalid sort")
+        sort_sql = sorts[sort]
+        conditions = [
+            "d.user_id=?",
+            "d.source_kind='source'",
+            "d.status!='failed'",
+            "json_type(" + safe_meta + ")='object'",
+            "json_type(" + safe_meta + ",'$.spec_version')='text'",
+            "json_type(" + safe_meta + ",'$.stage')='text'",
+        ]
+        params: list[Any] = [self.user_id]
+        facet_conditions, facet_params = sqlite_facet_conditions(clean, "d")
+        conditions.extend(facet_conditions)
+        params.extend(facet_params)
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                f"(d.filename LIKE ? OR COALESCE(d.title,'') LIKE ? OR json_extract({safe_meta},'$.entry_id') LIKE ?)"
+            )
+            params.extend([pattern, pattern, pattern])
+        count_conditions = list(conditions)
+        count_params = list(params)
+        if cursor:
+            decoded = decode_cursor(cursor, expected_scope="corpus.entries")
+            if decoded.revision != revision:
+                raise StaleReadCursor(revision)
+            if decoded.sort != sort or decoded.direction != direction:
+                raise ValueError("cursor sort does not match request")
+            if len(decoded.key) != 2:
+                raise ValueError("invalid corpus cursor key")
+            operator = "<" if direction == "desc" else ">"
+            conditions.append(f"({sort_sql},d.id) {operator} (?,?)")
+            params.extend(decoded.key)
+        order = "DESC" if direction == "desc" else "ASC"
+        cursor_result = await self.db.execute(
+            "SELECT d.id,d.filename,d.title,d.path,d.metadata," + sort_sql + " AS _sort_key "
+            "FROM documents d WHERE " + " AND ".join(conditions) + f" ORDER BY {sort_sql} {order},d.id {order} LIMIT ?",
+            [*params, limit + 1],
+        )
+        rows = await cursor_result.fetchall()
+        has_next = len(rows) > limit
+        rows = rows[:limit]
+        page: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row[4])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            page.append({"id": row[0], "filename": row[1], "title": row[2], "path": row[3], "metadata": metadata})
+        next_cursor = None
+        if has_next and page:
+            next_cursor = encode_cursor(
+                ReadCursor(
+                    "corpus.entries",
+                    revision,
+                    sort,
+                    direction,
+                    (str(rows[-1][5] or ""), str(rows[-1][0])),
+                )
+            )
+        count_cursor = await self.db.execute(
+            "SELECT count(*) FROM documents d WHERE " + " AND ".join(count_conditions),
+            count_params,
+        )
+        count_row = await count_cursor.fetchone()
+        return ReadPage(
+            revision=revision,
+            items=page,
+            next_cursor=next_cursor,
+            total_count=int(count_row[0]) if count_row else 0,
+        )
+
+    async def corpus_summary(
+        self, kb_id: str, filters: dict[str, str] | None, query: str | None = None
+    ) -> CorpusSummary:
+        revision = await self.revision(kb_id)
+        clean = validate_facets(filters)
+        query = query.strip() if query else None
+        cache_key = (self.user_id, kb_id, tuple(sorted(clean.items())), query, revision)
+        cached = _SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            _SUMMARY_CACHE.move_to_end(cache_key)
+            return cached
+        rows = await self._corpus_rows(query)
+        summary = build_summary(rows, clean, revision)
+        cited, wiki_covered, entry_cells = await self._summary_graph_kpis(clean, query)
+        summary.kpis.update(
+            cited=cited,
+            wiki_covered=wiki_covered,
+            wiki_cells_with_entries=entry_cells,
+        )
+        _SUMMARY_CACHE[cache_key] = summary
+        _SUMMARY_CACHE.move_to_end(cache_key)
+        while len(_SUMMARY_CACHE) > 256:
+            _SUMMARY_CACHE.popitem(last=False)
+        return summary
+
+    async def _summary_graph_kpis(self, filters: dict[str, str], query: str | None) -> tuple[int, int, int]:
+        safe_meta = "CASE WHEN typeof(t.metadata)='text' AND json_valid(t.metadata) THEN t.metadata ELSE '{}' END"
+        conditions = [
+            "t.user_id=?",
+            "t.source_kind='source'",
+            "t.status!='failed'",
+            f"json_type({safe_meta})='object'",
+            f"json_type({safe_meta},'$.spec_version')='text'",
+            f"json_type({safe_meta},'$.stage')='text'",
+        ]
+        params: list[Any] = [self.user_id]
+        facet_conditions, facet_params = sqlite_facet_conditions(filters, "t")
+        conditions.extend(facet_conditions)
+        params.extend(facet_params)
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                f"(t.filename LIKE ? OR COALESCE(t.title,'') LIKE ? OR json_extract({safe_meta},'$.entry_id') LIKE ?)"
+            )
+            params.extend([pattern, pattern, pattern])
+        where = " AND ".join(conditions)
+        cited_cursor = await self.db.execute(
+            "SELECT count(DISTINCT t.id) FROM documents t "
+            "JOIN document_references r ON r.target_document_id=t.id "
+            "JOIN documents s ON s.id=r.source_document_id "
+            f"WHERE {where} AND s.user_id=? AND s.source_kind='wiki' "
+            "AND r.reference_type IN ('cites','links_to')",
+            [*params, self.user_id],
+        )
+        cited_row = await cited_cursor.fetchone()
+
+        wiki_meta = "CASE WHEN typeof(w.metadata)='text' AND json_valid(w.metadata) THEN w.metadata ELSE '{}' END"
+        coverage_cursor = await self.db.execute(
+            "WITH entry_cells AS ("
+            f"SELECT DISTINCT json_extract({safe_meta},'$.stage') AS stage,"
+            f"substr(json_extract({safe_meta},'$.domain'),1,1) AS layer "
+            f"FROM documents t WHERE {where} "
+            f"AND substr(json_extract({safe_meta},'$.domain'),1,1) IN ('G','C','O','Z')"
+            "),wiki_cells AS ("
+            "SELECT DISTINCT ws.value AS stage,substr(wd.value,1,1) AS layer "
+            f"FROM documents w,json_each({wiki_meta},'$.facet_rollup.stage') ws,"
+            f"json_each({wiki_meta},'$.facet_rollup.domain') wd "
+            "WHERE w.user_id=? AND w.source_kind='wiki'"
+            ") SELECT (SELECT count(*) FROM entry_cells),"
+            "(SELECT count(*) FROM entry_cells e JOIN wiki_cells w "
+            "ON w.stage=e.stage AND w.layer=e.layer)",
+            [*params, self.user_id],
+        )
+        coverage_row = await coverage_cursor.fetchone()
+        return (
+            int(cited_row[0]) if cited_row else 0,
+            int(coverage_row[1]) if coverage_row else 0,
+            int(coverage_row[0]) if coverage_row else 0,
+        )
+
+    async def graph_summary(self, kb_id: str) -> GraphSummary:
+        revision = await self.revision(kb_id)
+        node_count = await self.db.execute_fetchall("SELECT count(*) FROM documents WHERE user_id=?", (self.user_id,))
+        rows = await self.db.execute_fetchall(
+            "SELECT DISTINCT r.target_document_id FROM document_references r "
+            "JOIN documents s ON s.id=r.source_document_id "
+            "JOIN documents t ON t.id=r.target_document_id "
+            "WHERE s.user_id=? AND t.user_id=? "
+            "AND r.reference_type IN ('cites','links_to') "
+            "ORDER BY r.target_document_id LIMIT 200",
+            (self.user_id, self.user_id),
+        )
+        edge_count = await self.db.execute_fetchall(
+            "SELECT count(*) FROM document_references r "
+            "JOIN documents s ON s.id=r.source_document_id "
+            "JOIN documents t ON t.id=r.target_document_id "
+            "WHERE s.user_id=? AND t.user_id=?",
+            (self.user_id, self.user_id),
+        )
+        return GraphSummary(
+            revision=revision,
+            node_count=int(node_count[0][0]),
+            edge_count=int(edge_count[0][0]),
+            cited_document_ids=[row[0] for row in rows],
+        )
 
 
 __all__ = ["LocalReadService", "StaleReadCursor"]

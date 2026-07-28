@@ -2,6 +2,7 @@
 
 FACET_KEYS = (
     "stage",
+    "layer",
     "domain",
     "genre",
     "rule",
@@ -10,6 +11,7 @@ FACET_KEYS = (
     "dept",
     "country",
     "region",
+    "geo",
     "industry",
     "mode",
     "timeliness",
@@ -81,20 +83,20 @@ def postgres_facet_conditions(
         return index
 
     for key, value in validate_facets(facets).items():
-        if key == "timeliness":
+        if key == "layer":
+            conditions.append(f"left({meta}->>'domain', 1) = ${bind(value)}")
+        elif key == "geo":
+            index = bind(value)
+            conditions.append(f"({meta}->'geo_region' ? ${index} OR {meta}->'geo_country_names' ? ${index})")
+        elif key == "timeliness":
             index = bind(value)
             conditions.append(
-                f"({meta}->>'timeliness' = ${index} OR "
-                f"{meta}#>>'{{facet_rollup,timeliness_worst}}' = ${index})"
+                f"({meta}->>'timeliness' = ${index} OR {meta}#>>'{{facet_rollup,timeliness_worst}}' = ${index})"
             )
         elif key in SCALAR_FACET_PATHS:
-            conditions.append(
-                f"{meta}->>'{SCALAR_FACET_PATHS[key]}' = ${bind(value)}"
-            )
+            conditions.append(f"{meta}->>'{SCALAR_FACET_PATHS[key]}' = ${bind(value)}")
         elif key in ARRAY_FACET_PATHS:
-            conditions.append(
-                f"{meta}->'{ARRAY_FACET_PATHS[key]}' ? ${bind(value)}"
-            )
+            conditions.append(f"{meta}->'{ARRAY_FACET_PATHS[key]}' ? ${bind(value)}")
         elif key in PRIMARY_EXTENSION_FACET_PATHS:
             primary, extension = PRIMARY_EXTENSION_FACET_PATHS[key]
             index = bind(value)
@@ -114,8 +116,7 @@ def postgres_facet_conditions(
             index = bind(value)
             if "." in value:
                 conditions.append(
-                    f"({meta}#>>'{{business,code}}' = ${index} OR "
-                    f"{meta}#>'{{facet_rollup,business}}' ? ${index})"
+                    f"({meta}#>>'{{business,code}}' = ${index} OR {meta}#>'{{facet_rollup,business}}' ? ${index})"
                 )
             else:
                 prefix_index = bind(f"{value}.%")
@@ -124,6 +125,76 @@ def postgres_facet_conditions(
                     f"{meta}#>>'{{business,code}}' LIKE ${prefix_index} OR "
                     f"{meta}#>'{{facet_rollup,business}}' ? ${index})"
                 )
+    return conditions, params
+
+
+def sqlite_facet_conditions(  # noqa: C901 - explicit closed facet compiler
+    facets: dict | None,
+    doc_alias: str = "d",
+) -> tuple[list[str], list[object]]:
+    """Compile validated facet predicates for SQLite's JSON1 extension.
+
+    The CASE expression prevents one malformed or non-text metadata value from
+    aborting the whole query. Values are always returned separately for bound
+    parameters; callers only interpolate these static condition fragments.
+    """
+    raw_meta = f"{doc_alias}.metadata"
+    meta = f"CASE WHEN typeof({raw_meta})='text' AND json_valid({raw_meta}) THEN {raw_meta} ELSE '{{}}' END"
+    conditions: list[str] = []
+    params: list[object] = []
+
+    def array_contains(path: str) -> str:
+        return f"EXISTS (SELECT 1 FROM json_each({meta}, '{path}') WHERE json_each.value = ?)"
+
+    for key, value in validate_facets(facets).items():
+        if key == "layer":
+            conditions.append(f"substr(json_extract({meta}, '$.domain'), 1, 1) = ?")
+            params.append(value)
+        elif key == "geo":
+            conditions.append(f"({array_contains('$.geo_region')} OR {array_contains('$.geo_country_names')})")
+            params.extend([value, value])
+        elif key == "timeliness":
+            conditions.append(
+                f"(json_extract({meta}, '$.timeliness') = ? OR "
+                f"json_extract({meta}, '$.facet_rollup.timeliness_worst') = ?)"
+            )
+            params.extend([value, value])
+        elif key in SCALAR_FACET_PATHS:
+            conditions.append(f"json_extract({meta}, '$.{SCALAR_FACET_PATHS[key]}') = ?")
+            params.append(value)
+        elif key in ARRAY_FACET_PATHS:
+            conditions.append(array_contains(f"$.{ARRAY_FACET_PATHS[key]}"))
+            params.append(value)
+        elif key in PRIMARY_EXTENSION_FACET_PATHS:
+            primary, extension = PRIMARY_EXTENSION_FACET_PATHS[key]
+            conditions.append(
+                f"(json_extract({meta}, '$.{primary}') = ? OR "
+                f"{array_contains(f'$.{extension}')} OR "
+                f"{array_contains(f'$.facet_rollup.{key}')})"
+            )
+            params.extend([value, value, value])
+        elif key == "country":
+            conditions.append(
+                f"({array_contains('$.geo_country')} OR "
+                f"{array_contains('$.geo_country_names')} OR "
+                f"{array_contains('$.facet_rollup.country')})"
+            )
+            params.extend([value, value, value])
+        elif key == "business":
+            if "." in value:
+                conditions.append(
+                    f"(json_extract({meta}, '$.business.code') = ? OR {array_contains('$.facet_rollup.business')})"
+                )
+                params.extend([value, value])
+            else:
+                conditions.append(
+                    f"(json_extract({meta}, '$.business.code') = ? OR "
+                    f"json_extract({meta}, '$.business.code') LIKE ? OR "
+                    f"{array_contains('$.facet_rollup.business')})"
+                )
+                params.extend([value, f"{value}.%", value])
+    if conditions:
+        conditions.insert(0, f"{raw_meta} IS NOT NULL")
     return conditions, params
 
 

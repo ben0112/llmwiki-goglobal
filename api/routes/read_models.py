@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from deps import get_read_service
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, model_validator
 from services.read_models import (
     StaleReadCursor,
@@ -151,6 +151,104 @@ async def upload_preflight(
         raise HTTPException(status_code=404, detail="Knowledge base not found") from None
     except ValueError as error:
         raise _translate_read_error(error) from None
+
+
+_CORPUS_FILTERS = {
+    "stage",
+    "layer",
+    "domain",
+    "genre",
+    "rule",
+    "evidence",
+    "origin",
+    "dept",
+    "country",
+    "region",
+    "geo",
+    "industry",
+    "mode",
+    "timeliness",
+    "state",
+    "business",
+    "entry_id",
+}
+
+
+def _corpus_filters(request: Request) -> dict[str, str]:
+    return {key: value for key, value in request.query_params.items() if key in _CORPUS_FILTERS and value.strip()}
+
+
+@router.get("/v1/knowledge-bases/{kb_id}/corpus/entries")
+async def corpus_entries(
+    kb_id: UUID,
+    request: Request,
+    response: Response,
+    service: Annotated[object, Depends(get_read_service)],
+    query: str | None = Query(default=None, max_length=1024),
+    sort: str = Query(default="name"),
+    direction: str = Query(default="asc"),
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: str | None = Query(default=None, max_length=2048),
+    if_none_match: str | None = Header(default=None),
+):
+    kb = str(kb_id)
+    revision = await _revision_or_404(service, kb)
+    etag = etag_for_revision(revision)
+    if etag_matches(if_none_match, revision):
+        return Response(status_code=304, headers={"ETag": etag})
+    try:
+        result = await service.corpus_entries(
+            kb,
+            _corpus_filters(request),
+            query=query,
+            sort=sort,
+            direction=direction,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (CursorError, StaleReadCursor, ValueError) as error:
+        raise _translate_read_error(error) from None
+    response.headers["ETag"] = etag
+    return result
+
+
+@router.get("/v1/knowledge-bases/{kb_id}/corpus/summary")
+async def corpus_summary(
+    kb_id: UUID,
+    request: Request,
+    response: Response,
+    service: Annotated[object, Depends(get_read_service)],
+    query: str | None = Query(default=None, max_length=1024),
+    if_none_match: str | None = Header(default=None),
+):
+    kb = str(kb_id)
+    revision = await _revision_or_404(service, kb)
+    etag = etag_for_revision(revision)
+    if etag_matches(if_none_match, revision):
+        return Response(status_code=304, headers={"ETag": etag})
+    try:
+        result = await service.corpus_summary(kb, _corpus_filters(request), query=query)
+    except ValueError as error:
+        raise _translate_read_error(error) from None
+    response.headers["ETag"] = etag
+    return result
+
+
+@router.get("/v1/knowledge-bases/{kb_id}/graph/summary")
+async def graph_summary(
+    kb_id: UUID,
+    response: Response,
+    service: Annotated[object, Depends(get_read_service)],
+    if_none_match: str | None = Header(default=None),
+):
+    kb = str(kb_id)
+    revision = await _revision_or_404(service, kb)
+    etag = etag_for_revision(revision)
+    if etag_matches(if_none_match, revision):
+        return Response(status_code=304, headers={"ETag": etag})
+    result = await service.graph_summary(kb)
+    response.headers["ETag"] = etag
+    return result
 
 
 __all__ = ["router"]
