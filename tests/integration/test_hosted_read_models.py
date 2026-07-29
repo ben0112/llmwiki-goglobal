@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from services.hosted import HostedUserService
 from services.read_hosted import HostedReadService
 from services.read_local import StaleReadCursor
 
@@ -99,6 +100,72 @@ async def test_hosted_read_adapter_is_stable_bounded_and_tenant_scoped(pool):
         )
     with pytest.raises(LookupError):
         await HostedReadService(pool, str(other_id)).revision(str(kb_id))
+
+
+@pytest.mark.asyncio
+async def test_hosted_source_browse_hides_wiki_documents_and_folders(pool):
+    user_id, kb_id = uuid4(), uuid4()
+    await pool.execute(
+        "INSERT INTO users(id,email) VALUES($1,$2)",
+        user_id,
+        f"{user_id}@source-browse.test",
+    )
+    await pool.execute(
+        "INSERT INTO knowledge_bases(id,user_id,name,slug) VALUES($1,$2,'Browse','browse-$1')",
+        kb_id,
+        user_id,
+    )
+    await pool.executemany(
+        "INSERT INTO documents"
+        "(id,knowledge_base_id,user_id,filename,path,source_kind,file_type,status,document_number) "
+        "VALUES($1,$2,$3,$4,$5,$6,'md','ready',$7)",
+        [
+            (uuid4(), kb_id, user_id, "source.md", "/folder/", "source", 1),
+            (uuid4(), kb_id, user_id, "overview.md", "/wiki/", "wiki", 2),
+        ],
+    )
+    service = HostedReadService(pool, str(user_id))
+
+    root = await service.browse(
+        str(kb_id), path="/", query=None, sort="name", direction="asc", limit=20, cursor=None,
+    )
+    wiki = await service.browse(
+        str(kb_id), path="/wiki/", query=None, sort="name", direction="asc", limit=20, cursor=None,
+    )
+
+    assert [folder.path for folder in root.folders] == ["/folder/"]
+    assert wiki.items == []
+    assert wiki.total_count == 0
+
+
+@pytest.mark.asyncio
+async def test_hosted_usage_counts_only_uploaded_source_documents(pool):
+    user_id, kb_id = uuid4(), uuid4()
+    await pool.execute(
+        "INSERT INTO users(id,email,page_limit,storage_limit_bytes) VALUES($1,$2,500,1000)",
+        user_id,
+        f"{user_id}@usage.test",
+    )
+    await pool.execute(
+        "INSERT INTO knowledge_bases(id,user_id,name,slug) VALUES($1,$2,'Usage','usage-$1')",
+        kb_id,
+        user_id,
+    )
+    await pool.executemany(
+        "INSERT INTO documents"
+        "(id,knowledge_base_id,user_id,filename,path,source_kind,file_type,status,page_count,file_size) "
+        "VALUES($1,$2,$3,$4,$5,$6,'md','ready',$7,$8)",
+        [
+            (uuid4(), kb_id, user_id, "source.md", "/", "source", 2, 20),
+            (uuid4(), kb_id, user_id, "overview.md", "/wiki/", "wiki", 10, 100),
+        ],
+    )
+
+    usage = await HostedUserService(pool, str(user_id)).get_usage()
+
+    assert usage["document_count"] == 1
+    assert usage["total_pages"] == 2
+    assert usage["total_storage_bytes"] == 20
 
 
 @pytest.mark.asyncio

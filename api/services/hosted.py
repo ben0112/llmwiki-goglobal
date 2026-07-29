@@ -47,7 +47,7 @@ class HostedUserService(UserService):
             "  COALESCE(SUM(page_count), 0)::bigint AS total_pages, "
             "  COALESCE(SUM(file_size), 0)::bigint AS total_storage_bytes, "
             "  COUNT(*)::bigint AS document_count "
-            "FROM documents WHERE user_id = $1 AND NOT archived",
+            "FROM documents WHERE user_id = $1 AND NOT archived AND source_kind = 'source'",
             self.user_id,
         )
 

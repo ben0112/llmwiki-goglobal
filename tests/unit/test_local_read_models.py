@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 from infra.db.sqlite import create_pool
-from services.local import LocalServiceFactory
+from services.local import LocalServiceFactory, LocalUserService
 from services.read_local import LocalReadService, StaleReadCursor
 
 
@@ -50,8 +50,40 @@ async def test_browse_uses_stable_bounded_keyset_and_narrow_projection(read_serv
     assert [item.id for item in items] == ["d1", "d2", "d3", "d4"]
     assert len({item.id for item in items}) == 4
     assert all("content" not in item.model_dump() for item in items)
-    assert [folder.path for folder in first.folders] == ["/folder/", "/wiki/"]
+    assert [folder.path for folder in first.folders] == ["/folder/"]
     assert (first.source_count, first.failed_count, first.corpus_count) == (6, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_source_browse_hides_wiki_documents_at_explicit_paths(read_service):
+    service, _ = read_service
+
+    page = await service.browse(
+        "ws1", path="/wiki/", query=None, sort="name", direction="asc", limit=20, cursor=None,
+    )
+
+    assert page.items == []
+    assert page.total_count == 0
+    assert page.folders == []
+
+
+@pytest.mark.asyncio
+async def test_local_usage_counts_only_uploaded_source_documents(read_service):
+    _, db = read_service
+    await db.execute("UPDATE documents SET status='failed'")
+    await db.execute(
+        "UPDATE documents SET status='ready', page_count=2, file_size=20 WHERE id='d1'",
+    )
+    await db.execute(
+        "UPDATE documents SET status='ready', page_count=10, file_size=100 WHERE id='w1'",
+    )
+    await db.commit()
+
+    usage = await LocalUserService(db, "u1").get_usage()
+
+    assert usage["document_count"] == 1
+    assert usage["total_pages"] == 2
+    assert usage["total_storage_bytes"] == 20
 
 
 @pytest.mark.asyncio

@@ -89,13 +89,16 @@ class HostedReadService:
         if sort not in sorts or direction not in {"asc", "desc"}:
             raise ValueError("invalid sort")
         sort_sql = sorts[sort]
-        conditions = ["knowledge_base_id=$1", "user_id=$2", "NOT archived"]
+        conditions = [
+            "knowledge_base_id=$1",
+            "user_id=$2",
+            "NOT archived",
+            "source_kind='source'",
+        ]
         params: list[Any] = [kb_id, self.user_id]
         if path is not None:
             params.append(path)
             conditions.append(f"path=${len(params)}")
-        else:
-            conditions.append("source_kind='source'")
         if query:
             params.append(f"%{query}%")
             conditions.append(f"filename ILIKE ${len(params)}")
@@ -163,7 +166,7 @@ class HostedReadService:
             "SELECT $3 || split_part(substring(path FROM char_length($3) + 1), '/', 1) || '/' "
             "AS child, count(*) AS document_count FROM documents "
             "WHERE knowledge_base_id=$1 AND user_id=$2 AND NOT archived "
-            "AND path LIKE $3 || '%' AND path != $3 "
+            "AND source_kind='source' AND path LIKE $3 || '%' AND path != $3 "
             "GROUP BY child ORDER BY child LIMIT 200",
             kb_id,
             self.user_id,

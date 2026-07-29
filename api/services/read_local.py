@@ -98,13 +98,11 @@ class LocalReadService:
         if direction not in {"asc", "desc"}:
             raise ValueError("invalid direction")
 
-        conditions: list[str] = []
+        conditions = ["source_kind = 'source'"]
         params: list[Any] = []
         if path is not None:
             conditions.append("path = ?")
             params.append(path)
-        else:
-            conditions.append("source_kind = 'source'")
         if query:
             conditions.append("filename LIKE ? ESCAPE '\\'")
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -209,7 +207,7 @@ class LocalReadService:
         cursor = await self.db.execute(
             "SELECT ? || substr(remainder,1,instr(remainder,'/')) AS child, count(*) "
             "FROM (SELECT substr(path, ?) AS remainder FROM documents "
-            "WHERE path LIKE ? AND path != ?) "
+            "WHERE source_kind = 'source' AND path LIKE ? AND path != ?) "
             "WHERE instr(remainder,'/') > 0 GROUP BY child ORDER BY child LIMIT 200",
             (prefix, len(prefix) + 1, f"{prefix}%", prefix),
         )

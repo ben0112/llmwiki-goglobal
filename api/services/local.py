@@ -37,7 +37,7 @@ class LocalUserService(UserService):
             "SELECT count(*) as doc_count, "
             "COALESCE(SUM(page_count), 0) as total_pages, "
             "COALESCE(SUM(file_size), 0) as total_storage "
-            "FROM documents WHERE status != 'failed'",
+            "FROM documents WHERE status != 'failed' AND source_kind = 'source'",
         )
         row = await cursor.fetchone()
         return {
