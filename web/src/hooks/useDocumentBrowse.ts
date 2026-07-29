@@ -65,8 +65,8 @@ export function useDocumentBrowse({
   const [folders, setFolders] = React.useState<ReadFolder[]>([])
   React.useEffect(() => setFolders([]), [queryKey])
   React.useEffect(() => {
-    if (page?.folders.length) setFolders(page.folders)
-  }, [page])
+    if (page && (!read.hasPrevious || page.folders.length)) setFolders(page.folders)
+  }, [page, read.hasPrevious])
 
   return {
     ...read,
