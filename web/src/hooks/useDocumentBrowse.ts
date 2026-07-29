@@ -65,7 +65,11 @@ export function useDocumentBrowse({
   const [folders, setFolders] = React.useState<ReadFolder[]>([])
   React.useEffect(() => setFolders([]), [queryKey])
   React.useEffect(() => {
-    if (page && (!read.hasPrevious || page.folders.length)) setFolders(page.folders)
+    if (page && (!read.hasPrevious || page.folders.length)) {
+      setFolders(
+        page.folders.filter((folder) => folder.path.replace(/\/+$/, '') !== '/wiki'),
+      )
+    }
   }, [page, read.hasPrevious])
 
   return {
