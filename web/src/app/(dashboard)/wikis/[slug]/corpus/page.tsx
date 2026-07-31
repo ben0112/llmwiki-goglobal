@@ -5,18 +5,16 @@ import { useParams } from 'next/navigation'
 import { Loader2 } from 'lucide-react'
 import { useKBStore, useUserStore } from '@/stores'
 import { CorpusView } from '@/components/corpus/CorpusView'
-import { decodeWikiRouteSlug } from '@/lib/wiki-routes'
 
 export default function CorpusPage() {
   const params = useParams<{ slug: string }>()
   const knowledgeBases = useKBStore((s) => s.knowledgeBases)
   const kbLoading = useKBStore((s) => s.loading)
   const user = useUserStore((s) => s.user)
-  const slug = decodeWikiRouteSlug(params.slug)
 
   const kb = React.useMemo(
-    () => knowledgeBases.find((k) => k.slug === slug),
-    [knowledgeBases, slug],
+    () => knowledgeBases.find((k) => k.slug === params.slug),
+    [knowledgeBases, params.slug],
   )
 
   if (kbLoading || !user) {
@@ -32,7 +30,7 @@ export default function CorpusPage() {
       <div className="flex h-full flex-col items-center justify-center gap-2 bg-background">
         <h1 className="text-lg font-medium">未找到维基</h1>
         <p className="text-sm text-muted-foreground">
-          维基 &ldquo;{slug}&rdquo; 不存在,或您没有访问权限。
+          维基 &ldquo;{params.slug}&rdquo; 不存在,或您没有访问权限。
         </p>
       </div>
     )

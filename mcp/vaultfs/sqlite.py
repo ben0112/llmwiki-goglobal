@@ -1,47 +1,24 @@
 """SQLite + local filesystem implementation of VaultFS."""
 
-import asyncio
 import json
 import logging
 import os
-import tempfile
 import uuid
 from datetime import date
 from pathlib import Path
-from time import perf_counter
 
 import aiosqlite
+
 from services.chunker import chunk_text, store_chunks_sqlite
-
-from llmwiki_core.documents import DocumentKind
-from llmwiki_core.models import EmbeddingProfile
-from llmwiki_core.references import build_lookup_maps, extract_references
-from llmwiki_core.search import (
-    RetrieverUnavailable,
-    SearchArea,
-    SearchQuery,
-    SearchResult,
-    SearchScope,
-)
-from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
-
-from .base import (
-    DuplicateDocumentError,
-    VaultFS,
-    _vault_search_hit,
-    is_wiki_directory,
-    logical_glob_to_sql_like,
-)
+from .base import VaultFS, DuplicateDocumentError
 from .facets import sqlite_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_schema.sql"
-_READ_SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_read_models.sql"
 
 _db: aiosqlite.Connection | None = None
 _workspace_root: Path | None = None
-_write_lock = asyncio.Lock()
 
 _OVERVIEW_TEMPLATE = """\
 ---
@@ -70,36 +47,16 @@ Chronological record of ingests, queries, and maintenance passes.
 """
 
 
-def _parse_tag_array(value: object) -> list[str] | None:
-    """Normalize a stored tag value, preserving only an actual SQL NULL."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return []
-    if isinstance(value, list) and all(isinstance(tag, str) for tag in value):
-        return value
-    return []
-
-
-def _parse_metadata_object(value: object) -> dict:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return value if isinstance(value, dict) else {}
-
-
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
     cols = [d[0] for d in cursor.description]
     results = []
     for row in rows:
         d = dict(zip(cols, row))
-        if "tags" in d:
-            d["tags"] = _parse_tag_array(d["tags"])
+        if "tags" in d and isinstance(d["tags"], str):
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (json.JSONDecodeError, TypeError):
+                d["tags"] = []
         if "elements" in d and isinstance(d["elements"], str):
             try:
                 d["elements"] = json.loads(d["elements"])
@@ -110,37 +67,13 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
                 d["highlights"] = json.loads(d["highlights"])
             except (json.JSONDecodeError, TypeError):
                 d["highlights"] = []
-        if "metadata" in d:
-            d["metadata"] = _parse_metadata_object(d["metadata"])
+        if "metadata" in d and isinstance(d["metadata"], str):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                d["metadata"] = {}
         results.append(d)
     return results
-
-
-def _sqlite_search_hit(row: dict):
-    metadata = dict(row.get("metadata") or {})
-    raw_tags = row.get("tags")
-    return _vault_search_hit(
-        document_id=str(row["document_id"]),
-        document_version=int(row["document_version"]),
-        chunk_index=int(row["chunk_index"]),
-        content=row["content"],
-        score=float(row["score"]),
-        path=f"{row['path']}{row['filename']}",
-        title=row.get("title"),
-        page=row.get("page"),
-        header_breadcrumb=row.get("header_breadcrumb"),
-        tags=raw_tags,
-        document_kind=DocumentKind(row["source_kind"]),
-        metadata=metadata,
-        filename=row["filename"],
-        directory=row["path"],
-        file_type=row["file_type"],
-        source_content=row.get("source_content") or "",
-        annotations_text=row.get("annotations_text"),
-        has_highlight=bool(row.get("has_highlight")),
-        source_hit=bool(row.get("source_hit")),
-        annotation_hit=bool(row.get("annotation_hit")),
-    )
 
 
 async def _migrate_fts_tokenizer(db: aiosqlite.Connection, schema: str) -> None:
@@ -194,42 +127,6 @@ async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> Non
     logger.info("Rebuilt document_references with relation-layer types")
 
 
-async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:
-    """Add and backfill derived-version columns in pre-migration workspaces."""
-    for table in ("document_pages", "document_chunks"):
-        cursor = await db.execute(f"PRAGMA table_info({table})")
-        columns = {row[1] for row in await cursor.fetchall()}
-        if "document_version" not in columns:
-            await db.execute(
-                f"ALTER TABLE {table} "
-                "ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0"
-            )
-            await db.execute(
-                f"UPDATE {table} SET document_version = "
-                f"COALESCE((SELECT version FROM documents WHERE id = {table}.document_id), 0)"
-            )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_pages_document_version "
-        "ON document_pages(document_id, document_version)"
-    )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_document_version "
-        "ON document_chunks(document_id, document_version)"
-    )
-
-
-async def _ensure_read_model_schema(db: aiosqlite.Connection) -> None:
-    """Backfill durable read state before installing triggers and indexes."""
-    cursor = await db.execute("PRAGMA table_info(workspace)")
-    columns = {row[1] for row in await cursor.fetchall()}
-    if "read_revision" not in columns:
-        await db.execute(
-            "ALTER TABLE workspace ADD COLUMN read_revision "
-            "INTEGER NOT NULL DEFAULT 1 CHECK (read_revision > 0)"
-        )
-    await db.executescript(_READ_SCHEMA_PATH.read_text(encoding="utf-8"))
-
-
 def _build_fts_match(query: str) -> str | None:
     """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
 
@@ -275,8 +172,6 @@ class SqliteVaultFS(VaultFS):
         if _SCHEMA_PATH.exists():
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)
-            await _ensure_read_model_schema(_db)
-            await _ensure_derived_version_columns(_db)
             await _migrate_fts_tokenizer(_db, schema)
             await _migrate_reference_types(_db, schema)
             await _db.commit()
@@ -402,7 +297,7 @@ class SqliteVaultFS(VaultFS):
         db = self._db_or_raise()
         doc_id = str(uuid.uuid4())
         relative_path = (dir_path.rstrip("/") + "/" + filename).lstrip("/")
-        source_kind = "wiki" if is_wiki_directory(dir_path) else "source"
+        source_kind = "wiki" if dir_path.strip("/").startswith("wiki") else "source"
 
         cursor = await db.execute("SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents")
         row = await cursor.fetchone()
@@ -418,7 +313,7 @@ class SqliteVaultFS(VaultFS):
                  json.dumps(metadata) if metadata else None, doc_number),
             )
             if file_type in ("md", "txt"):
-                await store_chunks_sqlite(db, doc_id, 1, chunk_text(content or ""))
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
             await db.commit()
         except aiosqlite.IntegrityError:
             await db.rollback()
@@ -456,149 +351,17 @@ class SqliteVaultFS(VaultFS):
             )
 
             cursor = await db.execute(
-                "SELECT filename, path, file_type, version FROM documents WHERE id = ?", (doc_id,),
+                "SELECT filename, path, file_type FROM documents WHERE id = ?", (doc_id,),
             )
             row = await cursor.fetchone()
             if row and row[2] in ("md", "txt"):
-                await store_chunks_sqlite(db, doc_id, row[3], chunk_text(content or ""))
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
 
             await db.commit()
         except Exception:
             await db.rollback()
             raise
         return {"id": doc_id, "filename": row[0], "path": row[1]} if row else None
-
-    async def write_wiki_bundle(self, kb_id: str, bundle: WikiWriteBundle) -> dict:
-        """Commit a wiki revision and every derived row in one SQLite transaction."""
-        from datetime import date as _date
-
-        from .facet_rollup import apply_rollup, rollup_from_metas
-
-        db = self._db_or_raise()
-        version = 1 if bundle.expected_version is None else bundle.expected_version + 1
-        relative_path = (bundle.path.rstrip("/") + "/" + bundle.filename).lstrip("/")
-        metadata = dict(bundle.metadata)
-
-        async with _write_lock:
-            try:
-                await db.execute("BEGIN IMMEDIATE")
-                if bundle.expected_version is None:
-                    cursor = await db.execute(
-                        "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents"
-                    )
-                    document_number = (await cursor.fetchone())[0]
-                    await db.execute(
-                        "INSERT INTO documents "
-                        "(id, user_id, filename, title, path, relative_path, source_kind, "
-                        "file_type, status, content, tags, date, metadata, version, document_number) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 'wiki', ?, 'ready', ?, ?, ?, ?, 1, ?)",
-                        (
-                            bundle.document_id,
-                            self.user_id,
-                            bundle.filename,
-                            bundle.title,
-                            bundle.path,
-                            relative_path,
-                            bundle.file_type,
-                            bundle.content,
-                            json.dumps(bundle.tags),
-                            bundle.date,
-                            json.dumps(metadata),
-                            document_number,
-                        ),
-                    )
-                else:
-                    cursor = await db.execute(
-                        "UPDATE documents SET content = ?, title = ?, tags = ?, date = ?, "
-                        "metadata = ?, version = ?, stale_since = NULL, updated_at = datetime('now') "
-                        "WHERE id = ? AND user_id = ? AND version = ?",
-                        (
-                            bundle.content,
-                            bundle.title,
-                            json.dumps(bundle.tags),
-                            bundle.date,
-                            json.dumps(metadata),
-                            version,
-                            bundle.document_id,
-                            self.user_id,
-                            bundle.expected_version,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise VersionConflict(
-                            f"document {bundle.document_id} is not at version "
-                            f"{bundle.expected_version}"
-                        )
-
-                await store_chunks_sqlite(
-                    db,
-                    bundle.document_id,
-                    version,
-                    chunk_text(bundle.content),
-                )
-                await db.execute(
-                    "DELETE FROM document_references WHERE source_document_id = ? "
-                    "AND reference_type IN ('cites', 'links_to')",
-                    (bundle.document_id,),
-                )
-                for edge in bundle.edges:
-                    await db.execute(
-                        "INSERT INTO document_references "
-                        "(id, source_document_id, target_document_id, reference_type, page) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (
-                            str(uuid.uuid4()),
-                            bundle.document_id,
-                            edge.target_id,
-                            edge.reference_type,
-                            edge.page,
-                        ),
-                    )
-
-                await db.execute(
-                    "UPDATE documents SET stale_since = datetime('now') "
-                    "WHERE id IN (SELECT source_document_id FROM document_references "
-                    "WHERE target_document_id = ? AND reference_type = 'links_to') "
-                    "AND stale_since IS NULL",
-                    (bundle.document_id,),
-                )
-
-                cursor = await db.execute(
-                    "SELECT d.metadata FROM document_references r "
-                    "JOIN documents d ON d.id = r.target_document_id "
-                    "WHERE r.source_document_id = ? AND r.reference_type = 'cites' "
-                    "AND d.relative_path LIKE 'corpus/%'",
-                    (bundle.document_id,),
-                )
-                metas = []
-                for (raw,) in await cursor.fetchall():
-                    try:
-                        parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    except ValueError:
-                        continue
-                    if isinstance(parsed, dict):
-                        metas.append(parsed)
-                rollup = rollup_from_metas(metas, _date.today().isoformat())
-                if apply_rollup(metadata, rollup):
-                    await db.execute(
-                        "UPDATE documents SET metadata = ? WHERE id = ?",
-                        (json.dumps(metadata, ensure_ascii=False), bundle.document_id),
-                    )
-                await db.commit()
-            except aiosqlite.IntegrityError as exc:
-                await db.rollback()
-                if "relative_path" in str(exc):
-                    raise DuplicateDocumentError(bundle.path, bundle.filename) from exc
-                raise
-            except Exception:
-                await db.rollback()
-                raise
-        return {
-            "id": bundle.document_id,
-            "filename": bundle.filename,
-            "path": bundle.path,
-            "version": version,
-        }
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         db = self._db_or_raise()
@@ -660,129 +423,6 @@ class SqliteVaultFS(VaultFS):
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
 
-    async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
-        db = self._db_or_raise()
-        started_at = perf_counter()
-        match_expr = _build_fts_match(query.text)
-        patterns = _like_patterns(query.text)
-        if not patterns:
-            return SearchResult(hits=(), candidate_count=0)
-
-        def like_expression(column: str) -> str:
-            return " AND ".join(
-                f"{column} LIKE ? ESCAPE '\\'" for _ in patterns
-            )
-
-        source_match = like_expression("dc.source_content")
-        annotation_match = like_expression("COALESCE(dc.annotations_text, '')")
-        select_params: list = [*patterns, *patterns]
-        where: list[str] = ["d.status != 'failed'", "d.user_id = ?"]
-        where_params: list = [self.user_id]
-
-        if match_expr is not None:
-            from_sql = (
-                "document_chunks dc "
-                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-                "JOIN documents d ON dc.document_id = d.id"
-            )
-            score_sql = "fts.rank"
-            where.append("chunks_fts MATCH ?")
-            where_params.append(match_expr)
-        else:
-            from_sql = "document_chunks dc JOIN documents d ON dc.document_id = d.id"
-            score_sql = "0.0"
-            where.append(like_expression("dc.content"))
-            where_params.extend(patterns)
-
-        where.append(
-            "EXISTS (SELECT 1 FROM workspace w WHERE w.id = ? AND w.user_id = ?)"
-        )
-        where_params.extend([kb_id, self.user_id])
-        if query.annotated_only:
-            where.append("dc.has_highlight = 1")
-        if query.area is SearchArea.WIKI:
-            where.append("d.source_kind = 'wiki'")
-        elif query.area is SearchArea.SOURCES:
-            where.append("d.source_kind != 'wiki'")
-        if query.document_kinds:
-            placeholders = ", ".join("?" for _ in query.document_kinds)
-            where.append(f"d.source_kind IN ({placeholders})")
-            where_params.extend(kind.value for kind in query.document_kinds)
-        if query.path_glob is not None:
-            where.append("(d.path || d.filename) LIKE ? ESCAPE '\\'")
-            where_params.append(logical_glob_to_sql_like(query.path_glob))
-        tags_array_sql = (
-            "CASE WHEN typeof(d.tags) = 'text' AND json_valid(d.tags) "
-            "THEN CASE WHEN json_type(d.tags) = 'array' THEN d.tags ELSE '[]' END "
-            "ELSE '[]' END"
-        )
-        if query.tags:
-            where.append(
-                "NOT EXISTS ("
-                f"SELECT 1 FROM json_each({tags_array_sql}) invalid_tag "
-                "WHERE invalid_tag.type != 'text')"
-            )
-        for tag in query.tags:
-            where.append(
-                "EXISTS ("
-                f"SELECT 1 FROM json_each({tags_array_sql}) tag "
-                "WHERE tag.type = 'text' AND lower(tag.value) = ?)"
-            )
-            where_params.append(tag)
-
-        facet_conds, facet_params = sqlite_facet_conditions(
-            validate_facets(dict(query.facets))
-        )
-        where.extend(facet_conds)
-        where_params.extend(facet_params)
-
-        scope_where = ""
-        if query.scope is SearchScope.SOURCE:
-            scope_where = "WHERE source_hit"
-        elif query.scope is SearchScope.ANNOTATIONS:
-            scope_where = "WHERE annotation_hit"
-
-        sql = (
-            "WITH labeled AS ("
-            "SELECT dc.document_id, dc.document_version, dc.content, "
-            "dc.source_content, dc.annotations_text, dc.has_highlight, "
-            "dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, d.metadata, "
-            "d.source_kind, "
-            f"{score_sql} AS score, "
-            f"({source_match}) AS source_hit, "
-            f"({annotation_match}) AS annotation_hit "
-            f"FROM {from_sql} WHERE {' AND '.join(where)}"
-            "), filtered AS ("
-            f"SELECT * FROM labeled {scope_where}"
-            "), counted AS ("
-            "SELECT *, COUNT(*) OVER () AS candidate_count FROM filtered"
-            ") SELECT * FROM counted "
-            "ORDER BY score ASC, document_id, document_version, chunk_index LIMIT ?"
-        )
-        params = [*select_params, *where_params, query.candidate_limit]
-        cursor = await db.execute(sql, params)
-        rows = _rows_to_dicts(cursor, await cursor.fetchall())
-        hits = tuple(_sqlite_search_hit(row) for row in rows)
-        candidate_count = int(rows[0]["candidate_count"]) if rows else 0
-        return SearchResult(
-            hits=hits,
-            candidate_count=candidate_count,
-            latency_ms=(perf_counter() - started_at) * 1000,
-            profile="lexical",
-        )
-
-    async def retrieve_vector(
-        self,
-        kb_id: str,
-        query: SearchQuery,
-        *,
-        embedding: tuple[float, ...],
-        profile: EmbeddingProfile,
-    ) -> SearchResult:
-        """SQLite stays lexical-only and never initializes vector machinery."""
-        raise RetrieverUnavailable("vector retrieval is unavailable in local mode")
-
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
         path_filter: str | None = None,
@@ -790,15 +430,83 @@ class SqliteVaultFS(VaultFS):
         scope: str = "all",
         facets: dict | None = None,
     ) -> list[dict]:
-        return await super().search_chunks(
-            kb_id,
-            query,
-            limit,
-            path_filter,
-            annotated_only,
-            scope,
-            facets,
-        )
+        db = self._db_or_raise()
+        # SQLite's chunks_fts only indexes `content` (which already includes
+        # annotations after sync). Scope filtering is a Python-side
+        # substring check; to avoid scope filters returning fewer rows than
+        # requested, over-fetch by 3x when scope narrows the set, then
+        # slice to the requested limit. Acceptable at personal scale;
+        # production hosted-mode uses Postgres + PGroonga per-column matches.
+        sql_limit = limit if scope == "all" else limit * 3
+
+        # Trigram MATCH when every token is indexable; otherwise a LIKE scan
+        # (short tokens — e.g. 2-char Chinese terms — have no trigrams).
+        match_expr = _build_fts_match(query)
+        params: list = []
+        if match_expr is not None:
+            sql = (
+                "SELECT dc.content, dc.source_content, dc.annotations_text, "
+                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "rank as score "
+                "FROM document_chunks dc "
+                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                "JOIN documents d ON dc.document_id = d.id "
+                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+            )
+            params.append(match_expr)
+        else:
+            patterns = _like_patterns(query)
+            if not patterns:
+                return []
+            like_conds = " AND ".join("dc.content LIKE ? ESCAPE '\\'" for _ in patterns)
+            sql = (
+                "SELECT dc.content, dc.source_content, dc.annotations_text, "
+                "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+                "d.filename, d.title, d.path, d.file_type, d.tags, "
+                "0 as score "
+                "FROM document_chunks dc "
+                "JOIN documents d ON dc.document_id = d.id "
+                f"WHERE {like_conds} AND d.status != 'failed' "
+            )
+            params.extend(patterns)
+
+        if annotated_only:
+            sql += "AND dc.has_highlight = 1 "
+        if path_filter == "wiki":
+            sql += "AND d.source_kind = 'wiki' "
+        elif path_filter == "sources":
+            sql += "AND d.source_kind != 'wiki' "
+
+        facet_conds, facet_params = sqlite_facet_conditions(validate_facets(facets))
+        for cond in facet_conds:
+            sql += f"AND {cond} "
+        params.extend(facet_params)
+
+        sql += "ORDER BY score LIMIT ?" if match_expr is not None else "ORDER BY d.path, d.filename, dc.chunk_index LIMIT ?"
+        params.append(sql_limit)
+
+        cursor = await db.execute(sql, params)
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+
+        # Label each row + apply scope filter, then slice to `limit`.
+        q_lower = query.lower()
+        labeled: list[dict] = []
+        for r in rows:
+            src = (r.get("source_content") or "").lower()
+            ann = (r.get("annotations_text") or "").lower()
+            source_hit = q_lower in src
+            annotation_hit = bool(ann) and q_lower in ann
+            if scope == "annotations" and not annotation_hit:
+                continue
+            if scope == "source" and not source_hit:
+                continue
+            r["source_hit"] = source_hit
+            r["annotation_hit"] = annotation_hit
+            labeled.append(r)
+            if len(labeled) >= limit:
+                break
+        return labeled
 
 
     async def corpus_search_context(self, kb_id: str, relpaths: list[str]) -> dict:
@@ -868,25 +576,8 @@ class SqliteVaultFS(VaultFS):
         if not file_path:
             return False
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=file_path.parent,
-                prefix=f".{file_path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temp_path = handle.name
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, file_path)
-            return True
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
+        file_path.write_text(content, encoding="utf-8")
+        return True
 
     def delete_from_disk(self, docs: list[dict]) -> None:
         for d in docs:
@@ -1070,7 +761,6 @@ class SqliteVaultFS(VaultFS):
         cursor = await db.execute("SELECT id FROM workspace LIMIT 1")
         row = await cursor.fetchone()
         if row:
-            await self._reconcile_wiki_files(row[0])
             return row[0]
         ws_id = str(uuid.uuid4())
         await db.execute(
@@ -1078,64 +768,7 @@ class SqliteVaultFS(VaultFS):
             (ws_id, workspace_name, self.user_id),
         )
         await db.commit()
-        await self._reconcile_wiki_files(ws_id)
         return ws_id
-
-    async def _reconcile_wiki_files(self, kb_id: str) -> int:
-        """Repair an indexed wiki revision when disk replacement won a prior crash."""
-        if _workspace_root is None:
-            return 0
-        db = self._db_or_raise()
-        cursor = await db.execute(
-            "SELECT id, filename, title, path, file_type, content, tags, date, metadata, version "
-            "FROM documents WHERE source_kind = 'wiki' AND file_type = 'md' "
-            "AND status != 'failed'"
-        )
-        rows = _rows_to_dicts(cursor, await cursor.fetchall())
-        if not rows:
-            return 0
-        # Include source documents so citations can be rebuilt with the page.
-        cursor = await db.execute("SELECT id, filename, title, path FROM documents")
-        lookup_docs = _rows_to_dicts(cursor, await cursor.fetchall())
-        filename_to_doc, base_to_doc, wiki_path_to_doc = build_lookup_maps(lookup_docs)
-
-        repaired = 0
-        for row in rows:
-            file_path = self._resolve_path(row["path"].lstrip("/") + row["filename"])
-            if file_path is None or not file_path.is_file():
-                continue
-            disk_content = file_path.read_text(encoding="utf-8")
-            if disk_content == (row["content"] or ""):
-                continue
-            wiki_dir = row["path"].replace("/wiki/", "", 1)
-            edges = extract_references(
-                disk_content,
-                str(row["id"]),
-                wiki_dir,
-                filename_to_doc,
-                base_to_doc,
-                wiki_path_to_doc,
-            )
-            await self.write_wiki_bundle(
-                kb_id,
-                WikiWriteBundle.build(
-                    document_id=str(row["id"]),
-                    expected_version=int(row["version"]),
-                    filename=row["filename"],
-                    path=row["path"],
-                    file_type=row["file_type"],
-                    content=disk_content,
-                    title=row["title"],
-                    tags=row.get("tags") or [],
-                    date=row.get("date"),
-                    metadata=row.get("metadata") or {},
-                    edges=edges,
-                ),
-            )
-            repaired += 1
-        if repaired:
-            logger.warning("Reconciled %d wiki file(s) from disk", repaired)
-        return repaired
 
     async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
         today = date.today().isoformat()

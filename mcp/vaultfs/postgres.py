@@ -1,42 +1,16 @@
 """Postgres + S3 implementation of VaultFS."""
 
-import json
 import logging
 import re
-from collections.abc import Sequence
 from datetime import date
-from math import isfinite
-from numbers import Real
-from time import perf_counter
-from typing import NoReturn
-from uuid import UUID
 
 import aioboto3
 import asyncpg
+
 from config import settings
-from db import get_pool, scoped_execute, scoped_query, scoped_queryrow, service_execute, service_queryrow
+from db import scoped_query, scoped_queryrow, scoped_execute, service_queryrow, service_execute, get_pool
 from services.chunker import chunk_text, store_chunks_pg
-
-import llmwiki_adapters.postgres.wiki as postgres_wiki_adapter
-import llmwiki_core.postgres_retrieval as postgres_retrieval
-from llmwiki_core.documents import DocumentKind
-from llmwiki_core.models import EmbeddingProfile
-from llmwiki_core.search import (
-    RetrieverUnavailable,
-    SearchHit,
-    SearchQuery,
-    SearchResult,
-    SearchScope,
-)
-from llmwiki_core.signals import sanitized_boundary_signal_or_unknown
-from llmwiki_core.wiki import WikiWriteBundle
-
-from .base import (
-    DuplicateDocumentError,
-    VaultFS,
-    _vault_search_hit,
-    is_wiki_directory,
-)
+from .base import VaultFS, DuplicateDocumentError
 from .facets import postgres_facet_conditions, validate_facets
 
 logger = logging.getLogger(__name__)
@@ -100,78 +74,6 @@ def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = re.sub(r"[\s-]+", "-", slug).strip("-")
     return slug or "kb"
-
-
-def _postgres_search_hit(row: dict):
-    raw_metadata = row.get("metadata")
-    if isinstance(raw_metadata, str):
-        try:
-            raw_metadata = json.loads(raw_metadata)
-        except (json.JSONDecodeError, TypeError):
-            raw_metadata = {}
-    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-    raw_tags = row.get("tags")
-    return _vault_search_hit(
-        document_id=str(row["document_id"]),
-        document_version=int(row["document_version"]),
-        chunk_index=int(row["chunk_index"]),
-        content=row["content"],
-        score=float(row["score"]),
-        path=f"{row['path']}{row['filename']}",
-        title=row.get("title"),
-        page=row.get("page"),
-        header_breadcrumb=row.get("header_breadcrumb"),
-        tags=raw_tags,
-        document_kind=DocumentKind(row["source_kind"]),
-        metadata=metadata,
-        filename=row["filename"],
-        directory=row["path"],
-        file_type=row["file_type"],
-        source_content=row.get("source_content") or "",
-        annotations_text=row.get("annotations_text"),
-        has_highlight=bool(row.get("has_highlight")),
-        source_hit=bool(row.get("source_hit")),
-        annotation_hit=bool(row.get("annotation_hit")),
-    )
-
-
-def _vector_literal(value: object, *, dimensions: int) -> str:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError("embedding must be a sequence of finite numbers")
-    if len(value) != dimensions:
-        raise ValueError("embedding dimensions do not match the configured profile")
-    coordinates: list[float] = []
-    for coordinate in value:
-        if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
-            raise ValueError("embedding must contain finite numbers")
-        normalized = float(coordinate)
-        if not isfinite(normalized):
-            raise ValueError("embedding must contain finite numbers")
-        coordinates.append(normalized)
-    if not any(coordinates):
-        raise ValueError("embedding must contain a non-zero coordinate")
-    return "[" + ",".join(format(number, ".17g") for number in coordinates) + "]"
-
-
-def _postgres_document_filters(
-    query: SearchQuery,
-    params: list,
-    *,
-    doc_alias: str,
-    chunk_alias: str,
-) -> list[str]:
-    return postgres_retrieval.postgres_document_filter_conditions(
-        query,
-        params,
-        doc_alias=doc_alias,
-        chunk_alias=chunk_alias,
-    )
-
-
-def _raise_postgres_ordinary_boundary(failure: BaseException, message: str) -> NoReturn:
-    if isinstance(failure, (asyncpg.PostgresError, OSError, TimeoutError)):
-        raise RetrieverUnavailable(message) from None
-    raise failure
 
 
 class PostgresVaultFS(VaultFS):
@@ -243,18 +145,17 @@ class PostgresVaultFS(VaultFS):
     async def create_document(self, kb_id: str, filename: str, title: str, dir_path: str, file_type: str, content: str, tags: list[str], date: str | None = None, metadata: dict | None = None) -> dict:
         import json as _json
         pool = await get_pool()
-        source_kind = "wiki" if is_wiki_directory(dir_path) else "source"
         async with pool.acquire() as conn:
             async with conn.transaction():
                 try:
                     row = await conn.fetchrow(
                         "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-                        "source_kind, file_type, status, content, tags, date, metadata, version) "
-                        "SELECT $1, $2, $3, $4, $5, $6, $7, 'ready', $8, $9, $10, $11::jsonb, 1 "
+                        "file_type, status, content, tags, date, metadata, version) "
+                        "SELECT $1, $2, $3, $4, $5, $6, 'ready', $7, $8, $9, $10::jsonb, 1 "
                         "WHERE EXISTS (SELECT 1 FROM knowledge_bases WHERE id = $1 AND user_id = $2) "
                         "RETURNING id, filename, path",
-                        kb_id, self.user_id, filename, title, dir_path, source_kind, file_type,
-                        content, tags, date, _json.dumps(metadata) if metadata else None,
+                        kb_id, self.user_id, filename, title, dir_path, file_type, content, tags,
+                        date, _json.dumps(metadata) if metadata else None,
                     )
                 except asyncpg.UniqueViolationError as e:
                     # Only re-raise as DuplicateDocumentError for the path/filename index.
@@ -266,7 +167,7 @@ class PostgresVaultFS(VaultFS):
                     raise PermissionError(f"knowledge base {kb_id} not owned by user")
                 if file_type in ("md", "txt"):
                     chunks = chunk_text(content or "")
-                    await store_chunks_pg(conn, str(row["id"]), self.user_id, kb_id, 1, chunks)
+                    await store_chunks_pg(conn, str(row["id"]), self.user_id, kb_id, chunks)
         return dict(row)
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
@@ -297,7 +198,7 @@ class PostgresVaultFS(VaultFS):
         sql = (
             f"UPDATE documents SET {', '.join(sets)} "
             f"WHERE id = $2 AND user_id = $3 "
-            f"RETURNING id, filename, path, knowledge_base_id, file_type, version"
+            f"RETURNING id, filename, path, knowledge_base_id, file_type"
         )
 
         pool = await get_pool()
@@ -308,26 +209,9 @@ class PostgresVaultFS(VaultFS):
                     chunks = chunk_text(content or "")
                     await store_chunks_pg(
                         conn, str(row["id"]), self.user_id,
-                        str(row["knowledge_base_id"]), row["version"], chunks,
+                        str(row["knowledge_base_id"]), chunks,
                     )
         return {"id": row["id"], "filename": row["filename"], "path": row["path"]} if row else None
-
-    async def write_wiki_bundle(self, kb_id: str, bundle: WikiWriteBundle) -> dict:
-        """Commit a wiki revision and every derived row in one Postgres transaction."""
-        pool = await get_pool()
-        async with pool.acquire() as conn, conn.transaction():
-            result = await postgres_wiki_adapter.write_wiki_bundle_in_transaction(
-                conn,
-                user_id=UUID(self.user_id),
-                knowledge_base_id=UUID(kb_id),
-                bundle=bundle,
-            )
-        return {
-            "id": str(result.document_id),
-            "filename": result.filename,
-            "path": result.path,
-            "version": result.version,
-        }
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         result = await service_execute(
@@ -379,229 +263,6 @@ class PostgresVaultFS(VaultFS):
         )
 
 
-    async def retrieve(self, kb_id: str, query: SearchQuery) -> SearchResult:
-        started_at = perf_counter()
-        compiled = postgres_retrieval.compile_postgres_lexical_query(
-            self.user_id,
-            kb_id,
-            query,
-        )
-
-        rows = await scoped_query(
-            self.user_id,
-            compiled.sql,
-            *compiled.params,
-        )
-        row_dicts = [dict(row) for row in rows]
-        hits = tuple(_postgres_search_hit(row) for row in row_dicts)
-        candidate_count = int(row_dicts[0]["candidate_count"]) if row_dicts else 0
-        return SearchResult(
-            hits=hits,
-            candidate_count=candidate_count,
-            latency_ms=(perf_counter() - started_at) * 1000,
-            profile="lexical",
-        )
-
-    async def retrieve_vector(
-        self,
-        kb_id: str,
-        query: SearchQuery,
-        *,
-        embedding: tuple[float, ...],
-        profile: EmbeddingProfile,
-    ) -> SearchResult:
-        """Retrieve exact cosine candidates inside the authenticated tenant scope."""
-        if not isinstance(profile, EmbeddingProfile):
-            raise TypeError("profile must be an EmbeddingProfile")
-        if query.scope is not SearchScope.ALL:
-            raise RetrieverUnavailable("vector retrieval does not support scoped content")
-        vector = _vector_literal(embedding, dimensions=profile.dimensions)
-        started_at = perf_counter()
-
-        availability_failure = None
-        available = None
-        try:
-            available = await scoped_queryrow(
-                self.user_id,
-                "SELECT EXISTS(SELECT 1 FROM chunk_embeddings ce "
-                "JOIN documents d ON d.id=ce.document_id "
-                "WHERE ce.user_id=$1::uuid AND ce.knowledge_base_id=$2::uuid "
-                "AND ce.provider=$3 AND ce.model=$4 AND ce.dimensions=$5 "
-                "AND d.user_id=$1::uuid AND d.knowledge_base_id=$2::uuid "
-                "AND ce.document_version=d.version AND NOT d.archived "
-                "AND d.status != 'failed') AS available",
-                self.user_id,
-                kb_id,
-                profile.provider,
-                profile.model,
-                profile.dimensions,
-            )
-        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
-            availability_failure = failure
-        if availability_failure is not None:
-            if signal := sanitized_boundary_signal_or_unknown(availability_failure):
-                raise signal from None
-            _raise_postgres_ordinary_boundary(
-                availability_failure,
-                "vector store is unavailable",
-            )
-        if not available or not available["available"]:
-            raise RetrieverUnavailable("current embeddings are unavailable")
-
-        params: list = [
-            self.user_id,
-            kb_id,
-            profile.provider,
-            profile.model,
-            profile.dimensions,
-            vector,
-        ]
-
-        def bind(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        where = [
-            "ce.user_id=$1::uuid",
-            "ce.knowledge_base_id=$2::uuid",
-            "ce.provider=$3",
-            "ce.model=$4",
-            "ce.dimensions=$5",
-            "d.user_id=$1::uuid",
-            "d.knowledge_base_id=$2::uuid",
-            "dc.user_id=$1::uuid",
-            "dc.knowledge_base_id=$2::uuid",
-            "ce.document_version=d.version",
-            "dc.document_version=d.version",
-            "d.status != 'failed'",
-            "NOT d.archived",
-        ]
-        where.extend(
-            _postgres_document_filters(
-                query,
-                params,
-                doc_alias="d",
-                chunk_alias="dc",
-            )
-        )
-        limit_param = bind(query.candidate_limit)
-
-        search_failure = None
-        rows = []
-        try:
-            rows = await scoped_query(
-                self.user_id,
-                "WITH filtered AS ("
-                "SELECT ce.document_id, ce.document_version, ce.chunk_index, "
-                "dc.content, dc.source_content, dc.annotations_text, dc.has_highlight, "
-                "dc.page, dc.header_breadcrumb, d.path, d.filename, d.title, d.file_type, "
-                "d.tags, d.source_kind, d.metadata, "
-                "ce.embedding <=> $6::vector AS distance "
-                "FROM chunk_embeddings ce JOIN documents d ON d.id=ce.document_id "
-                "JOIN document_chunks dc ON dc.document_id=ce.document_id "
-                "AND dc.document_version=ce.document_version "
-                "AND dc.chunk_index=ce.chunk_index "
-                f"WHERE {' AND '.join(where)}"
-                "), counted AS ("
-                "SELECT *, count(*) OVER () AS candidate_count FROM filtered"
-                ") SELECT *, 1.0-distance AS score, false AS source_hit, "
-                "false AS annotation_hit FROM counted "
-                "ORDER BY distance, document_id, document_version, chunk_index "
-                f"LIMIT {limit_param}",
-                *params,
-            )
-        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
-            search_failure = failure
-        if search_failure is not None:
-            if signal := sanitized_boundary_signal_or_unknown(search_failure):
-                raise signal from None
-            _raise_postgres_ordinary_boundary(
-                search_failure,
-                "vector store is unavailable",
-            )
-        hits = tuple(_postgres_search_hit(row) for row in rows)
-        candidate_count = int(rows[0]["candidate_count"]) if rows else 0
-        return SearchResult(
-            hits=hits,
-            candidate_count=candidate_count,
-            latency_ms=(perf_counter() - started_at) * 1000,
-            profile="vector",
-        )
-
-    async def expand_references(
-        self,
-        kb_id: str,
-        query: SearchQuery,
-        hits: tuple[SearchHit, ...],
-        *,
-        limit: int,
-    ) -> tuple[SearchHit, ...]:
-        """Follow one outbound edge and fetch one current chunk per related doc."""
-        if type(limit) is not int or limit <= 0 or not hits:
-            return ()
-        direct_ids = tuple(dict.fromkeys(hit.document_id for hit in hits))[:100]
-        if not direct_ids:
-            return ()
-        scan_limit = min(100, limit)
-        params: list = [kb_id, list(direct_ids), self.user_id]
-        where = [
-            "ref.knowledge_base_id=$1::uuid",
-            "target.knowledge_base_id=$1::uuid",
-            "target.user_id=$3::uuid",
-            "dc.user_id=$3::uuid",
-            "dc.knowledge_base_id=$1::uuid",
-            "NOT target.archived",
-            "target.status != 'failed'",
-            "NOT (target.id=ANY($2::uuid[]))",
-        ]
-        where.extend(
-            _postgres_document_filters(
-                query,
-                params,
-                doc_alias="target",
-                chunk_alias="dc",
-            )
-        )
-        params.append(scan_limit)
-        limit_parameter = f"${len(params)}"
-        expansion_failure = None
-        rows = []
-        try:
-            rows = await scoped_query(
-                self.user_id,
-                "WITH direct AS ("
-                "SELECT document_id, direct_rank FROM "
-                "unnest($2::uuid[]) WITH ORDINALITY AS input(document_id, direct_rank)"
-                "), related AS ("
-                "SELECT DISTINCT ON (target.id) direct.direct_rank, "
-                "target.id AS document_id, target.version AS document_version, "
-                "dc.chunk_index, dc.content, dc.source_content, dc.annotations_text, "
-                "dc.has_highlight, dc.page, dc.header_breadcrumb, target.path, "
-                "target.filename, target.title, target.file_type, target.tags, "
-                "target.source_kind, target.metadata "
-                "FROM direct JOIN document_references ref "
-                "ON ref.source_document_id=direct.document_id "
-                "JOIN documents target ON target.id=ref.target_document_id "
-                "JOIN document_chunks dc ON dc.document_id=target.id "
-                "AND dc.document_version=target.version "
-                f"WHERE {' AND '.join(where)} "
-                "ORDER BY target.id, direct.direct_rank, dc.chunk_index"
-                ") SELECT *, 0.0::double precision AS score, "
-                "false AS source_hit, false AS annotation_hit FROM related "
-                f"ORDER BY direct_rank, document_id LIMIT {limit_parameter}",
-                *params,
-            )
-        except BaseException as failure:  # noqa: BLE001 - sanitize database signals.
-            expansion_failure = failure
-        if expansion_failure is not None:
-            if signal := sanitized_boundary_signal_or_unknown(expansion_failure):
-                raise signal from None
-            _raise_postgres_ordinary_boundary(
-                expansion_failure,
-                "reference expansion is unavailable",
-            )
-        return tuple(_postgres_search_hit(row) for row in rows[:limit])
-
     async def search_chunks(
         self, kb_id: str, query: str, limit: int,
         path_filter: str | None = None,
@@ -609,15 +270,59 @@ class PostgresVaultFS(VaultFS):
         scope: str = "all",
         facets: dict | None = None,
     ) -> list[dict]:
-        return await super().search_chunks(
-            kb_id,
-            query,
-            limit,
-            path_filter,
-            annotated_only,
-            scope,
-            facets,
+        path_clause = ""
+        if path_filter == "wiki":
+            path_clause = " AND d.path LIKE '/wiki/%'"
+        elif path_filter == "sources":
+            path_clause = " AND d.path NOT LIKE '/wiki/%'"
+
+        # Always match against `content` — that's where the PGroonga index
+        # lives, and `content` already contains source + annotations
+        # materialized together. The per-side booleans below label *which
+        # side* matched so callers can post-filter by scope cheaply.
+        annotated_clause = " AND dc.has_highlight = true" if annotated_only else ""
+
+        # Push scope into SQL so the LIMIT counts only rows the user asked
+        # for. The earlier Python-side post-filter could return zero results
+        # for narrow scopes even when valid matches existed past the top-N.
+        if scope == "annotations":
+            scope_clause = (
+                " AND dc.annotations_text IS NOT NULL "
+                " AND dc.annotations_text &@~ $2"
+            )
+        elif scope == "source":
+            scope_clause = " AND dc.source_content &@~ $2"
+        else:
+            scope_clause = ""
+
+        facet_conds, facet_params = postgres_facet_conditions(
+            validate_facets(facets), start_index=5, doc_alias="d",
         )
+        facet_sql = "".join(f"  AND {c}" for c in facet_conds)
+
+        rows = await scoped_query(
+            self.user_id,
+            f"SELECT dc.content, dc.source_content, dc.annotations_text, "
+            f"  dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            f"  (dc.source_content &@~ $2) AS source_hit, "
+            f"  (dc.annotations_text IS NOT NULL AND dc.annotations_text &@~ $2) AS annotation_hit, "
+            f"  d.filename, d.title, d.path, d.file_type, d.tags, "
+            f"  pgroonga_score(dc.tableoid, dc.ctid) AS score "
+            f"FROM document_chunks dc "
+            f"JOIN documents d ON dc.document_id = d.id "
+            f"WHERE dc.knowledge_base_id = $1 "
+            f"  AND dc.content &@~ $2 "
+            f"  AND NOT d.archived"
+            f"  AND d.user_id = $3"
+            f"{annotated_clause}"
+            f"{scope_clause}"
+            f"{path_clause}"
+            f"{facet_sql} "
+            f"ORDER BY score DESC, dc.chunk_index "
+            f"LIMIT $4",
+            kb_id, query, self.user_id, limit, *facet_params,
+        )
+        return rows
 
 
     async def load_source_bytes(self, doc: dict) -> bytes | None:

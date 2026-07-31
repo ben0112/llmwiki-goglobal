@@ -11,7 +11,6 @@ const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false 
 
 interface GraphNode {
   id: string
-  filename: string
   title: string
   description?: string | null
   path: string
@@ -39,7 +38,7 @@ interface GraphData {
 interface Props {
   kbId: string
   focusNodeId?: string | null
-  onNavigateToDoc?: (logicalReference: string, sourceKind: string) => void
+  onNavigateToDoc?: (docId: string, sourceKind: string) => void
 }
 
 // d3-force stores simulation state (x/y/vx/vy) on the node objects themselves.
@@ -214,7 +213,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleNodeClick = React.useCallback(
-    (node: any) => { onNavigateToDoc?.(`${node.path}${node.filename}`.replace(/^\//, ''), node.source_kind) },
+    (node: any) => { onNavigateToDoc?.(node.id, node.source_kind) },
     [onNavigateToDoc],
   )
 

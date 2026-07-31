@@ -1,48 +1,13 @@
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 
 import aioboto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
 from config import settings
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class MultipartPart:
-    part_number: int
-    etag: str
-
-    def __post_init__(self) -> None:
-        _validate_part_number(self.part_number)
-        _validate_etag(self.etag)
-
-
-@dataclass(frozen=True, slots=True)
-class ObjectMetadata:
-    size: int
-    etag: str
-    content_type: str | None
-
-
-def _validate_part_number(part_number: object) -> None:
-    if isinstance(part_number, bool) or not isinstance(part_number, int) or not 1 <= part_number <= 10_000:
-        raise ValueError("part_number must be an integer between 1 and 10000")
-
-
-def _validate_etag(etag: object) -> None:
-    if not isinstance(etag, str) or not etag.strip():
-        raise ValueError("etag must be a non-empty string")
-
-
-def _normalize_etag(etag: str) -> str:
-    if len(etag) >= 2 and etag.startswith('"') and etag.endswith('"'):
-        return etag[1:-1]
-    return etag
 
 
 def s3_client_kwargs() -> dict:
@@ -72,104 +37,6 @@ class S3Service:
         data = await asyncio.to_thread(Path(file_path).read_bytes)
         await self.upload_bytes(key, data, content_type)
 
-    async def create_multipart(self, key: str, content_type: str) -> str:
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            response = await s3.create_multipart_upload(
-                Bucket=self._bucket,
-                Key=key,
-                ContentType=content_type,
-            )
-        return response["UploadId"]
-
-    async def upload_part(
-        self,
-        key: str,
-        upload_id: str,
-        part_number: int,
-        body: bytes,
-    ) -> str:
-        _validate_part_number(part_number)
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            response = await s3.upload_part(
-                Bucket=self._bucket,
-                Key=key,
-                UploadId=upload_id,
-                PartNumber=part_number,
-                Body=body,
-            )
-        return _normalize_etag(response["ETag"])
-
-    async def complete_multipart(
-        self,
-        key: str,
-        upload_id: str,
-        parts: list[MultipartPart],
-    ) -> None:
-        if not parts:
-            raise ValueError("multipart completion requires at least one part")
-
-        seen_part_numbers: set[int] = set()
-        ordered_parts: list[dict] = []
-        for part in parts:
-            _validate_part_number(part.part_number)
-            _validate_etag(part.etag)
-            if part.part_number in seen_part_numbers:
-                raise ValueError(f"duplicate PartNumber: {part.part_number}")
-            seen_part_numbers.add(part.part_number)
-            ordered_parts.append({"PartNumber": part.part_number, "ETag": part.etag})
-        ordered_parts.sort(key=lambda part: part["PartNumber"])
-
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            await s3.complete_multipart_upload(
-                Bucket=self._bucket,
-                Key=key,
-                UploadId=upload_id,
-                MultipartUpload={"Parts": ordered_parts},
-            )
-
-    async def abort_multipart(self, key: str, upload_id: str) -> None:
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            await s3.abort_multipart_upload(
-                Bucket=self._bucket,
-                Key=key,
-                UploadId=upload_id,
-            )
-
-    async def head_object(self, key: str) -> ObjectMetadata | None:
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            try:
-                response = await s3.head_object(Bucket=self._bucket, Key=key)
-            except ClientError as exc:
-                code = str(exc.response.get("Error", {}).get("Code", ""))
-                if code in {"404", "NoSuchKey", "NotFound"}:
-                    return None
-                raise
-        return ObjectMetadata(
-            size=response["ContentLength"],
-            etag=_normalize_etag(response["ETag"]),
-            content_type=response.get("ContentType"),
-        )
-
-    async def read_range(self, key: str, start: int, end: int) -> bytes:
-        """Read the inclusive byte range ``start..end`` from one object."""
-        if start < 0 or end < start:
-            raise ValueError("inclusive byte range must satisfy 0 <= start <= end")
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            response = await s3.get_object(
-                Bucket=self._bucket,
-                Key=key,
-                Range=f"bytes={start}-{end}",
-            )
-            return await response["Body"].read()
-
-    async def delete_object(self, key: str) -> None:
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            await s3.delete_object(Bucket=self._bucket, Key=key)
-
-    async def head_bucket(self) -> None:
-        async with self._session.client("s3", **s3_client_kwargs()) as s3:
-            await s3.head_bucket(Bucket=self._bucket)
-
     async def generate_presigned_get(self, key: str, expires_in: int = 3600) -> str:
         async with self._session.client("s3", **s3_client_kwargs()) as s3:
             return await s3.generate_presigned_url(
@@ -198,10 +65,6 @@ class S3Service:
                         batch = []
             if batch:
                 await s3.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
-
-    async def delete_key(self, key: str) -> None:
-        """Delete one exact object for transaction compensation."""
-        await self.delete_object(key)
 
     async def download_bytes(self, key: str) -> bytes:
         async with self._session.client("s3", **s3_client_kwargs()) as s3:

@@ -8,8 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from llmwiki_core.search import SearchQuery
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Chunker drops content under MIN_CHUNK_TOKENS (~128 chars) — keep these long.
@@ -159,45 +157,6 @@ async def test_search_facet_business_prefix(fs, corpus_docs):
     assert exact and prefix and {r["filename"] for r in exact} == {r["filename"] for r in prefix} == {"idn.md"}
 
 
-async def test_retrieve_facet_count_is_not_truncated_by_candidate_limit(fs):
-    instance, kb_id = fs
-    for index in range(4):
-        await instance.create_document(
-            kb_id,
-            f"excluded-facet-{index}.md",
-            "Excluded facet",
-            "/corpus/sgp/",
-            "md",
-            ("market access " * 30) + CN_DATA,
-            ["reviewed"],
-            metadata=corpus_meta(geo_country=["SGP"]),
-        )
-    for index in range(3):
-        await instance.create_document(
-            kb_id,
-            f"eligible-facet-{index}.md",
-            "Eligible facet",
-            "/corpus/idn/",
-            "md",
-            "market access " + CN_DATA,
-            ["reviewed"],
-            metadata=corpus_meta(geo_country=["IDN"]),
-        )
-
-    result = await instance.retrieve(
-        kb_id,
-        SearchQuery.build(
-            text="market access",
-            limit=2,
-            candidate_limit=2,
-            facets={"country": "IDN"},
-        ),
-    )
-
-    assert result.returned_count == 2
-    assert result.candidate_count == 3
-
-
 async def test_list_documents_facets(fs, corpus_docs):
     instance, kb_id = fs
     all_docs = await instance.list_documents(kb_id)
@@ -255,8 +214,8 @@ async def test_legacy_porter_db_is_migrated(tmp_path):
         assert "trigram" in row[0]
 
         instance = SqliteVaultFS("u")
-        kb_id = await instance.ensure_workspace("legacy")
-        rows = await instance.search_chunks(kb_id, "数据本地化", 10)
+        await instance.ensure_workspace("legacy")
+        rows = await instance.search_chunks("any-kb", "数据本地化", 10)
         assert rows and rows[0]["filename"] == "a.md"
     finally:
         await SqliteVaultFS.close()

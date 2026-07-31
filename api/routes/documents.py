@@ -1,19 +1,14 @@
 from typing import Annotated
 from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
 from auth import get_current_user
 from deps import get_document_service
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from infra.rate_limit import limiter
 from services.base import DocumentService
 from services.types import (
-    BulkDelete,
-    CreateFromUrl,
-    CreateNote,
-    ReplaceHighlights,
-    UpdateContent,
-    UpdateMetadata,
-    UpsertHighlight,
+    BulkDelete, CreateFromUrl, CreateNote,     ReplaceHighlights, UpdateContent, UpdateMetadata, UpsertHighlight,
 )
 from services.url_ingest import UrlIngestService
 
@@ -37,7 +32,6 @@ async def regen_status(request: Request):
     if getattr(request.app.state, "mode", "") != "local":
         return {"running": False, "total": 0, "done": 0, "failed": 0, "pages": [], "mode": "", "finished_at": None}
     from services.wiki_regen import regen_status as _regen_status
-
     return _regen_status()
 
 
@@ -51,8 +45,7 @@ async def get_document(doc_id: UUID, service: Annotated[DocumentService, Depends
 
 @router.post("/v1/documents/{doc_id}/retry-extraction", status_code=202)
 async def retry_extraction(
-    doc_id: UUID,
-    request: Request,
+    doc_id: UUID, request: Request,
     user: Annotated[dict, Depends(get_current_user)],
 ):
     """手动重试文档提取:清零失败隔离计数并重新排队(本地模式)。
@@ -64,22 +57,22 @@ async def retry_extraction(
     if getattr(state, "mode", "") != "local":
         raise HTTPException(status_code=400, detail="仅本地模式支持")
     db = state.sqlite_db
-    cursor = await db.execute("SELECT status FROM documents WHERE id = ?", (str(doc_id),))
+    cursor = await db.execute(
+        "SELECT status FROM documents WHERE id = ?", (str(doc_id),))
     if await cursor.fetchone() is None:
         raise HTTPException(status_code=404, detail="Document not found")
     await db.execute(
         "UPDATE documents SET status = 'pending', error_message = NULL, "
         "extraction_attempts = 0, updated_at = datetime('now') WHERE id = ?",
-        (str(doc_id),),
-    )
+        (str(doc_id),))
     await db.commit()
 
     from pathlib import Path
 
     from domain.local_processor import process_document_isolated
     from infra.tasks import spawn_logged
-
-    spawn_logged(process_document_isolated(Path(state.workspace_path), str(doc_id)), f"retry:{str(doc_id)[:8]}")
+    spawn_logged(process_document_isolated(Path(state.workspace_path), str(doc_id)),
+                 f"retry:{str(doc_id)[:8]}")
     return {"status": "queued"}
 
 
@@ -110,20 +103,13 @@ async def create_note(
 
 @router.post("/v1/documents/from-url", status_code=201)
 @limiter.limit("10/minute")
-async def create_document_from_url(request: Request, body: CreateFromUrl, response: Response):
+async def create_document_from_url(request: Request, body: CreateFromUrl):
     user_id = await get_current_user(request)
     state = request.app.state
-    if not state.s3_service:
+    if not state.s3_service or not state.ocr_service:
         raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
-    job_service = getattr(state, "job_service", None)
-    quota_service = getattr(state, "quota_service", None)
-    if not job_service or not quota_service:
-        raise HTTPException(status_code=503, detail="Durable URL ingestion is unavailable")
-    service = UrlIngestService(state.pool, state.s3_service, job_service, quota_service)
-    result = await service.ingest_pdf(user_id, str(body.knowledge_base_id), body.url, body.path)
-    if job_id := result.get("job_id"):
-        response.headers["X-Job-Id"] = job_id
-    return result
+    service = UrlIngestService(state.pool, state.s3_service, state.ocr_service)
+    return await service.ingest_pdf(user_id, str(body.knowledge_base_id), body.url, body.path)
 
 
 @router.get("/v1/documents/{doc_id}/highlights")
@@ -145,9 +131,7 @@ async def replace_document_highlights(
 ):
     highlights = [h.model_dump() for h in body.highlights]
     row = await service.replace_highlights(
-        str(doc_id),
-        highlights,
-        body.expectedVersion,
+        str(doc_id), highlights, body.expectedVersion,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -169,9 +153,7 @@ async def upsert_document_highlight(
     is safe; the wire-level retry behavior on dropped connections matters more
     than strict deduplication."""
     row = await service.upsert_highlight(
-        str(doc_id),
-        body.highlight.model_dump(),
-        body.expectedVersion,
+        str(doc_id), body.highlight.model_dump(), body.expectedVersion,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")

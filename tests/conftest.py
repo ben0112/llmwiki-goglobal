@@ -11,8 +11,5 @@ os.environ["SENTRY_DSN"] = ""
 os.environ["APP_URL"] = "http://localhost:3000"
 os.environ["GLOBAL_MAX_USERS"] = "1000"
 os.environ["MODE"] = "hosted"
-os.environ["DURABLE_JOBS_ENABLED"] = "true"
-os.environ["TUS_MULTIPART_ENABLED"] = "true"
-os.environ["REDIS_URL"] = "redis://localhost:6379/0"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))

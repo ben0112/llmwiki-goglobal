@@ -12,10 +12,10 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
-from llmwiki_core.chunking import MIN_CHUNK_TOKENS
 
 from config import settings
 from domain.file_types import (
@@ -23,12 +23,7 @@ from domain.file_types import (
     PDF_TYPES, SIMPLE_TEXT_TYPES, SPREADSHEET_TYPES,
 )
 from domain.watcher import mark_written
-from infra.db.sqlite import (
-    SQLiteDocumentRepository,
-    _write_lock,
-    create_pool,
-    serialized_write,
-)
+from infra.db.sqlite import SQLiteDocumentRepository, create_pool
 from infra.tasks import spawn_logged
 from services.extracted_assets import build_pdf_image_assets
 
@@ -45,14 +40,30 @@ _process_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 # 一遍 LibreOffice/JVM/OCR)。「重新识别」或文件内容变化时清零计数。
 FAILED_RETRY_LIMIT = 3
 
-# Backward-compatible name for tests and callers that observe the processor's
-# heavy-write gate. It aliases the single API-local SQLite write lock.
-_db_write_gate = _write_lock
+# 重量级写(整份分页/分块入库,含中文 trigram FTS 索引)在进程内串行:
+# N 路提取的 CPU 段(OCR/LibreOffice)照常并行,但大事务写不再互相排队
+# 到超时 —— 批量导入时的 database is locked 风暴正源于此。
+_db_write_gate = asyncio.Lock()
 
 # 排队中或处理中的文档 id:sweep 周期的自愈兜底(kick_pending_backlog)
 # 据此跳过已有任务在飞的文档,避免每轮重复入队。误判无害 —— claim 是
 # 原子的(status='pending' 才领走),重复入队只会空转一次。
 _inflight: set[str] = set()
+
+
+@asynccontextmanager
+async def _gated_write(db: aiosqlite.Connection):
+    """写闸门 + 异常回滚:闸门内半截事务若不回滚,会被同一连接上随后的
+    失败标记 commit 顺带提交(如旧资产已删、新数据未插全)。"""
+    async with _db_write_gate:
+        try:
+            yield
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                logger.warning("Rollback after failed gated write also failed")
+            raise
 
 
 async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Path) -> None:
@@ -92,10 +103,7 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
         return
 
     try:
-        if file_type in SIMPLE_TEXT_TYPES:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-            await replace_text_content(db, doc_id, content)
-        elif file_type in (PDF_TYPES | OFFICE_TYPES) and _sniff_html(file_path):
+        if file_type in (PDF_TYPES | OFFICE_TYPES) and _sniff_html(file_path):
             # 爬虫常把网页(错误页/正文)直接存成 .pdf/.doc 扩展名;
             # 按真实内容走 HTML 解析,而不是让两个提取引擎双双失败
             logger.info("HTML disguised as .%s, parsing as HTML: %s",
@@ -160,56 +168,18 @@ async def process_document_isolated(workspace: Path, doc_id: str) -> None:
 
 async def chunk_text_document(db: aiosqlite.Connection, doc_id: str, content: str | None) -> None:
     """Chunk an already-extracted text document so it becomes full-text searchable."""
-    await replace_text_content(db, doc_id, content)
-
-
-async def _replace_text_content_on_connection(
-    db: aiosqlite.Connection,
-    doc_id: str,
-    content: str | None,
-    chunks: list,
-    *,
-    parser: str = "text",
-    store_chunks=None,
-) -> int:
-    """Replace local text-derived rows using the caller's active transaction."""
-    cursor = await db.execute("SELECT version FROM documents WHERE id = ?", (doc_id,))
-    row = await cursor.fetchone()
-    if row is None:
-        raise LookupError(f"document {doc_id} not found for text replacement")
-    next_version = int(row[0] or 0) + 1
-    writer = store_chunks or _store_chunks
-    await writer(db, doc_id, chunks, next_version)
-    await db.execute(
-        "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, "
-        "page_count = 1, parser = ?, version = ?, error_message = NULL, "
-        "updated_at = datetime('now') WHERE id = ?",
-        (content, parser, next_version, doc_id),
-    )
-    return next_version
-
-
-async def replace_text_content(
-    db: aiosqlite.Connection,
-    doc_id: str,
-    content: str | None,
-    *,
-    parser: str = "text",
-) -> int:
-    """Atomically rebuild a local text document from its current source content."""
     from services.chunker import chunk_text
 
     chunks = chunk_text(content or "")
-    async with serialized_write(db):
-        version = await _replace_text_content_on_connection(
-            db,
-            doc_id,
-            content,
-            chunks,
-            parser=parser,
+    async with _gated_write(db):
+        await _store_chunks(db, doc_id, chunks)
+        # `parser` doubles as the chunked-marker so reconcile skips docs that
+        # legitimately produce zero chunks (empty/short) instead of retrying them.
+        await db.execute(
+            "UPDATE documents SET parser = 'text', updated_at = datetime('now') WHERE id = ?",
+            (doc_id,),
         )
         await db.commit()
-    return version
 
 
 async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
@@ -227,23 +197,6 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
     吞吐一致)—— 逐个串行会让重启后的大积压恢复慢一个数量级。
     """
     to_process: dict[str, None] = {}   # 有序去重
-
-    try:
-        inconsistent_ids = await _inconsistent_ready_document_ids(db)
-        if inconsistent_ids:
-            await db.executemany(
-                "UPDATE documents SET status = 'pending', updated_at = datetime('now') "
-                "WHERE id = ? AND status = 'ready'",
-                [(doc_id,) for doc_id in inconsistent_ids],
-            )
-            await db.commit()
-            logger.warning(
-                "Reconcile: queued %d ready docs with stale derived versions",
-                len(inconsistent_ids),
-            )
-        to_process.update(dict.fromkeys(inconsistent_ids))
-    except Exception:
-        logger.exception("Reconcile: derived-version scan failed")
 
     try:
         # 卡在 processing = 上次处理中进程中断(停机,或正是该文档拖垮了
@@ -340,10 +293,21 @@ async def reconcile_workspace(db: aiosqlite.Connection, workspace: Path) -> None
     workers = [spawn_logged(_drain(), f"reconcile-drain-{n}")
                for n in range(min(PROCESS_CONCURRENCY, len(ids)))]
 
-    if ids:
+    text_docs: list[tuple[str, str]] = []
+    try:
+        text_docs = await _unchunked_text_docs(db)
+        for doc_id, content in text_docs:
+            try:
+                await chunk_text_document(db, doc_id, content)
+            except Exception:
+                logger.exception("Reconcile: failed to chunk %s", doc_id[:8])
+    except Exception:
+        logger.exception("Reconcile: text-chunk scan failed")
+
+    if ids or text_docs:
         logger.info(
-            "Reconcile: %d docs queued for extraction (concurrency %d)",
-            len(ids), PROCESS_CONCURRENCY,
+            "Reconcile: %d docs queued for extraction (concurrency %d), %d text-chunked",
+            len(ids), PROCESS_CONCURRENCY, len(text_docs),
         )
     if workers:
         await asyncio.gather(*workers, return_exceptions=True)
@@ -364,12 +328,7 @@ async def kick_pending_backlog(db: aiosqlite.Connection, workspace: Path) -> int
     return len(ids[:200])
 
 
-async def _store_chunks(
-    db: aiosqlite.Connection,
-    doc_id: str,
-    chunks: list,
-    document_version: int,
-) -> None:
+async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> None:
     """Store chunks into SQLite, replacing any existing ones.
 
     批量 executemany:OCR 长文档动辄数百 chunk,逐条 execute 的跨线程
@@ -378,11 +337,9 @@ async def _store_chunks(
     if chunks:
         await db.executemany(
             "INSERT INTO document_chunks (id, document_id, chunk_index, content, source_content, page, "
-            "start_char, token_count, header_breadcrumb, document_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "start_char, token_count, header_breadcrumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
-              c.start_char, c.token_count, c.header_breadcrumb, document_version)
-             for c in chunks],
+              c.start_char, c.token_count, c.header_breadcrumb) for c in chunks],
         )
 
 
@@ -421,7 +378,7 @@ async def _save_local_images(
         local_asset.write_bytes(asset.data)
 
     asset_metadata = [a.metadata() for a in assets]   # 含 sha256,闸门外算完
-    async with serialized_write(db):
+    async with _gated_write(db):
         await db.execute(
             "DELETE FROM documents WHERE source_kind = 'asset' AND metadata LIKE ?",
             (f'%"parent_document_id": "{doc_id}"%',),
@@ -473,29 +430,21 @@ async def _store_page_contents(
     from services.chunker import chunk_pages
     chunks = chunk_pages(page_contents)   # CPU 段在闸门外
 
-    async with serialized_write(db):
-        cursor = await db.execute("SELECT version FROM documents WHERE id = ?", (doc_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            raise LookupError(f"document {doc_id} not found for page replacement")
-        next_version = int(row[0] or 0) + 1
+    async with _gated_write(db):
         await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
         if page_contents:
             await db.executemany(
-                "INSERT INTO document_pages "
-                "(id, document_id, page, content, elements, document_version) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO document_pages (id, document_id, page, content, elements) VALUES (?, ?, ?, ?, ?)",
                 [(str(uuid.uuid4()), doc_id, page_num, content,
                   json.dumps((page_elements or {}).get(page_num))
-                  if (page_elements or {}).get(page_num) else None,
-                  next_version)
+                  if (page_elements or {}).get(page_num) else None)
                  for page_num, content in page_contents],
             )
-        await _store_chunks(db, doc_id, chunks, next_version)
+        await _store_chunks(db, doc_id, chunks)
         await db.execute(
             "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = ?, "
-            "parser = ?, version = ?, error_message = NULL, updated_at = datetime('now') WHERE id = ?",
-            (full_content, num_pages, parser, next_version, doc_id),
+            "parser = ?, updated_at = datetime('now') WHERE id = ?",
+            (full_content, num_pages, parser, doc_id),
         )
         await db.commit()
 
@@ -677,17 +626,12 @@ async def _process_spreadsheet(db: aiosqlite.Connection, doc_id: str, file_path:
     """Extract spreadsheet data (openpyxl / xlrd). Stores pages AND chunks for search."""
     sheets = await asyncio.to_thread(_read_sheet_rows, file_path)
 
-    async with serialized_write(db):
+    async with _gated_write(db):
         await _store_spreadsheet_rows(db, doc_id, sheets, file_path)
 
 
 async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
                                   sheets: list[tuple[str, list[str]]], file_path: Path) -> None:
-    cursor = await db.execute("SELECT version FROM documents WHERE id = ?", (doc_id,))
-    row = await cursor.fetchone()
-    if row is None:
-        raise LookupError(f"document {doc_id} not found for spreadsheet replacement")
-    next_version = int(row[0] or 0) + 1
     await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
 
     all_content = []
@@ -696,14 +640,13 @@ async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
     for i, (sheet_name, rows) in enumerate(sheets, 1):
         content = "\n".join(rows)
         page_rows.append((str(uuid.uuid4()), doc_id, i, content,
-                          json.dumps({"sheet_name": sheet_name}), next_version))
+                          json.dumps({"sheet_name": sheet_name})))
         all_content.append(f"## {sheet_name}\n\n{content}")
         page_contents.append((i, content))
     if page_rows:
         await db.executemany(
-            "INSERT INTO document_pages "
-            "(id, document_id, page, content, elements, document_version) "
-            "VALUES (?, ?, ?, ?, ?, ?)", page_rows,
+            "INSERT INTO document_pages (id, document_id, page, content, elements) "
+            "VALUES (?, ?, ?, ?, ?)", page_rows,
         )
 
     num_sheets = len(sheets)
@@ -711,13 +654,13 @@ async def _store_spreadsheet_rows(db: aiosqlite.Connection, doc_id: str,
 
     from services.chunker import chunk_pages
     chunks = chunk_pages(page_contents)
-    await _store_chunks(db, doc_id, chunks, next_version)
+    await _store_chunks(db, doc_id, chunks)
 
     parser = "xlrd" if file_path.suffix.lower() == ".xls" else "openpyxl"
     await db.execute(
         "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = ?, "
-        "parser = ?, version = ?, error_message = NULL, updated_at = datetime('now') WHERE id = ?",
-        (full_content, num_sheets, parser, next_version, doc_id),
+        "parser = ?, updated_at = datetime('now') WHERE id = ?",
+        (full_content, num_sheets, parser, doc_id),
     )
     await db.commit()
 
@@ -728,8 +671,7 @@ async def _process_image(db: aiosqlite.Connection, doc_id: str) -> None:
     """Images are stored as-is — just mark ready."""
     await db.execute(
         "UPDATE documents SET status = 'ready', extraction_attempts = 0, page_count = 1, "
-        "parser = 'native', version = version + 1, error_message = NULL, "
-        "updated_at = datetime('now') WHERE id = ?",
+        "parser = 'native', updated_at = datetime('now') WHERE id = ?",
         (doc_id,),
     )
     await db.commit()
@@ -749,37 +691,17 @@ async def _process_html(db: aiosqlite.Connection, doc_id: str, file_path: Path) 
 
     from services.chunker import chunk_text
     chunks = chunk_text(content)
-    async with serialized_write(db):
-        cursor = await db.execute("SELECT version FROM documents WHERE id = ?", (doc_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            raise LookupError(f"document {doc_id} not found for HTML replacement")
-        next_version = int(row[0] or 0) + 1
-        await _store_chunks(db, doc_id, chunks, next_version)
+    async with _gated_write(db):
+        await _store_chunks(db, doc_id, chunks)
         await db.execute(
             "UPDATE documents SET status = 'ready', extraction_attempts = 0, content = ?, page_count = 1, "
-            "parser = 'webmd', version = ?, error_message = NULL, updated_at = datetime('now') "
-            "WHERE id = ?",
-            (content, next_version, doc_id),
+            "parser = 'webmd', updated_at = datetime('now') WHERE id = ?",
+            (content, doc_id),
         )
         await db.commit()
 
 
 # ── Reconciliation queries ────────────────────────────────────────────────
-
-async def _inconsistent_ready_document_ids(db: aiosqlite.Connection) -> list[str]:
-    """Return ready non-assets whose derived chunks do not match their version."""
-    cursor = await db.execute(
-        "SELECT d.id FROM documents d "
-        "WHERE d.status = 'ready' AND d.source_kind != 'asset' AND ("
-        "EXISTS (SELECT 1 FROM document_chunks c "
-        "        WHERE c.document_id = d.id AND c.document_version != d.version) "
-        "OR (length(trim(COALESCE(d.content, ''))) >= ? AND NOT EXISTS "
-        "    (SELECT 1 FROM document_chunks c WHERE c.document_id = d.id)))",
-        (MIN_CHUNK_TOKENS * 4,),
-    )
-    return [row[0] for row in await cursor.fetchall()]
-
 
 async def _unchunked_extractable_ids(db: aiosqlite.Connection) -> list[str]:
     """IDs of never-processed extractable docs (PDF/Office/spreadsheet/HTML) with no chunks.
