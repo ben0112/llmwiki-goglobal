@@ -19,12 +19,22 @@
 | **去 SaaS 化** | 移除 Google OAuth、Pydantic Logfire、OpenReplay;MCP/API 认证改为**平台内生成的 API 密钥**(`sv_` 前缀 Bearer),不再依赖 GoTrue 的 OAuth 2.1 服务;对象存储支持任意 S3 兼容端点(MinIO 等) |
 | **自部署** | `deploy/docker-compose.selfhost.yml` + [`docs/self-hosting.md`](docs/self-hosting.md) 完整部署指南(自托管 Supabase + MinIO + docker compose) |
 
+## 架构与运维文档
+
+- [总体架构](docs/architecture/overview.md)：分层、数据流、存储职责与部署拓扑。
+- [共享内核与数据不变量](docs/architecture/shared-kernel.md)
+- [持久任务与多副本 Hosted 部署](docs/architecture/durable-jobs.md)
+- [检索评测与混合召回](docs/architecture/retrieval.md)
+- [服务端 RAG](docs/architecture/server-rag.md)
+- [大规模工作区有界读模型](docs/architecture/read-models.md)
+- [自托管指南](docs/self-hosting.md) · [智能体接入](docs/agent-integration.md)
+
 # 功能
 
 - **MCP 连接** — 任何 MCP 兼容客户端(桌面端、CLI、网页端智能体)读写、检索语料与维基
 - **八维语料库** — 每条语料一张"身份证"(阶段×大类主/副 + 六分面),按货架落位,分面检索、覆盖率账本、业务视图 7 类 27 场景导航
 - **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等
-- **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)
+- **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)；文件/Wiki/语料主屏采用最多 200 条的游标分页、服务端摘要和 ETag 条件刷新，不轮询全量文档数组
 - **治理闭环** — `lint` 八维检查、复审到期工作清单、KPI 仪表盘(分面完备率/货架覆盖率/时效达标率/引用溯源率)
 
 # 两种运行模式
@@ -75,12 +85,15 @@
 >
 > 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
 
+> **大工作区**:文件夹上传没有 200 文件总量上限；清单会按每批最多 200 个描述符、最多 2 个并发请求做预检。Web 列表只保留 3 页窄记录。旧版数万条数据库首次升级会在 readiness 前创建新索引，可能持续数分钟并占用一个 CPU 核，完成后不会每次重建。请按 [`docs/architecture/read-models.md`](docs/architecture/read-models.md) 在数据库副本上运行性能门禁，不要直接改动在线 `index.db`。
+
 **1. 安装**
 
 ```bash
 git clone https://github.com/ben0112/llmwiki-goglobal.git
 cd llmwiki-goglobal
 python -m venv .venv && source .venv/bin/activate
+pip install -e . --no-deps
 pip install -r api/requirements.txt -r mcp/requirements.txt
 cd web && npm install && cd ..
 ```
@@ -153,7 +166,7 @@ python3 -m corpus.import_annotations \
 |---|---|
 | Postgres + 账号认证 | 自托管 Supabase(官方 docker compose;仅需 db/auth/kong) |
 | 对象存储 | MinIO(或任意 S3 兼容存储,经 `S3_ENDPOINT_URL`) |
-| api / mcp / converter | `deploy/docker-compose.selfhost.yml` |
+| gateway / api / worker / mcp / converter | `deploy/docker-compose.selfhost.yml`；API 与 durable worker 可独立横向扩容 |
 | Web 前端 | `web/Dockerfile` 构建镜像(`NEXT_PUBLIC_*` 构建期烧入) |
 
 **步骤**:
@@ -177,7 +190,7 @@ curl -fsS https://mcp.example.com/health     # ok
 
 - **登录方式只有邮箱密码**(GoTrue 原生支持),无任何外部身份提供商。
 - **MCP / API 用 API 密钥**:每个用户在 **设置 → 连接 AI 助手 (MCP)** 生成 `sv_` 密钥,作为静态 `Authorization: Bearer` 头同时通行 MCP 与 REST API(SHA-256 哈希存储、可吊销、记录最近使用时间)。无需 OAuth 服务。
-- **`api` 只跑一个副本**(TUS 上传状态、WebSocket 连接与图谱重建锁为进程内状态)。
+- **Hosted 默认使用 durable worker、Redis AOF 与 S3 multipart TUS**；Postgres 是任务账本，API 无进程内已接受任务或上传状态。可用 `--scale api=2 --scale worker=2` 独立扩容，gateway 是唯一公网 API 入口。架构与恢复规则见 [`docs/architecture/durable-jobs.md`](docs/architecture/durable-jobs.md)。
 - **converter 与 Postgres 不得暴露公网**;MinIO 的 S3 端口需公网可达(浏览器直传预签名 URL)。
 
 **托管模式导入语料** — 直接写入 Postgres,条目落入指定账号的知识库,分面检索/Web 语料库/lint/关系层即刻可用:
@@ -192,6 +205,71 @@ python3 -m corpus.import_annotations \
 ```
 
 账号须已注册;知识库不存在则自动创建;单事务、幂等。
+
+## 服务端 RAG CLI（托管模式）
+
+服务端 RAG 默认关闭；管理员需在 API 与 durable worker 上显式启用 `SERVER_RAG_ENABLED=true`，并配置服务端模型 profile。CLI 只调用 LLMWiki REST，不接受模型供应商的 API key 或 base URL。`LLMWIKI_ACCESS_TOKEN` 用于认证 LLMWiki REST，**不是**模型供应商密钥。
+完整的迁移顺序、预算、恢复、隐私、灰度与 flag-only 回滚合同见
+[`docs/architecture/server-rag.md`](docs/architecture/server-rag.md)。
+
+从部署环境或 secret manager 加载 LLMWiki 地址和访问令牌，不要把令牌写入命令行或仓库：
+
+```bash
+export LLMWIKI_API_URL=https://api.example.com
+: "${LLMWIKI_ACCESS_TOKEN:?load the LLMWiki REST token from your secret store}"
+export LLMWIKI_ACCESS_TOKEN
+```
+
+创建并观察一次构建；`--json` 输出适合脚本消费的紧凑 JSON：
+
+```bash
+PYTHONPATH=api python -m scripts.rag build-wiki \
+  --knowledge-base 00000000-0000-0000-0000-000000000001 \
+  --goal "Build launch guidance" \
+  --target-prefix /wiki/launch/ \
+  --model-profile primary \
+  --idempotency-key launch-2026-07-26 \
+  --json
+
+PYTHONPATH=api python -m scripts.rag status \
+  00000000-0000-0000-0000-000000000002 --json
+
+PYTHONPATH=api python -m scripts.rag steps \
+  00000000-0000-0000-0000-000000000002 \
+  --after 0 --limit 50 --json
+```
+
+dry-run 仍创建持久 run，但不提交页面；预算参数均在发起网络请求前校验：
+
+```bash
+PYTHONPATH=api python -m scripts.rag build-wiki \
+  --knowledge-base 00000000-0000-0000-0000-000000000001 \
+  --goal "Preview launch guidance" \
+  --target-prefix /wiki/launch/ \
+  --model-profile primary \
+  --idempotency-key launch-preview-1 \
+  --dry-run --max-pages 3 --max-model-tokens 12000 --json
+```
+
+失败 run 可用更高预算显式续跑：
+
+```bash
+PYTHONPATH=api python -m scripts.rag resume \
+  00000000-0000-0000-0000-000000000002 \
+  --idempotency-key launch-resume-1 \
+  --max-pages 6 --max-model-tokens 24000 --json
+```
+
+取消仍由通用 durable job API 负责；使用 create 响应中的 `job_id`：
+
+```bash
+JOB_ID=00000000-0000-0000-0000-000000000003
+curl -fsS -X POST "$LLMWIKI_API_URL/v1/jobs/$JOB_ID/cancel" --config - <<CURL_CONFIG
+header = "Authorization: Bearer $LLMWIKI_ACCESS_TOKEN"
+CURL_CONFIG
+```
+
+CLI 退出码：`0` 成功，`2` 参数或本地配置错误，`3` REST/传输失败，`4` 输出失败。错误只输出稳定的 `code`/`category`，不会回显 bearer token、goal、供应商端点、响应正文或异常链。
 
 ---
 
@@ -219,6 +297,51 @@ python3 -m corpus.import_annotations \
 | 网页 | `.html` `.htm` | 清洗为可读 Markdown,去导航与广告 |
 | 文本与数据 | `.md` `.txt` `.csv` `.json` `.xml` `.yaml` `.svg` 等 | 直接索引分块 |
 | 图片 | `.png` `.jpg` `.webp` `.gif` | 存储并内联展示,智能体可按需读取 |
+
+# 检索评测 CLI
+
+仓库内置版本化的纯合成检索 cohort，可在不连接数据库、向量服务或外部 API 的情况下复现 lexical baseline：
+
+```bash
+PYTHONPATH=api python -m scripts.retrieval_eval \
+  --dataset tests/fixtures/retrieval/v1/cases.jsonl \
+  --profile lexical \
+  --output-json retrieval-baseline.json
+```
+
+CLI 从 dataset 同目录严格读取 `corpus.jsonl`，先应用 area、scope、facets、path glob、tags、document kind 与 annotated-only 过滤，再按正文/annotation 词项命中及标题排序信号产生可解释的确定性排名。它不会读取 relevance judgments 来生成排名。`--output-json` 使用临时文件加原子替换；已有普通文件可覆盖，目录、符号链接及其他非普通文件会被拒绝。stdout 与输出文件字节完全相同。
+
+在部署环境中比较该租户/知识库的真实 Postgres lexical 与 hybrid，并把 promotion gate 作为门禁。先通过 secret manager 或部署环境加载 `DATABASE_URL`、`EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS` 及 `HYBRID_*` 配置；不要把 DSN 或 API key 写进命令行：
+
+```bash
+: "${DATABASE_URL:?load DATABASE_URL from the deployment secret store}"
+: "${EMBEDDING_BASE_URL:?load EMBEDDING_BASE_URL}"
+: "${EMBEDDING_MODEL:?load EMBEDDING_MODEL}"
+: "${EMBEDDING_DIMENSIONS:?load EMBEDDING_DIMENSIONS}"
+export HYBRID_SEARCH_ENABLED=true
+export RETRIEVAL_EVAL_USER_ID=00000000-0000-0000-0000-000000000001
+export RETRIEVAL_EVAL_KNOWLEDGE_BASE_ID=00000000-0000-0000-0000-000000000002
+PYTHONPATH=api python -m scripts.retrieval_eval \
+  --dataset /controlled/private-retrieval-cases.jsonl \
+  --compare \
+  --hosted \
+  --require-promotion-gate \
+  --output-json /controlled/private-retrieval-report.json
+```
+
+lexical 是本地与托管模式的默认检索路径，不依赖模型或网络。托管模式已支持可选的 pgvector hybrid 检索：只有调用方显式传入 `retrieval_profile="hybrid"` 且 `HYBRID_SEARCH_ENABLED=true` 时才启用；通过 promotion gate 也只代表该 profile 有资格灰度，不会自动打开开关或改变默认值。向量存储/服务故障先在 adapter 边界清洗，再以已分类的可用性故障回退到 lexical 并标记 `lexical_fallback`；配置错误、lexical 故障、租户隔离错误及非可用性类意外错误不会被静默吞掉。
+
+`--hosted` 是受支持的真实 Postgres 入口，不需要 Python 级 retriever factory 注入。缺失/非法的静态 hosted 配置（租户、知识库、embedding profile 或空 DSN）会以稳定的 `hybrid_unavailable` 失败关闭；非空但格式错误、不可连接或运行时失效的 DSN 在创建 pool 时会被清洗为 `retrieval_failed`，不会回显连接信息。真实比较在同一只读 `REPEATABLE READ` 快照和同一 dataset digest 上执行；lexical 侧与 serving MCP 复用唯一的 Postgres compiler，执行完全相同的 PGroonga `&@~`、`pgroonga_score`、状态、scope、过滤和排序语义，不使用 evaluator 专有的全文检索近似。成功、失败和进程控制路径都会执行并验证数据库池与 embedding client 的异步清理，清理自身抛出的控制信号会被清洗后传播。门槛是 hybrid Recall@10 至少为 lexical 的 110%，且 p95 延迟不超过 lexical 的 2.0 倍。配置、模型安全切换、回填/重嵌入、私有评测集、迁移、灰度及回滚流程见 [`docs/architecture/retrieval.md`](docs/architecture/retrieval.md)。
+
+退出码：`0` 表示评测成功（未要求 gate 时，即使 promotion 不合格仍为 `0`）；`2` 表示参数、dataset、配置或 retrieval 错误；`3` 表示 `--require-promotion-gate` 已启用且 hybrid 未通过；`4` 表示报告输出失败。错误输出只含稳定的 `code`/`category`，不会回显路径、查询、文档内容或底层异常。
+
+当前 v1 synthetic lexical baseline（单行、键排序稳定）：
+
+```json
+{"case_count":2,"dataset_schema_version":1,"evaluation_dataset_digest":"5d9969be5644602a859b1d25eba44e3881b61eb11fd84a4eb2aec1edea5e02c5","metrics":{"filtered_result_count":3,"latency_p50_ms":0.0,"latency_p95_ms":0.0,"mrr":1.0,"ndcg_at_10":1.0,"recall_at_10":1.0,"recall_at_20":1.0,"recall_at_5":1.0},"profile":"lexical","schema_version":1}
+```
+
+报告只包含 dataset identity、profile 与聚合指标；不会写出 query text、document content、API key、embedding 或原始异常字符串。baseline latency 来自 retriever 的 `SearchResult.latency_ms`（合成 adapter 固定为 `0.0`），不把 wall-clock jitter 写入稳定报告。
 
 # 许可证
 

@@ -11,38 +11,31 @@ import {
   isMandatoryReview, reviewEntry,
 } from './ReviewBar'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, LayoutGrid, ListFilter, RefreshCw, X } from 'lucide-react'
+import { ArrowLeft, ChevronLeft, ChevronRight, LayoutGrid, ListFilter, RefreshCw, Search, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
-import { useKBDocuments } from '@/hooks/useKBDocuments'
+import { useCorpusEntries } from '@/hooks/useCorpusEntries'
 import {
-  buildBusinessView,
-  buildCoverageGrid,
-  businessPendingCount,
-  collectCorpusEntries,
-  collectFacetOptions,
-  collectWikiRollups,
-  computeKpis,
-  entryMatches,
+  buildBatchReviewTargetIds,
   FACET_LABELS,
-  filterEntries,
   LAYER_LABELS,
   LAYERS,
   reviewStatus,
   STAGE_LABELS,
   STAGES,
+  summaryBusinessPending,
+  summaryCoverage,
+  summaryFacetOptions,
+  summaryKpis,
+  type CorpusKpis,
+  type CoverageGrid,
   type CorpusEntry,
   type FacetKey,
   type FacetSelections,
 } from '@/lib/corpus'
-
-interface GraphEdge {
-  source: string
-  target: string
-  type: string
-}
+import type { CorpusSummary } from '@/lib/types'
 
 const PANEL_FACETS: FacetKey[] = [
   'stage', 'domain', 'genre', 'rule', 'evidence', 'origin',
@@ -54,13 +47,21 @@ const MAX_CHIPS = 12
 export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: string; kbName: string }) {
   const router = useRouter()
   const token = useUserStore((s) => s.accessToken)
-  const { documents, loading, refetchDocuments } = useKBDocuments(kbId)
   const [view, setView] = React.useState<'knowledge' | 'business'>('knowledge')
   const [selections, setSelections] = React.useState<FacetSelections>({})
-  const [citedDocIds, setCitedDocIds] = React.useState<Set<string> | null>(null)
+  const [queryInput, setQueryInput] = React.useState('')
+  const [query, setQuery] = React.useState('')
+  const [sort, setSort] = React.useState<'name' | 'stage' | 'domain' | 'review_due' | 'updated'>('name')
+  const corpus = useCorpusEntries({ kbId, token, selections, query, sort, direction: 'asc' })
+  const { entries, summary, loading } = corpus
   const [codetable, setCodetable] = React.useState<CodetableOptions | null>(null)
   const [editing, setEditing] = React.useState<CorpusEntry | null>(null)
   const [batchBusy, setBatchBusy] = React.useState(false)
+
+  React.useEffect(() => {
+    const timer = setTimeout(() => setQuery(queryInput), 250)
+    return () => clearTimeout(timer)
+  }, [queryInput])
 
   // 复核对话框的码表取值(本地模式;端点不存在时静默,操作按钮不受影响)
   React.useEffect(() => {
@@ -70,50 +71,25 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
       .catch(() => {})
   }, [token, codetable])
 
-  const onReviewed = React.useCallback(() => { refetchDocuments() }, [refetchDocuments])
+  const onReviewed = React.useCallback(() => { void corpus.reload() }, [corpus.reload])
 
   const batchApprove = React.useCallback(async (targets: CorpusEntry[]) => {
     if (!token || batchBusy) return
+    const targetIds = buildBatchReviewTargetIds(targets.map((entry) => entry.doc.id))
     setBatchBusy(true)
     try {
-      for (const e of targets) {
-        await reviewEntry(token, e.doc.id, 'approve', undefined, '批量通过(低风险)')
+      for (const id of targetIds) {
+        await reviewEntry(token, id, 'approve', undefined, '批量通过(低风险)')
       }
     } catch { /* 剩余条目留在队列 */ } finally {
       setBatchBusy(false)
-      refetchDocuments()
+      void corpus.reload()
     }
-  }, [token, batchBusy, refetchDocuments])
+  }, [token, batchBusy, corpus.reload])
 
-  // Citation targets from the reference graph power the 引用溯源率 KPI.
-  React.useEffect(() => {
-    let cancelled = false
-    apiFetch<{ edges: GraphEdge[] }>(`/v1/knowledge-bases/${kbId}/graph`, token ?? '')
-      .then((res) => {
-        if (cancelled) return
-        const cited = new Set<string>()
-        for (const edge of res.edges ?? []) {
-          if (edge.type === 'cites') cited.add(edge.target)
-        }
-        setCitedDocIds(cited)
-      })
-      .catch(() => {
-        // KPI simply shows — when the graph is unavailable.
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [kbId, token])
-
-  const entries = React.useMemo(() => collectCorpusEntries(documents), [documents])
-  const filtered = React.useMemo(() => filterEntries(entries, selections), [entries, selections])
-  const coverage = React.useMemo(() => buildCoverageGrid(entries), [entries])
-  const businessClasses = React.useMemo(() => buildBusinessView(entries), [entries])
-  const pendingBusiness = React.useMemo(() => businessPendingCount(entries), [entries])
-  const kpis = React.useMemo(
-    () => computeKpis(entries, citedDocIds, undefined, collectWikiRollups(documents)),
-    [entries, citedDocIds, documents],
-  )
+  const coverage = React.useMemo(() => summaryCoverage(summary), [summary])
+  const pendingBusiness = React.useMemo(() => summaryBusinessPending(summary), [summary])
+  const kpis = React.useMemo(() => summaryKpis(summary), [summary])
 
   const toggleFacet = React.useCallback((key: FacetKey, value: string) => {
     setSelections((prev) => {
@@ -138,11 +114,11 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
     try {
       await apiFetch(`/v1/corpus/entries/${entry.doc.id}/reprocess`, token, { method: 'POST' })
       toast.success('已开始重新识别:重新提取源文件后将自动重新分类入库')
-      setTimeout(refetchDocuments, 800)
+      setTimeout(() => { void corpus.reload() }, 800)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '重新识别失败')
     }
-  }, [token, refetchDocuments])
+  }, [token, corpus.reload])
 
   const activeSelections = Object.entries(selections).filter(([, v]) => v) as Array<[FacetKey, string]>
 
@@ -160,9 +136,32 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
         <span className="text-xs text-muted-foreground/40">/</span>
         <span className="text-sm font-medium">语料库</span>
         <span className="text-xs text-muted-foreground tabular-nums">
-          {filtered.length === entries.length ? `${entries.length} 条` : `${filtered.length} / ${entries.length} 条`}
+          {summary && summary.filtered_count !== summary.total_count
+            ? `${summary.filtered_count} / ${summary.total_count} 条`
+            : `${summary?.total_count ?? 0} 条`}
         </span>
         <div className="flex-1" />
+        <label className="flex h-7 w-52 items-center gap-1.5 rounded-md border border-border px-2 text-xs text-muted-foreground">
+          <Search className="size-3" />
+          <input
+            value={queryInput}
+            onChange={(event) => setQueryInput(event.target.value)}
+            placeholder="搜索标题或条目编号"
+            className="min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-muted-foreground/60"
+          />
+        </label>
+        <select
+          value={sort}
+          onChange={(event) => setSort(event.target.value as typeof sort)}
+          className="h-7 rounded-md border border-border bg-background px-2 text-xs text-muted-foreground outline-none"
+          aria-label="语料排序"
+        >
+          <option value="name">按名称</option>
+          <option value="stage">按阶段</option>
+          <option value="domain">按领域</option>
+          <option value="review_due">按复审日期</option>
+          <option value="updated">按更新时间</option>
+        </select>
         <div className="flex items-center rounded-md border border-border p-0.5 text-xs">
           <button
             onClick={() => setView('knowledge')}
@@ -195,7 +194,7 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">加载中…</div>
-      ) : entries.length === 0 ? (
+      ) : summary?.total_count === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
           <p className="text-sm font-medium">还没有已分类语料</p>
           <p className="text-xs text-muted-foreground max-w-md">
@@ -206,7 +205,8 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
         </div>
       ) : view === 'business' ? (
         <BusinessPane
-          classes={businessClasses}
+          classCounts={summary?.business_classes ?? {}}
+          sceneCounts={summary?.business_scenes ?? {}}
           pending={pendingBusiness}
           selections={selections}
           catalog={codetable?.business}
@@ -223,7 +223,7 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
               <FacetGroup
                 key={key}
                 facet={key}
-                entries={entries}
+                summary={summary}
                 selections={selections}
                 onToggle={toggleFacet}
               />
@@ -270,7 +270,7 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
               />
 
               {selections.state === '待复核' && (() => {
-                const lowRisk = filtered.filter(
+                const lowRisk = entries.filter(
                   (e) => reviewStatus(e.meta) === 'pending_review' && !isMandatoryReview(e.meta))
                 return lowRisk.length > 0 ? (
                   <div className="mb-2 flex items-center justify-between rounded-md border border-border bg-muted/30 px-3 py-1.5 text-xs">
@@ -284,8 +284,27 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
                   </div>
                 ) : null
               })()}
-              <EntryTable entries={filtered} onOpen={openEntry}
+              <EntryTable entries={entries} onOpen={openEntry}
                 onReviewed={onReviewed} onEdit={setEditing} onReprocess={reprocessEntry} />
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>本页 {entries.length} 条 · 每页最多 200 条</span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={corpus.loadPrevious}
+                    disabled={!corpus.hasPrevious || corpus.refreshing}
+                    className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <ChevronLeft className="size-3" /> 上一页
+                  </button>
+                  <button
+                    onClick={corpus.loadNext}
+                    disabled={!corpus.hasNext || corpus.refreshing}
+                    className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    下一页 <ChevronRight className="size-3" />
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -298,24 +317,18 @@ export function CorpusView({ kbId, kbSlug, kbName }: { kbId: string; kbSlug: str
 
 function FacetGroup({
   facet,
-  entries,
+  summary,
   selections,
   onToggle,
 }: {
   facet: FacetKey
-  entries: CorpusEntry[]
+  summary: CorpusSummary | null
   selections: FacetSelections
   onToggle: (key: FacetKey, value: string) => void
 }) {
   const [expanded, setExpanded] = React.useState(false)
-  // Options counted against entries filtered by every *other* facet, so counts
-  // reflect what selecting this value would actually return.
-  const options = React.useMemo(() => {
-    const others = { ...selections }
-    delete others[facet]
-    const base = entries.filter((e) => entryMatches(e.meta, others))
-    return collectFacetOptions(base, facet)
-  }, [entries, selections, facet])
+  // Server summary counts each facet against every other active filter.
+  const options = React.useMemo(() => summaryFacetOptions(summary, facet), [summary, facet])
 
   if (options.length === 0) return null
   const shown = expanded ? options : options.slice(0, MAX_CHIPS)
@@ -362,7 +375,7 @@ function FacetGroup({
 
 // ---------------------------------------------------------------------------
 
-function KpiStrip({ kpis, onShowPending }: { kpis: ReturnType<typeof computeKpis>; onShowPending: () => void }) {
+function KpiStrip({ kpis, onShowPending }: { kpis: CorpusKpis; onShowPending: () => void }) {
   const pct = (x: number) => (kpis.total ? `${Math.round((x / kpis.total) * 100)}%` : '—')
   const cells: Array<{ label: string; value: string; hint: string; alert?: boolean; onClick?: () => void }> = [
     { label: '分面完备率', value: pct(kpis.completeness), hint: '八维必填维度全非空的条目占比 (公理一)' },
@@ -427,7 +440,7 @@ function CoverageMatrix({
   selections,
   onSelectCell,
 }: {
-  coverage: ReturnType<typeof buildCoverageGrid>
+  coverage: CoverageGrid
   selections: FacetSelections
   onSelectCell: (stage: string, layer: string) => void
 }) {
@@ -611,25 +624,23 @@ interface MergedClass {
 
 /** 码表全目录 × 条目计数合并:目录给全集(0 条的缺口场景可见),条目给计数。 */
 function mergeBusinessCatalog(
-  classes: ReturnType<typeof buildBusinessView>,
+  classCounts: Record<string, number>,
+  sceneCounts: Record<string, number>,
   catalog: CodetableOptions['business'],
 ): MergedClass[] {
   if (!catalog?.length) {
-    return classes.map((cls) => ({
-      code: cls.code, name: cls.name, priority: cls.priority, count: cls.count,
-      scenes: cls.scenes.map((s) => ({ code: s.code, name: s.scene, count: s.count })),
+    return Object.entries(classCounts).sort(([a], [b]) => a.localeCompare(b)).map(([code, count]) => ({
+      code, name: code, priority: code, count,
+      scenes: Object.entries(sceneCounts)
+        .filter(([sceneCode]) => sceneCode === code || sceneCode.startsWith(`${code}.`))
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+        .map(([sceneCode, sceneCount]) => ({ code: sceneCode, name: sceneCode, count: sceneCount })),
     }))
-  }
-  const sceneCounts = new Map<string, number>()
-  const classCounts = new Map<string, number>()
-  for (const cls of classes) {
-    classCounts.set(cls.code, cls.count)
-    for (const s of cls.scenes) sceneCounts.set(s.code, s.count)
   }
   const merged = catalog.map((c) => ({
     code: c.code, name: c.name, priority: c.priority,
-    count: classCounts.get(c.code) ?? 0,
-    scenes: c.scenes.map((s) => ({ code: s.code, name: s.name, count: sceneCounts.get(s.code) ?? 0 })),
+    count: classCounts[c.code] ?? 0,
+    scenes: c.scenes.map((s) => ({ code: s.code, name: s.name, count: sceneCounts[s.code] ?? 0 })),
   }))
   merged.sort((a, b) => a.priority.localeCompare(b.priority) || a.code.localeCompare(b.code))
   return merged
@@ -646,21 +657,26 @@ function StatTile({ label, value, sub }: { label: string; value: React.ReactNode
 }
 
 function BusinessPane({
-  classes,
+  classCounts,
+  sceneCounts,
   pending,
   selections,
   catalog,
   onSelectScene,
 }: {
-  classes: ReturnType<typeof buildBusinessView>
+  classCounts: Record<string, number>
+  sceneCounts: Record<string, number>
   pending: number
   selections: FacetSelections
   catalog: CodetableOptions['business']
   onSelectScene: (code: string) => void
 }) {
-  const merged = React.useMemo(() => mergeBusinessCatalog(classes, catalog), [classes, catalog])
+  const merged = React.useMemo(
+    () => mergeBusinessCatalog(classCounts, sceneCounts, catalog),
+    [catalog, classCounts, sceneCounts],
+  )
 
-  if (classes.length === 0 && merged.length === 0) {
+  if (Object.keys(classCounts).length === 0 && merged.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
         <p className="text-sm font-medium">暂无业务视图数据</p>

@@ -3,19 +3,23 @@
 Verifies that PostgresVaultFS operations for User A cannot reach User B's data,
 and vice versa, across reads, writes, graph queries, and S3 key derivation.
 
-search_chunks is excluded: it needs PGroonga's `&@~` operator, which the test
-Postgres lacks. Its tenancy guards (`d.user_id = $3` plus RLS on
-document_chunks) are the same ones every other query here exercises.
+The test database installs a tiny deterministic text-search operator shim so
+the real Postgres adapter query can exercise retrieval isolation without
+requiring the PGroonga extension in this integration environment.
 """
 
+import json
 import os
 import uuid
 
 import asyncpg
-import pytest
-
-from vaultfs.postgres import PostgresVaultFS
 import db as mcp_db
+import pytest
+from vaultfs.base import search_hit_to_legacy_dict
+from vaultfs.postgres import PostgresVaultFS
+
+from llmwiki_core.models import EmbeddingProfile
+from llmwiki_core.search import RetrieverUnavailable, SearchHit, SearchQuery
 
 USER_A_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -50,6 +54,18 @@ async def pg_pool():
     await pool.execute("CREATE SCHEMA public")
     schema_sql = (Path(__file__).parent.parent.parent / "helpers" / "schema.sql").read_text()
     await pool.execute(schema_sql)
+    await pool.execute(
+        "CREATE FUNCTION test_text_search(text, text) RETURNS boolean "
+        "LANGUAGE sql IMMUTABLE STRICT AS "
+        "'SELECT strpos(lower($1), lower($2)) > 0'"
+    )
+    await pool.execute(
+        "CREATE OPERATOR &@~ (LEFTARG = text, RIGHTARG = text, FUNCTION = test_text_search)"
+    )
+    await pool.execute(
+        "CREATE FUNCTION pgroonga_score(oid, tid) RETURNS double precision "
+        "LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 0.0::double precision'"
+    )
 
     yield pool
     pool.terminate()
@@ -194,6 +210,149 @@ class TestReadIsolation:
     async def test_find_document_by_name_other_tenant_returns_none(self, fs_alice):
         doc = await fs_alice.find_document_by_name(str(KB_B_ID), "notes.md")
         assert doc is None
+
+    async def test_create_document_uses_exact_wiki_path_segment(
+        self,
+        fs_alice,
+        pg_pool,
+    ):
+        wikipedia = await fs_alice.create_document(
+            KB_A_ID,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "pdf",
+            "",
+            ["reference"],
+        )
+        wiki = await fs_alice.create_document(
+            KB_A_ID,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "pdf",
+            "",
+            ["wiki"],
+        )
+
+        rows = await pg_pool.fetch(
+            "SELECT id, source_kind FROM documents WHERE id = ANY($1::uuid[])",
+            [str(wikipedia["id"]), str(wiki["id"])],
+        )
+        by_id = {str(row["id"]): row["source_kind"] for row in rows}
+        assert by_id[str(wikipedia["id"])] == "source"
+        assert by_id[str(wiki["id"])] == "wiki"
+
+    async def test_retrieve_filters_before_limit_and_isolates_tenant(
+        self,
+        fs_alice,
+        pg_pool,
+    ):
+        async def insert_ranked(
+            *,
+            user_id: str,
+            kb_id: str,
+            path: str,
+            filename: str,
+            tags: list[str],
+            country: str,
+            source_content: str,
+        ) -> None:
+            doc_id = str(uuid.uuid4())
+            await pg_pool.execute(
+                "INSERT INTO documents "
+                "(id, knowledge_base_id, user_id, filename, title, path, source_kind, "
+                " file_type, status, tags, metadata, version) "
+                "VALUES ($1, $2, $3, $4, $4, $5, 'source', 'md', 'ready', $6, $7, 1)",
+                doc_id,
+                kb_id,
+                user_id,
+                filename,
+                path,
+                tags,
+                json.dumps(
+                    {
+                        "geo_country": [country],
+                        "_legacy_tags": 7,
+                        "source_hit": "user metadata source hit",
+                    }
+                ),
+            )
+            await pg_pool.execute(
+                "INSERT INTO document_chunks "
+                "(document_id, document_version, user_id, knowledge_base_id, chunk_index, "
+                " content, source_content, annotations_text, has_highlight, token_count) "
+                "VALUES ($1, 1, $2, $3, 0, $4, $5, 'permit annotation', true, 10)",
+                doc_id,
+                user_id,
+                kb_id,
+                f"{source_content}\npermit annotation",
+                source_content,
+            )
+
+        for index in range(4):
+            await insert_ranked(
+                user_id=USER_A_ID,
+                kb_id=KB_A_ID,
+                path="/excluded/",
+                filename=f"excluded-{index}.md",
+                tags=["reviewed", "asean"],
+                country="IDN",
+                source_content="permit source",
+            )
+        for index in range(3):
+            await insert_ranked(
+                user_id=USER_A_ID,
+                kb_id=KB_A_ID,
+                path="/corpus/idn/",
+                filename=f"eligible-{index}.md",
+                tags=["Reviewed", "ASEAN"],
+                country="IDN",
+                source_content="permit source",
+            )
+        await insert_ranked(
+            user_id=USER_B_ID,
+            kb_id=KB_B_ID,
+            path="/corpus/idn/",
+            filename="bob-eligible.md",
+            tags=["reviewed", "asean"],
+            country="IDN",
+            source_content="permit source",
+        )
+
+        result = await fs_alice.retrieve(
+            KB_A_ID,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                path_glob="/corpus/idn/*.md",
+                tags=["REVIEWED", "asean"],
+                area="sources",
+                document_kinds=["source"],
+                annotated_only=True,
+                scope="source",
+                facets={"country": "IDN"},
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+        assert all(hit.path.startswith("/corpus/idn/eligible-") for hit in result.hits)
+        assert all(hit.tags == ("asean", "reviewed") for hit in result.hits)
+        assert all(
+            dict(hit.metadata)
+            == {
+                "geo_country": ("IDN",),
+                "_legacy_tags": 7,
+                "source_hit": "user metadata source hit",
+            }
+            for hit in result.hits
+        )
+        assert all(
+            search_hit_to_legacy_dict(hit)["tags"] == ["Reviewed", "ASEAN"]
+            for hit in result.hits
+        )
 
     async def test_load_asset_bytes_other_tenant_returns_none(self, fs_alice, monkeypatch):
         calls: list[str] = []
@@ -438,3 +597,120 @@ class TestBidirectional:
     async def test_bob_cannot_get_alice_backlinks(self, fs_bob):
         links = await fs_bob.get_backlinks(str(DOC_A2_ID))
         assert links == []
+
+
+class TestHostedRetrievalIsolation:
+    profile = EmbeddingProfile("openai_compatible", "isolation-v1", 3)
+
+    async def _seed_chunk_and_vector(self, pg_pool, *, user_id, kb_id, doc_id, vector):
+        await pg_pool.execute(
+            "INSERT INTO document_chunks "
+            "(document_id, document_version, user_id, knowledge_base_id, chunk_index, "
+            "content, source_content, token_count) VALUES ($1, 1, $2, $3, 0, $4, $4, 3)",
+            doc_id,
+            user_id,
+            kb_id,
+            f"content-{doc_id}",
+        )
+        await pg_pool.execute(
+            "INSERT INTO chunk_embeddings "
+            "(user_id, knowledge_base_id, document_id, document_version, chunk_index, "
+            "provider, model, dimensions, embedding) "
+            "VALUES ($1, $2, $3, 1, 0, $4, $5, 3, $6::vector)",
+            user_id,
+            kb_id,
+            doc_id,
+            self.profile.provider,
+            self.profile.model,
+            vector,
+        )
+
+    async def test_vector_retrieval_is_tenant_and_kb_scoped(
+        self, fs_alice, pg_pool
+    ):
+        await self._seed_chunk_and_vector(
+            pg_pool,
+            user_id=USER_A_ID,
+            kb_id=KB_A_ID,
+            doc_id=DOC_A_ID,
+            vector="[1,0,0]",
+        )
+        await self._seed_chunk_and_vector(
+            pg_pool,
+            user_id=USER_B_ID,
+            kb_id=KB_B_ID,
+            doc_id=DOC_B_ID,
+            vector="[1,0,0]",
+        )
+
+        result = await fs_alice.retrieve_vector(
+            KB_A_ID,
+            SearchQuery.build(text="q", limit=5, candidate_limit=5),
+            embedding=(1.0, 0.0, 0.0),
+            profile=self.profile,
+        )
+
+        assert [hit.document_id for hit in result.hits] == [DOC_A_ID]
+        assert result.candidate_count == 1
+
+    async def test_absent_current_embedding_profile_is_typed_unavailable(
+        self, fs_alice
+    ):
+        with pytest.raises(RetrieverUnavailable, match="current embeddings"):
+            await fs_alice.retrieve_vector(
+                KB_A_ID,
+                SearchQuery.build(text="q", limit=1),
+                embedding=(1.0, 0.0, 0.0),
+                profile=self.profile,
+            )
+
+    async def test_graph_expansion_is_one_hop_current_and_tenant_scoped(
+        self, fs_alice, pg_pool
+    ):
+        for chunk_index in range(2):
+            await pg_pool.execute(
+                "INSERT INTO document_chunks "
+                "(document_id, document_version, user_id, knowledge_base_id, chunk_index, "
+                "content, source_content, token_count) "
+                "VALUES ($1, 1, $2, $3, $4, $5, $5, 3)",
+                DOC_A2_ID,
+                USER_A_ID,
+                KB_A_ID,
+                chunk_index,
+                f"alice-related-{chunk_index}",
+            )
+        await pg_pool.execute(
+            "INSERT INTO document_chunks "
+            "(document_id, document_version, user_id, knowledge_base_id, chunk_index, "
+            "content, source_content, token_count) VALUES ($1, 1, $2, $3, 0, 'bob', 'bob', 3)",
+            DOC_B2_ID,
+            USER_B_ID,
+            KB_B_ID,
+        )
+        await pg_pool.execute(
+            "INSERT INTO document_references "
+            "(source_document_id, target_document_id, knowledge_base_id, reference_type) "
+            "VALUES ($1, $2, $3, 'links_to')",
+            DOC_A_ID,
+            DOC_B2_ID,
+            KB_A_ID,
+        )
+        await pg_pool.execute(
+            "INSERT INTO document_references "
+            "(source_document_id, target_document_id, knowledge_base_id, reference_type) "
+            "VALUES ($1, $1, $2, 'links_to')",
+            DOC_A_ID,
+            KB_A_ID,
+        )
+        direct = SearchHit(DOC_A_ID, 1, 0, "direct", 1.0, "/wiki/notes.md")
+
+        expanded = await fs_alice.expand_references(
+            KB_A_ID,
+            SearchQuery.build(text="q", limit=3),
+            (direct,),
+            limit=2,
+        )
+
+        assert [(hit.document_id, hit.chunk_index) for hit in expanded] == [
+            (DOC_A2_ID, 0)
+        ]

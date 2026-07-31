@@ -14,10 +14,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
+from llmwiki_core.search import SearchArea, SearchQuery
 
 logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_schema.sql"
+_READ_SCHEMA_PATH = Path(__file__).parent.parent.parent.parent / "shared" / "sqlite_read_models.sql"
 
 _DOC_COLUMNS = (
     "id, user_id, filename, title, path, relative_path, source_kind, "
@@ -100,10 +102,18 @@ def _serialized(method):
 
 
 @asynccontextmanager
-async def serialized_write():
-    """Hold the local write lock around a multi-statement write outside the repos."""
+async def serialized_write(db: aiosqlite.Connection | None = None):
+    """Serialize a local write span and roll its active connection back on failure."""
     async with _write_lock:
-        yield
+        try:
+            yield
+        except Exception:
+            if db is not None:
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.warning("Rollback after failed serialized write also failed")
+            raise
 
 
 async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Connection:
@@ -121,14 +131,52 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         cur = await db.execute("PRAGMA table_info(workspace)")
         if "kind" not in {row[1] for row in await cur.fetchall()}:
             await db.execute("ALTER TABLE workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'wiki'")
+        await _ensure_read_model_schema(db)
         cur = await db.execute("PRAGMA table_info(documents)")
         if "extraction_attempts" not in {row[1] for row in await cur.fetchall()}:
             await db.execute(
                 "ALTER TABLE documents ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0")
+        await _ensure_derived_version_columns(db)
         await _migrate_fts_tokenizer(db, schema)
         await _migrate_reference_types(db, schema)
         await db.commit()
     return db
+
+
+async def _ensure_read_model_schema(db: aiosqlite.Connection) -> None:
+    """Backfill durable read state before installing triggers and indexes."""
+    cursor = await db.execute("PRAGMA table_info(workspace)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if "read_revision" not in columns:
+        await db.execute(
+            "ALTER TABLE workspace ADD COLUMN read_revision "
+            "INTEGER NOT NULL DEFAULT 1 CHECK (read_revision > 0)"
+        )
+    await db.executescript(_READ_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+async def _ensure_derived_version_columns(db: aiosqlite.Connection) -> None:
+    """Add and backfill derived-version columns in pre-migration workspaces."""
+    for table in ("document_pages", "document_chunks"):
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "document_version" not in columns:
+            await db.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0"
+            )
+            await db.execute(
+                f"UPDATE {table} SET document_version = "
+                f"COALESCE((SELECT version FROM documents WHERE id = {table}.document_id), 0)"
+            )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pages_document_version "
+        "ON document_pages(document_id, document_version)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_document_version "
+        "ON document_chunks(document_id, document_version)"
+    )
 
 
 async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> None:
@@ -767,7 +815,15 @@ class SQLiteChunkRepository:
         self._db = db
 
     @_serialized
-    async def store(self, doc_id: str, user_id: str, kb_id: str, chunks: list) -> None:
+    async def store(
+        self,
+        doc_id: str,
+        user_id: str,
+        kb_id: str,
+        chunks: list,
+        *,
+        document_version: int,
+    ) -> None:
         await self._db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
         if not chunks:
             await self._db.commit()
@@ -778,11 +834,12 @@ class SQLiteChunkRepository:
         # into the chunk later. See api/services/highlight_chunks.
         await self._db.executemany(
             "INSERT INTO document_chunks "
-            "(id, document_id, chunk_index, content, source_content, page, start_char, token_count, header_breadcrumb) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, document_id, chunk_index, content, source_content, page, start_char, "
+            "token_count, header_breadcrumb, document_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
-                 c.start_char, c.token_count, c.header_breadcrumb)
+                 c.start_char, c.token_count, c.header_breadcrumb, document_version)
                 for c in chunks
             ],
         )
@@ -793,6 +850,10 @@ class SQLiteChunkRepository:
         self, kb_id: str, query: str, *, limit: int = 20,
         path_filter: str | None = None, user_id: str | None = None,
     ) -> list[dict]:
+        request = SearchQuery.build(text=query, limit=limit, area=path_filter)
+        query = request.text
+        limit = request.limit
+        path_filter = None if request.area is SearchArea.ALL else request.area.value
         match_expr = build_fts_match(query)
         params: list = []
         if match_expr is not None:

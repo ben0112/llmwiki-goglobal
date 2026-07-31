@@ -1,8 +1,12 @@
 """rebuild_local must rebuild the reference graph atomically — a mid-rebuild
 failure rolls back so the graph is never left wiped."""
 
+import os
+import subprocess
+import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiosqlite
 import pytest
@@ -23,8 +27,13 @@ async def _init_db() -> aiosqlite.Connection:
 
 
 async def _insert_doc(
-    db: aiosqlite.Connection, filename: str, path: str, source_kind: str,
-    file_type: str, content: str | None, number: int,
+    db: aiosqlite.Connection,
+    filename: str,
+    path: str,
+    source_kind: str,
+    file_type: str,
+    content: str | None,
+    number: int,
 ) -> str:
     doc_id = str(uuid.uuid4())
     title = filename.rsplit(".", 1)[0].title()
@@ -49,16 +58,19 @@ async def test_rebuild_local_builds_citation_edges():
     db = await _init_db()
     paper = await _insert_doc(db, "paper.pdf", "/", "source", "pdf", None, 1)
     await _insert_doc(
-        db, "a.md", "/wiki/", "wiki", "md",
-        "Intro text.\n\n[^1]: paper.pdf, p.3", 2,
+        db,
+        "a.md",
+        "/wiki/",
+        "wiki",
+        "md",
+        "Intro text.\n\n[^1]: paper.pdf, p.3",
+        2,
     )
 
     result = await rebuild_local(db, USER_ID)
 
     assert result == {"citations": 1, "links": 0, "facet_rollups": 0}
-    cursor = await db.execute(
-        "SELECT target_document_id, reference_type, page FROM document_references"
-    )
+    cursor = await db.execute("SELECT target_document_id, reference_type, page FROM document_references")
     rows = await cursor.fetchall()
     assert rows == [(paper, "cites", 3)]
 
@@ -94,3 +106,58 @@ async def test_rebuild_local_rolls_back_on_failure(monkeypatch):
     assert await _ref_count(db) == 1
 
     await db.close()
+
+
+async def test_local_graph_route_still_calls_synchronous_rebuild_directly(monkeypatch):
+    import routes.local_graph as local_graph
+
+    db = object()
+    expected = {"citations": 2, "links": 3, "facet_rollups": 1}
+    calls = []
+
+    async def rebuild_directly(received_db, user_id):
+        calls.append((received_db, user_id))
+        return expected
+
+    monkeypatch.setattr(local_graph, "rebuild_local", rebuild_directly)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(sqlite_db=db)))
+
+    result = await local_graph.rebuild_references("ignored-kb", USER_ID, request)
+
+    assert result == expected
+    assert calls == [(db, USER_ID)]
+
+
+def test_local_graph_registration_does_not_load_durable_job_modules():
+    root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.update(
+        {
+            "MODE": "local",
+            "PYTHONPATH": str(root / "api"),
+            "DURABLE_JOBS_ENABLED": "false",
+            "TUS_MULTIPART_ENABLED": "false",
+            "REDIS_URL": "",
+        }
+    )
+    probe = (
+        "import sys; import main; "
+        "routes={route.path: route for route in main.app.routes}; "
+        "route=routes['/v1/knowledge-bases/{kb_id}/graph/rebuild']; "
+        "assert route.endpoint.__module__ == 'routes.local_graph'; "
+        "blocked=('jobs', 'routes.jobs', 'routes.graph', 'redis', 'arq'); "
+        "assert not [name for name in sys.modules "
+        "if any(name == prefix or name.startswith(prefix + '.') for prefix in blocked)]"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -12,6 +12,14 @@ from pydantic import BaseModel, Field
 class DownloadedPdf:
     data: bytes
     filename: str
+
+
+class IngestedPdf(TypedDict):
+    id: str
+    filename: str
+    status: str
+    already_exists: bool
+    job_id: str
 
 
 class CreateKB(BaseModel):
@@ -52,6 +60,7 @@ class CreateNote(BaseModel):
 class HighlightAnchor(BaseModel):
     """DOM-relative anchor: where the highlight lives on the live page.
     Used by the Chrome extension to re-apply highlights on revisit."""
+
     xpath: str = Field(max_length=2000)
     endXPath: str | None = Field(default=None, max_length=2000)
     startOffset: int = Field(ge=0)
@@ -69,6 +78,7 @@ class TextAnchor(BaseModel):
     Computed at save time by the html_parser when a web clip is saved with
     highlights — the parser maps each DOM anchor to its plaintext position.
     """
+
     textStart: int = Field(ge=0)
     textEnd: int = Field(ge=0)
     textContent: str = Field(max_length=10000)
@@ -79,6 +89,7 @@ class TextAnchor(BaseModel):
 class PdfRect(BaseModel):
     """One line-rect of a PDF highlight, in PDF user-space points (1/72").
     Zoom/rotation independent — viewer converts to viewport coords at render."""
+
     x: float
     y: float
     width: float = Field(ge=0)
@@ -88,6 +99,7 @@ class PdfRect(BaseModel):
 class PdfAnchor(BaseModel):
     """PDF-relative anchor used when Highlight.type == "pdf".
     Stored once per highlight; one rect per visual line of the selection."""
+
     page: int = Field(ge=1)
     textContent: str = Field(max_length=10000)
     prefix: str | None = Field(default=None, max_length=200)
@@ -115,12 +127,14 @@ class UpsertHighlight(BaseModel):
     """Single-entry idempotent upsert. Server matches by `highlight.id` and
     replaces the matching entry, or appends if absent. Re-posting the same
     payload twice is a no-op semantically (same final state)."""
+
     highlight: Highlight
     expectedVersion: int | None = None
 
 
 class DeleteHighlight(BaseModel):
     """Optional body for the DELETE granular endpoint. Empty body is fine."""
+
     expectedVersion: int | None = None
 
 
@@ -128,7 +142,6 @@ class CreateFromUrl(BaseModel):
     knowledge_base_id: UUID
     url: str = Field(max_length=2048)
     path: str = Field(default="/", max_length=256)
-
 
 
 class UpdateContent(BaseModel):

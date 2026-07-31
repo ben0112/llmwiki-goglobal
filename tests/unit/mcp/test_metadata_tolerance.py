@@ -8,8 +8,6 @@ MCP 客户端因此拿不到任何源文件。
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 SCHEMA = (Path(__file__).parents[3] / "shared" / "sqlite_schema.sql").read_text(encoding="utf-8")
 
 
@@ -72,15 +70,23 @@ def test_to_dir_path_always_leading_slash():
     assert h._to_dir_path("笔记.md") == "/"
 
 
-def test_facet_rollup_helper_copies_in_sync():
-    """mcp 与 api 两份 facet_rollup 拷贝必须一致(同 parse_citation 模式)。"""
-    from pathlib import Path
-    mcp_copy = Path(__file__).parents[3] / "mcp" / "vaultfs" / "facet_rollup.py"
-    api_copy = Path(__file__).parents[3] / "api" / "services" / "facet_rollup.py"
-    mcp_text = mcp_copy.read_text(encoding="utf-8")
-    api_text = api_copy.read_text(encoding="utf-8")
-    # api 侧在共同部分之后追加批量刷新;共同前缀必须逐字一致
-    assert api_text.startswith(mcp_text.rstrip() + "\n")
+def test_facet_rollup_adapters_share_core_functions():
+    """API 与 MCP 适配器必须复用共享内核语义。"""
+    import importlib.util
+
+    from llmwiki_core.facets import apply_rollup, rollup_from_metas
+    from vaultfs import facet_rollup as mcp_rollup
+
+    api_path = Path(__file__).parents[3] / "api" / "services" / "facet_rollup.py"
+    spec = importlib.util.spec_from_file_location("api_facet_rollup_adapter", api_path)
+    assert spec is not None and spec.loader is not None
+    api_rollup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api_rollup)
+
+    assert api_rollup.apply_rollup is apply_rollup
+    assert api_rollup.rollup_from_metas is rollup_from_metas
+    assert mcp_rollup.apply_rollup is apply_rollup
+    assert mcp_rollup.rollup_from_metas is rollup_from_metas
 
 
 def test_wiki_coverage_summary():

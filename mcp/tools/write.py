@@ -1,6 +1,7 @@
 """Write tools — create, edit, and append wiki pages and notes."""
 
 import re
+import uuid
 import yaml
 from datetime import date
 
@@ -8,8 +9,9 @@ from mcp.server.fastmcp import FastMCP, Context
 
 from vaultfs import VaultFS
 from vaultfs.base import DuplicateDocumentError
+from llmwiki_core.references import build_lookup_maps, extract_references
+from llmwiki_core.wiki import VersionConflict, WikiWriteBundle
 from .helpers import deep_link, resolve_path
-from .references import update_references
 
 _ASSET_EXTENSIONS = {".svg", ".csv", ".json", ".xml", ".html"}
 _FILE_EXT_RE = re.compile(r"\.(md|txt|svg|csv|json|xml|html)$", re.IGNORECASE)
@@ -225,18 +227,32 @@ class WriteHandler:
         fm_date, fm_metadata = _extract_metadata(meta)
         saved_date = _effective_date(content, date_str)
 
-        if existing:
-            await self.fs.update_document(
-                str(existing["id"]),
-                content,
-                effective_tags,
-                title=title,
-                date=saved_date,
-                metadata=fm_metadata,
-            )
-            doc = existing
-        else:
-            try:
+        try:
+            if self._is_wiki_markdown(dir_path, file_type):
+                document_id = str(existing["id"]) if existing else str(uuid.uuid4())
+                doc = await self._write_wiki(
+                    document_id=document_id,
+                    expected_version=int(existing["version"]) if existing else None,
+                    filename=filename,
+                    dir_path=dir_path,
+                    file_type=file_type,
+                    content=content,
+                    title=title,
+                    tags=effective_tags,
+                    date_str=saved_date,
+                    metadata=fm_metadata,
+                )
+            elif existing:
+                await self.fs.update_document(
+                    str(existing["id"]),
+                    content,
+                    effective_tags,
+                    title=title,
+                    date=saved_date,
+                    metadata=fm_metadata,
+                )
+                doc = existing
+            else:
                 doc = await self.fs.create_document(
                     self.kb_id,
                     filename,
@@ -248,14 +264,17 @@ class WriteHandler:
                     date=saved_date,
                     metadata=fm_metadata,
                 )
-            except DuplicateDocumentError:
-                return (
-                    f"Error: `{dir_path}{filename}` already exists. "
-                    f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
-                )
+        except DuplicateDocumentError:
+            await self._restore_disk_from_database(dir_path, filename)
+            return (
+                f"Error: `{dir_path}{filename}` already exists. "
+                f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
+            )
+        except VersionConflict:
+            await self._restore_disk_from_database(dir_path, filename)
+            return f"Error: `{dir_path}{filename}` changed concurrently; read it again before writing."
 
         doc_id = str(doc["id"])
-        await self._sync_references(doc_id, content, dir_path, file_type)
 
         impact = await self._get_wiki_impact(doc_id, dir_path)
         return self._format_create_response(
@@ -288,16 +307,33 @@ class WriteHandler:
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(
-            str(doc["id"]),
-            new_content,
-            _effective_tags(new_content, None),
-            date=fm_date,
-            metadata=fm_metadata,
-        )
+        try:
+            if self._is_wiki_markdown(dir_path, doc["file_type"]):
+                await self._write_wiki(
+                    document_id=str(doc["id"]),
+                    expected_version=int(doc["version"]),
+                    filename=filename,
+                    dir_path=dir_path,
+                    file_type=doc["file_type"],
+                    content=new_content,
+                    title=doc.get("title"),
+                    tags=_effective_tags(new_content, None) or doc.get("tags") or [],
+                    date_str=fm_date or doc.get("date"),
+                    metadata=fm_metadata,
+                )
+            else:
+                await self.fs.update_document(
+                    str(doc["id"]),
+                    new_content,
+                    _effective_tags(new_content, None),
+                    date=fm_date,
+                    metadata=fm_metadata,
+                )
+        except VersionConflict:
+            await self._restore_disk_from_database(dir_path, filename)
+            return f"Error: `{path}` changed concurrently; read it again before editing."
 
         doc_id = str(doc["id"])
-        await self._sync_references(doc_id, new_content, dir_path)
 
         snippet = self._extract_context(new_content, replace_start, len(new_text))
         impact = await self._get_wiki_impact(doc_id, dir_path)
@@ -315,27 +351,96 @@ class WriteHandler:
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(
-            str(doc["id"]),
-            new_content,
-            _effective_tags(new_content, None),
-            date=fm_date,
-            metadata=fm_metadata,
-        )
+        try:
+            if self._is_wiki_markdown(dir_path, doc["file_type"]):
+                await self._write_wiki(
+                    document_id=str(doc["id"]),
+                    expected_version=int(doc["version"]),
+                    filename=filename,
+                    dir_path=dir_path,
+                    file_type=doc["file_type"],
+                    content=new_content,
+                    title=doc.get("title"),
+                    tags=_effective_tags(new_content, None) or doc.get("tags") or [],
+                    date_str=fm_date or doc.get("date"),
+                    metadata=fm_metadata,
+                )
+            else:
+                await self.fs.update_document(
+                    str(doc["id"]),
+                    new_content,
+                    _effective_tags(new_content, None),
+                    date=fm_date,
+                    metadata=fm_metadata,
+                )
+        except VersionConflict:
+            await self._restore_disk_from_database(dir_path, filename)
+            return f"Error: `{path}` changed concurrently; read it again before appending."
 
         doc_id = str(doc["id"])
-        await self._sync_references(doc_id, new_content, dir_path)
 
         impact = await self._get_wiki_impact(doc_id, dir_path)
         return self._format_append_response(path, dir_path, filename) + impact
 
-    async def _sync_references(self, doc_id: str, content: str, dir_path: str, file_type: str = "md") -> None:
-        """Update citation graph and propagate staleness for wiki pages."""
-        if dir_path.startswith("/wiki/") and file_type == "md":
-            await update_references(self.fs, self.kb_id, doc_id, content, dir_path)
-            await self.fs.propagate_staleness(doc_id)
-            # 引用边更新后立刻重算本页的分面聚合(facet_rollup)
-            await self.fs.refresh_facet_rollup(doc_id)
+    @staticmethod
+    def _is_wiki_markdown(dir_path: str, file_type: str) -> bool:
+        return dir_path.startswith("/wiki/") and file_type == "md"
+
+    async def _write_wiki(
+        self,
+        *,
+        document_id: str,
+        expected_version: int | None,
+        filename: str,
+        dir_path: str,
+        file_type: str,
+        content: str,
+        title: str | None,
+        tags: list[str],
+        date_str: str | None,
+        metadata: dict,
+    ) -> dict:
+        """Build and commit one complete wiki revision."""
+        all_docs = await self.fs.list_documents(self.kb_id)
+        if not any(str(document["id"]) == document_id for document in all_docs):
+            all_docs.append(
+                {
+                    "id": document_id,
+                    "filename": filename,
+                    "title": title,
+                    "path": dir_path,
+                }
+            )
+        filename_to_doc, base_to_doc, wiki_path_to_doc = build_lookup_maps(all_docs)
+        wiki_relative_dir = dir_path.replace("/wiki/", "", 1)
+        edges = extract_references(
+            content,
+            document_id,
+            wiki_relative_dir,
+            filename_to_doc,
+            base_to_doc,
+            wiki_path_to_doc,
+        )
+        bundle = WikiWriteBundle.build(
+            document_id=document_id,
+            expected_version=expected_version,
+            filename=filename,
+            path=dir_path,
+            file_type=file_type,
+            content=content,
+            title=title,
+            tags=tags,
+            date=date_str,
+            metadata=metadata,
+            edges=edges,
+        )
+        return await self.fs.write_wiki_bundle(self.kb_id, bundle)
+
+    async def _restore_disk_from_database(self, dir_path: str, filename: str) -> None:
+        """Undo a losing local disk replacement after a CAS or create conflict."""
+        current = await self.fs.get_document(self.kb_id, filename, dir_path)
+        if current is not None:
+            self.fs.write_to_disk(dir_path, filename, current.get("content") or "")
 
     async def _get_wiki_impact(self, doc_id: str, dir_path: str) -> str:
         """Return impact surface text for wiki pages, empty string otherwise."""

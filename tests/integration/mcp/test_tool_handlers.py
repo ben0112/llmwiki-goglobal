@@ -4,20 +4,32 @@ Tests the full flow through WriteHandler, ReadHandler, SearchHandler, DeleteHand
 Uses SqliteVaultFS with a temp workspace — no Postgres needed.
 """
 
+import asyncio
+import logging
+import uuid
+
 import pytest
-from tests.integration.mcp.conftest import TEST_USER_ID
+
+from llmwiki_core.search import SearchQuery, SearchResult
+from tests.helpers.telemetry_contract import assert_telemetry_event
 
 
 def _make_kb(kb_id: str) -> dict:
     return {"id": kb_id, "name": "test-workspace", "slug": "test-workspace"}
 
 
+def _linked_retrieval_control(signal):
+    failure = RuntimeError("private wrapper")
+    failure.__cause__ = signal
+    return failure
+
+
 class TestWriteReadFlow:
 
     async def test_create_then_read_round_trip(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -37,6 +49,36 @@ class TestWriteReadFlow:
         writer = WriteHandler(instance, _make_kb(kb_id))
         result = await writer.create("/wiki/", "Concepts", "# Concepts", ["overview"], "", False)
         assert "cite sources" in result.lower() or "footnotes" in result.lower()
+
+    async def test_wiki_writes_commit_reference_graph_with_revision(self, fs):
+        instance, kb_id = fs
+        from tools.write import WriteHandler
+
+        source = await instance.create_document(
+            kb_id, "source.pdf", "Source", "/", "pdf", "", ["source"]
+        )
+        writer = WriteHandler(instance, _make_kb(kb_id))
+        await writer.create(
+            "/wiki/",
+            "Atomic References",
+            "Claim.[^1]\n\n[^1]: source.pdf, p.7",
+            ["wiki"],
+            "",
+            False,
+        )
+
+        page = await instance.get_document(kb_id, "atomic-references.md", "/wiki/")
+        refs = await instance.get_forward_references(str(page["id"]))
+        assert [(str(row["id"]), row["reference_type"], row["page"]) for row in refs] == [
+            (str(source["id"]), "cites", 7)
+        ]
+
+        await writer.edit(
+            "wiki/atomic-references.md",
+            "Claim.[^1]\n\n[^1]: source.pdf, p.7",
+            "Claim without a citation.",
+        )
+        assert await instance.get_forward_references(str(page["id"])) == []
 
     async def test_create_wiki_page_adds_frontmatter_from_args(self, fs):
         instance, kb_id = fs
@@ -84,8 +126,8 @@ class TestWriteReadFlow:
 
     async def test_create_uses_frontmatter_tags_as_index_source(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -114,8 +156,8 @@ class TestWriteReadFlow:
 
     async def test_create_with_overwrite_replaces_content(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -130,8 +172,8 @@ class TestWriteReadFlow:
 
     async def test_edit_replaces_text(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -165,8 +207,8 @@ class TestWriteReadFlow:
 
     async def test_edit_keeps_index_synced_to_frontmatter_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -187,8 +229,8 @@ class TestWriteReadFlow:
 
     async def test_append_adds_content(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -204,8 +246,8 @@ class TestWriteReadFlow:
 
     async def test_append_inserts_before_trailing_footnotes(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -227,8 +269,8 @@ class TestWriteReadFlow:
 
     async def test_append_renumbers_colliding_footnotes(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -255,8 +297,8 @@ class TestWriteReadFlow:
 
     async def test_append_keeps_index_synced_to_frontmatter_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -288,8 +330,8 @@ class TestLintTool:
 
     async def test_lint_passes_clean_wiki_page(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.lint import LintHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -569,8 +611,8 @@ class TestReadModes:
 
     async def test_read_falls_back_to_title(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -582,8 +624,8 @@ class TestReadModes:
 
     async def test_read_sections_filters_headings(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -597,8 +639,8 @@ class TestReadModes:
 
     async def test_read_glob_batch(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -633,11 +675,9 @@ class TestReadModes:
 
     async def test_read_backlinks_shown(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.read import ReadHandler
 
         kb = _make_kb(kb_id)
-        writer = WriteHandler(instance, kb)
         reader = ReadHandler(instance, kb)
 
         target = await instance.create_document(kb_id, "target.md", "Target", "/wiki/", "md", "target content", ["tag"])
@@ -652,8 +692,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_list_groups_sources_and_wiki(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -668,8 +708,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_list_filters_by_tags(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -684,8 +724,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_search_chunks_after_indexing(self, fs, insert_chunk):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.search import SearchHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -697,6 +737,133 @@ class TestSearchDeleteLifecycle:
 
         result = await searcher.search_chunks("quantum", "*", None, 10)
         assert "quantum" in result.lower()
+
+    async def test_omitted_and_explicit_lexical_profiles_are_byte_identical_and_observed(
+        self, fs, insert_chunk, caplog
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        doc = await instance.create_document(
+            kb_id, "compat.md", "Compat", "/", "md", "", ["search"]
+        )
+        await insert_chunk(str(doc["id"]), kb_id, "stable lexical output")
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        with caplog.at_level(logging.INFO, logger="services.retrieval"):
+            omitted = await searcher.search_chunks("stable", "*", None, 10)
+        omitted_event = assert_telemetry_event(
+            caplog,
+            "retrieval_finished",
+            expected={"profile": "lexical", "result_count": 1},
+        )
+        assert_telemetry_event(caplog, "retrieval_fallback", count=0)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="services.retrieval"):
+            explicit = await searcher.search_chunks(
+                "stable", "*", None, 10, retrieval_profile="lexical"
+            )
+        explicit_event = assert_telemetry_event(
+            caplog,
+            "retrieval_finished",
+            expected={"profile": "lexical", "result_count": 1},
+        )
+        assert_telemetry_event(caplog, "retrieval_fallback", count=0)
+
+        assert explicit.encode() == omitted.encode()
+        assert omitted_event["retrieval_id"] != explicit_event["retrieval_id"]
+
+    async def test_lexical_handler_ordinary_telemetry_failure_never_masks_output(
+        self,
+        fs,
+        monkeypatch,
+    ):
+        instance, kb_id = fs
+        from services import retrieval
+        from tools.search import SearchHandler
+
+        calls = []
+
+        def failing_sink(event, **_fields):
+            calls.append(event)
+            raise RuntimeError("private sink")
+
+        monkeypatch.setattr(retrieval, "_log_telemetry", failing_sink)
+        result = await SearchHandler(instance, _make_kb(kb_id)).search_chunks(
+            "stable", "*", None, 10
+        )
+
+        assert result == "No matches for `stable` in test-workspace."
+        assert calls == ["retrieval_finished"]
+
+    @pytest.mark.parametrize(
+        ("signal", "expected", "exit_code"),
+        [
+            (KeyboardInterrupt("private"), KeyboardInterrupt, None),
+            (SystemExit("private"), SystemExit, 1),
+            (asyncio.CancelledError("private"), asyncio.CancelledError, None),
+            (GeneratorExit("private"), GeneratorExit, None),
+            (
+                _linked_retrieval_control(asyncio.CancelledError("private")),
+                asyncio.CancelledError,
+                None,
+            ),
+            (
+                BaseExceptionGroup(
+                    "private", [RuntimeError("ordinary"), KeyboardInterrupt("private")]
+                ),
+                KeyboardInterrupt,
+                None,
+            ),
+        ],
+    )
+    async def test_lexical_handler_telemetry_controls_propagate_sanitized(
+        self,
+        fs,
+        monkeypatch,
+        signal,
+        expected,
+        exit_code,
+    ):
+        instance, kb_id = fs
+        from services import retrieval
+        from tools.search import SearchHandler
+
+        def signal_sink(*_args, **_kwargs):
+            raise signal
+
+        monkeypatch.setattr(retrieval, "_log_telemetry", signal_sink)
+        with pytest.raises(expected) as raised:
+            await SearchHandler(instance, _make_kb(kb_id)).search_chunks(
+                "private", "*", None, 10
+            )
+
+        assert raised.value.args in ((), (exit_code,))
+        assert "private" not in str(raised.value)
+        assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+    async def test_local_search_strictly_rejects_hybrid_and_unknown_profiles(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        with pytest.raises(ValueError, match="hybrid retrieval is unavailable"):
+            await searcher.search_chunks(
+                "query", "*", None, 10, retrieval_profile="hybrid"
+            )
+        with pytest.raises(ValueError, match="unsupported retrieval profile"):
+            await searcher.search_chunks(
+                "query", "*", None, 10, retrieval_profile="unknown"
+            )
+
+    async def test_search_chunks_uses_shared_limit_contract(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            await searcher.search_chunks("query", "*", None, 101)
 
     async def test_search_chunks_respects_file_glob(self, fs, insert_chunk):
         instance, kb_id = fs
@@ -715,6 +882,151 @@ class TestSearchDeleteLifecycle:
         assert "paper.pdf" in result
         assert "notes.md" not in result
 
+    @pytest.mark.parametrize(
+        ("path", "expected_area", "expected_kinds"),
+        [
+            ("/wiki", "wiki", ("wiki",)),
+            ("/wiki/deep/*.md", "wiki", ("wiki",)),
+            ("/wikipedia/*.md", "all", ()),
+            ("/wiki*", "all", ()),
+        ],
+    )
+    async def test_search_chunks_only_classifies_exact_wiki_directory(
+        self,
+        fs,
+        path,
+        expected_area,
+        expected_kinds,
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        captured = []
+
+        async def capture(kb, request):
+            captured.append(request)
+            return SearchResult(hits=(), candidate_count=0)
+
+        instance.retrieve = capture
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        await searcher.search_chunks("permit", path, None, 2)
+
+        assert len(captured) == 1
+        assert captured[0].area.value == expected_area
+        assert tuple(kind.value for kind in captured[0].document_kinds) == expected_kinds
+        assert captured[0].path_glob == path
+
+    async def test_search_chunks_wikipedia_glob_reaches_sqlite_adapter(
+        self,
+        fs,
+        insert_chunk,
+    ):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        wikipedia = await instance.create_document(
+            kb_id,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "md",
+            "",
+            ["reference"],
+        )
+        wiki = await instance.create_document(
+            kb_id,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "md",
+            "",
+            ["wiki"],
+        )
+        await insert_chunk(str(wikipedia["id"]), kb_id, "permit wikipedia result")
+        await insert_chunk(str(wiki["id"]), kb_id, "permit wiki result")
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+
+        result = await searcher.search_chunks(
+            "permit",
+            "/wikipedia/*.md",
+            None,
+            2,
+        )
+
+        assert "article.md" in result
+        assert "page.md" not in result
+
+    async def test_search_chunks_pushes_full_query_before_limit(self, fs):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+        from vaultfs.sqlite import SqliteVaultFS
+
+        db = SqliteVaultFS._db_or_raise()
+        for index in range(4):
+            doc = await instance.create_document(
+                kb_id,
+                f"excluded-{index}.md",
+                "Excluded",
+                "/excluded/",
+                "md",
+                "",
+                ["other"],
+            )
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, chunk_index, content, source_content, token_count) "
+                "VALUES (?, ?, 0, ?, ?, 10)",
+                (str(uuid.uuid4()), str(doc["id"]), "quantum " * 30, "quantum"),
+            )
+        for index in range(2):
+            doc = await instance.create_document(
+                kb_id,
+                f"eligible-{index}.pdf",
+                "Eligible",
+                "/target/",
+                "pdf",
+                "",
+                ["Science", "Reviewed"],
+            )
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, chunk_index, content, source_content, token_count) "
+                "VALUES (?, ?, 0, ?, ?, 10)",
+                (str(uuid.uuid4()), str(doc["id"]), "quantum", "quantum"),
+            )
+        await db.commit()
+
+        captured: list[SearchQuery] = []
+        real_retrieve = instance.retrieve
+
+        async def capture(kb, request):
+            captured.append(request)
+            return await real_retrieve(kb, request)
+
+        instance.retrieve = capture
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        result = await searcher.search_chunks(
+            " quantum ",
+            "/target/*.pdf",
+            ["SCIENCE", "reviewed"],
+            2,
+            annotated_only=False,
+            scope="source",
+            facets={},
+        )
+
+        assert "**2 result(s)**" in result
+        assert "eligible-0.pdf" in result and "eligible-1.pdf" in result
+        assert "excluded" not in result
+        assert len(captured) == 1
+        request = captured[0]
+        assert request.text == "quantum"
+        assert request.limit == request.candidate_limit == 2
+        assert request.path_glob == "/target/*.pdf"
+        assert request.tags == ("reviewed", "science")
+        assert request.scope.value == "source"
+
     async def test_search_references_uncited(self, fs):
         instance, kb_id = fs
         from tools.search import SearchHandler
@@ -726,8 +1038,8 @@ class TestSearchDeleteLifecycle:
 
     async def test_delete_exact_path(self, fs):
         instance, kb_id = fs
-        from tools.write import WriteHandler
         from tools.delete import DeleteHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)
@@ -767,10 +1079,10 @@ class TestSearchDeleteLifecycle:
 
     async def test_full_lifecycle(self, fs, insert_chunk):
         instance, kb_id = fs
-        from tools.write import WriteHandler
+        from tools.delete import DeleteHandler
         from tools.read import ReadHandler
         from tools.search import SearchHandler
-        from tools.delete import DeleteHandler
+        from tools.write import WriteHandler
 
         kb = _make_kb(kb_id)
         writer = WriteHandler(instance, kb)

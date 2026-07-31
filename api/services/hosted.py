@@ -47,7 +47,7 @@ class HostedUserService(UserService):
             "  COALESCE(SUM(page_count), 0)::bigint AS total_pages, "
             "  COALESCE(SUM(file_size), 0)::bigint AS total_storage_bytes, "
             "  COUNT(*)::bigint AS document_count "
-            "FROM documents WHERE user_id = $1 AND NOT archived",
+            "FROM documents WHERE user_id = $1 AND NOT archived AND source_kind = 'source'",
             self.user_id,
         )
 
@@ -356,7 +356,7 @@ class HostedDocumentService(DocumentService):
 
     async def get_url(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(
-            "SELECT id, user_id, filename, file_type FROM documents WHERE id = $1 AND user_id = $2",
+            "SELECT id, user_id, filename, file_type, metadata FROM documents WHERE id = $1 AND user_id = $2",
             doc_id, self.user_id,
         )
         if not row:
@@ -366,9 +366,11 @@ class HostedDocumentService(DocumentService):
 
         ext = row["filename"].rsplit(".", 1)[-1].lower() if "." in row["filename"] else row["file_type"]
         if ext in {"pptx", "ppt", "docx", "doc"}:
-            s3_key = f"{row['user_id']}/{row['id']}/converted.pdf"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            s3_key = metadata.get("converted_s3_key") or f"{row['user_id']}/{row['id']}/converted.pdf"
         elif ext in {"html", "htm"}:
-            s3_key = f"{row['user_id']}/{row['id']}/tagged.html"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            s3_key = metadata.get("tagged_s3_key") or f"{row['user_id']}/{row['id']}/tagged.html"
         else:
             s3_key = f"{row['user_id']}/{row['id']}/source.{ext}"
         url = await self.s3.generate_presigned_get(s3_key)
@@ -1009,7 +1011,7 @@ class HostedPublicWikiService(PublicWikiService):
     async def get_asset_key(self, slug: str, document_number: int) -> str | None:
         row = await self.pool.fetchrow(
             "SELECT d.id::text AS doc_id, d.user_id::text AS user_id, "
-            "       d.filename, d.file_type "
+            "       d.filename, d.file_type, d.metadata "
             "FROM documents d "
             "JOIN knowledge_bases kb ON kb.id = d.knowledge_base_id "
             "WHERE kb.public_slug = $1 "
@@ -1029,9 +1031,11 @@ class HostedPublicWikiService(PublicWikiService):
             else row["file_type"]
         )
         if ext in {"pptx", "ppt", "docx", "doc"}:
-            return f"{row['user_id']}/{row['doc_id']}/converted.pdf"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            return metadata.get("converted_s3_key") or f"{row['user_id']}/{row['doc_id']}/converted.pdf"
         if ext in {"html", "htm"}:
-            return f"{row['user_id']}/{row['doc_id']}/tagged.html"
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {})
+            return metadata.get("tagged_s3_key") or f"{row['user_id']}/{row['doc_id']}/tagged.html"
         return f"{row['user_id']}/{row['doc_id']}/source.{ext}"
 
 
@@ -1050,6 +1054,11 @@ class HostedServiceFactory(ServiceFactory):
 
     def document_service(self, user_id: str) -> HostedDocumentService:
         return HostedDocumentService(self.pool, user_id, self.s3)
+
+    def read_service(self, user_id: str):
+        from .read_hosted import HostedReadService
+
+        return HostedReadService(self.pool, user_id)
 
     def public_wiki_service(self) -> HostedPublicWikiService:
         return HostedPublicWikiService(self.pool, self.s3)

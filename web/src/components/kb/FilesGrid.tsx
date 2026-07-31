@@ -27,7 +27,7 @@ import {
   PdfDocViewer, ImageViewer, HtmlDocViewer, ContentViewer,
   UnsupportedViewer, ProcessingViewer, FailedViewer,
 } from '@/components/kb/DocViewers'
-import type { DocumentListItem } from '@/lib/types'
+import type { DocumentListItem, ReadFolder } from '@/lib/types'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -36,49 +36,9 @@ import type { DocumentListItem } from '@/lib/types'
 type SortField = 'name' | 'date' | 'type'
 type SortDir = 'asc' | 'desc'
 
-interface FolderNode {
-  name: string
-  path: string
-}
-
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
-
-function getChildFolders(docs: DocumentListItem[], currentPath: string): FolderNode[] {
-  const folders = new Map<string, FolderNode>()
-  for (const doc of docs) {
-    const docPath = doc.path || '/'
-    if (!docPath.startsWith(currentPath) || docPath === currentPath) continue
-    const rest = docPath.slice(currentPath.length)
-    const nextSlash = rest.indexOf('/')
-    if (nextSlash <= 0) continue
-    const segment = rest.slice(0, nextSlash)
-    const folderPath = currentPath + segment + '/'
-    if (!folders.has(folderPath)) {
-      folders.set(folderPath, { name: segment, path: folderPath })
-    }
-  }
-  return Array.from(folders.values()).sort((a, b) => a.name.localeCompare(b.name))
-}
-
-function getDocsInFolder(docs: DocumentListItem[], currentPath: string): DocumentListItem[] {
-  return docs.filter((d) => (d.path || '/') === currentPath)
-}
-
-function sortDocs(docs: DocumentListItem[], field: SortField, dir: SortDir): DocumentListItem[] {
-  const sorted = [...docs]
-  sorted.sort((a, b) => {
-    let cmp = 0
-    switch (field) {
-      case 'name': cmp = (a.title || a.filename).localeCompare(b.title || b.filename); break
-      case 'date': cmp = new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime(); break
-      case 'type': cmp = a.file_type.localeCompare(b.file_type); break
-    }
-    return dir === 'asc' ? cmp : -cmp
-  })
-  return sorted
-}
 
 function parseBreadcrumbs(path: string): { label: string; path: string }[] {
   const segments: { label: string; path: string }[] = [{ label: '文件', path: '/' }]
@@ -144,6 +104,16 @@ function docIconSmall(ft: string) {
 
 interface FilesGridProps {
   documents: DocumentListItem[]
+  activeDocument?: DocumentListItem | null
+  folders: ReadFolder[]
+  hasNext?: boolean
+  loadingMore?: boolean
+  onLoadNext?: () => void
+  onBrowseOptionsChange?: (options: {
+    query: string
+    sort: SortField
+    direction: SortDir
+  }) => void
   onDeleteDocument: (id: string) => void
   onRenameDocument: (id: string, newTitle: string) => void
   onUpload: (path: string) => void
@@ -167,6 +137,12 @@ interface FilesGridProps {
 
 export function FilesGrid({
   documents,
+  activeDocument = null,
+  folders,
+  hasNext = false,
+  loadingMore = false,
+  onLoadNext,
+  onBrowseOptionsChange,
   onDeleteDocument,
   onRenameDocument,
   onUpload,
@@ -215,6 +191,14 @@ export function FilesGrid({
   const [folderDialogOpen, setFolderDialogOpen] = React.useState(false)
   const [folderName, setFolderName] = React.useState('')
 
+  React.useEffect(() => {
+    onBrowseOptionsChange?.({
+      query: searchQuery,
+      sort: sortField,
+      direction: sortDir,
+    })
+  }, [onBrowseOptionsChange, searchQuery, sortDir, sortField])
+
   // Note editor instance (for rendering formatting buttons in the toolbar)
   const [noteEditor, setNoteEditor] = React.useState<Editor | null>(null)
   // Editable note title (synced from NoteEditor, displayed in breadcrumb)
@@ -236,8 +220,11 @@ export function FilesGrid({
   )
 
   const activeDoc = React.useMemo(
-    () => activeDocId ? sourceDocs.find((d) => d.id === activeDocId) ?? null : null,
-    [activeDocId, sourceDocs],
+    () => activeDocId
+      ? sourceDocs.find((d) => d.id === activeDocId) ??
+        (activeDocument?.id === activeDocId ? activeDocument : null)
+      : null,
+    [activeDocId, activeDocument, sourceDocs],
   )
 
   // 未成功导入(提取失败)统计:跨全部文件夹;清单点击即打开失败详情
@@ -311,20 +298,13 @@ export function FilesGrid({
   }, [isBrowsing, canGoForward])
 
   // Grid data
-  const folders = React.useMemo(() => getChildFolders(sourceDocs, currentPath), [sourceDocs, currentPath])
-  const docsInFolder = React.useMemo(() => sortDocs(getDocsInFolder(sourceDocs, currentPath), sortField, sortDir), [sourceDocs, currentPath, sortField, sortDir])
-
   const filteredFolders = React.useMemo(() => {
     if (!searchQuery) return folders
     const q = searchQuery.toLowerCase()
     return folders.filter((f) => f.name.toLowerCase().includes(q))
   }, [folders, searchQuery])
 
-  const filteredDocs = React.useMemo(() => {
-    if (!searchQuery) return docsInFolder
-    const q = searchQuery.toLowerCase()
-    return docsInFolder.filter((d) => (d.title || d.filename).toLowerCase().includes(q) || d.file_type.toLowerCase().includes(q))
-  }, [docsInFolder, searchQuery])
+  const filteredDocs = sourceDocs
 
   const isActiveWebClip = activeDoc ? isWebClipDoc(activeDoc) : false
   const isActiveNote = activeDoc ? isNoteFile(activeDoc) && !isActiveWebClip : false
@@ -756,6 +736,17 @@ export function FilesGrid({
                         ))}
                       </AnimatePresence>
                     </div>
+                    {hasNext && (
+                      <div className="flex justify-center py-6">
+                        <button
+                          onClick={onLoadNext}
+                          disabled={loadingMore}
+                          className="rounded-md border border-border px-4 py-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
+                        >
+                          {loadingMore ? '加载中…' : '加载更多'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

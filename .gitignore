@@ -41,6 +41,8 @@ Thumbs.db
 
 # Deploy
 deploy.sh
+deploy/.ci-jwks/
+deploy/.env.selfhost
 
 # Local Netlify folder
 .netlify

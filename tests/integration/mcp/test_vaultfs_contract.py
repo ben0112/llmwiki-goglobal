@@ -6,7 +6,130 @@ Tests every VaultFS method. Self-contained — no Postgres needed.
 import uuid
 
 import pytest
+
+from llmwiki_core.search import SearchHit, SearchQuery
 from tests.integration.mcp.conftest import TEST_USER_ID
+
+
+def _legacy_compatible_vault_type(*, search_chunks=None):
+    """Build a concrete test double without implementing the new retrieve port."""
+    from vaultfs.base import VaultFS
+
+    async def unused(*args, **kwargs):
+        return None
+
+    implementations = {
+        name: unused
+        for name in VaultFS.__abstractmethods__
+        if name != "retrieve"
+    }
+    if search_chunks is not None:
+        implementations["search_chunks"] = search_chunks
+    return type("LegacyCompatibleVault", (VaultFS,), implementations)
+
+
+class TestRetrievalCompatibility:
+
+    async def test_legacy_only_subclass_keeps_old_search_but_typed_retrieve_fails_closed(self):
+        async def legacy_search(
+            self,
+            kb_id,
+            query,
+            limit,
+            path_filter=None,
+            annotated_only=False,
+            scope="all",
+            facets=None,
+        ):
+            return [{"content": "legacy permit", "tags": ["Raw", "raw"]}]
+
+        legacy_type = _legacy_compatible_vault_type(search_chunks=legacy_search)
+        instance = legacy_type()
+        instance.user_id = TEST_USER_ID
+
+        assert await instance.search_chunks("kb-1", "permit", 1) == [
+            {"content": "legacy permit", "tags": ["Raw", "raw"]}
+        ]
+        with pytest.raises(
+            NotImplementedError,
+            match="typed contract requires native retrieve",
+        ):
+            await instance.retrieve(
+                "kb-1",
+                SearchQuery.build(
+                    text="permit",
+                    limit=1,
+                    path_glob="/secret/*.md",
+                    tags=["reviewed"],
+                    document_kinds=["source"],
+                ),
+            )
+
+    async def test_vault_without_retrieval_implementation_fails_without_recursion(self):
+        vault_type = _legacy_compatible_vault_type()
+        instance = vault_type()
+        instance.user_id = TEST_USER_ID
+
+        with pytest.raises(
+            NotImplementedError,
+            match="typed contract requires native retrieve",
+        ):
+            await instance.retrieve("kb-1", SearchQuery.build(text="permit", limit=1))
+        with pytest.raises(
+            NotImplementedError,
+            match="typed contract requires native retrieve",
+        ):
+            await instance.search_chunks("kb-1", "permit", 1)
+
+    async def test_mutual_super_overrides_fail_explicitly_without_recursion(self):
+        async def super_search(self, *args, **kwargs):
+            return await super(type(self), self).search_chunks(*args, **kwargs)
+
+        async def super_retrieve(self, *args, **kwargs):
+            return await super(type(self), self).retrieve(*args, **kwargs)
+
+        vault_type = _legacy_compatible_vault_type(search_chunks=super_search)
+        vault_type.retrieve = super_retrieve
+        instance = vault_type()
+        instance.user_id = TEST_USER_ID
+
+        with pytest.raises(
+            NotImplementedError,
+            match="typed contract requires native retrieve",
+        ):
+            await instance.search_chunks("kb-1", "permit", 1)
+        with pytest.raises(
+            NotImplementedError,
+            match="typed contract requires native retrieve",
+        ):
+            await instance.retrieve("kb-1", SearchQuery.build(text="permit", limit=1))
+
+    def test_plain_typed_hit_conversion_ignores_transport_named_user_metadata(self):
+        from vaultfs.base import search_hit_to_legacy_dict
+
+        user_metadata = {
+            "_legacy_tags": 7,
+            "_filename": {"not": "transport"},
+            "source_hit": "user value",
+        }
+        hit = SearchHit(
+            "doc",
+            1,
+            0,
+            "permit",
+            0.5,
+            "/typed/policy.md",
+            tags=("Reviewed",),
+            metadata=user_metadata,
+        )
+
+        row = search_hit_to_legacy_dict(hit)
+
+        assert row["filename"] == "policy.md"
+        assert row["path"] == "/typed/"
+        assert row["tags"] == ["reviewed"]
+        assert row["source_hit"] is False
+        assert row["metadata"] == user_metadata
 
 
 class TestWorkspace:
@@ -162,7 +285,7 @@ class TestDocumentCRUD:
 
     async def test_create_wiki_document(self, fs):
         instance, kb_id = fs
-        doc = await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
+        await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
         fetched = await instance.get_document(kb_id, "scaling.md", "/wiki/concepts/")
         assert fetched is not None
         assert fetched["content"] == "# Scaling"
@@ -278,6 +401,261 @@ class TestPages:
 
 class TestSearch:
 
+    @staticmethod
+    async def _seed_ranked_rows(
+        instance,
+        kb_id: str,
+        *,
+        excluded: list[dict],
+        eligible: list[dict],
+    ) -> None:
+        """Insert excluded rows with stronger lexical scores before eligible rows."""
+        from vaultfs.sqlite import SqliteVaultFS
+
+        db = SqliteVaultFS._db_or_raise()
+        for index, row in enumerate([*excluded, *eligible]):
+            doc = await instance.create_document(
+                kb_id,
+                row.get("filename", f"ranked-{index}.md"),
+                f"Ranked {index}",
+                row.get("path", "/"),
+                "md",
+                "",
+                row.get("tags", ["reviewed", "asean"]),
+                metadata=row.get("metadata"),
+            )
+            if source_kind := row.get("source_kind"):
+                await db.execute(
+                    "UPDATE documents SET source_kind = ? WHERE id = ?",
+                    (source_kind, str(doc["id"])),
+                )
+            source_content = row.get("source_content", "permit source text")
+            annotations_text = row.get("annotations_text")
+            content = row.get("content") or "\n".join(
+                part for part in (source_content, annotations_text) if part
+            )
+            if row.get("excluded_score"):
+                content = "permit " * 30 + content
+            await db.execute(
+                "INSERT INTO document_chunks "
+                "(id, document_id, document_version, chunk_index, content, "
+                " source_content, annotations_text, has_highlight, token_count) "
+                "VALUES (?, ?, 1, 0, ?, ?, ?, ?, 10)",
+                (
+                    str(uuid.uuid4()),
+                    str(doc["id"]),
+                    content,
+                    source_content,
+                    annotations_text,
+                    int(row.get("has_highlight", False)),
+                ),
+            )
+        await db.commit()
+
+    @pytest.mark.parametrize(
+        ("query_kwargs", "excluded_override", "eligible_override"),
+        [
+            ({"path_glob": "/target/*.md"}, {"path": "/excluded/"}, {"path": "/target/"}),
+            ({"tags": ["REVIEWED", "asean"]}, {"tags": ["review"]}, {"tags": ["Reviewed", "ASEAN"]}),
+            ({"area": "sources"}, {"path": "/wiki/"}, {"path": "/sources/"}),
+            ({"document_kinds": ["source"]}, {"source_kind": "asset"}, {"source_kind": "source"}),
+            ({"document_kinds": ["asset"]}, {"source_kind": "source"}, {"source_kind": "asset"}),
+            ({"annotated_only": True}, {"has_highlight": False}, {"has_highlight": True}),
+            (
+                {"scope": "source"},
+                {"source_content": "other", "annotations_text": "permit annotation"},
+                {"source_content": "permit source", "annotations_text": "other"},
+            ),
+            (
+                {"scope": "annotations"},
+                {"source_content": "permit source", "annotations_text": "other"},
+                {"source_content": "other", "annotations_text": "permit annotation"},
+            ),
+            (
+                {"facets": {"country": "IDN"}},
+                {"metadata": {"geo_country": ["SGP"]}},
+                {"metadata": {"geo_country": ["IDN"]}},
+            ),
+        ],
+    )
+    async def test_retrieve_applies_each_filter_before_limit(
+        self,
+        fs,
+        query_kwargs,
+        excluded_override,
+        eligible_override,
+    ):
+        instance, kb_id = fs
+        excluded = [
+            {"filename": f"excluded-{i}.md", "excluded_score": True, **excluded_override}
+            for i in range(4)
+        ]
+        eligible = [
+            {"filename": f"eligible-{i}.md", **eligible_override}
+            for i in range(3)
+        ]
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=excluded,
+            eligible=eligible,
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                **query_kwargs,
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+        assert all(hit.path.endswith(("eligible-0.md", "eligible-1.md", "eligible-2.md")) for hit in result.hits)
+        assert all("source_hit" not in hit.metadata for hit in result.hits)
+        assert all("annotation_hit" not in hit.metadata for hit in result.hits)
+        from vaultfs.base import search_hit_to_legacy_dict
+
+        legacy_rows = [search_hit_to_legacy_dict(hit) for hit in result.hits]
+        if query_kwargs.get("scope") == "source":
+            assert all(row["source_hit"] is True for row in legacy_rows)
+            assert all(row["annotation_hit"] is False for row in legacy_rows)
+        if query_kwargs.get("scope") == "annotations":
+            assert all(row["source_hit"] is False for row in legacy_rows)
+            assert all(row["annotation_hit"] is True for row in legacy_rows)
+
+    async def test_retrieve_applies_combined_filters_before_limit(self, fs):
+        instance, kb_id = fs
+        good = {
+            "path": "/corpus/idn/",
+            "tags": ["Reviewed", "ASEAN"],
+            "source_kind": "source",
+            "source_content": "permit source",
+            "annotations_text": "permit annotation",
+            "has_highlight": True,
+            "metadata": {"geo_country": ["IDN"]},
+        }
+        excluded = []
+        for index, override in enumerate(
+            (
+                {"path": "/corpus/sgp/"},
+                {"tags": ["reviewed"]},
+                {"source_kind": "wiki"},
+                {"annotations_text": "other"},
+                {"has_highlight": False},
+                {"metadata": {"geo_country": ["SGP"]}},
+            )
+        ):
+            excluded.append(
+                {
+                    **good,
+                    **override,
+                    "filename": f"excluded-combined-{index}.md",
+                    "excluded_score": True,
+                }
+            )
+        eligible = [{**good, "filename": f"eligible-combined-{i}.md"} for i in range(3)]
+        await self._seed_ranked_rows(instance, kb_id, excluded=excluded, eligible=eligible)
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                candidate_limit=2,
+                path_glob="/corpus/idn/*.md",
+                tags=["reviewed", "ASEAN"],
+                area="sources",
+                document_kinds=["source"],
+                annotated_only=True,
+                scope="annotations",
+                facets={"country": "IDN"},
+            ),
+        )
+
+        assert result.returned_count == 2
+        assert result.candidate_count == 3
+
+    async def test_retrieve_intersects_area_and_document_kind(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[{"filename": "wiki.md", "path": "/wiki/"}],
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                area="wiki",
+                document_kinds=["source"],
+            ),
+        )
+
+        assert result.hits == ()
+        assert result.candidate_count == 0
+
+    async def test_retrieve_glob_escapes_sql_metacharacters_and_literal_question_mark(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[
+                {"filename": "literal%_?.md", "path": "/target/"},
+                {"filename": "literalXXa.md", "path": "/target/"},
+            ],
+        )
+
+        exact = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                path_glob="/target/literal%_?.md",
+            ),
+        )
+        directory = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=2, path_glob="/target/"),
+        )
+
+        assert [hit.path for hit in exact.hits] == ["/target/literal%_?.md"]
+        assert exact.candidate_count == 1
+        assert directory.returned_count == directory.candidate_count == 2
+
+    async def test_retrieve_candidate_limit_is_distinct_from_result_limit(self, fs):
+        instance, kb_id = fs
+        await self._seed_ranked_rows(
+            instance,
+            kb_id,
+            excluded=[],
+            eligible=[{"filename": f"candidate-{i}.md"} for i in range(5)],
+        )
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=2, candidate_limit=4),
+        )
+
+        assert result.returned_count == 4
+        assert result.candidate_count == 5
+
+    async def test_retrieve_reports_zero_candidates(self, fs):
+        instance, kb_id = fs
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="no-such-retrieval-token", limit=2),
+        )
+
+        assert result.hits == ()
+        assert result.candidate_count == 0
+
     async def test_search_chunks_finds_matching_content(self, fs, insert_chunk):
         instance, kb_id = fs
         doc = await instance.create_document(kb_id, "notes.md", "Notes", "/", "md", "hello world", ["tag"])
@@ -286,6 +664,196 @@ class TestSearch:
         results = await instance.search_chunks(kb_id, "hello", 10)
         assert len(results) >= 1
         assert "hello" in results[0]["content"]
+
+    async def test_create_and_retrieve_use_exact_wiki_path_segment(self, fs, insert_chunk):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        wikipedia = await instance.create_document(
+            kb_id,
+            "article.md",
+            "Wikipedia article",
+            "/wikipedia/",
+            "md",
+            "",
+            ["reference"],
+        )
+        wiki = await instance.create_document(
+            kb_id,
+            "page.md",
+            "Wiki page",
+            "/wiki/",
+            "md",
+            "",
+            ["wiki"],
+        )
+        await insert_chunk(str(wikipedia["id"]), kb_id, "permit wikipedia result")
+        await insert_chunk(str(wiki["id"]), kb_id, "permit wiki result")
+
+        db = SqliteVaultFS._db_or_raise()
+        cursor = await db.execute(
+            "SELECT relative_path, source_kind FROM documents "
+            "WHERE id IN (?, ?) ORDER BY relative_path",
+            (str(wikipedia["id"]), str(wiki["id"])),
+        )
+        assert await cursor.fetchall() == [
+            ("wiki/page.md", "wiki"),
+            ("wikipedia/article.md", "source"),
+        ]
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(
+                text="permit",
+                limit=2,
+                path_glob="/wikipedia/*.md",
+                document_kinds=["source"],
+            ),
+        )
+        assert [hit.path for hit in result.hits] == ["/wikipedia/article.md"]
+
+    async def test_sqlite_typed_and_legacy_results_preserve_raw_tags(self, fs, insert_chunk):
+        from vaultfs.base import search_hit_to_legacy_dict
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        raw_tags = ["Policy", "policy", "ASEAN", "Policy"]
+        user_metadata = {
+            "_legacy_tags": 7,
+            "_filename": "user metadata filename",
+            "source_hit": "user metadata source hit",
+        }
+        doc = await instance.create_document(
+            kb_id,
+            "raw-tags.md",
+            "Raw tags",
+            "/",
+            "md",
+            "",
+            raw_tags,
+            metadata=user_metadata,
+        )
+        await insert_chunk(str(doc["id"]), kb_id, "raw tags permit")
+
+        result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=1),
+        )
+
+        assert result.hits[0].tags == ("asean", "policy")
+        assert dict(result.hits[0].metadata) == user_metadata
+        assert search_hit_to_legacy_dict(result.hits[0])["tags"] == raw_tags
+        assert search_hit_to_legacy_dict(result.hits[0])["metadata"] == user_metadata
+
+        db = SqliteVaultFS._db_or_raise()
+        await db.execute("UPDATE documents SET tags = NULL WHERE id = ?", (str(doc["id"]),))
+        await db.commit()
+        null_result = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=1),
+        )
+
+        assert null_result.hits[0].tags == ()
+        assert dict(null_result.hits[0].metadata) == user_metadata
+        assert search_hit_to_legacy_dict(null_result.hits[0])["tags"] is None
+
+    async def test_sqlite_retrieve_tolerates_corrupt_tag_and_metadata_json(
+        self,
+        fs,
+        insert_chunk,
+    ):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        corrupt_values = [
+            ('["reviewed"]', '{"kind":"valid"}'),
+            ('"reviewed"', "7"),
+            ('{"x":"reviewed"}', "[]"),
+            ("null", "null"),
+            ("not-json", "not-json"),
+        ]
+        db = SqliteVaultFS._db_or_raise()
+        for index, (raw_tags, raw_metadata) in enumerate(corrupt_values):
+            doc = await instance.create_document(
+                kb_id,
+                f"corrupt-{index}.md",
+                f"Corrupt {index}",
+                "/corrupt/",
+                "md",
+                "",
+                [],
+            )
+            await db.execute(
+                "UPDATE documents SET tags = ?, metadata = ? WHERE id = ?",
+                (raw_tags, raw_metadata, str(doc["id"])),
+            )
+            await insert_chunk(str(doc["id"]), kb_id, "corrupt permit content")
+        await db.commit()
+
+        all_rows = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=5),
+        )
+        tagged = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=5, tags=["reviewed"]),
+        )
+
+        assert all_rows.returned_count == all_rows.candidate_count == 5
+        assert [dict(hit.metadata) for hit in all_rows.hits].count({}) == 4
+        assert [dict(hit.metadata) for hit in all_rows.hits].count({"kind": "valid"}) == 1
+        assert all(hit.tags in ((), ("reviewed",)) for hit in all_rows.hits)
+        assert tagged.returned_count == tagged.candidate_count == 1
+        assert tagged.hits[0].path == "/corrupt/corrupt-0.md"
+
+    async def test_sqlite_tag_filter_rejects_arrays_with_non_string_elements(
+        self,
+        fs,
+        insert_chunk,
+    ):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        instance, kb_id = fs
+        stored_tags = [
+            ("numeric.md", "[7]"),
+            ("mixed.md", '["reviewed", 7]'),
+            ("strings.md", '["reviewed", "asean"]'),
+        ]
+        db = SqliteVaultFS._db_or_raise()
+        for filename, raw_tags in stored_tags:
+            doc = await instance.create_document(
+                kb_id,
+                filename,
+                filename,
+                "/tag-arrays/",
+                "md",
+                "",
+                [],
+            )
+            await db.execute(
+                "UPDATE documents SET tags = ? WHERE id = ?",
+                (raw_tags, str(doc["id"])),
+            )
+            await insert_chunk(str(doc["id"]), kb_id, "array permit content")
+        await db.commit()
+
+        unfiltered = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3),
+        )
+        numeric = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3, tags=["7"]),
+        )
+        reviewed = await instance.retrieve(
+            kb_id,
+            SearchQuery.build(text="permit", limit=3, tags=["reviewed"]),
+        )
+
+        assert sorted(hit.tags for hit in unfiltered.hits) == [(), (), ("asean", "reviewed")]
+        assert numeric.returned_count == numeric.candidate_count == 0
+        assert reviewed.returned_count == reviewed.candidate_count == 1
+        assert reviewed.hits[0].path == "/tag-arrays/strings.md"
 
     async def test_search_chunks_respects_limit(self, fs, insert_chunk):
         instance, kb_id = fs

@@ -44,6 +44,115 @@ export interface Document {
 
 export type DocumentListItem = Omit<Document, 'content'>
 
+export interface ReadDocument {
+  id: string
+  filename: string
+  path: string
+  file_type: string
+  status: string
+  knowledge_base_id: string | null
+  title: string | null
+  file_size: number | null
+  page_count: number | null
+  tags: string[]
+  date: string | null
+  metadata: Record<string, unknown> | null
+  error_message: string | null
+  version: number | null
+  document_number: number | null
+  sort_order: number | null
+  archived: boolean
+  stale_since: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ReadPage<T> {
+  revision: number
+  items: T[]
+  next_cursor: string | null
+  total_count: number
+}
+
+export interface ReadFolder {
+  name: string
+  path: string
+  document_count: number
+}
+
+export interface DocumentBrowsePage extends ReadPage<ReadDocument> {
+  folders: ReadFolder[]
+  source_count: number
+  failed_count: number
+  corpus_count: number
+}
+
+export interface CorpusSummary {
+  revision: number
+  total_count: number
+  filtered_count: number
+  facets: Record<string, Record<string, number>>
+  coverage: {
+    counts?: Record<string, Record<string, number>>
+    total?: number
+    [key: string]: unknown
+  }
+  business_classes: Record<string, number>
+  business_scenes: Record<string, number>
+  kpis: Record<string, number | null>
+}
+
+export interface CorpusEntryRecord {
+  id: string
+  filename: string
+  title: string | null
+  path: string
+  document_number: number | null
+  metadata: Record<string, unknown> | null
+}
+
+export interface GraphSummary {
+  revision: number
+  node_count: number
+  edge_count: number
+  cited_document_ids: string[]
+}
+
+export interface ReadDocumentStatus {
+  id: string | null
+  document_number: number | null
+  status: string
+  error_message: string | null
+  version: number | null
+}
+
+export interface ReadDocumentStatusPage {
+  revision: number
+  items: ReadDocumentStatus[]
+}
+
+export type UploadPreflightCode =
+  | 'accepted'
+  | 'duplicate_name'
+  | 'duplicate_content'
+  | 'unsupported'
+  | 'too_large'
+
+export interface UploadPreflightItem {
+  path: string
+  filename: string
+  size: number
+  sha256?: string | null
+  accepted?: boolean | null
+  code?: UploadPreflightCode | null
+  existing_document_id?: string | null
+}
+
+export interface UploadPreflightResponse {
+  revision: number
+  items: UploadPreflightItem[]
+}
+
 export type PropertyType = 'text' | 'number' | 'date' | 'checkbox' | 'select' | 'url'
 
 export interface TypedProperty {

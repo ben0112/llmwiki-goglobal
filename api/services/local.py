@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import uuid
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -39,7 +37,7 @@ class LocalUserService(UserService):
             "SELECT count(*) as doc_count, "
             "COALESCE(SUM(page_count), 0) as total_pages, "
             "COALESCE(SUM(file_size), 0) as total_storage "
-            "FROM documents WHERE status != 'failed'",
+            "FROM documents WHERE status != 'failed' AND source_kind = 'source'",
         )
         row = await cursor.fetchone()
         return {
@@ -233,7 +231,13 @@ class LocalDocumentService(DocumentService):
 
         if content:
             chunks = chunk_text(content)
-            await self.chunk_repo.store(str(row["id"]), self.user_id, kb_id, chunks)
+            await self.chunk_repo.store(
+                str(row["id"]),
+                self.user_id,
+                kb_id,
+                chunks,
+                document_version=int(row["version"]),
+            )
 
         return row
 
@@ -275,11 +279,19 @@ class LocalDocumentService(DocumentService):
             file_path.write_text(content, encoding="utf-8")
 
         row = await self.doc_repo.update_content(doc_id, self.user_id, content)
+        if row is None:
+            return None
 
         kb_id = await self.doc_repo.get_kb_id(doc_id)
         if kb_id:
             chunks = chunk_text(content) if content else []
-            await self.chunk_repo.store(doc_id, self.user_id, kb_id, chunks)
+            await self.chunk_repo.store(
+                doc_id,
+                self.user_id,
+                kb_id,
+                chunks,
+                document_version=int(row["version"]),
+            )
 
         return row
 
@@ -370,6 +382,11 @@ class LocalServiceFactory(ServiceFactory):
 
     def document_service(self, user_id: str) -> LocalDocumentService:
         return LocalDocumentService(self.db, user_id)
+
+    def read_service(self, user_id: str):
+        from .read_local import LocalReadService
+
+        return LocalReadService(self.db, user_id)
 
     def public_wiki_service(self):
         raise HTTPException(status_code=404, detail="Public wikis aren't available in local mode.")

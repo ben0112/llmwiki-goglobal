@@ -1,6 +1,13 @@
 """Unit tests for the text chunker."""
 
-from services.chunker import chunk_text, chunk_pages, _estimate_tokens, CHUNK_SIZE
+import uuid
+
+from services.chunker import (
+    _estimate_tokens,
+    _store_chunks_on_conn,
+    chunk_pages,
+    chunk_text,
+)
 
 
 class TestChunkText:
@@ -84,6 +91,25 @@ class TestEstimateTokens:
     def test_rough_estimate(self):
         assert _estimate_tokens("a" * 400) == 100
         assert _estimate_tokens("") == 1
+
+
+async def test_store_chunks_accepts_uuid_document_id():
+    class RecordingConnection:
+        async def execute(self, *args):
+            return None
+
+        async def executemany(self, *args):
+            return None
+
+    chunks = chunk_text("Document content long enough to form a chunk. " * 10)
+    await _store_chunks_on_conn(
+        RecordingConnection(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        chunks,
+        document_version=1,
+    )
 
 
 class TestEnforceMaxCharsAssignsPerPieceStartChar:

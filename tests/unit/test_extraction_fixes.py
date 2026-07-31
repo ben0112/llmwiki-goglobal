@@ -301,13 +301,13 @@ async def test_heavy_writes_serialized_by_gate(tmp_path, monkeypatch):
     peak = 0
     real_store = lp._store_chunks
 
-    async def tracking_store(db, doc_id, chunks):
+    async def tracking_store(db, doc_id, chunks, document_version):
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
         try:
             await asyncio.sleep(0.02)
-            return await real_store(db, doc_id, chunks)
+            return await real_store(db, doc_id, chunks, document_version)
         finally:
             active -= 1
 

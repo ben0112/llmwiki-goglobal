@@ -1,9 +1,9 @@
-// 出海智能体语料 (go-global corpus) — client-side helpers over the structured
-// 八维 metadata that corpus/import_annotations.py writes into documents.metadata.
-// All derivations (facet values, coverage grid, business view) are computed
-// from the loaded document list, so the UI adapts to any 码表 version.
+// 出海智能体语料 (go-global corpus) presentation helpers and compatibility
+// derivations over the structured 八维 metadata. Main-screen aggregates come
+// from the bounded corpus summary API; legacy pure helpers remain for callers
+// that already hold a small explicit document collection.
 
-import type { DocumentListItem } from '@/lib/types'
+import type { CorpusEntryRecord, CorpusSummary, DocumentListItem } from '@/lib/types'
 
 export interface CorpusBusiness {
   code: string
@@ -43,11 +43,11 @@ export interface CorpusMeta {
 }
 
 export interface CorpusEntry {
-  doc: DocumentListItem
+  doc: CorpusEntryRecord
   meta: CorpusMeta
 }
 
-export function getCorpusMeta(doc: DocumentListItem): CorpusMeta | null {
+export function getCorpusMeta(doc: Pick<CorpusEntryRecord, 'metadata'>): CorpusMeta | null {
   let meta: unknown = doc.metadata
   if (typeof meta === 'string') {
     try {
@@ -106,6 +106,18 @@ export function collectCorpusEntries(docs: DocumentListItem[]): CorpusEntry[] {
     if (meta) entries.push({ doc, meta })
   }
   return entries
+}
+
+export function corpusEntryFromRecord(doc: CorpusEntryRecord): CorpusEntry | null {
+  const meta = getCorpusMeta(doc)
+  return meta ? { doc, meta } : null
+}
+
+export function buildBatchReviewTargetIds(ids: readonly string[]): string[] {
+  if (ids.length > 200) throw new RangeError('batch review is limited to 200 document ids')
+  const unique = Array.from(new Set(ids.filter(Boolean)))
+  if (unique.length === 0) throw new RangeError('batch review requires at least one document id')
+  return unique
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +241,12 @@ export interface FacetOption {
   count: number
 }
 
+export function summaryFacetOptions(summary: CorpusSummary | null, key: FacetKey): FacetOption[] {
+  const options = Object.entries(summary?.facets[key] ?? {}).map(([value, count]) => ({ value, count }))
+  options.sort((a, b) => b.count - a.count || a.value.localeCompare(b.value, 'zh-Hans-CN'))
+  return options
+}
+
 /** Distinct values (with entry counts) present for a facet, most frequent first. */
 export function collectFacetOptions(entries: CorpusEntry[], key: FacetKey): FacetOption[] {
   const counts = new Map<string, number>()
@@ -250,6 +268,23 @@ export interface CoverageGrid {
   counts: Record<string, Record<string, number>>
   total: number
   emptyCells: Array<{ stage: string; layer: string }>
+}
+
+export function summaryCoverage(summary: CorpusSummary | null): CoverageGrid {
+  const source = summary?.coverage?.counts
+  const counts: Record<string, Record<string, number>> = {}
+  for (const stage of STAGES) {
+    counts[stage] = {}
+    for (const layer of LAYERS) {
+      const value = source?.[stage]?.[layer]
+      counts[stage][layer] = typeof value === 'number' ? value : 0
+    }
+  }
+  const emptyCells = STAGES.flatMap((stage) =>
+    LAYERS.filter((layer) => layer !== 'X' && counts[stage][layer] === 0)
+      .map((layer) => ({ stage, layer })),
+  )
+  return { counts, total: summary?.filtered_count ?? 0, emptyCells }
 }
 
 export function buildCoverageGrid(entries: CorpusEntry[]): CoverageGrid {
@@ -345,6 +380,35 @@ export interface CorpusKpis {
   /** Wiki 覆盖率: 有语料的货架格中被维基页 facet_rollup 覆盖的格数(P2A)。 */
   wikiCovered: number | null
   wikiCellsWithEntries: number
+}
+
+function numericKpi(summary: CorpusSummary | null, key: string, fallback = 0): number {
+  const value = summary?.kpis[key]
+  return typeof value === 'number' ? value : fallback
+}
+
+function nullableNumericKpi(summary: CorpusSummary | null, key: string): number | null {
+  const value = summary?.kpis[key]
+  return typeof value === 'number' ? value : null
+}
+
+export function summaryKpis(summary: CorpusSummary | null): CorpusKpis {
+  return {
+    total: numericKpi(summary, 'total', summary?.filtered_count ?? 0),
+    completeness: numericKpi(summary, 'completeness'),
+    shelfFilled: numericKpi(summary, 'shelf_filled'),
+    shelfTotal: numericKpi(summary, 'shelf_total', 20),
+    onTime: numericKpi(summary, 'on_time'),
+    cited: nullableNumericKpi(summary, 'cited'),
+    pendingReview: numericKpi(summary, 'pending_review'),
+    wikiCovered: nullableNumericKpi(summary, 'wiki_covered'),
+    wikiCellsWithEntries: numericKpi(summary, 'wiki_cells_with_entries'),
+  }
+}
+
+export function summaryBusinessPending(summary: CorpusSummary | null): number {
+  const assigned = Object.values(summary?.business_classes ?? {}).reduce((total, count) => total + count, 0)
+  return Math.max(0, (summary?.filtered_count ?? 0) - assigned)
 }
 
 export interface WikiRollup {

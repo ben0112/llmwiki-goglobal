@@ -1,8 +1,10 @@
-# Context for Dockerfile.local (repo root). Service Dockerfiles (api/, mcp/,
-# web/, converter/) use their own subdirectory contexts and ignore this file.
+# Repository-root contexts for Dockerfile.local and the hosted API/MCP images.
 .git
 .github
 .venv
+.env
+.env.*
+!.env.example
 **/__pycache__
 **/.pytest_cache
 **/node_modules
