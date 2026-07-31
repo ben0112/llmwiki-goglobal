@@ -106,9 +106,6 @@ async def test_s3_key_isolation_ignores_filename_and_path_metadata(monkeypatch, 
     assert ".." not in s3.upload_file_calls[0][0]
     assert not temp_path.exists()
     assert upload.upload_id not in tus._uploads
-    insert_sql, _ = pool.execute_calls[0]
-    assert "source_kind" in insert_sql
-    assert "'source'" in insert_sql
 
 
 async def test_presigned_urls_are_scoped_to_exact_document_keys(monkeypatch):

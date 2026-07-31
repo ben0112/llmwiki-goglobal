@@ -16,7 +16,7 @@ import { resolveAssetUrl } from '@/lib/runtime-env'
 import { useUserStore } from '@/stores'
 import { ExpandableMedia } from './DiagramViewer'
 import { WikiHighlighter } from './WikiHighlighter'
-import type { DocumentListItem, ReadDocument } from '@/lib/types'
+import type { DocumentListItem } from '@/lib/types'
 
 const MermaidBlock = dynamic(() => import('./MermaidBlock').then((mod) => mod.MermaidBlock), {
   ssr: false,
@@ -363,12 +363,12 @@ function CitationBadge({
 function WikiImage({
   src,
   alt,
-  resolveDocument,
+  documents,
   wikiActivePath,
 }: {
   src?: string
   alt?: string
-  resolveDocument?: (logicalReference: string, signal?: AbortSignal) => Promise<ReadDocument | null>
+  documents?: DocumentListItem[]
   wikiActivePath?: string
 }) {
   const token = useUserStore((s) => s.accessToken)
@@ -377,54 +377,48 @@ function WikiImage({
   const [loading, setLoading] = React.useState(false)
 
   React.useEffect(() => {
-    if (!src || !resolveDocument || !token) return
+    if (!src || !documents || !token) return
     // Only resolve relative paths (not http:// or data: URIs)
     if (src.startsWith('http') || src.startsWith('data:')) return
 
-    const controller = new AbortController()
-    const activeDirectory = wikiActivePath?.includes('/')
-      ? wikiActivePath.slice(0, wikiActivePath.lastIndexOf('/') + 1)
-      : ''
-    const normalized = new URL(src, `https://wiki.invalid/${activeDirectory}`).pathname.replace(/^\//, '')
-    const logicalReference = `wiki/${normalized}`
-    let objectUrl: string | null = null
-    setSvgContent(null)
-    setImageUrl(null)
+    // Resolve relative path: strip leading ./ and resolve against current wiki path
+    let filename = src.replace(/^\.\//, '')
+    const doc = documents.find((d) => {
+      return d.filename === filename || d.filename === filename.split('/').pop()
+    })
+
+    if (!doc) return
+
+    const isSvg = doc.file_type === 'svg'
+    const isTextAsset = ['svg', 'csv', 'xml', 'html'].includes(doc.file_type)
+    const isImageBinary = ['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(doc.file_type)
+
     setLoading(true)
-    void resolveDocument(logicalReference, controller.signal)
-      .then(async (doc) => {
-        if (!doc || controller.signal.aborted) return
-        const isSvg = doc.file_type === 'svg'
-        const isTextAsset = ['svg', 'csv', 'xml', 'html'].includes(doc.file_type)
-        const isImageBinary = ['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(doc.file_type)
-        if (isTextAsset) {
-          const response = await apiFetch<{ content: string }>(
-            `/v1/documents/${doc.id}/content`, token, { signal: controller.signal },
-          )
-          if (controller.signal.aborted || !response.content) return
-          if (isSvg) setSvgContent(response.content)
-          else {
-            objectUrl = URL.createObjectURL(
-              new Blob([response.content], { type: `image/${doc.file_type}+xml` }),
-            )
-            setImageUrl(objectUrl)
+
+    if (isSvg || isTextAsset) {
+      // Text-based assets stored in the content column — fetch via API
+      apiFetch<{ content: string }>(`/v1/documents/${doc.id}/content`, token)
+        .then((res) => {
+          if (isSvg && res.content) {
+            setSvgContent(res.content)
+          } else if (res.content) {
+            // For non-SVG text assets, render as data URI
+            const blob = new Blob([res.content], { type: `image/${doc.file_type}+xml` })
+            setImageUrl(URL.createObjectURL(blob))
           }
-        } else if (isImageBinary) {
-          const response = await apiFetch<{ url: string }>(
-            `/v1/documents/${doc.id}/url`, token, { signal: controller.signal },
-          )
-          if (!controller.signal.aborted) setImageUrl(resolveAssetUrl(response.url))
-        }
-      })
-      .catch(() => { /* unresolved images keep the original Markdown URL */ })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false)
-      })
-    return () => {
-      controller.abort()
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
+        })
+        .catch(() => { /* silent fail — image just won't render */ })
+        .finally(() => setLoading(false))
+    } else if (isImageBinary) {
+      // Binary images stored in S3 — use the /url endpoint
+      apiFetch<{ url: string }>(`/v1/documents/${doc.id}/url`, token)
+        .then((res) => setImageUrl(resolveAssetUrl(res.url)))
+        .catch(() => { /* silent fail */ })
+        .finally(() => setLoading(false))
+    } else {
+      setLoading(false)
     }
-  }, [src, resolveDocument, token, wikiActivePath])
+  }, [src, documents, token, wikiActivePath])
 
   // Inline SVG rendering
   if (svgContent) {
@@ -483,8 +477,7 @@ interface WikiContentProps {
   onNavigate: (path: string) => void
   onSourceClick?: (filename: string, page?: number) => void
   onGraphClick?: () => void
-  activeDocument?: DocumentListItem | null
-  resolveDocument?: (logicalReference: string, signal?: AbortSignal) => Promise<ReadDocument | null>
+  documents?: DocumentListItem[]
   courseMode?: boolean
   courseView?: 'overview' | 'lesson' | null
   isComplete?: boolean
@@ -502,7 +495,7 @@ interface LessonLink {
   path: string
 }
 
-export function WikiContent({ content, title, path, documentId = null, onNavigate, onSourceClick, onGraphClick, activeDocument = null, resolveDocument, courseMode = false, courseView = null, isComplete = false, prevLesson = null, forwardLabel = null, onForward, resumeLesson = null, onLessonNavigate, lessonsTotal = 0, lessonsComplete = 0 }: WikiContentProps) {
+export function WikiContent({ content, title, path, documentId = null, onNavigate, onSourceClick, onGraphClick, documents, courseMode = false, courseView = null, isComplete = false, prevLesson = null, forwardLabel = null, onForward, resumeLesson = null, onLessonNavigate, lessonsTotal = 0, lessonsComplete = 0 }: WikiContentProps) {
   const scrollRef = React.useRef<HTMLDivElement | null>(null)
   const markdownRef = React.useRef<HTMLDivElement | null>(null)
   const body = React.useMemo(() => stripFrontmatter(content), [content])
@@ -514,18 +507,21 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
   // 待复查标记(语料复核变更/复审到期联动置位;页面被编辑保存后清除)
-  const staleSince = activeDocument?.id === documentId ? activeDocument.stale_since : null
+  const staleSince = React.useMemo(() => {
+    if (!documentId || !documents) return null
+    return documents.find((d) => d.id === documentId)?.stale_since ?? null
+  }, [documentId, documents])
   // 分面聚合徽章:本页引用的语料条目自动汇总的八维范围
   const facetRollup = React.useMemo(() => {
-    if (!documentId || activeDocument?.id !== documentId) return null
-    const meta = activeDocument.metadata as
+    if (!documentId || !documents) return null
+    const meta = documents.find((d) => d.id === documentId)?.metadata as
       | Record<string, unknown> | null | undefined
     const r = meta?.facet_rollup as {
       stage?: string[]; domain?: string[]; country?: string[]; business?: string[]
       timeliness_worst?: string | null; entry_count?: number
     } | undefined
     return r && (r.entry_count ?? 0) > 0 ? r : null
-  }, [activeDocument, documentId])
+  }, [documentId, documents])
   const [copied, setCopied] = React.useState(false)
 
   const handleCopy = React.useCallback(() => {
@@ -800,8 +796,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
           <WikiImage
             src={typeof src === 'string' ? src : undefined}
             alt={typeof alt === 'string' ? alt : undefined}
-            resolveDocument={resolveDocument}
-            wikiActivePath={path}
+            documents={documents}
           />
         )
       },
@@ -838,7 +833,7 @@ export function WikiContent({ content, title, path, documentId = null, onNavigat
         return <section {...props}>{children}</section>
       },
     }),
-    [onNavigate, onSourceClick, footnoteSources, resolveDocument, path],
+    [onNavigate, onSourceClick, footnoteSources, documents],
   )
 
   const hasToc = tocItems.length > 0

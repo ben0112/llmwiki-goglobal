@@ -5,9 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { ArrowUpRight, BookOpen, Loader2, Upload as UploadIcon } from 'lucide-react'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { WikiContent } from '@/components/wiki/WikiContent'
-import { readDocumentToListItem, useDocumentBrowse } from '@/hooks/useDocumentBrowse'
-import { useDocumentResolver } from '@/hooks/useDocumentResolver'
-import { useWikiPages } from '@/hooks/useWikiPages'
+import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
 import { useUserStore } from '@/stores'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
@@ -119,16 +117,7 @@ export function WikiOnlyDetail({
   const router = useRouter()
   const searchParams = useSearchParams()
   const token = useUserStore((s) => s.accessToken)
-  const wiki = useWikiPages(kbId, token)
-  const sourceSummary = useDocumentBrowse({
-    kbId,
-    token,
-    path: '/',
-    query: '',
-    sort: 'name',
-    direction: 'asc',
-  })
-  const { documents: wikiDocs, setDocuments, loading } = wiki
+  const { documents, setDocuments, loading } = useKBDocuments(kbId)
   const courseMode = kbKind === 'course'
   const { markComplete } = useCourseProgress(setDocuments)
 
@@ -139,6 +128,15 @@ export function WikiOnlyDetail({
     window.history.replaceState(window.history.state, '', url.pathname + url.search)
   }, [])
 
+  const wikiDocs = React.useMemo(
+    () => documents.filter((d) => (d.path === '/wiki/' || d.path.startsWith('/wiki/')) && !d.archived && d.file_type === 'md'),
+    [documents],
+  )
+  const sourceDocs = React.useMemo(
+    () => documents.filter((d) => !d.path.startsWith('/wiki/') && !d.archived),
+    [documents],
+  )
+
   const pParam = searchParams.get('p')
   const urlWikiDocNumber = pParam ? parseInt(pParam, 10) : null
   const [wikiActivePath, setWikiActivePath] = React.useState<string | null>(null)
@@ -146,20 +144,20 @@ export function WikiOnlyDetail({
   const handledUrlDocNumberRef = React.useRef<number | null>(null)
 
   // Applies ?p= to the active path exactly once per URL value (deep links, back/forward).
-  // Wiki metadata can churn (polling, optimistic course-progress writes) — re-running
+  // `documents` churns constantly (WS/poll, optimistic course-progress writes) — re-running
   // on churn would re-assert a stale URL and snap in-app navigation back. useSearchParams
   // also lags our own history.replaceState writes, so a churn-triggered run can observe the
   // pre-navigation ?p= — trust only values that match the live URL.
   React.useEffect(() => {
-    if (urlWikiDocNumber == null || !wikiDocs.length) return
+    if (urlWikiDocNumber == null || !documents.length) return
     if (urlWikiDocNumber === handledUrlDocNumberRef.current) return
     if (new URL(window.location.href).searchParams.get('p') !== String(urlWikiDocNumber)) return
-    const doc = wikiDocs.find((d) => d.document_number === urlWikiDocNumber)
+    const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
     if (!doc) return
     handledUrlDocNumberRef.current = urlWikiDocNumber
     setWikiActivePath((doc.path + doc.filename).replace(/^\/wiki\/?/, ''))
     lastWikiDocNumberRef.current = urlWikiDocNumber
-  }, [urlWikiDocNumber, wikiDocs])
+  }, [urlWikiDocNumber, documents])
 
   const indexDoc = wikiDocs.find((d) => d.filename === 'index.json' && d.path === '/wiki/')
   const scaffoldFiles = React.useMemo(() => new Set(['index.json', 'overview.md', 'log.md']), [])
@@ -221,17 +219,6 @@ export function WikiOnlyDetail({
 
   const activeWikiVersion = activeWikiDoc?.version ?? -1
   const activeWikiDocId = activeWikiDoc?.id ?? null
-  const { resolve: resolveDocument } = useDocumentResolver({
-    kbId,
-    token,
-    revision: wiki.revision,
-    navigationKey: wikiActivePath ?? '',
-  })
-  const resolveLogicalDocument = React.useCallback(
-    (logicalReference: string, signal?: AbortSignal) =>
-      resolveDocument({ logicalReference }, signal),
-    [resolveDocument],
-  )
 
   // ─── Course progress (derived from the lessons' metadata.course.status) ─────
   const displayTree = React.useMemo(
@@ -376,12 +363,14 @@ export function WikiOnlyDetail({
   }, [kbSlug, router])
 
   const handleCitationSourceClick = React.useCallback((filename: string) => {
-    void (async () => {
-      const document = await resolveLogicalDocument(filename) ??
-        (!/\.[^/]+$/.test(filename) ? await resolveLogicalDocument(`${filename}.md`) : null)
-      if (document) openSourceDoc(readDocumentToListItem(document))
-    })().catch(() => undefined)
-  }, [openSourceDoc, resolveLogicalDocument])
+    const lower = filename.toLowerCase()
+    const match = sourceDocs.find((d) => {
+      const fn = d.filename.toLowerCase()
+      const title = (d.title || '').toLowerCase()
+      return fn === lower || title === lower || fn === lower + '.md' || fn.replace(/\.md$/, '') === lower
+    })
+    if (match) openSourceDoc(match)
+  }, [openSourceDoc, sourceDocs])
 
   const showMainLoading =
     loading ||
@@ -398,9 +387,7 @@ export function WikiOnlyDetail({
             wikiTree={displayTree}
             wikiActivePath={wikiActivePath}
             onWikiNavigate={handleWikiSelect}
-            sourceCount={sourceSummary.sourceCount}
-            failedCount={sourceSummary.failedCount}
-            corpusCount={sourceSummary.corpusCount}
+            sourceDocs={sourceDocs}
             wikiDocs={wikiDocs}
             hasWiki={hasNavigableWiki}
             loading={loading}
@@ -409,7 +396,10 @@ export function WikiOnlyDetail({
             onFilesToggle={() => router.push(`/wikis/${kbSlug}/files`)}
             graphViewActive={false}
             onGraphToggle={() => router.push(`/wikis/${kbSlug}/graph`)}
-            onOpenSourceDoc={(document) => openSourceDoc(readDocumentToListItem(document))}
+            onOpenSourceDoc={(docId) => {
+              const doc = documents.find((d) => d.id === docId)
+              if (doc) openSourceDoc(doc)
+            }}
             courseMode={courseMode}
             courseCurrentPath={currentLessonPath}
             courseProgress={courseMode ? { completed: completedCount, total: lessons.length } : undefined}
@@ -429,8 +419,7 @@ export function WikiOnlyDetail({
               onNavigate={handleWikiNavigate}
               onSourceClick={handleCitationSourceClick}
               onGraphClick={() => router.push(`/wikis/${kbSlug}/graph`)}
-              activeDocument={activeWikiDoc}
-              resolveDocument={resolveLogicalDocument}
+              documents={documents}
               courseMode={courseMode}
               courseView={courseView}
               isComplete={lessonStatus(activeWikiDoc) === 'complete'}

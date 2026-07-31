@@ -1,27 +1,19 @@
 # 第三方 LLM 智能体接入指南(MCP 配置与认证)
 
-LLM Wiki 通过 **MCP(Model Context Protocol)** 提供交互式读写、检索与治理
-工具；Hosted REST 另行提供文档任务、取消和可选的服务端 RAG。任何支持 MCP
-的智能体——桌面端助手、OpenAI Codex CLI、Hermes、OpenClaw，以及其他 MCP
-客户端——都可以接入。整体边界见[总体架构](architecture/overview.md)。
+LLM Wiki 通过 **MCP(Model Context Protocol)** 对外提供全部读写与检索能力。任何支持 MCP 的智能体——桌面端助手、OpenAI Codex CLI、Hermes、OpenClaw,以及其他任意 MCP 客户端——都可以接入,读写维基、分面检索语料、维护关系层、跑复审工作清单。
 
 本指南覆盖:两种部署形态下的连接方式、API 密钥的创建与认证流程、各主流客户端的具体配置、通用配方(适配未列出的客户端)、验证与排错。
 
 ---
 
-## 1. 两种形态，一张能力矩阵
+## 1. 两种形态,一张矩阵
 
-| Surface | Local | Hosted | Purpose |
-|---|---|---|---|
-| MCP tools | yes：stdio | yes：Streamable HTTP | 交互式搜索、读取、写入与治理 |
-| REST document/job APIs | no | yes | 上传、持久任务状态与取消 |
-| REST server-RAG APIs | no | gated，默认关闭 | 有界的服务端 wiki 构建 |
-| `scripts.rag` CLI | no | gated，默认关闭 | 通过 REST 操作服务端 RAG |
-
-本地 MCP 由客户端拉起进程，进程与工作区构成信任边界。Hosted MCP URL 是
-`https://mcp.example.com/mcp`，使用 Streamable HTTP；Hosted MCP 与 REST
-都接受 `sv_` API 密钥形式的 `Authorization: Bearer` 认证。仅支持 stdio 的
-客户端可通过 `mcp-remote` 桥接 Hosted MCP。
+| | 本地模式(单机) | 自部署托管模式(多用户) |
+|---|---|---|
+| MCP 传输 | **stdio**(客户端拉起本机进程) | **Streamable HTTP**(`https://mcp.example.com/mcp`) |
+| 认证 | 无(进程即信任边界,数据不出本机) | **API 密钥**(`sv_` 前缀,`Authorization: Bearer` 头) |
+| 配置来源 | `./llmwiki mcp-config <工作区>` 一键打印 | Web 端 **设置 → 连接 AI 助手 (MCP)** 一键生成 |
+| 适用客户端 | 任何支持 stdio MCP 的客户端 | 任何支持 Streamable HTTP + 自定义请求头的客户端;仅支持 stdio 的客户端经 `mcp-remote` 桥接 |
 
 > 托管模式同时接受 Supabase 会话 JWT 作为 Bearer(Web 端内部使用),但**给智能体配的应当是 API 密钥**:长期有效、可单独吊销、有使用审计,不随会话过期。
 
@@ -78,40 +70,6 @@ curl -sS -X DELETE "https://api.example.com/v1/api-keys/<id>" -H "Authorization:
 ```
 
 **认证过程**(便于排错时理解):客户端在每个 HTTP 请求上带 `Authorization: Bearer sv_…`;MCP 服务端计算密钥的 SHA-256 与 `api_keys` 表比对(库中只存哈希),命中且未吊销即放行,并同步更新 `last_used_at`(设置页可见,用于审计)。同一个密钥也通行 REST API(`https://api.example.com/v1/…`),权限等同于该用户本人。
-
-### 2.3 Hosted 持久任务状态与取消
-
-文档上传或其他 Hosted 写入返回 `job_id` 后，客户端可使用同一 Bearer 凭据
-观察和取消任务：
-
-```bash
-curl -sS "https://api.example.com/v1/jobs/$JOB_ID" \
-  -H "Authorization: Bearer $LLMWIKI_ACCESS_TOKEN" | jq .
-curl -sS -X POST "https://api.example.com/v1/jobs/$JOB_ID/cancel" \
-  -H "Authorization: Bearer $LLMWIKI_ACCESS_TOKEN" | jq .
-```
-
-任务状态由 Postgres 持久账本拥有；轮询任意 API 副本得到同一结果。取消在
-worker 检查点生效，不保证撤回已经原子提交的结果。租约、重试和恢复合同见
-[durable-jobs.md](architecture/durable-jobs.md)。
-
-### 2.4 可选服务端 RAG
-
-当管理员在 API 与 worker 上启用 `SERVER_RAG_ENABLED=true` 后，通过认证的
-REST 提供：
-
-- `POST /v1/rag/build-wiki`；
-- `GET /v1/rag/runs/{run_id}`；
-- `GET /v1/rag/runs/{run_id}/steps`；
-- `POST /v1/rag/runs/{run_id}/resume`；以及
-- 通用的 `POST /v1/jobs/{job_id}/cancel`。
-
-`PYTHONPATH=api python -m scripts.rag` 提供 `build-wiki`、`status`、`steps`
-和 `resume`，它只调用 REST。客户端只提交服务器允许的 profile 名称；服务端
-**不接受 provider URL、模型 ID 或 provider credential**。
-`LLMWIKI_ACCESS_TOKEN` 是
-LLMWiki Bearer 凭据，不是模型供应商密钥。预算、dry-run、部分提交和恢复合同
-见 [server-rag.md](architecture/server-rag.md)。
 
 ---
 

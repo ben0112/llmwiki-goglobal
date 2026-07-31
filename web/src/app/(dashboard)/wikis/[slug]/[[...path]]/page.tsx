@@ -3,9 +3,8 @@
 import * as React from 'react'
 import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import { useKBStore, useUserStore } from '@/stores'
-import { useWikiPages } from '@/hooks/useWikiPages'
+import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { WikiOnlyDetail } from '@/components/kb/WikiOnlyDetail'
-import { decodeWikiRouteSlug } from '@/lib/wiki-routes'
 import { Loader2 } from 'lucide-react'
 
 export default function KBPage() {
@@ -15,19 +14,17 @@ export default function KBPage() {
   const knowledgeBases = useKBStore((s) => s.knowledgeBases)
   const kbLoading = useKBStore((s) => s.loading)
   const user = useUserStore((s) => s.user)
-  const token = useUserStore((s) => s.accessToken)
-  const slug = decodeWikiRouteSlug(params.slug)
 
   const kb = React.useMemo(
-    () => knowledgeBases.find((k) => k.slug === slug),
-    [knowledgeBases, slug],
+    () => knowledgeBases.find((k) => k.slug === params.slug),
+    [knowledgeBases, params.slug],
   )
 
   // ── Legacy ?page= redirect (old URL format) ─────────────────
   const legacyPage = searchParams.get('page')
   const needsDocLookup = !!legacyPage
-  const { documents: legacyDocs, loading: legacyLoading } = useWikiPages(
-    needsDocLookup ? (kb?.id ?? '') : '', token,
+  const { documents: legacyDocs, loading: legacyLoading } = useKBDocuments(
+    needsDocLookup ? (kb?.id ?? '') : '',
   )
 
   React.useEffect(() => {
@@ -58,7 +55,7 @@ export default function KBPage() {
       <div className="flex flex-col items-center justify-center h-full gap-2 bg-background">
         <h1 className="text-lg font-medium">未找到维基</h1>
         <p className="text-sm text-muted-foreground">
-          维基 &ldquo;{slug}&rdquo; 不存在,或您没有访问权限。
+          维基 &ldquo;{params.slug}&rdquo; 不存在,或您没有访问权限。
         </p>
       </div>
     )

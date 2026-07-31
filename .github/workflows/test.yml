@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [master, "claude/**", "feat/**"]
+    branches: [master, "claude/**"]
   pull_request:
     branches: [master, "claude/**"]
 
@@ -21,32 +21,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install shared core
-        run: pip install -e . --no-deps
-
       - name: Install all dependencies
         run: |
           pip install -r api/requirements.txt
           pip install -r mcp/requirements.txt
           pip install -r tests/requirements.txt cryptography
 
-      - name: Run shared core unit tests
-        run: python -m tests.helpers.ci_test_matrix run unit-core -- pytest -v
-
       - name: Run API unit tests
-        run: python -m tests.helpers.ci_test_matrix run unit-api -- env PYTHONPATH=api pytest -v
-
-      - name: Verify complete CI test matrix ownership
-        run: pytest tests/test_ci_matrix_contract.py -v
-
-      - name: Run durable scaling static tests
-        run: PYTHONPATH=api pytest tests/integration/test_scaled_compose.py -v
+        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py tests/unit/test_highlight_granular.py tests/unit/test_html_parser_highlights.py tests/unit/test_s3_selfhost.py tests/unit/test_sqlite_document_repo.py tests/unit/test_wiki_regen.py tests/unit/test_archive_extract.py tests/unit/test_tus_sanitize_and_tasks.py tests/unit/test_facet_rollup.py tests/unit/test_resumable_upload.py tests/unit/test_workspace_sweep.py tests/unit/test_extraction_fixes.py -v
 
       - name: Run MCP unit tests
-        run: python -m tests.helpers.ci_test_matrix run unit-mcp -- env PYTHONPATH=mcp pytest -v
+        working-directory: mcp
+        run: pytest ../tests/unit/mcp/ -v
 
       - name: Run corpus classification tests
-        run: python -m tests.helpers.ci_test_matrix run unit-corpus -- pytest -v
+        run: pytest tests/unit/corpus/ -v
 
   mcp-integration:
     name: MCP integration tests (SQLite)
@@ -59,9 +48,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install shared core
-        run: pip install -e . --no-deps
-
       - name: Install MCP dependencies
         run: pip install -r mcp/requirements.txt
 
@@ -69,83 +55,8 @@ jobs:
         run: pip install -r tests/requirements.txt cryptography
 
       - name: Run MCP VaultFS + tool handler tests
-        run: python -m tests.helpers.ci_test_matrix run integration-mcp -- env PYTHONPATH=mcp pytest -v
-
-  s3-integration:
-    name: Integration tests (MinIO)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install API dependencies
-        run: pip install -r api/requirements.txt
-
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
-
-      - name: Start MinIO
-        run: |
-          docker run --detach --name llmwiki-minio \
-            --publish 127.0.0.1:9000:9000 \
-            --env MINIO_ROOT_USER=test-access \
-            --env MINIO_ROOT_PASSWORD=test-secret-key \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          for attempt in {1..40}; do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 40 ]; then
-              docker logs llmwiki-minio
-              exit 1
-            fi
-            sleep 0.25
-          done
-
-      - name: Run multipart object-store tests
-        env:
-          S3_MULTIPART_TEST_ENDPOINT: http://127.0.0.1:9000
-          S3_MULTIPART_TEST_ACCESS_KEY: test-access
-          S3_MULTIPART_TEST_SECRET_KEY: test-secret-key
-          S3_MULTIPART_TEST_BUCKET: llmwiki-multipart-test
-        run: python -m tests.helpers.ci_test_matrix run integration-minio -- env PYTHONPATH=api pytest -v
-
-  redis-integration:
-    name: Integration tests (Redis)
-    runs-on: ubuntu-latest
-
-    services:
-      redis:
-        image: redis:7.4.2-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 20
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install API dependencies
-        run: pip install -r api/requirements.txt
-
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
-
-      - name: Run Redis TUS coordination tests
-        env:
-          TUS_REDIS_TEST_URL: redis://127.0.0.1:6379/0
-        run: python -m tests.helpers.ci_test_matrix run integration-redis -- env PYTHONPATH=api pytest -v
+        working-directory: mcp
+        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_corpus_facets.py ../tests/integration/mcp/test_corpus_relations.py ../tests/integration/mcp/test_corpus_fold.py -v
 
   postgres-integration:
     name: Integration tests (Postgres)
@@ -153,7 +64,7 @@ jobs:
 
     services:
       postgres:
-        image: pgvector/pgvector:0.8.0-pg16
+        image: postgres:16-alpine
         env:
           POSTGRES_DB: supavault_test
           POSTGRES_USER: postgres
@@ -165,15 +76,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
-      redis:
-        image: redis:7.4.2-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -181,9 +83,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install shared core
-        run: pip install -e . --no-deps
 
       - name: Install API dependencies
         run: pip install -r api/requirements.txt
@@ -194,99 +93,12 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt cryptography
 
-      - name: Start fixed-version MinIO for Hosted TUS
-        run: |
-          docker run --detach --name llmwiki-tus-minio \
-            --publish 127.0.0.1:9000:9000 \
-            --env MINIO_ROOT_USER=test-access \
-            --env MINIO_ROOT_PASSWORD=test-secret-key \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          for attempt in {1..40}; do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 40 ]; then
-              docker logs llmwiki-tus-minio
-              exit 1
-            fi
-            sleep 0.25
-          done
+      - name: Run API isolation + lifecycle tests
+        run: PYTHONPATH=api MODE=hosted pytest tests/integration/isolation/ tests/integration/test_kb_lifecycle.py tests/integration/test_note_lifecycle.py -v
 
-      - name: Run complete isolated API integration matrix
-        env:
-          QUOTA_REDIS_TEST_URL: redis://127.0.0.1:6379/0
-          TUS_MULTIPART_REDIS_URL: redis://127.0.0.1:6379/0
-          TUS_MULTIPART_S3_ENDPOINT: http://127.0.0.1:9000
-          TUS_MULTIPART_S3_ACCESS_KEY: test-access
-          TUS_MULTIPART_S3_SECRET_KEY: test-secret-key
-          TUS_MULTIPART_S3_BUCKET: llmwiki-tus-test
-        run: python -m tests.helpers.ci_test_matrix run integration-api -- env PYTHONPATH=api MODE=hosted pytest -v
-
-      - name: Run deterministic retrieval promotion gate
-        run: python -m tests.helpers.ci_test_matrix run integration-retrieval -- env PYTHONPATH=api MODE=hosted pytest -v
-
-      - name: Run server RAG integration matrix
-        run: python -m tests.helpers.ci_test_matrix run integration-rag -- env PYTHONPATH=api MODE=hosted pytest -v
+      - name: Run API-key auth + hosted corpus import tests
+        run: PYTHONPATH=api MODE=hosted pytest tests/integration/test_api_key_auth.py tests/integration/test_corpus_hosted_import.py tests/integration/test_corpus_hosted_pipeline.py -v
 
       - name: Run MCP Postgres isolation tests
-        run: python -m tests.helpers.ci_test_matrix run integration-mcp-postgres -- env PYTHONPATH=mcp pytest -v
-
-  scaled-compose:
-    name: Required scaled Compose (2 API / 2 worker)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install scaled smoke dependencies
-        run: |
-          pip install -r api/requirements.txt
-          pip install -r tests/requirements.txt cryptography
-
-      - name: Generate ephemeral scaled identity
-        run: |
-          python -m tests.helpers.scaled_ci_identity --jwks-root deploy/.ci-jwks --env-file deploy/.env.selfhost
-          cat >> deploy/.env.selfhost <<'EOF'
-          SERVER_RAG_ENABLED=true
-          RAG_MODEL_PROFILES_JSON={"primary":{"base_url":"http://fake-model:8000/v1","model":"deterministic-writer","timeout_seconds":60,"version":"fake-profile-v1"}}
-          RAG_MODEL_API_KEYS_JSON={"primary":"fake-ci-provider-key"}
-          EOF
-
-      - name: Validate Compose configuration
-        run: docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci config --quiet
-
-      - name: Start CI dependencies
-        run: |
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d ci-postgres
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d ci-auth
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d redis
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d minio
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d converter
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d fake-model
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d --wait ci-postgres redis minio
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci exec -T ci-postgres psql -v ON_ERROR_STOP=1 -U postgres -d postgres < tests/helpers/schema.sql
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci exec -T ci-postgres psql -v ON_ERROR_STOP=1 -U postgres -d postgres -c "INSERT INTO users (id, email) VALUES ('d7cba9c8-55f4-4ffc-8e81-279fa4b41c03', 'scaled-ci@example.invalid')"
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci run --rm --no-deps minio-init
-
-      - name: Build and start two API and two worker replicas
-        run: docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci up -d --build --wait --scale api=2 --scale worker=2 fake-model api worker gateway
-
-      - name: Run required scaled smoke
-        env:
-          SCALED_COMPOSE_TEST: "1"
-          SCALED_COMPOSE_ENV_FILE: deploy/.env.selfhost
-        run: python -m tests.helpers.ci_test_matrix run integration-scaled -- env PYTHONPATH=api pytest -v
-
-      - name: Print scaled service logs on failure
-        if: failure()
-        run: docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci logs --no-color api worker gateway fake-model redis minio ci-postgres ci-auth converter
-
-      - name: Tear down scaled stack
-        if: always()
-        run: |
-          docker compose -f deploy/docker-compose.selfhost.yml --env-file deploy/.env.selfhost --profile ci down -v --remove-orphans
-          rm -rf deploy/.ci-jwks deploy/.env.selfhost
+        working-directory: mcp
+        run: pytest ../tests/integration/mcp/test_mcp_isolation.py -v

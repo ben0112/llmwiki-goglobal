@@ -6,25 +6,16 @@ import dynamic from 'next/dynamic'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Upload as UploadIcon, BookOpen, ArrowUpRight, Loader2 } from 'lucide-react'
 import { useUserStore, useUploadStore } from '@/stores'
-import { readDocumentToListItem, useDocumentBrowse } from '@/hooks/useDocumentBrowse'
-import { useDocumentResolver } from '@/hooks/useDocumentResolver'
-import { useWikiPages } from '@/hooks/useWikiPages'
+import { useKBDocuments } from '@/hooks/useKBDocuments'
 import { apiFetch } from '@/lib/api'
 import { apiUrl } from '@/lib/runtime-env'
 import { collectDroppedFiles } from '@/lib/dropFiles'
-import { reconcileDocumentStatuses, runUploadPreflight } from '@/lib/upload-preflight'
 import { toast } from 'sonner'
 import { KBSidenav } from '@/components/kb/KBSidenav'
 import { SelectionActionBar } from '@/components/kb/SelectionActionBar'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { WikiContent } from '@/components/wiki/WikiContent'
-import type {
-  DocumentListItem,
-  ReadDocumentStatusPage,
-  ReadDocument,
-  UploadPreflightResponse,
-  WikiNode,
-} from '@/lib/types'
+import type { DocumentListItem, WikiNode } from '@/lib/types'
 import type { ViewMode } from '@/components/kb/viewMode'
 
 
@@ -142,32 +133,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const searchParams = useSearchParams()
   const token = useUserStore((s) => s.accessToken)
   const userId = useUserStore((s) => s.user?.id)
-  const [browseOptions, setBrowseOptions] = React.useState<{
-    query: string
-    sort: 'name' | 'date' | 'type'
-    direction: 'asc' | 'desc'
-  }>({ query: '', sort: 'name', direction: 'asc' })
-  const [browsePath, setBrowsePath] = React.useState(routeFilesPath)
-  React.useEffect(() => setBrowsePath(routeFilesPath), [routeFilesPath])
-  const browse = useDocumentBrowse({
-    kbId,
-    token,
-    path: browsePath,
-    ...browseOptions,
-  })
-  const wiki = useWikiPages(kbId, token)
-  const documents = React.useMemo(
-    () => [...wiki.documents, ...browse.items],
-    [browse.items, wiki.documents],
-  )
-  const refreshReadModels = React.useCallback(
-    () => {
-      void browse.reload()
-      void wiki.reload()
-    },
-    [browse.reload, wiki.reload],
-  )
-  const loading = wiki.loading
+  const { documents, setDocuments, loading } = useKBDocuments(kbId)
 
   // ─── Upload tracking (global progress panel) ─────────────────
   const addUpload = useUploadStore((s) => s.addUpload)
@@ -175,12 +141,9 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
   const markUploadProcessing = useUploadStore((s) => s.markProcessing)
   const markUploadReady = useUploadStore((s) => s.markReady)
   const markUploadFailed = useUploadStore((s) => s.markFailed)
-  const reconcileUploads = useUploadStore((s) => s.reconcileStatuses)
-  const processingUploadIds = useUploadStore(
-    (s) => s.items
-      .filter((item) => item.kbId === kbId && item.phase === 'processing' && item.documentId)
-      .map((item) => item.documentId)
-      .join(','),
+  const reconcileUploads = useUploadStore((s) => s.reconcileDocuments)
+  const processingUploads = useUploadStore(
+    (s) => s.items.filter((i) => i.kbId === kbId && i.phase === 'processing').length,
   )
   const openRequest = useUploadStore((s) => s.openRequest)
   const consumeOpenRequest = useUploadStore((s) => s.consumeOpenRequest)
@@ -214,12 +177,12 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   // ─── Document splits ─────────────────────────────────────────
   const wikiDocs = React.useMemo(
-    () => wiki.documents.filter((d) => !d.archived && d.file_type === 'md'),
-    [wiki.documents],
+    () => documents.filter((d) => (d.path === '/wiki/' || d.path.startsWith('/wiki/')) && !d.archived && d.file_type === 'md'),
+    [documents],
   )
   const sourceDocs = React.useMemo(
-    () => browse.items.filter((d) => !d.archived),
-    [browse.items],
+    () => documents.filter((d) => !d.path.startsWith('/wiki/') && !d.archived),
+    [documents],
   )
 
   // ─── View state ──────────────────────────────────────────────
@@ -237,50 +200,39 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   const [wikiActivePath, setWikiActivePath] = React.useState<string | null>(null)
   const lastWikiDocNumberRef = React.useRef<number | null>(urlWikiDocNumber)
-  const { resolve: resolveDocument } = useDocumentResolver({
-    kbId,
-    token,
-    revision: wiki.revision ?? browse.revision,
-    navigationKey: `${activeView}|${wikiActivePath ?? ''}`,
-  })
-  const resolveLogicalDocument = React.useCallback(
-    (logicalReference: string, signal?: AbortSignal) =>
-      resolveDocument({ logicalReference }, signal),
-    [resolveDocument],
-  )
 
   // Initialize wikiActivePath from ?p= on mount and when ?p= changes
   React.useEffect(() => {
     if (urlWikiDocNumber == null) return
-    if (!wikiDocs.length) return
-    const doc = wikiDocs.find((d) => d.document_number === urlWikiDocNumber)
+    if (!documents.length) return
+    const doc = documents.find((d) => d.document_number === urlWikiDocNumber)
     if (doc) {
       const path = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
       setWikiActivePath(path)
       lastWikiDocNumberRef.current = urlWikiDocNumber
     }
-  }, [urlWikiDocNumber, wikiDocs])
+  }, [urlWikiDocNumber, documents])
 
   // ─── Source doc selection ────────────────────────────────────
   // Read ?doc= only on mount (for bookmarked URLs / browser back-forward)
   const initialDocParam = React.useRef(searchParams.get('doc'))
   const initialDocNumber = initialDocParam.current ? parseInt(initialDocParam.current, 10) : null
 
-  const [activeSourceDocId, setActiveSourceDocId] = React.useState<string | null>(null)
-  const [activeSourceDocument, setActiveSourceDocument] = React.useState<DocumentListItem | null>(null)
+  const [activeSourceDocId, setActiveSourceDocId] = React.useState<string | null>(() => {
+    if (initialDocNumber == null) return null
+    const doc = documents.find((d) => d.document_number === initialDocNumber)
+    return doc?.id ?? null
+  })
 
   // Resolve initial ?doc= once documents load
   React.useEffect(() => {
-    if (initialDocNumber == null || activeSourceDocId || !token) return
-    const controller = new AbortController()
-    resolveDocument({ documentNumber: initialDocNumber }, controller.signal).then((document) => {
-      if (!document) return
-      setActiveSourceDocId(document.id)
-      setActiveSourceDocument(readDocumentToListItem(document))
+    if (initialDocNumber == null || activeSourceDocId) return
+    const doc = documents.find((d) => d.document_number === initialDocNumber)
+    if (doc) {
+      setActiveSourceDocId(doc.id)
       setActiveView('doc')
-    }).catch(() => undefined)
-    return () => controller.abort()
-  }, [initialDocNumber, activeSourceDocId, token, resolveDocument])
+    }
+  }, [initialDocNumber, documents, activeSourceDocId])
 
   const [filesInitialPage, setFilesInitialPage] = React.useState<number | undefined>()
 
@@ -504,7 +456,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       } else {
         await apiFetch('/v1/documents/bulk-delete', t, { method: 'POST', body: JSON.stringify({ ids }) })
       }
-      refreshReadModels()
+      setDocuments((prev) => prev.filter((d) => !ids.includes(d.id)))
       if (impact.length > 0 && process.env.NEXT_PUBLIC_MODE === 'local') {
         toast.info(`已删除 ${ids.length} 个文件;${impact.length} 个引用维基页面正在后台重新生成`)
         pollRegenCompletion(impact.length)
@@ -517,7 +469,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       setDeleting(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deleteRequest, clearSelection, pollRegenCompletion, refreshReadModels])
+  }, [deleteRequest, clearSelection, pollRegenCompletion, setDocuments])
 
   const handleDeleteSelected = () => { requestDelete(Array.from(selectedIds), true) }
 
@@ -539,7 +491,6 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     if (activeView === 'doc') {
       // Doc is open — close it, go to root file browser
       setActiveSourceDocId(null)
-      setActiveSourceDocument(null)
       setActiveView('files')
       navigateToView('files')
     } else if (activeView === 'files') {
@@ -569,49 +520,47 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     }
   }, [graphViewActive, navigateToView])
 
-  const handleGraphNodeClick = React.useCallback((logicalReference: string, sourceKind: string) => {
-    void resolveLogicalDocument(logicalReference).then((document) => {
-      if (!document) return
-      const doc = readDocumentToListItem(document)
-      if (sourceKind === 'wiki') {
-        const wikiPath = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
-        setActiveView('wiki')
-        setWikiActivePath(wikiPath)
-        lastWikiDocNumberRef.current = doc.document_number
-        navigateToView('wiki', { searchParams: doc.document_number != null ? { p: String(doc.document_number) } : undefined })
-        return
-      }
-      setActiveSourceDocId(doc.id)
-      setActiveSourceDocument(doc)
-      setActiveView('doc')
-      navigateToView('files', { searchParams: doc.document_number != null ? { doc: String(doc.document_number) } : undefined })
-    }).catch(() => undefined)
-  }, [navigateToView, resolveLogicalDocument])
-
-  const handleOpenSourceDoc = React.useCallback((doc: ReadDocument) => {
+  const handleGraphNodeClick = React.useCallback((docId: string, sourceKind: string) => {
+    const doc = documents.find((d) => d.id === docId)
+    if (!doc) return
+    if (sourceKind === 'wiki') {
+      const wikiPath = (doc.path + doc.filename).replace(/^\/wiki\/?/, '')
+      setActiveView('wiki')
+      setWikiActivePath(wikiPath)
+      lastWikiDocNumberRef.current = doc.document_number
+      navigateToView('wiki', { searchParams: doc.document_number != null ? { p: String(doc.document_number) } : undefined })
+      return
+    }
     setActiveSourceDocId(doc.id)
-    setActiveSourceDocument(readDocumentToListItem(doc))
+    setActiveView('doc')
+    navigateToView('files', { searchParams: doc.document_number != null ? { doc: String(doc.document_number) } : undefined })
+  }, [documents, navigateToView])
+
+  const handleOpenSourceDoc = React.useCallback((docId: string) => {
+    const doc = documents.find((d) => d.id === docId)
+    if (!doc) return
+    setActiveSourceDocId(doc.id)
     setActiveView('doc')
     if (doc.document_number != null) {
       navigateToView('files', { searchParams: { doc: String(doc.document_number) } })
     }
-  }, [navigateToView])
+  }, [documents, navigateToView])
 
   const handleCitationSourceClick = React.useCallback((filename: string, page?: number) => {
-    void (async () => {
-      const document = await resolveLogicalDocument(filename) ??
-        (!/\.[^/]+$/.test(filename) ? await resolveLogicalDocument(`${filename}.md`) : null)
-      if (!document) return
-      const match = readDocumentToListItem(document)
-      setActiveSourceDocId(match.id)
-      setActiveSourceDocument(match)
-      setActiveView('doc')
-      setFilesInitialPage(page)
-      if (match.document_number != null) {
-        navigateToView('files', { searchParams: { doc: String(match.document_number) } })
-      }
-    })().catch(() => undefined)
-  }, [navigateToView, resolveLogicalDocument])
+    const lower = filename.toLowerCase()
+    const match = sourceDocs.find((d) => {
+      const fn = d.filename.toLowerCase()
+      const title = (d.title || '').toLowerCase()
+      return fn === lower || title === lower || fn === lower + '.md' || fn.replace(/\.md$/, '') === lower
+    })
+    if (!match) return
+    setActiveSourceDocId(match.id)
+    setActiveView('doc')
+    setFilesInitialPage(page)
+    if (match.document_number != null) {
+      navigateToView('files', { searchParams: { doc: String(match.document_number) } })
+    }
+  }, [sourceDocs, navigateToView])
 
   const handlePageGraphClick = React.useCallback(() => {
     if (!activeWikiDocId) return
@@ -671,7 +620,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         method: 'POST',
         body: JSON.stringify({ filename: '无标题.md', path: targetPath }),
       })
-      refreshReadModels()
+      setDocuments((prev) => [data, ...prev])
       if (!filesViewActive) {
         setActiveView('files')
         navigateToView('files')
@@ -690,7 +639,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       body: JSON.stringify({ filename: '无标题.md', path }),
     })
       .then((data) => {
-        refreshReadModels()
+        setDocuments((prev) => [data, ...prev])
         if (!filesViewActive) {
           setActiveView('files')
           navigateToView('files')
@@ -704,7 +653,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     if (!t) return
     try {
       await apiFetch(`/v1/documents/${docId}`, t, { method: 'PATCH', body: JSON.stringify({ path: targetPath }) })
-      refreshReadModels()
+      setDocuments((prev) => prev.map((d) => d.id === docId ? { ...d, path: targetPath } : d))
     } catch { toast.error('移动文档失败') }
   }
 
@@ -717,7 +666,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     if (!t) return
     try {
       await apiFetch(`/v1/documents/${docId}`, t, { method: 'PATCH', body: JSON.stringify({ title: newTitle }) })
-      refreshReadModels()
+      setDocuments((prev) => prev.map((d) => d.id === docId ? { ...d, title: newTitle } : d))
     } catch { toast.error('重命名文档失败') }
   }
 
@@ -759,10 +708,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
         headers: { Authorization: `Bearer ${t}` },
         onProgress: (sent, total) => setUploadProgress(uploadId, total > 0 ? sent / total : 0),
         onError: (error) => { markUploadFailed(uploadId); reject(error) },
-        onSuccess: ({ lastResponse }) => {
-          markUploadProcessing(uploadId, lastResponse.getHeader('X-Document-Id') ?? null)
-          resolve()
-        },
+        onSuccess: () => { markUploadProcessing(uploadId); resolve() },
       })
       upload.start()
     })
@@ -792,41 +738,63 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
       || relOf(file).split('/').some((p) => p.startsWith('.') || p === '__MACOSX')
     const isArchive = (name: string): boolean => /\.(zip|tar|tgz)$/i.test(name) || /\.tar\.gz$/i.test(name)
 
-    // 浏览器只枚举一次目录;预检按 200 个描述符分块且最多并发 2 个请求。
-    // 最终唯一性仍由上传写路径负责,预检只用于尽早跳过确定失败的文件。
-    const HASH_MAX_BYTES = 64 * 1024 * 1024
-    const archives = files.filter((file) => !isJunk(file) && isArchive(file.name))
-    const candidates = files
-      .filter((file) => !isJunk(file) && !isArchive(file.name))
-      .map((file) => ({ file, path: destOf(file) }))
-    const preflight = await runUploadPreflight(candidates, {
-      hashFile: process.env.NEXT_PUBLIC_MODE === 'local',
-      shouldHash: ({ file }) => file.size <= HASH_MAX_BYTES,
-      preflight: async (items, signal) => {
-        const response = await apiFetch<UploadPreflightResponse>(
-          `/v1/knowledge-bases/${kbId}/documents/upload-preflight`,
-          t,
-          { method: 'POST', body: JSON.stringify({ items }), signal },
-        )
-        return response.items
-      },
-    })
-    const skippedByName = preflight.skipped
-      .filter((item) => item.reason === 'duplicate_name')
-      .map((item) => item.candidate.file.name)
-    const skippedByContent = preflight.skipped
-      .filter((item) => item.reason === 'duplicate_content')
-      .map((item) => item.candidate.file.name)
-    const oversizeNames = preflight.skipped
-      .filter((item) => item.reason === 'too_large')
-      .map((item) => item.candidate.file.name)
-    const preflightUnsupportedNames = preflight.skipped
-      .filter((item) => item.reason === 'unsupported')
-      .map((item) => item.candidate.file.name)
-    const toUpload = [
-      ...archives,
-      ...preflight.accepted.map((item) => item.candidate.file),
-    ]
+    // 双层去重,自动跳过(不打断上传,仅在完成报告中提及):
+    // 第一层:目标位置同名文件(不区分大小写);
+    // 第二层:文件内容 SHA-256 与库内任意既有文件相同(本地模式;
+    // 后端 content_hash 即原始字节哈希),同批内重复内容也只传一份。
+    // 压缩包本身不入库,跳过去重(包内条目由服务端按同口径去重)。
+    const namesByPath = new Map<string, Set<string>>()
+    for (const d of documents) {
+      if (d.archived || d.status === 'failed') continue   // 失败文件允许同名重传重试
+      const set = namesByPath.get(d.path) ?? new Set<string>()
+      set.add(d.filename.toLowerCase())
+      namesByPath.set(d.path, set)
+    }
+    const existingHashes = new Set(
+      // failed 文档不参与去重:同内容重传应被允许(比如修复环境后重试)
+      documents.filter((d) => !d.archived && d.status !== 'failed' && d.content_hash)
+        .map((d) => d.content_hash as string),
+    )
+    const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024      // 1 GiB,与后端一致
+    const HASH_MAX_BYTES = 64 * 1024 * 1024          // 超过则跳过浏览器内容哈希(避免整读进内存)
+    const canHash = process.env.NEXT_PUBLIC_MODE === 'local'
+      && typeof crypto !== 'undefined' && !!crypto.subtle
+    const skippedByName: string[] = []
+    const skippedByContent: string[] = []
+    const oversizeNames: string[] = []
+    const batchHashes = new Set<string>()
+    const batchNames = new Set<string>()
+    const toUpload: File[] = []
+    for (const file of files) {
+      if (isJunk(file)) continue // 系统垃圾文件静默丢弃
+      if (file.size > MAX_UPLOAD_BYTES) {
+        oversizeNames.push(file.name)
+        continue
+      }
+      if (isArchive(file.name)) {
+        toUpload.push(file)
+        continue
+      }
+      const dest = destOf(file)
+      const nameKey = dest + ' ' + file.name.toLowerCase()
+      if (namesByPath.get(dest)?.has(file.name.toLowerCase()) || batchNames.has(nameKey)) {
+        skippedByName.push(file.name)
+        continue
+      }
+      if (canHash && file.size <= HASH_MAX_BYTES) {
+        try {
+          const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
+          const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+          if (existingHashes.has(hex) || batchHashes.has(hex)) {
+            skippedByContent.push(file.name)
+            continue
+          }
+          batchHashes.add(hex)
+        } catch { /* 哈希失败不阻断上传 */ }
+      }
+      batchNames.add(nameKey)
+      toUpload.push(file)
+    }
     const skippedTotal = skippedByName.length + skippedByContent.length
     if (toUpload.length === 0) {
       if (skippedTotal > 0 || oversizeNames.length > 0) {
@@ -894,7 +862,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
     const supportedTypes = new Set(['pdf', 'pptx', 'ppt', 'docx', 'doc', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'xlsx', 'xls', 'csv', 'html', 'htm'])
     const results: { name: string; ok: boolean }[] = []
-    const unsupportedNames: string[] = [...preflightUnsupportedNames]
+    const unsupportedNames: string[] = []
     let extractedCreated = 0
     let archiveSkipped = 0
 
@@ -935,7 +903,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             xhr.onerror = () => reject(new Error('网络错误'))
             xhr.send(formData)
           })
-          refreshReadModels()
+          setDocuments((prev) => [...data.documents, ...prev])
           extractedCreated += data.created
           archiveSkipped += data.skipped_duplicate + data.skipped_unsupported
           markUploadReady(uploadId)
@@ -956,9 +924,9 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             method: 'POST',
             body: JSON.stringify({ filename: file.name, title, content, path: dest }),
           })
-          refreshReadModels()
+          setDocuments((prev) => [data, ...prev])
           setUploadProgress(uploadId, 1)
-          markUploadProcessing(uploadId, data.id)
+          markUploadProcessing(uploadId)
           return true
         } catch {
           markUploadFailed(uploadId, '导入失败')
@@ -997,8 +965,8 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
               xhr.send(formData)
             })
           }
-          refreshReadModels()
-          markUploadProcessing(uploadId, data.id)
+          setDocuments((prev) => [data, ...prev])
+          markUploadProcessing(uploadId)
           return true
         } catch (err) {
           markUploadFailed(uploadId, err instanceof Error ? err.message : null)
@@ -1061,61 +1029,25 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
     }
 
     // Navigate to files view after first upload
-    if (browse.sourceCount === 0 && okCount > 0) {
+    if (sourceDocs.length === 0 && okCount > 0) {
       setActiveView('files')
       navigateToView('files')
     }
-  }, [kbId, kbSlug, userId, tusUploadFile, browse.sourceCount, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadReady, markUploadFailed, refreshReadModels])
+  }, [kbId, kbSlug, userId, tusUploadFile, documents, sourceDocs.length, navigateToView, addUpload, setUploadProgress, markUploadProcessing, markUploadReady, markUploadFailed])
 
   React.useEffect(() => {
-    if (!processingUploadIds || !token) return
-    const controller = new AbortController()
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const poll = async () => {
-      if (controller.signal.aborted) return
-      if (document.hidden) {
-        timer = setTimeout(poll, 2_000)
-        return
-      }
-      const ids = processingUploadIds.split(',').filter(Boolean)
-      try {
-        const statuses = await reconcileDocumentStatuses(
-          ids,
-          async (batch, signal) => {
-            const response = await apiFetch<ReadDocumentStatusPage>(
-              `/v1/knowledge-bases/${kbId}/documents/status`,
-              token,
-              { method: 'POST', body: JSON.stringify({ ids: batch }), signal },
-            )
-            return response.items
-          },
-          controller.signal,
-        )
-        reconcileUploads(kbId, statuses)
-      } finally {
-        if (!controller.signal.aborted) timer = setTimeout(poll, 2_000)
-      }
-    }
-    void poll()
-    return () => {
-      controller.abort()
-      if (timer) clearTimeout(timer)
-    }
-  }, [kbId, processingUploadIds, reconcileUploads, token])
+    reconcileUploads(kbId, documents)
+  }, [kbId, documents, processingUploads, reconcileUploads])
 
   React.useEffect(() => {
-    if (!openRequest || openRequest.kbId !== kbId || !token) return
-    const controller = new AbortController()
-    resolveDocument({ documentNumber: openRequest.documentNumber }, controller.signal).then((document) => {
-      if (!document) return
-      setActiveSourceDocId(document.id)
-      setActiveSourceDocument(readDocumentToListItem(document))
-      setActiveView('doc')
-      navigateToView('files', { searchParams: { doc: String(openRequest.documentNumber) } })
-      consumeOpenRequest()
-    }).catch(() => undefined)
-    return () => controller.abort()
-  }, [openRequest, kbId, token, navigateToView, consumeOpenRequest, resolveDocument])
+    if (!openRequest || openRequest.kbId !== kbId) return
+    const doc = documents.find((d) => d.document_number === openRequest.documentNumber)
+    if (!doc) return
+    setActiveSourceDocId(doc.id)
+    setActiveView('doc')
+    navigateToView('files', { searchParams: { doc: String(openRequest.documentNumber) } })
+    consumeOpenRequest()
+  }, [openRequest, kbId, documents, navigateToView, consumeOpenRequest])
 
   // ─── Drag-and-drop ───────────────────────────────────────────
   const [fileDragOver, setFileDragOver] = React.useState(false)
@@ -1154,7 +1086,6 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   // ─── FilesGrid URL-sync callbacks ────────────────────────────
   const handleFilesPathChange = React.useCallback((path: string) => {
-    setBrowsePath(path)
     const clean = path === '/' ? '' : path.replace(/^\//, '').replace(/\/$/, '')
     const url = `/wikis/${kbSlug}` + (clean ? `/files/${encodeURI(clean)}` : '/files')
     // pushState so each folder is a back-button stop; FilesGrid already holds the path.
@@ -1163,13 +1094,16 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
 
   const handleFilesDocOpen = React.useCallback((docNumber: number | null) => {
     if (docNumber == null) return
-    setActiveView('doc')
-    updateParam('doc', String(docNumber))
-  }, [updateParam])
+    const doc = documents.find((d) => d.document_number === docNumber)
+    if (doc) {
+      setActiveSourceDocId(doc.id)
+      setActiveView('doc')
+      updateParam('doc', String(docNumber))
+    }
+  }, [documents, updateParam])
 
   const handleFilesDocClose = React.useCallback(() => {
     setActiveSourceDocId(null)
-    setActiveSourceDocument(null)
     setActiveView('files')
     updateParam('doc', null)
   }, [updateParam])
@@ -1215,9 +1149,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
             wikiTree={wikiTree}
             wikiActivePath={filesViewActive || graphViewActive ? null : wikiActivePath}
             onWikiNavigate={handleWikiSelect}
-            sourceCount={browse.sourceCount}
-            failedCount={browse.failedCount}
-            corpusCount={browse.corpusCount}
+            sourceDocs={sourceDocs}
             wikiDocs={wikiDocs}
             hasWiki={hasNavigableWiki}
             loading={loading}
@@ -1268,13 +1200,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
               >
                 <FilesGrid
                   key={kbId}
-                  documents={browse.items}
-                  activeDocument={activeSourceDocument}
-                  folders={browse.folders}
-                  hasNext={browse.hasNext}
-                  loadingMore={browse.refreshing}
-                  onLoadNext={browse.loadNext}
-                  onBrowseOptionsChange={setBrowseOptions}
+                  documents={documents}
                   onDeleteDocument={handleDeleteDocument}
                   onRenameDocument={handleRenameDocument}
                   onUpload={handleUploadClick}
@@ -1285,7 +1211,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                   onUploadFiles={uploadFiles}
                   initialDocId={activeSourceDocId}
                   initialPage={filesInitialPage}
-                  initialPath={browsePath}
+                  initialPath={routeFilesPath}
                   onPathChange={handleFilesPathChange}
                   onDocOpen={handleFilesDocOpen}
                   onDocClose={handleFilesDocClose}
@@ -1319,8 +1245,7 @@ export function KBDetail({ kbId, kbSlug, kbName, viewMode, routeFilesPath }: Pro
                   onNavigate={handleWikiNavigate}
                   onSourceClick={handleCitationSourceClick}
                   onGraphClick={handlePageGraphClick}
-                  activeDocument={activeWikiDoc}
-                  resolveDocument={resolveLogicalDocument}
+                  documents={documents}
                 />
               </motion.div>
             ) : (

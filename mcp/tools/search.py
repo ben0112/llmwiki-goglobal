@@ -7,11 +7,8 @@ from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from vaultfs import VaultFS
-from vaultfs.base import RELATION_TYPES, search_hit_to_legacy_dict
+from vaultfs.base import RELATION_TYPES
 from vaultfs.facets import UnknownFacetError
-
-from llmwiki_core.documents import DocumentKind
-from llmwiki_core.search import SearchArea, SearchQuery
 
 from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
 
@@ -93,7 +90,6 @@ class SearchHandler:
         self, query: str, path: str, tags: list[str] | None, limit: int,
         annotated_only: bool = False, scope: str = "all",
         facets: dict | None = None,
-        retrieval_profile: Literal["lexical", "hybrid"] = "lexical",
     ) -> str:
         """Full-text search across document chunks.
 
@@ -104,35 +100,16 @@ class SearchHandler:
         `facets` filters by the corpus 八维 classification metadata.
         """
         path_filter = self._path_filter_key(path)
-        area = SearchArea.ALL if path_filter is None else SearchArea(path_filter)
-        if area is SearchArea.WIKI:
-            document_kinds = (DocumentKind.WIKI,)
-        elif area is SearchArea.SOURCES:
-            document_kinds = (DocumentKind.SOURCE, DocumentKind.ASSET)
-        else:
-            document_kinds = ()
-        path_glob = None if path in ("*", "**", "**/*") else path
-        request = SearchQuery.build(
-            text=query,
-            limit=limit,
-            candidate_limit=limit,
-            path_glob=path_glob,
-            tags=tags,
-            area=area,
-            document_kinds=document_kinds,
-            annotated_only=annotated_only,
-            scope=scope,
-            facets=facets,
-        )
-        query = request.text
-        scope = request.scope.value
-        from services.retrieval import HostedRetrievalService
 
-        result = await HostedRetrievalService(self.fs, self.kb_id).retrieve(
-            request,
-            profile=retrieval_profile,
+        matches = await self.fs.search_chunks(
+            self.kb_id, query, limit, path_filter,
+            annotated_only=annotated_only, scope=scope, facets=facets,
         )
-        matches = [search_hit_to_legacy_dict(hit) for hit in result.hits]
+        matches = self._apply_path_glob(matches, path)
+
+        if tags:
+            tag_set = {t.lower() for t in tags}
+            matches = [m for m in matches if tag_set.issubset({t.lower() for t in (m.get("tags") or [])})]
 
         matches = await self._fold_corpus(matches)
 
@@ -215,7 +192,7 @@ class SearchHandler:
             lines.append(f"  {r['path']}{r['filename']} ({title}) — stale since {stale or '?'}")
         return "\n".join(lines)
 
-    async def _document_references(self, path: str) -> str:  # noqa: C901
+    async def _document_references(self, path: str) -> str:
         """Show forward references and backlinks for a specific document."""
         if not path or path in ("*", "**"):
             return "references mode requires a `path` to a specific document, or `query=\"uncited\"` / `query=\"stale\"`."
@@ -275,11 +252,23 @@ class SearchHandler:
         """Map a path pattern to a coarse wiki/sources search filter key."""
         if path in ("*", "**", "**/*"):
             return None
-        if path == "/wiki" or path.startswith("/wiki/"):
+        if path.startswith("/wiki"):
             return "wiki"
         if path in ("/", "/*"):
             return "sources"
         return None
+
+    def _apply_path_glob(self, matches: list[dict], path: str) -> list[dict]:
+        """Narrow results by a file-level glob (e.g. `*.pdf`).
+
+        The coarse wiki/sources filter is pushed into SQL; finer globs the SQL
+        can't express are applied here, mirroring list/read/delete. Bare
+        directory scopes (no wildcard) are left to the coarse filter.
+        """
+        if path in ("*", "**", "**/*") or not ("*" in path or "?" in path):
+            return matches
+        glob_pat = path if path.startswith("/") else "/" + path.lstrip("/")
+        return [m for m in matches if glob_match(m["path"] + m["filename"], glob_pat)]
 
     def _format_source_line(self, doc: dict) -> str:
         """Format a single source document for list output."""
@@ -318,7 +307,7 @@ class SearchHandler:
             return matches
         try:
             ctx = await self.fs.corpus_search_context(self.kb_id, source_rps)
-        except Exception:  # noqa: BLE001 - optional corpus folding fails open to search hits.
+        except Exception:
             return matches
         if not ctx.get("has_pipeline"):
             return matches
@@ -326,7 +315,7 @@ class SearchHandler:
         entries, states = ctx["entries"], ctx["states"]
         entry_native = {rp for rp in rps if rp.startswith("corpus/")}
         out: list[dict] = []
-        for m, rp in zip(matches, rps, strict=True):
+        for m, rp in zip(matches, rps):
             if rp.startswith(("corpus/", "wiki/")):
                 out.append(m)
                 continue
@@ -445,7 +434,6 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         annotated_only: bool = False,
         scope: Literal["all", "annotations", "source"] = "all",
         facets: dict[str, str] | None = None,
-        retrieval_profile: Literal["lexical", "hybrid"] = "lexical",
     ) -> str:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
@@ -468,7 +456,6 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
                 return await handler.search_chunks(
                     query, path, tags, min(limit, MAX_SEARCH),
                     annotated_only=annotated_only, scope=scope, facets=facets,
-                    retrieval_profile=retrieval_profile,
                 )
             if mode == "references":
                 return await handler.query_references(path, query)

@@ -8,8 +8,6 @@ import asyncio
 import json
 import logging
 import uuid
-from contextlib import suppress
-from dataclasses import dataclass
 
 import asyncpg
 from auth import verify_token
@@ -71,58 +69,33 @@ KEEPALIVE_SECONDS = 30
 RECONNECT_DELAY_SECONDS = 5
 
 
-@dataclass(frozen=True, slots=True)
-class ListenerHandle:
-    """Supervised LISTEN task plus its current subscription readiness."""
-
-    task: asyncio.Task
-    ready: asyncio.Event
-
-    async def wait_ready(self, *, timeout_seconds: float) -> None:
-        async with asyncio.timeout(timeout_seconds):
-            await self.ready.wait()
-
-    async def close(self) -> None:
-        self.ready.clear()
-        self.task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self.task
-
-
-async def setup_listener(database_url: str) -> ListenerHandle:
+async def setup_listener(database_url: str) -> asyncio.Task:
     """Start a supervised Postgres LISTEN loop that reconnects on failure."""
-    ready = asyncio.Event()
-    task = asyncio.create_task(_supervise_listener(database_url, ready))
-    return ListenerHandle(task=task, ready=ready)
+    return asyncio.create_task(_supervise_listener(database_url))
 
 
-async def _supervise_listener(database_url: str, ready: asyncio.Event) -> None:
+async def _supervise_listener(database_url: str) -> None:
     """Reconnect forever around a single LISTEN connection's lifetime."""
     while True:
-        ready.clear()
         try:
-            await _listen_until_closed(database_url, ready)
+            await _listen_until_closed(database_url)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - listener supervision must recover from any asyncpg/socket failure.
             logger.warning("LISTEN connection lost (%s), reconnecting in %ds", e, RECONNECT_DELAY_SECONDS)
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-        finally:
-            ready.clear()
 
 
-async def _listen_until_closed(database_url: str, ready: asyncio.Event) -> None:
+async def _listen_until_closed(database_url: str) -> None:
     """Hold one LISTEN connection open, pinging it so it stays alive and a drop surfaces."""
     conn = await asyncpg.connect(database_url)
     try:
         await conn.add_listener("document_changes", _on_notify)
-        ready.set()
         logger.info("Postgres LISTEN on 'document_changes' active")
         while True:
             await asyncio.sleep(KEEPALIVE_SECONDS)
             await conn.execute("SELECT 1")
     finally:
-        ready.clear()
         if not conn.is_closed():
             await conn.close()
 
@@ -140,14 +113,10 @@ async def _handle_notify(payload: str) -> None:
     user_id = data.get("user_id")
     kb_id = data.get("knowledge_base_id")
     if user_id and kb_id:
-        await manager.broadcast(
-            user_id,
-            kb_id,
-            {
-                "event": data.get("event"),
-                "id": data.get("id"),
-            },
-        )
+        await manager.broadcast(user_id, kb_id, {
+            "event": data.get("event"),
+            "id": data.get("id"),
+        })
 
 
 async def _kb_owned_by_user(websocket: WebSocket, user_id: str, kb_id: str) -> bool:
@@ -158,13 +127,12 @@ async def _kb_owned_by_user(websocket: WebSocket, user_id: str, kb_id: str) -> b
     try:
         uuid.UUID(kb_id)
         uuid.UUID(user_id)
-        return bool(
-            await pool.fetchval(
-                "SELECT 1 FROM knowledge_bases WHERE id = $1::uuid AND user_id = $2::uuid",
-                kb_id,
-                user_id,
-            )
-        )
+        return bool(await pool.fetchval(
+            "SELECT 1 FROM knowledge_bases "
+            "WHERE id = $1::uuid AND user_id = $2::uuid",
+            kb_id,
+            user_id,
+        ))
     except (ValueError, asyncpg.PostgresError):
         logger.warning(
             "Rejecting WS connection for invalid kb/user scope: user=%s kb=%s",
