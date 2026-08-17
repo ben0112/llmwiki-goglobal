@@ -266,3 +266,26 @@ async def test_lint_ignores_unclassified_sources(fs, corpus_docs):
     kb = await instance.resolve_kb("test-workspace")
     report = await LintHandler(instance, kb).run(path="/notes.md", scope="sources")
     assert "corpus-" not in report and "覆盖率账本" not in report
+
+
+async def test_two_char_query_uses_bigram_index_when_ready(fs, corpus_docs):
+    """bigram 伴生索引追平后,二字查询经 FTS 命中(生产由 API 后台同步)。"""
+    instance, kb_id = fs
+    db = instance._db_or_raise()
+    from vaultfs.cjk_bigram import bigramize
+
+    cur = await db.execute("SELECT chunk_rowid FROM chunks_bi_dirty")
+    for (rid,) in await cur.fetchall():
+        row = await (await db.execute(
+            "SELECT content FROM document_chunks WHERE rowid = ?", (rid,))).fetchone()
+        if row:
+            await db.execute(
+                "INSERT INTO chunks_fts_bi(rowid, content) VALUES (?, ?)",
+                (rid, bigramize(row[0] or "")))
+    await db.execute("DELETE FROM chunks_bi_dirty")
+    await db.commit()
+
+    hits = await instance.search_chunks(kb_id, "备案", 10)
+    assert hits and any("备案" in (h.get("content") or "") for h in hits)
+    hits2 = await instance.search_chunks(kb_id, "数据 合规", 10)
+    assert hits2                                   # 多 token AND 仍可用

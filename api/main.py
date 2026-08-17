@@ -169,6 +169,7 @@ async def _local_lifespan(app: FastAPI):
     reconcile_db = await create_sqlite_pool(db_path, init_schema=False)
     watcher_db = await create_sqlite_pool(db_path, init_schema=False)
     sweep_db = await create_sqlite_pool(db_path, init_schema=False)
+    bigram_db = await create_sqlite_pool(db_path, init_schema=False)
 
     # 启动对账挂掉必须留痕:它负责接住停机断点的整个提取积压,静默死亡
     # 的表现就是"重启后 CPU 闲置、队列不动"
@@ -181,6 +182,10 @@ async def _local_lifespan(app: FastAPI):
     # 拷入 bind mount、容器停机期间的增删),启动即扫一轮
     from domain.watcher import sweep_loop
     sweep_task = spawn_logged(sweep_loop(sweep_db, workspace), "workspace-sweep")
+
+    # 二字中文搜索伴生索引的后台同步(消费脏队列;老库首次升级在此回填)
+    from domain.bigram_sync import bigram_sync_loop
+    bigram_task = spawn_logged(bigram_sync_loop(bigram_db), "bigram-sync")
 
     # 语料自动分类轮询(默认关;设置页/环境变量开启后才会真正跑)
     from routes.corpus_pipeline import auto_loop
@@ -222,6 +227,11 @@ async def _local_lifespan(app: FastAPI):
             await sweep_task
         except asyncio.CancelledError:
             pass
+        bigram_task.cancel()
+        try:
+            await bigram_task
+        except asyncio.CancelledError:
+            pass
         if watcher_task:
             watcher_task.cancel()
             try:
@@ -231,6 +241,7 @@ async def _local_lifespan(app: FastAPI):
         await reconcile_db.close()
         await watcher_db.close()
         await sweep_db.close()
+        await bigram_db.close()
         await db.close()
 
 

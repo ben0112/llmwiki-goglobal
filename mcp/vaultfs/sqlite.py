@@ -127,6 +127,18 @@ async def _migrate_reference_types(db: aiosqlite.Connection, schema: str) -> Non
     logger.info("Rebuilt document_references with relation-layer types")
 
 
+async def _bi_index_ready(db) -> bool:
+    """bigram 伴生索引是否已追平(API 后台同步维护);未追平回落 LIKE。"""
+    try:
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_bi_dirty LIMIT 1)")
+        if (await cur.fetchone())[0]:
+            return False
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_fts_bi LIMIT 1)")
+        return bool((await cur.fetchone())[0])
+    except Exception:
+        return False
+
+
 def _build_fts_match(query: str) -> str | None:
     """FTS5 trigram MATCH expression, or None when a LIKE scan is needed.
 
@@ -439,9 +451,16 @@ class SqliteVaultFS(VaultFS):
         # production hosted-mode uses Postgres + PGroonga per-column matches.
         sql_limit = limit if scope == "all" else limit * 3
 
-        # Trigram MATCH when every token is indexable; otherwise a LIKE scan
-        # (short tokens — e.g. 2-char Chinese terms — have no trigrams).
+        # Trigram MATCH when every token is indexable. 2-char Chinese terms
+        # (税务/备案) use the bigram companion index when it is caught up
+        # (maintained by the API's background sync); otherwise a LIKE scan.
         match_expr = _build_fts_match(query)
+        fts_table = "chunks_fts"
+        if match_expr is None:
+            from .cjk_bigram import build_bi_match
+            bi_expr = build_bi_match(query)
+            if bi_expr is not None and await _bi_index_ready(db):
+                match_expr, fts_table = bi_expr, "chunks_fts_bi"
         params: list = []
         if match_expr is not None:
             sql = (
@@ -450,9 +469,9 @@ class SqliteVaultFS(VaultFS):
                 "d.filename, d.title, d.path, d.file_type, d.tags, "
                 "rank as score "
                 "FROM document_chunks dc "
-                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                f"JOIN {fts_table} fts ON dc.rowid = fts.rowid "
                 "JOIN documents d ON dc.document_id = d.id "
-                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+                f"WHERE {fts_table} MATCH ? AND d.status != 'failed' "
             )
             params.append(match_expr)
         else:

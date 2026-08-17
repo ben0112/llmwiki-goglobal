@@ -125,6 +125,16 @@ async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Conne
         if "extraction_attempts" not in {row[1] for row in await cur.fetchall()}:
             await db.execute(
                 "ALTER TABLE documents ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0")
+        # 二字搜索伴生索引:老库首次升级把存量 chunk 全量入脏队列,由 API
+        # 后台循环(domain/bigram_sync)逐批补算 —— 几十万 chunk 也不阻塞启动
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_fts_bi LIMIT 1)")
+        bi_has_rows = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_bi_dirty LIMIT 1)")
+        dirty_has_rows = (await cur.fetchone())[0]
+        if not bi_has_rows and not dirty_has_rows:
+            await db.execute(
+                "INSERT OR IGNORE INTO chunks_bi_dirty(chunk_rowid) "
+                "SELECT rowid FROM document_chunks")
         await _migrate_fts_tokenizer(db, schema)
         await _migrate_reference_types(db, schema)
         await db.commit()
@@ -196,6 +206,19 @@ def build_fts_match(query: str) -> str | None:
         return None
     quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " AND ".join(quoted)
+
+
+async def bi_index_ready(db: aiosqlite.Connection) -> bool:
+    """bigram 伴生索引是否已追平:脏队列空且索引非空才启用;回填/落后
+    期间回落 LIKE(慢但正确),旧库无表时同样回落。"""
+    try:
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_bi_dirty LIMIT 1)")
+        if (await cur.fetchone())[0]:
+            return False
+        cur = await db.execute("SELECT EXISTS(SELECT 1 FROM chunks_fts_bi LIMIT 1)")
+        return bool((await cur.fetchone())[0])
+    except Exception:
+        return False
 
 
 def build_like_patterns(query: str) -> list[str]:
@@ -794,6 +817,13 @@ class SQLiteChunkRepository:
         path_filter: str | None = None, user_id: str | None = None,
     ) -> list[dict]:
         match_expr = build_fts_match(query)
+        fts_table = "chunks_fts"
+        if match_expr is None:
+            # 二字中文查询:bigram 伴生索引追平时启用,否则回落 LIKE
+            from services.cjk_bigram import build_bi_match
+            bi_expr = build_bi_match(query)
+            if bi_expr is not None and await bi_index_ready(self._db):
+                match_expr, fts_table = bi_expr, "chunks_fts_bi"
         params: list = []
         if match_expr is not None:
             sql = (
@@ -801,9 +831,9 @@ class SQLiteChunkRepository:
                 "d.filename, d.title, d.path, d.file_type, d.tags, "
                 "rank "
                 "FROM document_chunks dc "
-                "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+                f"JOIN {fts_table} fts ON dc.rowid = fts.rowid "
                 "JOIN documents d ON dc.document_id = d.id "
-                "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+                f"WHERE {fts_table} MATCH ? AND d.status != 'failed' "
             )
             params.append(match_expr)
         else:

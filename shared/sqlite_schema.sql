@@ -122,6 +122,32 @@ CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON document_chunks B
     INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 
+-- 二字中文查询(税务/备案)的伴生索引:trigram 只覆盖 ≥3 字,二字词曾
+-- 退化为 LIKE 全表扫描。正文的 CJK 相邻二元组由 Python 切词(空格连接)
+-- 后存入本表(unicode61 直接按空格分词)。同步走"脏行队列":触发器只记
+-- rowid(纯 SQL,任何写入方都安全),API 后台循环补算 bigram 文本;查询
+-- 侧仅在队列清空(索引追平)时启用 bigram,否则维持 LIKE —— 零回归。
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_bi USING fts5(
+    content,
+    tokenize='unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS chunks_bi_dirty (
+    chunk_rowid INTEGER PRIMARY KEY
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_bi_insert AFTER INSERT ON document_chunks BEGIN
+    INSERT OR IGNORE INTO chunks_bi_dirty(chunk_rowid) VALUES (new.rowid);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_bi_delete AFTER DELETE ON document_chunks BEGIN
+    INSERT OR IGNORE INTO chunks_bi_dirty(chunk_rowid) VALUES (old.rowid);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_bi_update AFTER UPDATE ON document_chunks BEGIN
+    INSERT OR IGNORE INTO chunks_bi_dirty(chunk_rowid) VALUES (new.rowid);
+END;
+
 CREATE INDEX IF NOT EXISTS idx_documents_relative_path ON documents(relative_path);
 CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
 CREATE INDEX IF NOT EXISTS idx_documents_source_kind ON documents(source_kind);
