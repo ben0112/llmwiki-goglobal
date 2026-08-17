@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .annotate import audit, classify, extract_title
+from .annotate import audit, audit_classify, classify, extract_title
 from .codetable import DEFAULT_VERSION, load
 from .derive import apply_business_view
 from .import_annotations import entry_relative_path, render_entry_markdown, upsert_document
@@ -215,13 +215,13 @@ async def run_batch(workspace: Path, config: LLMConfig, limit: int | None = None
             try:
                 content_src = await _fetch_content(doc["id"])
                 title = extract_title(content_src) or doc["title"]
-                include, reason = await audit(config, title, content_src)
+                include, reason, row = await audit_classify(
+                    config, title, content_src, relpath)
                 if not include:
                     await _set(doc["id"], "excluded", error=reason)
                     result.excluded += 1
                     return
 
-                row = await classify(config, title, content_src, relpath)
                 apply_business_view(row)
                 rec = parse_row(row, table, today=today)
                 if any(i.level == ERROR for i in rec.issues):
@@ -390,13 +390,13 @@ async def run_batch_hosted(database_url: str, user_email: str, kb_slug: str,
                         doc["id"])
                 content_src = row_c["c"] if row_c else ""
                 title = extract_title(content_src) or doc["title"] or doc["filename"]
-                include, reason = await audit(config, title, content_src)
+                include, reason, row = await audit_classify(
+                    config, title, content_src, relpath)
                 if not include:
                     await set_state(doc["id"], "excluded", error=reason)
                     result.excluded += 1
                     return
 
-                row = await classify(config, title, content_src, relpath)
                 apply_business_view(row)
                 rec = parse_row(row, table, today=today)
                 entry_content = render_entry_markdown(rec, content_src, imported_on)

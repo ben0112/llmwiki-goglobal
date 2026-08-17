@@ -140,14 +140,14 @@ def test_run_batch_failure_isolated_and_retried(tmp_path, monkeypatch):
     good = _insert_source(ws, "0001_境外投资备案通知.txt", "境外投资备案(核准)无纸化通知", POLICY_BODY)
     bad = _insert_source(ws, "0002_坏文档.txt", "会失败的文档", POLICY_BODY)
 
-    real_classify = pl.classify
+    real_ac = pl.audit_classify
 
-    async def flaky_classify(config, title, body, relpath):
+    async def flaky_ac(config, title, body, relpath):
         if "坏文档" in relpath:
             raise LLMError("模拟端点故障")
-        return await real_classify(config, title, body, relpath)
+        return await real_ac(config, title, body, relpath)
 
-    monkeypatch.setattr(pl, "classify", flaky_classify)
+    monkeypatch.setattr(pl, "audit_classify", flaky_ac)
 
     cfg = LLMConfig(base_url="mock")
     result = asyncio.run(pl.run_batch(ws, cfg))
@@ -208,21 +208,21 @@ def test_run_batch_llm_calls_are_concurrent(tmp_path, monkeypatch):
     for i in range(4):
         _insert_source(ws, f"000{i}_通知{i}.txt", f"境外投资备案通知{i}", POLICY_BODY)
 
-    real_audit = pl.audit
+    real_ac = pl.audit_classify
     active = 0
     peak = 0
 
-    async def tracking_audit(config, title, body):
+    async def tracking_ac(config, title, body, relpath):
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
         try:
             await asyncio.sleep(0.05)   # 撑开时间窗,让并发可观测
-            return await real_audit(config, title, body)
+            return await real_ac(config, title, body, relpath)
         finally:
             active -= 1
 
-    monkeypatch.setattr(pl, "audit", tracking_audit)
+    monkeypatch.setattr(pl, "audit_classify", tracking_ac)
 
     result = asyncio.run(pl.run_batch(ws, LLMConfig(base_url="mock", concurrency=2)))
     assert result.picked == 4 and result.failed == 0
@@ -478,15 +478,15 @@ def test_reset_failed_requeues_quarantined(tmp_path, monkeypatch):
     ws = _init_ws(tmp_path)
     bad = _insert_source(ws, "0001_坏文档.txt", "会失败的文档", POLICY_BODY)
 
-    real_classify = pl.classify
+    real_ac = pl.audit_classify
     broken = True
 
-    async def flaky_classify(config, title, body, relpath):
+    async def flaky_ac(config, title, body, relpath):
         if broken:
             raise LLMError("模拟端点故障")
-        return await real_classify(config, title, body, relpath)
+        return await real_ac(config, title, body, relpath)
 
-    monkeypatch.setattr(pl, "classify", flaky_classify)
+    monkeypatch.setattr(pl, "audit_classify", flaky_ac)
     cfg = LLMConfig(base_url="mock")
     for _ in range(3):
         asyncio.run(pl.run_batch(ws, cfg))
@@ -537,3 +537,56 @@ def test_excluded_list_and_requeue(tmp_path):
     assert pl.requeue(conn) == 0                             # 空参防误删
     conn.close()
     assert _states(ws)[good][0] == "imported"                # 已入库的不受影响
+
+
+async def test_audit_classify_merged_single_call(monkeypatch):
+    """合并调用:一次补全同时给出判定+标注;排除不标注;缺标签回退。"""
+    import corpus.annotate as an
+    from corpus.llm import LLMConfig
+
+    FULL = {"收录": "是", "理由": "权威政策", "阶段": "S2", "服务大类": "G1",
+            "体裁": "政策法规", "隐性规则": "R0", "证据": "E1", "来源": "国内",
+            "归口": "商务委", "国别区域": "通用", "行业形态": "通用/通用",
+            "时效": "M2", "置信度": "高"}
+    calls: list[tuple] = []
+
+    async def fake_full(config, sys_p, user_p, *, required_keys, strict_retry=True):
+        calls.append(required_keys)
+        return dict(FULL)
+
+    monkeypatch.setattr(an, "chat_json", fake_full)
+    cfg = LLMConfig(base_url="http://x/v1")
+    include, reason, row = await an.audit_classify(cfg, "标题", "正文内容" * 100, "a.txt")
+    assert include and reason == "权威政策"
+    assert row["服务大类"] == "G1" and row["entry_id"] and "收录" not in row
+    assert len(calls) == 1                            # 全程单次调用
+
+    async def fake_exclude(config, sys_p, user_p, *, required_keys, strict_retry=True):
+        return {"收录": "否", "理由": "纯广告"}
+
+    monkeypatch.setattr(an, "chat_json", fake_exclude)
+    include, reason, row = await an.audit_classify(cfg, "t", "b", "a.txt")
+    assert not include and reason == "纯广告" and row is None
+
+    partial_calls: list[tuple] = []
+
+    async def fake_partial(config, sys_p, user_p, *, required_keys, strict_retry=True):
+        partial_calls.append(required_keys)
+        if "收录" in required_keys:
+            return {"收录": "是", "理由": "ok"}     # 合并响应缺标注键
+        return dict(FULL)                            # 回退的单独 classify
+
+    monkeypatch.setattr(an, "chat_json", fake_partial)
+    include, reason, row = await an.audit_classify(cfg, "t", "b", "a.txt")
+    assert include and row["服务大类"] == "G1"       # 回退兜住质量
+    assert len(partial_calls) == 2
+
+
+def test_merged_system_prompt_composition():
+    """合并提示词包含审核标准、八维规范与合并输出契约,不含审核旧契约。"""
+    from corpus.annotate import build_merged_system_prompt
+
+    p = build_merged_system_prompt()
+    assert "收录标准" in p and "不收录" in p          # 审核段
+    assert "八维取值" in p and "输出格式" in p        # 标注段
+    assert "合并输出契约" in p and '"收录":"是"' in p

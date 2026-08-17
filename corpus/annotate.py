@@ -116,6 +116,61 @@ async def audit(config: LLMConfig, title: str, body: str) -> tuple[bool, str]:
     return include, str(obj.get("理由", "")).strip()
 
 
+def build_merged_system_prompt() -> str:
+    """审核+标注合并提示词:运行时由两份提示词拼接,避免内容漂移。
+
+    审核段截掉其独立输出契约,末尾换成合并契约(排除→只出判定;
+    收录→完整标注 JSON 附带收录键)。"""
+    audit_txt = load_prompt("audit_system_prompt.txt")
+    audit_criteria = audit_txt.split("只输出一个扁平JSON")[0].rstrip()
+    return (
+        audit_criteria
+        + "\n\n先按上述标准做准入判定;对收录者继续完成八维标注,标注规范如下:\n\n"
+        + load_prompt("classify_system_prompt.txt")
+        + "\n\n==================== 合并输出契约(覆盖以上输出格式) ====================\n"
+          '判定不收录:只输出 {"收录":"否","理由":"一句话依据"},不含任何标注键。\n'
+          '判定收录:输出上述完整标注 JSON,并额外加入 "收录":"是"。\n'
+          "无论哪种情况,仍然只输出一个扁平 JSON,禁止其他文字。"
+    )
+
+
+def build_merged_prompt(title: str, body: str, max_chars: int = 6000) -> str:
+    body = effective_body(body)
+    if len(body) > max_chars:
+        body = body[: int(max_chars * 0.8)] + "\n……[截断]……\n" + body[-int(max_chars * 0.2):]
+    return (f"候选语料如下,请先判定是否收录,收录则一并完成八维标注。\n标题：{title}"
+            f"\n正文：\n{body}\n\n只输出一个扁平JSON。")
+
+
+async def audit_classify(config: LLMConfig, title: str, body: str,
+                         relpath: str) -> tuple[bool, str, dict | None]:
+    """合并调用:一次补全同时完成准入判定与(收录时的)八维标注。
+
+    返回 (是否收录, 理由, 标注行或 None)。响应缺关键标签(服务大类/阶段)
+    时回退单独 classify 一次 —— 与两段式等价的质量兜底。
+    每条语料的 LLM 调用数从 1+收录率 降到 ~1。mock 走原两段规则桩。
+    """
+    if config.is_mock:
+        include, reason = await audit(config, title, body)
+        if not include:
+            return False, reason, None
+        return True, reason, await classify(config, title, body, relpath)
+
+    obj = await chat_json(config, build_merged_system_prompt(),
+                          build_merged_prompt(title, body), required_keys=("收录",))
+    include = str(obj.get("收录", "")).strip().startswith("是")
+    reason = str(obj.get("理由", "")).strip()
+    if not include:
+        return False, reason, None
+    if not (obj.get("服务大类") and obj.get("阶段")):
+        return True, reason, await classify(config, title, body, relpath)
+    rec = {k: v for k, v in obj.items() if k != "收录"}
+    rec["relpath"] = relpath
+    rec["title"] = title
+    rec["entry_id"] = make_entry_id(rec, relpath)
+    return True, reason, rec
+
+
 async def classify(config: LLMConfig, title: str, body: str, relpath: str) -> dict:
     """八维标注:返回「标注明细」行形状的中文键字典(含 entry_id)。"""
     if config.is_mock:
