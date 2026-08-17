@@ -14,7 +14,7 @@
 
 | 方向 | 内容 |
 |---|---|
-| **八维语料层** | 受控码表(独立版本号,只增不改)、`EntryRecord` 八维条目模型与校验、标注明细 CSV 导入器(本地/托管双模式)、分面检索(15 个分面键,SQLite/Postgres 同一套)、中文全文检索(FTS5 trigram)、`lint` 完备性检查 + 覆盖率账本、Web 语料库视图(知识/业务双视图 + 覆盖率矩阵)、关系层五类边 + 复审工作清单 + KPI 仪表盘。详见 [`corpus/README.md`](corpus/README.md) |
+| **八维语料层** | 受控码表(独立版本号,只增不改)、`EntryRecord` 八维条目模型与校验、标注明细 CSV 导入器(本地/托管双模式)、分面检索(15 个分面键,SQLite/Postgres 同一套)、中文全文检索(FTS5 trigram + 二字词 bigram 伴生索引)、LLM 分类流水线(审核+标注单次调用/并发退避/排除清单)、`lint` 完备性检查 + 覆盖率账本、Web 语料库视图(知识/业务双视图 + 覆盖率矩阵)、关系层五类边 + 复审工作清单 + KPI 仪表盘。详见 [`corpus/README.md`](corpus/README.md) |
 | **前端中文化** | Web 应用的全部用户界面文本为简体中文(法律条款页除外) |
 | **去 SaaS 化** | 移除 Google OAuth、Pydantic Logfire、OpenReplay;MCP/API 认证改为**平台内生成的 API 密钥**(`sv_` 前缀 Bearer),不再依赖 GoTrue 的 OAuth 2.1 服务;对象存储支持任意 S3 兼容端点(MinIO 等) |
 | **自部署** | `deploy/docker-compose.selfhost.yml` + [`docs/self-hosting.md`](docs/self-hosting.md) 完整部署指南(自托管 Supabase + MinIO + docker compose) |
@@ -23,7 +23,8 @@
 
 - **MCP 连接** — 任何 MCP 兼容客户端(桌面端、CLI、网页端智能体)读写、检索语料与维基
 - **八维语料库** — 每条语料一张"身份证"(阶段×大类主/副 + 六分面),按货架落位,分面检索、覆盖率账本、业务视图 7 类 27 场景导航
-- **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等
+- **LLM 分类流水线** — 设置页配一个 OpenAI 兼容端点(本地 vLLM/MLX 或云端均可),即可对工作区源文件自动完成准入审核+八维标注(单次调用),支持并发(端点感知默认,上限 256)、思考模式开关、限流自动退避、失败隔离与排除清单(带理由、可重审)、30 秒自动分类轮询
+- **文件上传** — Markdown、PDF、Word、PowerPoint、Excel、图片等;单文件至 1GB、断点续传、文件夹/压缩包整批导入(保留目录结构),或直接把文件拷进工作区文件夹(周期对账自动收录)
 - **Web 应用** — 浏览维基与源文件、语料库分面筛选、知识图谱(含关系层五类边)
 - **治理闭环** — `lint` 八维检查、复审到期工作清单、KPI 仪表盘(分面完备率/货架覆盖率/时效达标率/引用溯源率)
 
@@ -46,7 +47,7 @@
 
 # 本地模式(快速开始)
 
-**要求**:Python 3.11+、Node.js 20+。可选:[LibreOffice](https://www.libreoffice.org/)(抽取 Word/PPT)、`MISTRAL_API_KEY`(更高质量的 PDF OCR;默认用本地 opendataloader,无需联网)。
+**要求**:Python 3.11+、Node.js 20+。可选:[LibreOffice](https://www.libreoffice.org/)(抽取 Word/PPT)、poppler + tesseract(损坏文本层 PDF 的 OCR 兜底,Docker 镜像已内置)、`MISTRAL_API_KEY`(更高质量的 PDF 版面解析;默认用本地 opendataloader,无需联网)。
 
 > **Docker 一键运行(免装任何依赖)** — 镜像内置全部运行时(Python、Node、JRE、LibreOffice、Noto CJK 字体):
 >
@@ -71,7 +72,7 @@
 > {"mcpServers": {"llmwiki": {"command": "docker", "args": ["exec", "-i", "llmwiki", "/app/llmwiki", "mcp", "/workspace"]}}}
 > ```
 >
-> **端口**:API 宿主机默认 `9000`(容器内固定 8000,避开本机 LLM 推理栈常占的 8000)、Web `3000`、MCP `8080`。换端口:`LLMWIKI_API_PORT=9100 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认只绑定 127.0.0.1(本地实例无鉴权),局域网访问设 `LLMWIKI_BIND=0.0.0.0`。
+> **端口**:API 宿主机默认 `9000`(容器内固定 8000,避开本机 LLM 推理栈常占的 8000)、Web `3000`、MCP `8080`。换端口:`LLMWIKI_API_PORT=9100 LLMWIKI_WEB_PORT=9300 LLMWIKI_MCP_PORT=9280 docker compose up -d`(`PUBLIC_*_URL` 自动对齐,设置页与启动日志随之更新);裸 `docker run` 换端口时需同时传 `-e PUBLIC_API_URL=... -e PUBLIC_MCP_URL=...`。端口默认绑定 `0.0.0.0`,局域网设备可直接访问(前端按浏览器地址自动对齐 API/MCP 地址,无需配置);本地实例无鉴权,如需仅限本机访问设 `LLMWIKI_BIND=127.0.0.1`。
 >
 > 本地构建:`docker build -f Dockerfile.local -t llmwiki-local .`;CI 在 `master` 推送/打 tag 时自动构建并发布到 Docker Hub(需配置 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` 两个仓库 secret,见 `.github/workflows/docker-publish.yml`)。用 Docker 时可跳过下面 1–3 步。
 
@@ -103,7 +104,10 @@ cd web && npm install && cd ..
 
 > 各类智能体的接入方式(Codex CLI、Hermes、OpenClaw 等)以及托管模式的 API 密钥认证,见 **[`docs/agent-integration.md`](docs/agent-integration.md)**。
 
-**4. 导入标注语料(可选)** — 若已有 LLM 标注工具包产出的 `标注明细.csv`:
+**4. 语料入库(可选)** — 两条路径任选:
+
+- **内置分类流水线(推荐)**:Web 应用 **设置 → 语料分类流水线** 配好 LLM 端点,语料库页点「立即分类」或打开自动分类,流水线对工作区源文件逐条完成审核+八维标注入库;
+- **导入现成标注**:若已有 LLM 标注工具包产出的 `标注明细.csv`:
 
 ```bash
 # 校验(不写入,报告出在 CSV 同目录 corpus_import_dryrun/)
@@ -203,7 +207,7 @@ python3 -m corpus.import_annotations \
 |------|------|
 | `guide` | 首次调用:说明知识库结构与工作方式 |
 | `create_knowledge_base` / `list_knowledge_bases` | 建库/列库 |
-| `search` | 文件浏览、全文检索(中文 trigram 分词)、**分面过滤**(`facets={"domain":"Z1","country":"IDN",...}`)、引用图谱查询;`query="due"` 返回复审到期工作清单 |
+| `search` | 文件浏览、全文检索(中文 ≥3 字 trigram、二字词 bigram)、**分面过滤**(`facets={"domain":"Z1","country":"IDN",...}`)、引用图谱查询;`query="due"` 返回复审到期工作清单 |
 | `read` | 读取文档(单文件或 glob 批量、PDF/Office 页码区间、可含图片) |
 | `create` / `edit` / `append` / `delete` | 维基页面与资产的增删改(`overview.md`/`log.md` 受保护) |
 | `relate` | 维护**关系层五类边**:`is_a` 上下位 · `next` 前后置 · `routes_to` 路径衔接 · `governed_by` 归口映射 · `serves` 阶段服务包(跨内容重建持久保留) |
@@ -213,8 +217,8 @@ python3 -m corpus.import_annotations \
 
 | 类型 | 格式 | 处理方式 |
 |------|------|----------|
-| PDF | `.pdf` | 本地抽取文本与图表;设 `MISTRAL_API_KEY` 可提升表格/复杂版面 OCR 质量 |
-| Office | `.docx` `.doc` `.pptx` `.ppt` | LibreOffice 转换后抽取(需本机安装 LibreOffice) |
+| PDF | `.pdf` | 本地抽取文本与图表;文本层损坏(常见于设计类报告)自动按页并行 OCR 兜底(镜像内置 tesseract 中文);设 `MISTRAL_API_KEY` 可提升表格/复杂版面质量 |
+| Office | `.docx` `.doc` `.pptx` `.ppt` | LibreOffice 转换后抽取(需本机安装 LibreOffice);LibreOffice 对损坏 docx 崩溃时自动解包直读兜底 |
 | 表格 | `.xlsx` `.xls` | 逐表抽取 |
 | 网页 | `.html` `.htm` | 清洗为可读 Markdown,去导航与广告 |
 | 文本与数据 | `.md` `.txt` `.csv` `.json` `.xml` `.yaml` `.svg` 等 | 直接索引分块 |

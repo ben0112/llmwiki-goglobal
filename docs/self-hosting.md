@@ -133,7 +133,7 @@ prefer):
 server {
     listen 443 ssl http2;
     server_name api.example.com;
-    client_max_body_size 110m;            # TUS upload chunks (100 MB cap + headroom)
+    client_max_body_size 1100m;           # TUS upload chunks (1 GiB cap + headroom)
 
     location /v1/ws/ {                    # WebSocket live updates
         proxy_pass http://127.0.0.1:8000;

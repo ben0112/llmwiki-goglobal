@@ -10,10 +10,15 @@ Implements the eight-dimension corpus classification layer (spec v2026.06) on to
 | `codetable.py` | 码表加载与取值归一化(别名、U 码、ISO 转换、置信度、复审周期) |
 | `schema.py` | 八维条目模型 `EntryRecord`:解析 `标注明细.csv` 两种口径(流水线扁平列 / 试标注样本装饰值,如 `S2④(副S3⑤)`、`E2/商务委U3`),主/副标签拆分、entry_id 校验与重派、review_due 推算;**公理一**——任何行都能落位,码表外取值走兜底并记录问题 |
 | `import_annotations.py` | 导入 CLI:标注明细 → 工作区 markdown 条目 + SQLite 索引行 + 导入报告/复核队列 |
+| `pipeline.py` | LLM 分类流水线编排器:审核+标注(合并单次调用)→ 业务派生 → 入库,`corpus_pipeline` 状态机(失败重试≤3、排除清单/重审),本地 SQLite 与托管 Postgres 双实现,含 CLI |
+| `annotate.py` | LLM 审核/八维标注调用与提示词装配(合并提示词运行时拼接,缺标签自动回退单独标注;mock 规则桩) |
+| `llm.py` | OpenAI 兼容异步客户端:进程级连接复用、并发上限(默认 256,`CORPUS_LLM_MAX_CONCURRENCY` 可放宽)、429/5xx 指数退避(尊重 Retry-After)、思考模式开关 |
+| `review.py` | 条目复核(通过/修正/排除)、重新识别(删条目→重提取→重分类)、码表下拉取值 |
+| `derive.py` | 八维 → 业务码(7类27场景)确定性派生 |
 
 ## 用法
 
-上游流程不变(先审后标,见工具包 README):
+**两条入库路径**:① 内置 LLM 分类流水线(推荐,无需外部工具包)—— Web 设置页配好端点后在语料库页「立即分类」或开自动分类,亦可 CLI `python3 -m corpus.pipeline --workspace ~/goglobal-ws --mock` 自测;② 导入外部标注工具包的产出,上游流程不变(先审后标,见工具包 README):
 
 ```
 原始语料 →〔审核 收/不收〕→ 收录/ →〔classify 八维标注〕→ 标注明细.csv
@@ -93,8 +98,10 @@ search(knowledge_base="...", mode="search", query="数据出境",
 两种后端(SQLite / Postgres)同一套分面键。
 
 **中文全文检索**:本地 FTS5 分词器由 `porter unicode61` 换为 `trigram`
-(旧库启动时自动重建索引);短于 3 字符的检索词(如二字词"税务")自动降级为
-LIKE 扫描,FTS 特殊字符不再报错。英文检索改为子串匹配(不再做词干归并)。
+(旧库启动时自动重建索引),FTS 特殊字符不再报错;英文检索为子串匹配(不做词干归并)。
+二字词("税务""备案")走 **bigram 伴生索引** `chunks_fts_bi`:正文 CJK 相邻二元组
+由 API 后台循环切词维护(触发器记脏行,老库自动回填),索引追平后二字查询毫秒级命中;
+未追平期间自动回落 LIKE 扫描,慢但正确。
 
 **lint 八维检查**:对已分类语料逐条检查维度完备性(公理一)、码表取值合法性、
 `review_due` 复审到期(时效达标率)、待复核队列;报告末尾附**覆盖率账本**
@@ -143,3 +150,4 @@ LIKE 扫描,FTS 特殊字符不再报错。英文检索改为子串匹配(不再
 - **第二期**:分面检索(VaultFS 双后端 + MCP `search`)、FTS5 CJK 分词(trigram + 迁移)、`lint` 八维完备率检查 + 覆盖率账本。✅
 - **第三期**:Web 语料库视图(分面筛选/覆盖率矩阵/业务视图导航/生命周期徽标)。✅
 - **第四期**:关系层五类边 + `relate` 工具、复审工作清单(query="due")、KPI 仪表盘(lint + Web)。✅
+- **第五期**:LLM 分类流水线线上化(审核+标注合并单次调用、并发退避、失败隔离、排除清单/重审、「重新识别」闭环、思考模式开关、自动分类轮询)。✅
