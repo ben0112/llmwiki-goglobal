@@ -43,6 +43,34 @@ the URLs consistently). The converter must **not** be exposed publicly.
 
 ---
 
+## Shortcut: LAN one-click deployment (no domain / no TLS)
+
+For an **internal-network deployment reachable by IP** (e.g. `192.168.x.x`),
+skip sections 1–6 entirely — `deploy/lan/` bundles the whole stack
+(supabase/postgres + GoTrue + auth router + MinIO + api/mcp/converter/web)
+into one compose file with generated secrets:
+
+```bash
+sudo git clone https://github.com/ben0112/llmwiki-goglobal.git /opt/llmwiki
+cd /opt/llmwiki
+sudo bash deploy/lan/bootstrap.sh <LAN-IP>     # e.g. 192.168.171.9
+```
+
+The bootstrap script generates all secrets into `deploy/lan/.env.lan`
+(git-ignored; includes an ES256 signing key — GoTrue publishes the public
+half at `/auth/v1/.well-known/jwks.json`, which is exactly what
+`api/auth.py` validates against), builds the images, applies
+`supabase/migrations/` idempotently, and health-checks every service.
+Re-running it is safe: existing secrets are kept and compose just
+reconciles. Host ports: Web **3000** · API **8000** · MCP **8080** ·
+Auth **8001** · MinIO S3 **9000** / console **9001** · Postgres
+**127.0.0.1:5432** only. Signup is open with e-mail auto-confirm
+(no mail server on a LAN) — front it with TLS and a real mailer before
+exposing it beyond the LAN. The rest of this guide covers the
+domain-based production layout.
+
+---
+
 ## 1. Prerequisites
 
 - Docker + docker compose on the host(s)
