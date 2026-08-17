@@ -132,3 +132,43 @@ async def test_migration_seeds_dirty_for_existing_chunks(tmp_path):
         assert (await cursor.fetchone())[0] == 1            # 存量已入队
     finally:
         await db.close()
+
+
+# ── 跨进程写入口(flock 咨询锁)────────────────────────────────
+
+async def test_cross_process_write_lock_mutual_exclusion(tmp_path):
+    """两个持锁者互斥;超时降级为无锁继续(不因对端卡死饿死自己)。"""
+    from infra import write_lock as wl
+
+    (tmp_path / ".llmwiki").mkdir(parents=True)
+    wl.configure(tmp_path)
+    try:
+        async with wl.cross_process_write_lock():
+            # 第二个获取者(等价于另一进程的 open+flock)拿不到
+            fh = open(tmp_path / ".llmwiki" / "db-write.lock", "a+")
+            try:
+                assert wl._acquire_blocking(fh, timeout=0.2) is False
+            finally:
+                fh.close()
+            # 超时降级:锁被占时短超时进入不阻塞(降级路径)
+            async with wl.cross_process_write_lock(timeout=0.2):
+                pass
+        # 释放后可正常获取
+        fh = open(tmp_path / ".llmwiki" / "db-write.lock", "a+")
+        try:
+            assert wl._acquire_blocking(fh, timeout=0.2) is True
+        finally:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    finally:
+        wl._lock_path = None                       # 全局状态复原,勿影响他测
+
+
+async def test_write_lock_noop_when_unconfigured():
+    """未 configure(测试/托管模式):空操作,行为与从前一致。"""
+    from infra import write_lock as wl
+
+    assert wl._lock_path is None
+    async with wl.cross_process_write_lock():
+        pass

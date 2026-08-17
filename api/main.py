@@ -171,6 +171,10 @@ async def _local_lifespan(app: FastAPI):
     sweep_db = await create_sqlite_pool(db_path, init_schema=False)
     bigram_db = await create_sqlite_pool(db_path, init_schema=False)
 
+    # 跨进程写入口:API 写闸门与 MCP 直写共持 .llmwiki/db-write.lock
+    from infra.write_lock import configure as configure_write_lock
+    configure_write_lock(workspace)
+
     # 启动对账挂掉必须留痕:它负责接住停机断点的整个提取积压,静默死亡
     # 的表现就是"重启后 CPU 闲置、队列不动"
     from domain.local_processor import reconcile_workspace

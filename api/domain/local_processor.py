@@ -53,17 +53,23 @@ _inflight: set[str] = set()
 
 @asynccontextmanager
 async def _gated_write(db: aiosqlite.Connection):
-    """写闸门 + 异常回滚:闸门内半截事务若不回滚,会被同一连接上随后的
-    失败标记 commit 顺带提交(如旧资产已删、新数据未插全)。"""
+    """写闸门 + 跨进程写锁 + 异常回滚。
+
+    进程内经 _db_write_gate 串行;跨进程(MCP 直写同一 SQLite)经
+    .llmwiki/db-write.lock 的 flock 统一写入口 —— 交互式 MCP 写不再与
+    提取大事务硬碰 busy_timeout。闸门内半截事务若不回滚,会被同一连接
+    上随后的失败标记 commit 顺带提交(如旧资产已删、新数据未插全)。"""
+    from infra.write_lock import cross_process_write_lock
     async with _db_write_gate:
-        try:
-            yield
-        except Exception:
+        async with cross_process_write_lock():
             try:
-                await db.rollback()
+                yield
             except Exception:
-                logger.warning("Rollback after failed gated write also failed")
-            raise
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.warning("Rollback after failed gated write also failed")
+                raise
 
 
 async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Path) -> None:

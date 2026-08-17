@@ -175,12 +175,16 @@ class SqliteVaultFS(VaultFS):
         """Initialize the SQLite connection and workspace root for the given path."""
         global _db, _workspace_root
         _workspace_root = Path(workspace_path).resolve()
+        # 跨进程写入口:与 API 的写闸门共持 .llmwiki/db-write.lock
+        from .write_lock import configure as _configure_write_lock
+        _configure_write_lock(_workspace_root)
         db_path = os.path.join(workspace_path, ".llmwiki", "index.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         _db = await aiosqlite.connect(db_path)
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
-        await _db.execute("PRAGMA busy_timeout=30000")
+        # 与 API 主连接同口径 60s:批量提取的连续大事务会长时间占住写锁
+        await _db.execute("PRAGMA busy_timeout=60000")
         if _SCHEMA_PATH.exists():
             schema = _SCHEMA_PATH.read_text(encoding='utf-8')
             await _db.executescript(schema)
@@ -315,7 +319,9 @@ class SqliteVaultFS(VaultFS):
         row = await cursor.fetchone()
         doc_number = row[0]
 
+        from .write_lock import cross_process_write_lock
         try:
+          async with cross_process_write_lock():
             await db.execute(
                 "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
                 "file_type, status, content, tags, date, metadata, version, document_number) "
@@ -356,7 +362,9 @@ class SqliteVaultFS(VaultFS):
             args.append(json.dumps(metadata))
 
         args.append(doc_id)
+        from .write_lock import cross_process_write_lock
         try:
+          async with cross_process_write_lock():
             await db.execute(
                 f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",
                 tuple(args),
@@ -380,8 +388,11 @@ class SqliteVaultFS(VaultFS):
         if not doc_ids:
             return 0
         placeholders = ",".join("?" for _ in doc_ids)
-        cursor = await db.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", doc_ids)
-        await db.commit()
+        from .write_lock import cross_process_write_lock
+        async with cross_process_write_lock():
+            cursor = await db.execute(
+                f"DELETE FROM documents WHERE id IN ({placeholders})", doc_ids)
+            await db.commit()
         return cursor.rowcount
 
 
